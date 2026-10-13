@@ -137,8 +137,11 @@ jobs:
             $python = (Get-Command python3 -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
             if ($python -isnot [string] -or -not [System.IO.Path]::IsPathFullyQualified($python) -or -not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'A single absolute Python application path is required.' }
             & $python -B ./tools/bootstrap/bootstrap-unix.py --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root $evidence --timeout-seconds 1200 --jobs 2
+            if ($LASTEXITCODE -ne 0) { throw 'Supervised Unix bootstrap did not complete.' }
           }
-          if ($LASTEXITCODE -ne 0) { throw 'Supervised bootstrap did not complete.' }
+          # Windows bootstrap is a PowerShell script that throws on failure and
+          # validates its native receipts. LASTEXITCODE belongs to the most
+          # recent native command and can be unset or stale after this script.
           $receipt = Get-Content -LiteralPath (Join-Path $evidence 'bootstrap-complete.json') -Raw | ConvertFrom-Json
           if ($receipt.schema -cne 'mmmm-bootstrap-complete/1' -or $receipt.lease_released -ne $true -or $receipt.slot_id -cnotmatch '^(windows|linux|macos)-(x86_64|aarch64)-[0-9a-f]{24}-bootstrap$') { throw 'Bootstrap completion receipt is invalid.' }
           $exe = if ($IsWindows) { 'mmmm-xtask.exe' } else { 'mmmm-xtask' }

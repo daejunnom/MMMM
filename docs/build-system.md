@@ -249,6 +249,11 @@ CI가 설정한 `MMMM_CARGO`가 있으면 하나의 절대 일반 파일 경로�
 실행 파일 사전 검사 실패는 native process scope나 lease를 생성하지 않는다.
 native 시작 실패의 진단은 작업 이름, 캡처한 Win32 오류 번호와 해당 시스템 메시지를
 최대 512자로 보존하며 명령 인수와 환경 값은 포함하지 않는다.
+Windows script의 실패는 예외와 native receipt로 판정한다. `$LASTEXITCODE`는
+가장 최근 native 명령의 상태이므로 PowerShell script 호출의 완료 판정으로 사용하지 않는다.
+Unix launcher의 실패 진단은 고정 단계명과 native operation, errno를 기록하며
+파일명·명령 인수·환경 값은 포함하지 않는다. 원래 오류를 보존하고 유효한 evidence
+root가 확보된 경우 작은 `bootstrap-failure.json`을 저장한다.
 
 Unix launcher는 별도 session의 leader를 먼저 만들고, 부모가 native identity를
 확인한 뒤 보내는 시작 신호가 있어야 Cargo를 실행한다. leader는 자식 종료 이후에도

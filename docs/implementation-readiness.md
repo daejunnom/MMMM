@@ -52,6 +52,12 @@ Windows의 빌드 관리 도구 bootstrap은 실제로 통과했으며, 제품 �
 | Windows Cargo 사전 검사 실패 복구 | native 실행 전 거절, 정확한 소유 기록 대조와 빈 scratch 확인 후 수동 lease 해제 | 정상 rustup proxy 처리와 lease 획득 전 사전 검사로 수정; 수동 복구는 자동 완료 근거가 아님 |
 | Windows 수정 launcher 첫 Cargo 실행 | 실제 Cargo 종료 101, drain 및 실패 로그 export, 정확한 소유 slot 완료와 lease 해제 | 병행한 승인 의존성 변경으로 locked resolution 거절; 제품 또는 bootstrap 성공으로 표시하지 않음 |
 | Windows 수정 launcher 재검사 | Cargo 종료 0, Job drain, export, 소유 자식 정리와 lease 해제 통과 | 승인 의존성 변경의 명시적 lock 갱신을 선택; 원격 Windows 시작 실패의 후속 CI 확인은 별도 |
+| 두 번째 3개 OS 기반 CI | Linux 구조 검사·formatting·tests·Clippy 통과; 집계 실패 | Windows native bootstrap은 통과했으나 미설정 PowerShell native exit 변수를 실패로 판정; macOS 최초 컴파일 준비 중 EPERM, 원인 확인 중 |
+| Windows PowerShell 종료 판정 회귀 | caller native exit 7을 유지하면서 bootstrap 종료 0, 실제 완료 receipt와 lease 해제 확인 | PowerShell script의 예외 및 native receipt를 사용하며 과거 native exit를 bootstrap 결과로 사용하지 않음 |
+| Coordinator와 CLI 첫 통합 컴파일 | Windows lib 및 bin 컴파일 통과 | 인증 transport·부분 자료 조회와 공통 application 연결; 실제 native peer 검사 및 game pairing은 별도 |
+| 부분 자료 조회·형상·큰 결과 집중 검사 | application 19, reference 30, runtime 26 검사 통과 | 실제 임시 SQLite/CAS·재시작·범위/ACL·무결성·큰 결과의 자료 참조; native shape와 실제 게임의 인수는 별도 |
+| JVM 도구 준비 | 공식 JDK 및 Gradle ZIP SHA-256 일치, 유한 extraction 및 외부 소유 cache 보존 | Temurin `25.0.4.1+1`, Gradle `9.6.0`; JVM 제품 컴파일 및 테스트 결과와 구분 |
+| 첫 JVM 실행 | Java 시작의 jimage 경로 오류로 실패, 종료 및 로그 보존 | Windows native 경로 형식 경계 확인 후 재검사 중; 오류 파일은 내용 출력 없이 외부 증거 위치로 이동 |
 
 실패한 실행의 원본 판정은 유지한다. native drain과 정확한 소유 기록을 확인하고
 로그를 별도로 내보내며 digest를 대조한 경우에만 해당 실행의 알려진 임시 파일을
@@ -64,6 +70,13 @@ Windows의 빌드 관리 도구 bootstrap은 실제로 통과했으며, 제품 �
 실패 로그와 Windows 시작 실패 artifact를 외부 증거 위치에 보존했다.
 실행 파일 경로 선택 및 native 오류 진단을 수정한 source로 후속 CI를 진행하며,
 실제 결과를 확인하기 전 원격 보호의 필수 성공 검사나 G0 인수를 등록하지 않는다.
+
+두 번째 원격 실행은 source `098327185c202c0c2f9ae14008654feb56627613`의
+[foundation run](https://github.com/daejunnom/MMMM/actions/runs/38435093729)이다.
+Linux job의 성공과 Windows bootstrap 자체의 성공을 확인했으나 전체 집계는
+실패했다. Windows workflow 종료 판정과 Unix 실패 단계 진단을 보완해 다음
+source에서 재검증한다. macOS의 EPERM은 단계 진단 없이 원인을 단정하거나
+process 관찰·자원 한도를 완화하지 않는다.
 
 ## 단계별 규약 적용
 

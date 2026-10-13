@@ -10,6 +10,7 @@ provided. Deliberate daemon/session escape is outside this cooperative boundary.
 import argparse
 import ctypes
 import errno
+import functools
 import hashlib
 import json
 import os
@@ -38,6 +39,51 @@ OWNER_FIELDS = {"schema", "catalog_id", "slot_id", "checkout_digest", "os", "arc
                 "purpose", "token", "pid", "state", "completed_ms"}
 cancelled = False
 DIRECTORY_PINS = {}
+CURRENT_PHASE = "startup"
+FAILURE_EVIDENCE = None
+
+
+def native_call(operation, function, *args, **kwargs):
+    """Tag only static operation names; retain native exception subclasses."""
+    try:
+        return function(*args, **kwargs)
+    except OSError as error:
+        if not hasattr(error, "mmmm_operation"):
+            error.mmmm_operation = operation
+        raise
+
+
+def native_operation(operation):
+    def decorate(function):
+        @functools.wraps(function)
+        def wrapped(*args, **kwargs):
+            return native_call(operation, function, *args, **kwargs)
+        return wrapped
+    return decorate
+
+
+def failure_details(error):
+    # OSError.__str__ can include filenames. These diagnostics contain only
+    # static source labels and the OS's numeric error and standard message.
+    operation = getattr(error, "mmmm_operation", "unspecified")
+    if isinstance(error, OSError):
+        number = error.errno if isinstance(error.errno, int) else None
+        message = os.strerror(number) if number is not None else "native error unavailable"
+        detail = "errno=" + str(number) + " " + message
+    elif isinstance(error, RuntimeError):
+        detail = str(error)
+    else:
+        detail = type(error).__name__
+    detail = "".join(character if 32 <= ord(character) < 127 else "?" for character in detail)[:384]
+    details = {"phase": CURRENT_PHASE, "operation": operation, "error": detail}
+    if hasattr(error, "mmmm_cleanup_errors"):
+        details["cleanup_errors"] = error.mmmm_cleanup_errors
+    return details
+
+
+def phase(name):
+    global CURRENT_PHASE
+    CURRENT_PHASE = name
 
 
 def safe_name(name):
@@ -50,23 +96,26 @@ def safe_name(name):
         raise RuntimeError("secret-named paths are not accessed")
 
 
+@native_operation("directory traversal")
 def open_directory(path, create=False, pin=False):
     path = Path(path)
     if not path.is_absolute() or path.anchor != "/" or ".." in path.parts or "." in path.parts:
         raise RuntimeError("regular absolute directory required")
     current = Path(path.anchor)
-    descriptor = os.open(current, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    descriptor = native_call("open directory root", os.open, current,
+                             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         for part in path.parts[1:]:
             safe_name(part)
             current /= part
             if create:
                 try:
-                    os.mkdir(part, mode=0o700, dir_fd=descriptor)
-                    os.fsync(descriptor)
+                    native_call("create directory component", os.mkdir, part, mode=0o700, dir_fd=descriptor)
+                    native_call("sync created directory parent", os.fsync, descriptor)
                 except FileExistsError:
                     pass
-            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            child = native_call("open directory component", os.open, part,
+                                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = child
             metadata = os.fstat(descriptor)
@@ -117,6 +166,7 @@ def sync_directory(path):
         os.close(descriptor)
 
 
+@native_operation("create and sync record")
 def write_new(path, data):
     safe_name(path.name)
     parent = open_directory(path.parent)
@@ -143,6 +193,7 @@ def replace_record(path, record):
         os.close(parent)
 
 
+@native_operation("read regular file")
 def read_regular(path, limit):
     safe_name(path.name)
     parent = open_directory(path.parent)
@@ -191,6 +242,7 @@ def digest(value):
     return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
 
 
+@native_operation("enumerate bounded entries")
 def entries(path, allowed):
     descriptor = open_directory(path)
     try:
@@ -207,6 +259,7 @@ def entries(path, allowed):
         os.close(descriptor)
 
 
+@native_operation("enumerate directory names")
 def names(path):
     descriptor = open_directory(path)
     try:
@@ -222,6 +275,7 @@ def names(path):
         os.close(descriptor)
 
 
+@native_operation("read entry metadata")
 def metadata(path):
     safe_name(path.name)
     descriptor = open_directory(path.parent)
@@ -446,10 +500,10 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
     if owned_tail_policy not in ("reject", "terminate-build"):
         raise RuntimeError("unsupported owned-tail policy")
     streams, descriptors = [], set()
-    selector = selectors.DefaultSelector()
+    selector = native_call("create output selector", selectors.DefaultSelector)
 
     def pipe():
-        ends = os.pipe()
+        ends = native_call("create owned pipe", os.pipe)
         descriptors.update(ends)
         return ends
 
@@ -463,8 +517,9 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
             safe_name(path.name)
             parent = open_directory(path.parent)
             try:
-                descriptor = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                                     0o600, dir_fd=parent)
+                descriptor = native_call("create owned command log", os.open, path.name,
+                                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                         0o600, dir_fd=parent)
             finally:
                 os.close(parent)
             stream = os.fdopen(descriptor, "wb")
@@ -475,15 +530,28 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
         release_read, release_write = pipe()
         start_read, start_write = pipe()
         for descriptor, key in ((out_read, 0), (err_read, 1), (report_read, 2)):
-            os.set_blocking(descriptor, False)
-            selector.register(descriptor, selectors.EVENT_READ, key)
-        leader = os.fork()
-    except BaseException:
+            native_call("set owned pipe nonblocking", os.set_blocking, descriptor, False)
+            native_call("register owned pipe selector", selector.register, descriptor, selectors.EVENT_READ, key)
+        leader = native_call("fork reserved session leader", os.fork)
+    except BaseException as preparation_error:
+        cleanup_errors = []
+
+        def cleanup(operation, function, *args):
+            try:
+                native_call(operation, function, *args)
+            except OSError as cleanup_error:
+                details = failure_details(cleanup_error)
+                cleanup_errors.append(details["operation"] + ": " + details["error"])
+
         for stream in streams:
-            stream.close()
+            cleanup("close unstarted command log", stream.close)
         for descriptor in descriptors:
-            os.close(descriptor)
-        selector.close()
+            cleanup("close unstarted owned pipe", os.close, descriptor)
+        cleanup("close unstarted output selector", selector.close)
+        if cleanup_errors:
+            # At most two logs, ten pipe ends and one selector were prepared.
+            # Preserve the first failure while recording every cleanup attempt.
+            preparation_error.mmmm_cleanup_errors = cleanup_errors
         raise
     if leader == 0:
         session_id = None
@@ -493,7 +561,7 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
                 stream.close()
             for descriptor in (out_read, err_read, report_read, release_write, start_write):
                 os.close(descriptor)
-            os.setsid()
+            native_call("establish reserved session", os.setsid)
             session_id = os.getpid()
             # The still-live wrapper reserves SID/PGID until parent drain checks.
             os.write(report_write, b"ready\n")
@@ -502,10 +570,10 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
             if os.read(start_read, 1) != b"x":
                 os._exit(126)
             os.close(start_read)
-            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-            resource.setrlimit(resource.RLIMIT_AS, (MEMORY_LIMIT, MEMORY_LIMIT))
-            resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
-            worker = os.fork()
+            native_call("set core dump limit", resource.setrlimit, resource.RLIMIT_CORE, (0, 0))
+            native_call("set address space limit", resource.setrlimit, resource.RLIMIT_AS, (MEMORY_LIMIT, MEMORY_LIMIT))
+            native_call("set descriptor limit", resource.setrlimit, resource.RLIMIT_NOFILE, (256, 256))
+            worker = native_call("fork bounded build worker", os.fork)
             if worker == 0:
                 os.close(report_write)
                 os.close(release_read)
@@ -550,9 +618,11 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
                     os._exit(126)
                 time.sleep(0.05)
             os._exit(0)
-        except BaseException:
+        except BaseException as child_error:
             try:
-                os.write(report_write, b"launcher-error\n")
+                details = failure_details(child_error)
+                diagnostic = details["operation"] + ": " + details["error"]
+                os.write(report_write, ("launcher-error:" + diagnostic[:192] + "\n").encode("ascii"))
             except OSError:
                 pass
             if session_id is not None:
@@ -597,6 +667,8 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
                                 ready = True
                             elif line.startswith(b"exit:") and ready and command_exit is None:
                                 command_exit = int(line[5:])
+                            elif line.startswith(b"launcher-error:"):
+                                raise RuntimeError("reserved launcher: " + line[15:].decode("ascii"))
                             else:
                                 raise RuntimeError("native control report invalid")
                     else:
@@ -666,7 +738,8 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
                 time.sleep(0.05)
         observe()
     except BaseException as error:
-        errors.append("native supervision: " + str(error))
+        details = failure_details(error)
+        errors.append("native supervision: " + details["operation"] + ": " + details["error"])
         if ready and not reaped:
             try:
                 os.killpg(leader, signal.SIGKILL)
@@ -748,6 +821,7 @@ def default_output(target_os):
 
 
 def entry():
+    global FAILURE_EVIDENCE
     if sys.version_info < (3, 10) or sys.platform not in ("linux", "darwin"):
         raise RuntimeError("bootstrap requires Python 3.10+ on Linux or macOS")
     parser = argparse.ArgumentParser(description=__doc__)
@@ -767,7 +841,9 @@ def entry():
     if arch is None:
         raise RuntimeError("unsupported Unix architecture")
     # Check the physical native API before any ownership mutation.
-    NativeSnapshot(target_os)
+    phase("native preflight")
+    native_call("load native process API", NativeSnapshot, target_os)
+    phase("validate managed roots")
     checkout = directory(options.checkout)
     output = options.output_root or default_output(target_os)
     evidence = options.evidence_root
@@ -776,6 +852,8 @@ def entry():
     separate(output / "build/managed-v1", evidence)
     output = directory(output, True)
     evidence = directory(evidence, True)
+    FAILURE_EVIDENCE = evidence
+    phase("reserve bootstrap ownership")
     catalog = directory(output / "build/managed-v1", True)
     checkout_digest = hashlib.sha256(str(checkout).rstrip("/").encode("utf-8")).hexdigest()
     slot_id = target_os + "-" + arch + "-" + checkout_digest[:24] + "-bootstrap"
@@ -861,6 +939,7 @@ def entry():
                  "purpose": "bootstrap"}
     ownership_file = evidence / "bootstrap-ownership.json"
     write_new(ownership_file, encode_record(ownership))
+    phase("prepare build environment")
     environment = os.environ.copy()
     overrides = {"CARGO_TARGET_DIR": str(cache / "cargo-target"), "CARGO_HOME": str(cache / "cargo-home"),
                  "CARGO_INCREMENTAL": "0", "CARGO_BUILD_JOBS": str(options.jobs),
@@ -873,11 +952,13 @@ def entry():
     if cargo is None:
         raise RuntimeError("Cargo executable unavailable; lease preserved")
     cargo_invocation = cargo
-    cargo = str(Path(cargo).resolve(strict=True))
+    cargo = str(native_call("resolve Cargo executable", Path(cargo).resolve, strict=True))
     stdout, stderr = scratch / ("cargo-" + token + ".stdout.log"), scratch / ("cargo-" + token + ".stderr.log")
     signal.signal(signal.SIGINT, cancellation)
     signal.signal(signal.SIGTERM, cancellation)
+    phase("initial managed resource observation")
     observe()
+    phase("inspect Cargo lock")
     try:
         lock_exists = stat.S_ISREG(metadata(checkout / "Cargo.lock").st_mode)
         if not lock_exists:
@@ -887,9 +968,11 @@ def entry():
     build_args = ["build", "-p", "mmmm-xtask", "--jobs", str(options.jobs)]
     if lock_exists and not options.update_lock:
         build_args.insert(1, "--locked")
+    phase("prepare and supervise Cargo build")
     result = supervise(cargo, build_args,
                        str(checkout), environment, stdout, stderr, options.timeout_seconds, observe, target_os,
                        invocation=cargo_invocation, owned_tail_policy="terminate-build")
+    phase("export Cargo supervision evidence")
     exported = False
     if result["drained"]:
         logs = [read_regular(path, LOG_LIMIT) for path in (stdout, stderr)]
@@ -908,6 +991,7 @@ def entry():
             or result["supervisor_errors"] or not exported):
         # No automatic failed/stale lease recovery is implemented here.
         raise RuntimeError("bootstrap failed; exported proof, slot and lease preserved")
+    phase("validate completed bootstrap for adoption")
     for path, expected in records.items():
         if read_regular(path, RECORD_LIMIT) != expected:
             raise RuntimeError("bootstrap ownership record changed before adoption")
@@ -928,11 +1012,13 @@ def entry():
         # mutable slot trees here would race its authorized scratch deletion
         # and completed-slot eviction. This phase is separately capped at 60s.
 
+    phase("supervise Rust bootstrap adoption")
     completion = supervise(str(tool), completion_args, str(checkout), environment,
                            evidence / "bootstrap-complete.stdout.log", evidence / "bootstrap-complete.stderr.log",
                            60, observe_completion, target_os)
     if completion["command_exit"] != 0 or not completion["drained"] or completion["supervisor_errors"]:
         raise RuntimeError("Rust bootstrap completion failed; ownership and receipts retained")
+    phase("verify Rust bootstrap completion receipt")
     receipt = json.loads(read_regular(evidence / "bootstrap-complete.json", RECORD_LIMIT),
                          object_pairs_hook=unique_pairs)
     if (receipt.get("schema") != "mmmm-bootstrap-complete/1" or receipt.get("token") != token
@@ -948,5 +1034,15 @@ if __name__ == "__main__":
     try:
         entry()
     except Exception as failure:
-        print("mmmm-bootstrap: " + str(failure), file=sys.stderr)
+        details = failure_details(failure)
+        if FAILURE_EVIDENCE is not None:
+            try:
+                write_new(FAILURE_EVIDENCE / "bootstrap-failure.json", encode_record({
+                    "schema": "mmmm-bootstrap-failure/1", **details}))
+            except Exception as export_error:
+                export_details = failure_details(export_error)
+                print("mmmm-bootstrap: diagnostic export failed: " + export_details["operation"]
+                      + ": " + export_details["error"], file=sys.stderr)
+        print("mmmm-bootstrap: phase=" + details["phase"] + "; operation=" + details["operation"]
+              + "; " + details["error"], file=sys.stderr)
         sys.exit(1)
