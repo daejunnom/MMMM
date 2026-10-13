@@ -296,7 +296,7 @@ async-signal-safe 설정을 하고 exec 직후 첫 소유 process 관측을 수�
 거치며 lease를 보존한다. 실제 macOS 기반 CI에서 이 정책의 실행과 전체 기반 검사
 성공을 확인했으며, 새 제품 입력의 성공과 JVM 적합성은 별도로 검증한다.
 
-일반 Rust 관리 명령의 `ResourcePolicy`는 현재 OS와 일치해야 한다. Windows는
+Rust 관리 명령의 `ResourcePolicy`는 현재 OS와 목적에 일치해야 한다. Windows는
 자식 시작 전에 Job의 kill-on-close, commit 2 GiB와 process 32개 설정을 readback으로
 대조한다. 실행 중 같은 Job의 실제 peak commit과 process 수를 관측한다. Linux는
 자식의 async-signal-safe 시작 경로에서 `RLIMIT_AS` soft 및 hard 각각 2 GiB를
@@ -308,6 +308,41 @@ async-signal-safe 설정을 하고 exec 직후 첫 소유 process 관측을 수�
 않는다. 실제 Windows 자식의 설정 및 readback 검사는 통과했으며, 다른 OS의 새
 일반 정책과 JVM의 주소 공간 요구는 실제 후속 실행으로 확인한다. 이전 bootstrap
 또는 이전 감독 도구의 성공을 새 일반 명령 정책의 완료 근거로 사용하지 않는다.
+
+정확한 `purpose=jvm`은 Linux에서만 `managed-linux-jvm-resources/1`을 선택한다.
+이 정책은 process별 `RLIMIT_AS` soft 및 hard를 고정 512 GiB로 설정하고 정확한
+readback을 확인한다. 소유 그룹의 `smaps_rollup` `Rss` 합계를 2 GiB, live process를
+32개까지 관측한다. PowerShell launcher와 Java·Gradle·test 자식을 포함하고 Rust
+supervisor는 제외한다. 일반 `checks`와 다른 목적의 Linux 주소 공간 2 GiB,
+Windows Job과 Darwin의 기존 설정은 유지한다. 숫자 상한 옵션, 프로그램 이름에
+따른 추정, 실패 뒤 fallback·상한 확대·자동 재시도는 제공하지 않는다.
+
+Linux의 일반 process 수 검사와 JVM 자원 검사는 고정 procfs root FD, 그 FD를
+기준으로 연 숫자 PID directory 및 원래 `stat` FD를 사용한다. 원래 leader의
+PID·starttime·SID·PGID를 확보하고 unreaped child reservation을 유지한다. member의
+RSS 전후에도 같은 identity를 대조한다. `stat`은 8 KiB, `smaps_rollup`은 32 KiB,
+directory 순회는 100000 entry로 제한하며 읽기 횟수와 interruption에도 상한을 둔다.
+`Z`·`X` 상태라도 thread가 남으면 종료로 제외하지 않는다. 살아 있는 process의
+permission·malformed 자료·identity 오류를 0 또는 이전 값으로 바꾸지 않는다.
+RSS의 `ENOENT`·`ESRCH`만으로 종료를 판정하지 않고 원래 stat의 실제 종료를 확인한다.
+이미 성공적으로 읽은 RSS와 VM은 바로 뒤의 종료로 없애지 않고 관측 사실로 보존한다.
+초기 leader identity를 확보하지 못하거나 reservation을 잃으면 group signal과 drain
+완료를 허용하지 않으며 lease와 진단을 보존한다.
+
+RSS 합계는 각 process를 순서대로 읽은 관측이다. 공유 페이지를 process마다 포함하며
+그룹 전체의 동시 snapshot, 유일한 물리 메모리 사용량이나 kernel resident quota가
+아니다. `kernel_resident_quota=false`, `kernel_process_quota=false`,
+`group_snapshot_atomic=false`, `sampling_may_overshoot=true`를 기록한다. 100 ms는 목표이고
+실제 sample 수, peak RSS·VM·process 수, 최대 sample 간격과 미완성 memory sample을
+보존한다. process 상한 초과로 RSS 전체를 읽지 않은 sample은 완전한 memory sample로
+기록하지 않는다. 관측 위반과 오류는 소유 종료·출력 수집·drain 경로로 전달한다.
+새 Linux JVM 정책의 native 실행과 실제 Gradle 적합성은 아직 별도 검증 대상이다.
+
+Linux JVM native VM probe는 일반 `checks`의 이미 낮아진 hard limit 안에서 실행하지
+않는다. 고정 `jvm` 소유 실행에서만 명시적으로 선택하는 ignored 검사이며, inherited
+512 GiB readback과 8 GiB의 유한한 VM 예약을 확인한다. 실제 resident allocation은
+소량으로 제한한다. 이 probe나 pure parser·tracker 검사를 실제 전체 JVM 인수로
+보고하지 않는다.
 
 저장 크기 관측의 native 실패에는 단계, 소유 생성물 루트 기준 경로, 시도 횟수와
 OS 오류를 유한하게 남긴다. 개인 절대 경로와 보호된 이름은 진단에 넣지 않는다.

@@ -33,6 +33,7 @@
 | MMMM-D021 | `CommandContext.rotationDegrees`의 두 값은 `[pitchDegrees, yawDegrees]` 순서로 해석한다. | 원본의 명시되지 않은 순서를 Minecraft native Vec2 의미와 맞춘 구현 결정이다. Rust와 Java 경계에서 같은 순서와 유한 값 검사를 적용한다. |
 | MMMM-D022 | Darwin 빌드는 `managed-darwin-resources/1`의 플랫폼별 자원 정책을 적용한다. | 512 GiB의 VM 설정·관측 한도와 소유 그룹 합계 RSS 및 physical footprint 각각 2 GiB를 구분한다. 100 ms 목표 관측, 완전한 성공 관측 사이 1초 상한과 worker 32개를 적용한다. kernel resident quota로 표현하지 않으며 실제 macOS CI로 검증한다. |
 | MMMM-D023 | 일반 Rust 관리 명령도 플랫폼별 자원 정책을 명시하고 native 설정과 관측 결과를 보존한다. | Windows는 시작 전 Job의 commit 2 GiB 및 process 32개 상한을 확인한다. Linux는 process마다 주소 공간 2 GiB를 설정·확인하고 소유 그룹 32개를 관측한다. 두 정책의 100 ms 목표 표본 및 최대 간격을 기록하며 Linux에 kernel resident quota나 Darwin의 1초 표본 간격 보장을 주장하지 않는다. Windows의 실제 자식 설정 검사는 통과했으며 다른 OS와 JVM 적합성은 별도 검증한다. |
+| MMMM-D024 | 정확한 `purpose=jvm`에만 Linux JVM 자원 정책 `managed-linux-jvm-resources/1`을 선택한다. | Linux JVM의 process별 VM soft/hard를 고정 512 GiB로 설정·대조하고 소유 그룹의 `smaps_rollup` RSS 합계 2 GiB 및 live process 32개를 100 ms 목표로 관측한다. 일반 `checks`의 2 GiB 주소 공간과 Windows·Darwin 기존 정책은 유지한다. kernel RSS/process quota, 그룹의 동시 snapshot이나 새 session 이탈 containment를 주장하지 않는다. 순차 RSS는 공유 페이지를 process마다 포함하고 관측 사이 초과가 가능하다. 실패 후 자동 확대·재시도나 ICU 원인 확정은 하지 않으며 새 정책의 실제 Linux 실행은 별도 검증한다. |
 
 ## 구현 전에 확인할 항목
 

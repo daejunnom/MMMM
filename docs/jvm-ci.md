@@ -84,10 +84,35 @@ Hermetic build, 게임 profile 검증과 릴리스 artifact 동등성은 별도 
 
 일반 명령의 1200초, 실제 Rust 관리 출력 상한 64 MiB, slot 8 GiB, catalog 12 GiB와
 5초 disk 관측을 사용한다. bootstrap 출력 상한 128 MiB와 일반 명령 상한을 구분한다.
-이 heap 및 관측 설정은 전체 JVM kernel memory quota를 의미하지 않는다. Windows와
-Linux의 일반 관리 명령 resource quota 연결, Darwin 감독 정책의 실제 검증 상태는
-[빌드 수명](build-system.md)과 [구현 착수 조건](implementation-readiness.md)을 따른다.
-실패 또는 초과 뒤 상한을 바꾸거나 자동 재시도하지 않는다.
+이 heap 및 관측 설정은 전체 JVM kernel memory quota를 의미하지 않는다. Windows는
+기존 Job commit 2 GiB와 process 32개 설정을 유지한다. Darwin도 기존 VM 512 GiB,
+소유 그룹 RSS 및 physical footprint 각각 2 GiB, worker 32개와 관측 조건을 유지한다.
+실제 검증 상태는 [빌드 수명](build-system.md)과
+[구현 착수 조건](implementation-readiness.md)을 따른다. 실패 또는 초과 뒤 상한을
+바꾸거나 자동 재시도하지 않는다.
+
+[MMMM-D024](DECISIONS.md)는 정확한 `purpose=jvm`에만 Linux의
+`managed-linux-jvm-resources/1`을 선택한다. 이 정책은 process별 `RLIMIT_AS` soft 및
+hard를 고정 512 GiB로 설정하고 정확한 readback을 확인한다. 원래 leader의 native
+identity와 unreaped child reservation을 유지한 소유 그룹에서 `smaps_rollup`의 `Rss`
+합계를 2 GiB, live process를 32개까지 100 ms 목표로 관측한다. PowerShell launcher,
+Java·Gradle·test 자식을 포함하고 Rust supervisor는 제외한다. 일반 `checks`와 다른
+목적의 Linux 주소 공간 2 GiB는 유지하며 시간·출력·disk 예산도 변경하지 않는다.
+
+Linux 관측은 고정 procfs root FD와 그 FD를 기준으로 연 숫자 PID directory 및 원래
+stat FD를 사용한다. RSS 전후의 PID·starttime·SID·PGID를 확인하고 유한하게 자료를
+읽는다. 살아 있는 원래 process의 permission·malformed 자료·identity 오류는 실패로
+보존한다. RSS 오류만으로 종료나 0 RSS를 판정하지 않으며 성공적으로 읽은 RSS와 VM은
+직후 실제 종료에도 관측 사실로 남긴다. 초기 leader identity 확보 실패나 reservation
+상실은 group signal과 drain 완료를 허용하지 않고 lease와 진단을 보존한다.
+
+RSS 합계는 process들을 순서대로 읽은 관측이고 공유 페이지를 process마다 포함한다.
+그룹 전체의 동시 snapshot이나 kernel RSS·process quota가 아니며 관측 사이 초과가
+가능하다. receipt에는 `kernel_resident_quota=false`, `kernel_process_quota=false`,
+`group_snapshot_atomic=false`, `sampling_may_overshoot=true`, 실제 sample 수·peak·최대
+sample 간격과 미완성 memory sample을 보존한다. 새 session으로 의도적으로 이탈한
+process를 모두 포괄하는 sandbox 보장을 제공하지 않는다. 새 정책의 실제 Linux native
+실행과 PowerShell·Gradle 적합성은 아직 미검증이며 소스 및 순수 검사 결과와 구분한다.
 
 JVM helper는 관리 경로를 `managedGradleHome`에 보관한다. PowerShell의 `$HOME`과
 겹치는 변수 이름을 사용하지 않는다. 실패 record에는 원래 exception chain의 타입과
@@ -113,8 +138,11 @@ helper가 시작 전에 종료하면 내부 record는 없으며 감독기의 실
 [Linux getrlimit 문서](https://man7.org/linux/man-pages/man2/getrlimit.2.html)
 .NET은 GC 시작 시 commit과 별도로 가상 주소 구간을 예약하며 기본 region range는
 큰 값일 수 있다. [공식 GC 설정 문서](https://learn.microsoft.com/en-us/dotnet/core/runtime-config/garbage-collector)
-새 probe 결과와 목적별 메모리 정책 검토가 필요하다. 이 수정은 Linux 상한을 변경하지
-않으며 ICU 설치, invariant globalization 또는 상한 확대 재시도를 추가하지 않는다.
+이전 JVM helper와 공유 probe 변경은 Linux 상한을 유지한 진단 범위였다. 이후 D024로
+채택한 목적별 정책은 위에 별도로 기록한 명시적 변경이며, 원래 실패의 원인을 확정한
+결과는 아니다. 관리 범위 전후 probe도 환경과 관측값을 비교하는 자료이며 패키지 부재나
+주소 공간이 signal 6의 원인이었다고 단독으로 확정하지 않는다. ICU 설치, invariant
+globalization, silent fallback 또는 실패 뒤 상한 확대 재시도는 추가하지 않는다.
 
 세 runner job 모두 성공해야 `jvm-result` 집계가 성공한다. workflow는 path filter로
 필수 상태를 생략하지 않는다. `always()` 기록과 artifact export에 실제 step outcome,

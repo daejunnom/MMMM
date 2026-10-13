@@ -94,6 +94,10 @@ Windows의 빌드 관리 도구 bootstrap은 실제로 통과했으며, 제품 �
 | bootstrap 활성 항목 관측 회귀 | Windows 실제 harness 17개 사례 통과, 명령 종료 0 | 원래 열거된 authored leaf를 삭제한 뒤 실제 누락 예외를 보존하고 활성 descendant만 허용. PowerShell child tuple의 깊이 증가 괄호를 수정하여 실제 깊이 5/5/1 및 root 선택을 확인. 완료 cache·owner record·링크·알 수 없는 wrapper 거절, fixture와 외부 sentinel 보존. 첫 두 harness 실패 및 원격 Windows bootstrap 재검증은 별도 |
 | JVM 공유 runtime probe | Windows 관리 한도 안의 실제 PowerShell 7.6.5·.NET 10.0.11에서 `en-US` 정렬 통과 | 정해진 GC 숫자와 유한 record만 확인. helper와 workflow의 정적 파싱은 통과했으나 Linux·macOS probe 및 수정 후 3개 OS JVM CI 성공은 미검증 |
 | 열한 번째 Rust 3개 OS CI | Windows 전체 기반 job 통과; Linux·macOS 및 집계 실패 | source `ef9d9281e1dd16aa467a9a880ead2851c0a4df2c`; 세 artifact의 bytes·SHA-256을 대조. macOS stdio의 `posix_spawnattr_setflags` 인자형 컴파일 오류와 Linux의 platform 조건부 린트 두 건을 확인해 수정. 원래 실패를 유지하며 수정 후 해당 OS 성공은 별도 검증 |
+| 저장 계획과 undo claim의 추가 경계 | runtime 78 검사 통과, 실패 및 warning 없음 | 실제 PlanId와 hash를 source material의 claim에 묶고 mutable retained target 관측을 transaction 전에 수행. 같은 Store의 원장·CAS·GC·재시작 및 거절 경로이며 실제 게임 복원 인수와 구분 |
+| production Application과 calibration recipe 연결 | application 56, compiler 85 검사 통과 | 기존 공개 경로와 lazy undo 경로가 같은 알고리즘을 사용. 처음 실패한 ordinary context fixture는 정본의 external side와 descriptor·digest에 맞춰 수정했고 원래 55 통과·1 실패 기록을 보존. sealed 47개 calibration 프로그램과 metadata 출력의 순수 recipe 검사이며 실제 게임 실행·profile 발급은 별도 |
+| Linux JVM 자원 정책의 Windows 검사와 실행기 빌드 | 관리 도구 96 통과·1 ignored, all-targets Clippy 및 실행기 빌드 통과 | 새 Linux 정책의 parser·identity·tracker 순수 검사를 Windows에서 수행. 새 실행기도 Windows 2 GiB Job 정책 안에서 빌드했다. Linux의 실제 VM 설정·RSS 관측·PowerShell 및 Gradle 실행은 아직 미검증 |
+| 열두 번째 Rust 3개 OS CI | Windows와 Linux 전체 기반 job 통과; macOS 및 집계 실패 | source `8b9dda10a02aa188fcd731b9dcd28c3b67b49dd3`; macOS artifact bytes·SHA-256을 대조. 제품 컴파일은 통과했고 Coordinator는 135 통과·2 실패. native peer Protocol 거절과 stdio 시작 실패의 제한된 assertion을 보완 중이며 supervisor drain·export·정리 및 lease 해제는 완료 |
 
 실패한 실행의 원본 판정은 유지한다. native drain과 정확한 소유 기록을 확인하고
 로그를 별도로 내보내며 digest를 대조한 경우에만 해당 실행의 알려진 임시 파일을

@@ -25,6 +25,9 @@ const READ_BATCH_BYTES: usize = 8192;
 #[cfg(any(target_os = "macos", test))]
 #[path = "darwin_resources.rs"]
 mod darwin_resources;
+#[cfg(any(target_os = "linux", test))]
+#[path = "linux_resources.rs"]
+mod linux_resources;
 #[path = "resource_policy.rs"]
 mod resource_policy;
 pub use resource_policy::ResourcePolicy;
@@ -54,7 +57,8 @@ pub struct ProcessSpec {
     /// Combined retained stdout and stderr bytes. Excess output fails the run.
     pub max_log_bytes: u64,
     pub tail_policy: TailPolicy,
-    /// Fixed native policy for the current platform; foreign modes are rejected.
+    /// Fixed native policy for this platform and managed purpose; foreign modes
+    /// are rejected. The default retains the general command policy.
     pub resource_policy: ResourcePolicy,
 }
 
@@ -1281,6 +1285,8 @@ mod native {
         resources: darwin_resources::Tracker,
         #[cfg(target_os = "linux")]
         resources: resource_policy::Tracker,
+        #[cfg(target_os = "linux")]
+        linux_group: Option<linux_resources::OwnedGroup>,
     }
     impl Process {
         pub(super) fn spawn(spec: &ProcessSpec) -> Result<Self, ProcessError> {
@@ -1294,6 +1300,9 @@ mod native {
                 darwin_resources::Tracker::new(memory)?
             };
             let mut command = Command::new(&spec.program);
+            #[cfg(target_os = "linux")]
+            let linux_address_limit: libc::rlim_t =
+                spec.resource_policy.linux_address_space_limit()?;
             command
                 .args(&spec.args)
                 .current_dir(&spec.cwd)
@@ -1303,15 +1312,15 @@ mod native {
                 .stderr(Stdio::piped());
             // Only async-signal-safe libc calls occur between fork and exec.
             unsafe {
-                command.pre_exec(|| {
+                command.pre_exec(move || {
                     if libc::setsid() == -1 {
                         return Err(std::io::Error::last_os_error());
                     }
                     #[cfg(target_os = "linux")]
                     {
                         let limits = libc::rlimit {
-                            rlim_cur: resource_policy::MEMORY_LIMIT as libc::rlim_t,
-                            rlim_max: resource_policy::MEMORY_LIMIT as libc::rlim_t,
+                            rlim_cur: linux_address_limit,
+                            rlim_max: linux_address_limit,
                         };
                         if libc::setrlimit(libc::RLIMIT_AS, &limits) != 0 {
                             return Err(std::io::Error::last_os_error());
@@ -1347,7 +1356,7 @@ mod native {
             #[cfg(target_os = "macos")]
             resources.configured();
             #[cfg(target_os = "linux")]
-            let resources = resource_policy::Tracker::linux();
+            let resources = resource_policy::Tracker::linux_for_policy(spec.resource_policy)?;
             let stdout = child
                 .stdout
                 .take()
@@ -1370,14 +1379,32 @@ mod native {
                     eof: false,
                 },
                 reaped: false,
-                reservation_valid: true,
+                reservation_valid: !cfg!(target_os = "linux"),
                 #[cfg(target_os = "macos")]
                 mac_leader_identity: None,
                 #[cfg(target_os = "macos")]
                 resources,
                 #[cfg(target_os = "linux")]
                 resources,
+                #[cfg(target_os = "linux")]
+                linux_group: None,
             };
+            #[cfg(target_os = "linux")]
+            {
+                match linux_resources::OwnedGroup::capture(pid) {
+                    Ok(group) => {
+                        process.linux_group = Some(group);
+                        process.reservation_valid = true;
+                    }
+                    Err(mut error) => {
+                        // Initial native identity was never established. Do
+                        // not signal a numeric group based only on Child, or
+                        // invent drain/release its storage lease after failure.
+                        error.drained = false;
+                        return Err(error);
+                    }
+                }
+            }
             for fd in [
                 process.stdout.file.as_raw_fd(),
                 process.stderr.file.as_raw_fd(),
@@ -1464,9 +1491,9 @@ mod native {
                 }))
             }
         }
-        pub(super) fn scope_empty(&self) -> Result<bool, ProcessError> {
+        pub(super) fn scope_empty(&mut self) -> Result<bool, ProcessError> {
             #[cfg(target_os = "linux")]
-            let members = live_group_members(self.pid)?;
+            let members = self.linux_sample(false)?.live_processes;
             #[cfg(target_os = "macos")]
             let members = live_group_members(
                 self.pid,
@@ -1502,10 +1529,33 @@ mod native {
         #[cfg(target_os = "linux")]
         pub(super) fn observe_resources(&mut self) -> Result<(), ProcessError> {
             if self.resources.due() {
-                let members = live_group_members(self.pid)?;
-                self.resources.record_linux(members)?;
+                let include_rss = self.resources.requires_linux_rss();
+                let sample = self.linux_sample(include_rss)?;
+                if include_rss {
+                    self.resources.record_linux_jvm(
+                        sample.live_processes,
+                        sample.aggregate_rss_bytes,
+                        sample.max_virtual_bytes,
+                    )?;
+                } else {
+                    self.resources.record_linux(sample.live_processes)?;
+                }
             }
             Ok(())
+        }
+        #[cfg(target_os = "linux")]
+        fn linux_sample(
+            &mut self,
+            include_rss: bool,
+        ) -> Result<linux_resources::Sample, ProcessError> {
+            let group = self.linux_group.as_mut().ok_or_else(|| {
+                ProcessError::new("process_identity", "missing anchored Linux group identity")
+            })?;
+            let result = group.sample(include_rss);
+            if !group.reservation_valid() {
+                self.reservation_valid = false;
+            }
+            result
         }
         #[cfg(target_os = "linux")]
         pub(super) fn resource_evidence(&self) -> resource_policy::Evidence {
@@ -1607,94 +1657,6 @@ mod native {
                 }
             }
         }
-    }
-    #[cfg(target_os = "linux")]
-    fn live_group_members(group: libc::pid_t) -> Result<usize, ProcessError> {
-        let mut members = 0;
-        let mut entries = 0;
-        let mut leader_seen = false;
-        for entry in fs::read_dir("/proc")
-            .map_err(|e| ProcessError::io("observe native process group", e))?
-        {
-            entries += 1;
-            if entries > 100_000 {
-                return Err(ProcessError::new(
-                    "process_limit",
-                    "native process observation exceeds entry bound",
-                ));
-            }
-            let entry = entry.map_err(|e| ProcessError::io("observe native process entry", e))?;
-            if !entry
-                .file_name()
-                .to_string_lossy()
-                .bytes()
-                .all(|b| b.is_ascii_digit())
-            {
-                continue;
-            }
-            let mut stat = Vec::new();
-            let metadata = File::open(entry.path().join("stat"))
-                .and_then(|file| file.take(8193).read_to_end(&mut stat));
-            let stat = match metadata {
-                Ok(_) if stat.len() <= 8192 => stat,
-                Ok(_) => {
-                    return Err(ProcessError::new(
-                        "process_limit",
-                        "native process metadata exceeds bound",
-                    ));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(ProcessError::io("read native process metadata", error)),
-            };
-            let end = stat.iter().rposition(|b| *b == b')').ok_or_else(|| {
-                ProcessError::new("process_metadata", "invalid native process metadata")
-            })?;
-            let fields: Vec<_> = stat[end + 1..]
-                .split(|b| b.is_ascii_whitespace())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if fields.len() < 4 {
-                return Err(ProcessError::new(
-                    "process_metadata",
-                    "incomplete native process metadata",
-                ));
-            }
-            let parse = |field: &[u8]| {
-                std::str::from_utf8(field)
-                    .ok()
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .ok_or_else(|| {
-                        ProcessError::new("process_metadata", "invalid native process identity")
-                    })
-            };
-            let pgrp = parse(fields[2])?;
-            let session = parse(fields[3])?;
-            if entry.file_name().to_string_lossy().parse::<i32>().ok() == Some(group) {
-                if pgrp != group || session != group {
-                    return Err(ProcessError::new(
-                        "process_identity",
-                        "reserved group leader changed native identity",
-                    ));
-                }
-                leader_seen = true;
-            }
-            if session == group && pgrp != group && fields[0] != b"Z" && fields[0] != b"X" {
-                return Err(ProcessError::new(
-                    "scope_escape",
-                    "owned session member changed process group; drain cannot be certified",
-                ));
-            }
-            if pgrp == group && fields[0] != b"Z" && fields[0] != b"X" {
-                members += 1;
-            }
-        }
-        if !leader_seen {
-            return Err(ProcessError::new(
-                "process_identity",
-                "reserved group leader missing from native snapshot",
-            ));
-        }
-        Ok(members)
     }
     // ABI and constants are from Apple's public libproc/proc_info headers.
     // PROC_ALL_PIDS = 1; PROC_PIDTBSDINFO = 3; SZOMB = 5.
@@ -2190,6 +2152,37 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(250));
             }
             #[cfg(target_os = "linux")]
+            "jvm_resource_probe" => {
+                let mut readback = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                // This isolated fixture reads its inherited limit and reserves
+                // VM without committing a large resident allocation.
+                assert_eq!(
+                    unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut readback) },
+                    0
+                );
+                assert_eq!(readback.rlim_cur, resource_policy::JVM_VM_LIMIT);
+                assert_eq!(readback.rlim_max, resource_policy::JVM_VM_LIMIT);
+                let reservation_bytes = 8usize * 1024 * 1024 * 1024;
+                let reservation = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        reservation_bytes,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(reservation, libc::MAP_FAILED);
+                unsafe { (reservation as *mut u8).write_volatile(1) };
+                println!("owned Linux JVM exact readback and finite VM reservation verified");
+                std::thread::sleep(Duration::from_millis(350));
+                assert_eq!(unsafe { libc::munmap(reservation, reservation_bytes) }, 0);
+            }
+            #[cfg(target_os = "linux")]
             "many_owned" => {
                 // This ignored isolated fixture has a finite count and delay.
                 // Its enclosing supervisor owns termination and reap evidence.
@@ -2430,6 +2423,49 @@ mod tests {
         }
         run.cleanup(result.drained);
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "isolated Linux JVM policy proof; requires an outer JVM-purpose scope with its original address-space hard limit"]
+    fn linux_jvm_vm_reservation_is_observed_separately_from_resident_memory() {
+        let mut run = TestRun::new("jvm_resource_probe");
+        run.spec.resource_policy = ResourcePolicy::for_managed_purpose("jvm");
+        let result = supervise(&run.spec, &AtomicBool::new(false), || Ok(())).unwrap();
+        assert_eq!(result.resource_policy, ResourcePolicy::LinuxJvmObserved);
+        assert_eq!(result.termination_reason, TerminationReason::Completed);
+        assert!(result.drained && result.output_complete && result.supervisor_errors.is_empty());
+        let evidence = serde_json::to_value(result.resource_limits.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            evidence["rlimit_as_readback_soft_bytes"],
+            resource_policy::JVM_VM_LIMIT
+        );
+        assert_eq!(
+            evidence["rlimit_as_readback_hard_bytes"],
+            resource_policy::JVM_VM_LIMIT
+        );
+        assert!(evidence["sample_count"].as_u64().unwrap() > 0);
+        assert!(
+            evidence["peak_observed_aggregate_rss_bytes"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            evidence["peak_observed_aggregate_rss_bytes"]
+                .as_u64()
+                .unwrap()
+                <= resource_policy::MEMORY_LIMIT
+        );
+        assert!(
+            evidence["peak_observed_per_process_vm_bytes"]
+                .as_u64()
+                .unwrap()
+                >= 8 * 1024 * 1024 * 1024
+        );
+        assert_eq!(evidence["kernel_resident_quota"], false);
+        assert_eq!(evidence["group_snapshot_atomic"], false);
+        run.cleanup(result.drained);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "isolated finite native process-count quota proof; root runs separately"]

@@ -96,6 +96,7 @@ fn run_managed(
     let purpose = flags
         .remove("--purpose")
         .ok_or("required flag: --purpose")?;
+    let resource_policy = process::ResourcePolicy::for_managed_purpose(&purpose);
     let timeout = flags
         .remove("--timeout-seconds")
         .map(|v| v.parse::<u64>())
@@ -150,6 +151,7 @@ fn run_managed(
     spec.env.insert("CARGO_BUILD_JOBS".into(), "2".into());
     spec.timeout = Duration::from_secs(timeout);
     spec.tail_policy = tail_policy;
+    spec.resource_policy = resource_policy;
     let result = process::supervise_with_progress(&spec, &cancellation, |checkpoint| {
         let measurement = build
             .measure_with_progress(checkpoint)
