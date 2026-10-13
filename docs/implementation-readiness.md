@@ -48,12 +48,22 @@ Windows의 빌드 관리 도구 bootstrap은 실제로 통과했으며, 제품 �
 | 공통 application 경로 | 16개 검사 통과, Cargo 종료 0, export 및 lease 해제 | 실제 임시 SQLite/CAS와 stateful 독립 target fixture; actual host·게임 및 인증 transport는 통합 중 |
 | Windows 전체 workspace 검사 | 8개 crate의 216개 검사 통과, 실패 없음 | 자식 fixture 1개는 감독 검사가 직접 호출; 인수 ID 82개 및 실제 게임의 통과 수와 구분 |
 | Windows 코드 검사 | workspace 전체 formatting 및 all-targets Clippy `-D warnings` 통과 | 수학 반복문 정리 후 도메인 43개 재검사 통과; 다른 OS는 CI에서 실제 검증 |
+| 첫 3개 OS 기반 CI | 세 OS 모두 Rust 제품 검사 전 실패 | macOS의 rustup 및 Linux의 Python 복수 탐색 경로, Windows의 native 시작 실패; 동일 SHA의 성공으로 재해석하지 않음 |
+| Windows Cargo 사전 검사 실패 복구 | native 실행 전 거절, 정확한 소유 기록 대조와 빈 scratch 확인 후 수동 lease 해제 | 정상 rustup proxy 처리와 lease 획득 전 사전 검사로 수정; 수동 복구는 자동 완료 근거가 아님 |
+| Windows 수정 launcher 첫 Cargo 실행 | 실제 Cargo 종료 101, drain 및 실패 로그 export, 정확한 소유 slot 완료와 lease 해제 | 병행한 승인 의존성 변경으로 locked resolution 거절; 제품 또는 bootstrap 성공으로 표시하지 않음 |
+| Windows 수정 launcher 재검사 | Cargo 종료 0, Job drain, export, 소유 자식 정리와 lease 해제 통과 | 승인 의존성 변경의 명시적 lock 갱신을 선택; 원격 Windows 시작 실패의 후속 CI 확인은 별도 |
 
 실패한 실행의 원본 판정은 유지한다. native drain과 정확한 소유 기록을 확인하고
 로그를 별도로 내보내며 digest를 대조한 경우에만 해당 실행의 알려진 임시 파일을
 정리했다. 원래 자동 export 실패와 수동 보존 성공을 같은 결과로 기록하지 않는다.
 원본 증거와 회수 기록은 저장소 밖에 보존한다. 이 표는 로컬 WIP 소스의 관측이며
 고정된 출시 SHA, 3개 OS 통과 또는 실제 게임 인수를 의미하지 않는다.
+
+첫 원격 실행은 source `f8e083811c61e9b845dc88db97727575f9081035`의
+[foundation run](https://github.com/daejunnom/MMMM/actions/runs/38432345224)이다.
+실패 로그와 Windows 시작 실패 artifact를 외부 증거 위치에 보존했다.
+실행 파일 경로 선택 및 native 오류 진단을 수정한 source로 후속 CI를 진행하며,
+실제 결과를 확인하기 전 원격 보호의 필수 성공 검사나 G0 인수를 등록하지 않는다.
 
 ## 단계별 규약 적용
 

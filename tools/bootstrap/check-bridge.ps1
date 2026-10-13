@@ -43,7 +43,10 @@ $fixtureToken=[System.Guid]::NewGuid().ToString('N')
 Write-FixtureRecord 'bridge-owner.json' ([ordered]@{schema='mmmm-bootstrap-bridge-owner/1';token=$fixtureToken;pid=$PID;purpose=('bootstrap-bridge-' + $Case.ToLowerInvariant())})
 $script:mmmmBridgeObservationCount=0
 $observer=[System.Func[string]]{ $script:mmmmBridgeObservationCount++; return $null }
-$pwsh=(Get-Command pwsh -CommandType Application -ErrorAction Stop).Source
+$pwshApplication=Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1
+if ($null -eq $pwshApplication -or $pwshApplication.Source -isnot [string] -or -not [System.IO.Path]::IsPathFullyQualified($pwshApplication.Source)) { throw 'Fixture PowerShell must use one literal absolute executable path.' }
+$pwsh=[System.IO.Path]::GetFullPath($pwshApplication.Source)
+if (([System.IO.File]::GetAttributes($pwsh) -band ([System.IO.FileAttributes]::Directory -bor [System.IO.FileAttributes]::ReparsePoint)) -ne 0) { throw 'Fixture PowerShell executable must be a regular literal file.' }
 if ($Case -eq 'NullObserver') {
     $child=[string[]]@('-NoProfile','-NonInteractive','-Command',"Start-Sleep -Milliseconds 6200; [Console]::Out.WriteLine('bridge fixture completed'); exit 0")
 } else {

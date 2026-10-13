@@ -44,6 +44,43 @@ function Assert-SafeFile([string]$Path) {
     Assert-SafeName $name
     if ($name.ToLowerInvariant() -in @('credential','credentials','api-key','api_key','api-keys','api_keys','private-key')) { throw 'Secret-named regular files are not inspected or managed.' }
 }
+function Resolve-CargoExecutable {
+    $configured = [System.Environment]::GetEnvironmentVariable('MMMM_CARGO','Process')
+    if ($null -ne $configured) {
+        if ([string]::IsNullOrWhiteSpace($configured)) { throw 'MMMM_CARGO must identify one absolute executable file.' }
+        $candidate = $configured
+    } else {
+        $application = Get-Command cargo -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        if ($null -eq $application -or $application -isnot [System.Management.Automation.ApplicationInfo]) { throw 'Cargo application discovery did not identify one executable.' }
+        $candidate = $application.Source
+        if ($candidate -isnot [string] -or -not [System.IO.Path]::IsPathFullyQualified($candidate)) { throw 'Cargo must use one literal absolute executable path.' }
+        Assert-SafeRoot $candidate
+        Assert-SafeFile $candidate
+        # A normal rustup installation can expose Cargo as a proxy symlink.
+        # Resolve its selected toolchain before taking ownership of any slot;
+        # execute only the separately validated, literal toolchain executable.
+        if (([System.IO.File]::GetAttributes($candidate) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            $rustupApplication = Get-Command rustup -CommandType Application -ErrorAction Stop | Select-Object -First 1
+            if ($null -eq $rustupApplication -or $rustupApplication -isnot [System.Management.Automation.ApplicationInfo]) { throw 'Rustup application discovery did not identify one executable.' }
+            $rustupPath = $rustupApplication.Source
+            if ($rustupPath -isnot [string] -or -not [System.IO.Path]::IsPathFullyQualified($rustupPath)) { throw 'Rustup must use one literal absolute executable path.' }
+            Assert-SafeRoot $rustupPath
+            Assert-SafeFile $rustupPath
+            $rustupAttributes = [System.IO.File]::GetAttributes($rustupPath)
+            if (($rustupAttributes -band ([System.IO.FileAttributes]::Directory -bor [System.IO.FileAttributes]::ReparsePoint)) -ne 0) { throw 'Rustup executable must be a regular literal file.' }
+            $toolchainCargo = @(& $rustupPath which cargo)
+            if ($LASTEXITCODE -ne 0 -or $toolchainCargo.Count -ne 1 -or $toolchainCargo[0] -isnot [string]) { throw 'Rustup did not identify one toolchain Cargo executable.' }
+            $candidate = $toolchainCargo[0]
+        }
+    }
+    if ($candidate -isnot [string] -or -not [System.IO.Path]::IsPathFullyQualified($candidate)) { throw 'Cargo must use one literal absolute executable path.' }
+    $resolved = [System.IO.Path]::GetFullPath($candidate)
+    Assert-SafeRoot $resolved
+    Assert-SafeFile $resolved
+    $attributes = [System.IO.File]::GetAttributes($resolved)
+    if (($attributes -band ([System.IO.FileAttributes]::Directory -bor [System.IO.FileAttributes]::ReparsePoint)) -ne 0) { throw 'Cargo executable must be a regular literal file.' }
+    return $resolved
+}
 function Assert-Directory([string]$Path, [bool]$Create) {
     if (-not [System.IO.Path]::IsPathFullyQualified($Path)) { throw 'An absolute path is required.' }
     $full = [System.IO.Path]::GetFullPath($Path)
@@ -356,6 +393,7 @@ $evidenceIdentity = $evidencePath.ToLowerInvariant()
 Assert-Separate $outputPath $checkoutPath
 Assert-Separate $evidencePath $checkoutPath
 Assert-Separate ([System.IO.Path]::Combine($outputPath,'build','managed-v1')) $evidencePath
+$cargo = Resolve-CargoExecutable
 $catalogPath = [System.IO.Path]::Combine($outputPath, 'build', 'managed-v1')
 $catalogPath = Assert-Directory $catalogPath $true
 $catalogPath = [Mmmm.Bootstrap.WindowsBoundary]::PhysicalDirectory($catalogPath)
@@ -478,7 +516,6 @@ $observeControl = [System.Func[string]]{
 try {
     foreach ($name in $overrides.Keys) { [System.Environment]::SetEnvironmentVariable($name, $overrides[$name], 'Process') }
     $preflight = $observe.Invoke(); if ($preflight) { throw $preflight }
-    $cargo = (Get-Command cargo -CommandType Application -ErrorAction Stop).Source
     $stdout = [System.IO.Path]::Combine($scratch, 'cargo-' + $token + '.stdout.log')
     $stderr = [System.IO.Path]::Combine($scratch, 'cargo-' + $token + '.stderr.log')
     $cargoArgs = [System.Collections.Generic.List[string]]::new()

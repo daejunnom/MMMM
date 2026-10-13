@@ -241,6 +241,15 @@ Coordinator와 변환 구현은 Rust 책임을 유지한다. Unix에는 Python 3
 Linux procfs 또는 macOS libproc의 native process 관찰이 필요하다.
 관찰 API, 출력 루트나 소유 기록이 유효하지 않으면 빌드를 시작하지 않거나 실패를 반환한다.
 
+Windows launcher는 소유 lease를 획득하기 전에 Cargo 실행 파일을 확인한다.
+CI가 설정한 `MMMM_CARGO`가 있으면 하나의 절대 일반 파일 경로여야 한다.
+설정이 없으면 첫 번째 application 경로를 선택하고, 정상 rustup proxy가 링크인
+경우에는 검증한 rustup의 `which cargo`가 반환하는 실제 toolchain 파일을 사용한다.
+복수 경로를 하나의 명령 문자열로 합치거나 executable 링크를 그대로 실행하지 않는다.
+실행 파일 사전 검사 실패는 native process scope나 lease를 생성하지 않는다.
+native 시작 실패의 진단은 작업 이름, 캡처한 Win32 오류 번호와 해당 시스템 메시지를
+최대 512자로 보존하며 명령 인수와 환경 값은 포함하지 않는다.
+
 Unix launcher는 별도 session의 leader를 먼저 만들고, 부모가 native identity를
 확인한 뒤 보내는 시작 신호가 있어야 Cargo를 실행한다. leader는 자식 종료 이후에도
 살아 있거나 unreaped 상태로 남아 SID와 process group identity를 예약한다.

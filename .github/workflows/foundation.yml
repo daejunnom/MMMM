@@ -108,14 +108,17 @@ jobs:
         timeout-minutes: 5
         run: |
           $ErrorActionPreference = 'Stop'
-          $rustup = (Get-Command rustup -CommandType Application -ErrorAction Stop).Source
+          $rustup = (Get-Command rustup -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+          if ($rustup -isnot [string] -or -not [System.IO.Path]::IsPathFullyQualified($rustup) -or -not (Test-Path -LiteralPath $rustup -PathType Leaf)) { throw 'A single absolute Rustup application path is required.' }
           $toolchainRoot = Join-Path $env:MMMM_OUTPUT_ROOT 'toolchain'
           $env:RUSTUP_HOME = Join-Path $toolchainRoot 'rustup'
           $env:CARGO_HOME = Join-Path $toolchainRoot 'cargo'
           & $rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy --no-self-update
           if ($LASTEXITCODE -ne 0) { throw 'Pinned Rust installation failed.' }
-          $cargo = (& $rustup which --toolchain 1.96.0 cargo).Trim()
-          if ($LASTEXITCODE -ne 0 -or -not [System.IO.Path]::IsPathFullyQualified($cargo)) { throw 'Pinned Cargo executable is unavailable.' }
+          $cargoOutput = @(& $rustup which --toolchain 1.96.0 cargo)
+          if ($LASTEXITCODE -ne 0 -or $cargoOutput.Count -ne 1 -or $cargoOutput[0] -isnot [string]) { throw 'Pinned Cargo path probe must return one line.' }
+          $cargo = $cargoOutput[0].Trim()
+          if (-not [System.IO.Path]::IsPathFullyQualified($cargo) -or -not (Test-Path -LiteralPath $cargo -PathType Leaf)) { throw 'Pinned Cargo executable is unavailable.' }
           $bin = Split-Path -Parent $cargo
           "RUSTUP_HOME=$env:RUSTUP_HOME" | Add-Content -LiteralPath $env:GITHUB_ENV
           "MMMM_CARGO=$cargo" | Add-Content -LiteralPath $env:GITHUB_ENV
@@ -131,7 +134,8 @@ jobs:
           if ($IsWindows) {
             & ./tools/bootstrap/bootstrap.ps1 -Checkout $env:GITHUB_WORKSPACE -OutputRoot $env:MMMM_OUTPUT_ROOT -EvidenceRoot $evidence -TimeoutSeconds 1200 -Jobs 2
           } else {
-            $python = (Get-Command python3 -CommandType Application -ErrorAction Stop).Source
+            $python = (Get-Command python3 -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+            if ($python -isnot [string] -or -not [System.IO.Path]::IsPathFullyQualified($python) -or -not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'A single absolute Python application path is required.' }
             & $python -B ./tools/bootstrap/bootstrap-unix.py --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root $evidence --timeout-seconds 1200 --jobs 2
           }
           if ($LASTEXITCODE -ne 0) { throw 'Supervised bootstrap did not complete.' }

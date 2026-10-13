@@ -92,8 +92,22 @@ namespace Mmmm.Bootstrap {
         [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] private static extern IntPtr CreateFileW(string name, uint access, uint sharing, ref SecurityAttributes security, uint disposition, uint flags, IntPtr template);
         [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] private static extern uint GetFinalPathNameByHandleW(IntPtr file, StringBuilder path, uint capacity, uint flags);
 
-        private static Exception NativeError(string operation) { return new Win32Exception(Marshal.GetLastWin32Error(), operation); }
-        private static string Diagnostic(string message) { return string.IsNullOrWhiteSpace(message) ? "bootstrap supervisor failure without diagnostic text" : message; }
+        private static Exception NativeError(string operation) {
+            int code=Marshal.GetLastWin32Error();
+            // The system message uses only the captured error code. Never append
+            // executable arguments or environment values to native diagnostics.
+            string systemMessage=new Win32Exception(code).Message;
+            return new Win32Exception(code, Diagnostic(operation+"; win32="+code+"; message="+systemMessage));
+        }
+        private static string Diagnostic(string message) {
+            if(string.IsNullOrWhiteSpace(message)) return "bootstrap supervisor failure without diagnostic text";
+            StringBuilder bounded=new StringBuilder();
+            foreach(char value in message) {
+                if(bounded.Length>=512) break;
+                bounded.Append(char.IsControl(value) ? ' ' : value);
+            }
+            return bounded.ToString();
+        }
         private static string OwnedProcessNames(IntPtr job) {
             // The job's configured process limit is 32. Only IDs from this job
             // are inspected, and pinned handle membership is checked again.
