@@ -76,6 +76,7 @@ Windows의 빌드 관리 도구 bootstrap은 실제로 통과했으며, 제품 �
 | 교환·계획·실행·저장 집중 검사 | application 38, exchange 59, planner 37, runtime 63 검사 통과 | 실제 임시 SQLite/CAS와 순수 도메인 및 실패 경로; 이후 raw bytes 읽기와 호스트 연결 변경은 별도 재검사 |
 | JVM 호스트와 공개 Java 어댑터 | host-core 32, public-java-adapter 17 검사 통과; SDK 107개의 유효 성공을 재사용; Fabric compileJava 통과 | 실제 Gradle 및 XML 결과 확인; 이후 native 실행·승인 변경과 실제 서버·클라이언트 인수는 별도 |
 | Coordinator와 CLI의 확장 검사 | CLI 12 통과; Coordinator 73 통과, 11 실패, 1 ignored | 정책 이름 fixture 10개와 native 종료 증거 경로 fixture 1개를 수정 중; 실제 stdio 통합 검사 실행은 lib 성공 이후 별도 |
+| Coordinator 인증·범위 재검사 | CLI 12, Coordinator 86 통과; 1 실패, 1 ignored | 잘못된 정책 이름 fixture 10개 및 per-Project scope 검사는 통과; native 종료 증거의 `child_parent_identity` 경계는 미해결. 이후 retained authentication hook은 미실행 |
 
 실패한 실행의 원본 판정은 유지한다. native drain과 정확한 소유 기록을 확인하고
 로그를 별도로 내보내며 digest를 대조한 경우에만 해당 실행의 알려진 임시 파일을

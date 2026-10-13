@@ -68,6 +68,20 @@ impl Application<'_> {
         let mut chains: BTreeMap<String, Vec<mmmm_runtime::storage::RecoverySnapshot>> =
             BTreeMap::new();
         for snapshot in snapshots {
+            let invocation = self
+                .store
+                .stored_invocation(&operation, &snapshot.step_id)
+                .map_err(|e| AppError::storage("RECOVERY_EXPIRED", e))?;
+            if self
+                .captured_before(&operation, &snapshot.step_id, &invocation)?
+                .get(&snapshot.target)
+                != Some(&snapshot.before)
+            {
+                return Err(AppError::new(
+                    "RECOVERY_EXPIRED",
+                    "Recorded direct recovery has no matching original independent before capture",
+                ));
+            }
             let chain = chains.entry(snapshot.target.clone()).or_default();
             if chain.last().is_some_and(|previous| {
                 previous.after != snapshot.before
@@ -102,7 +116,9 @@ impl Application<'_> {
                     "Recovery belongs to an earlier binding, world or session epoch",
                 ));
             }
-            let current = self.observer.read_target(&invocation, &snapshot.target)?;
+            let current =
+                self.observer
+                    .read_target_with_store(self.store, &invocation, &snapshot.target)?;
             let current_ref = self
                 .store
                 .put_blob(&current)
@@ -130,7 +146,8 @@ impl Application<'_> {
                 current_after_bytes: current,
             });
         }
-        let prepared = self.planner.prepare_recovery(
+        let prepared = self.planner.prepare_recovery_with_store(
+            self.store,
             principal,
             &RecoveryPreparation {
                 operation_id: operation,

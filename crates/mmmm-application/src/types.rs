@@ -35,6 +35,20 @@ impl AppError {
             source: Some(Box::new(error)),
         }
     }
+    pub(crate) fn json(error: mmmm_contracts::JsonError) -> Self {
+        Self {
+            code: "INVALID_INPUT",
+            message: "Strict JSON validation failed",
+            source: Some(Box::new(error)),
+        }
+    }
+    pub(crate) fn digest(error: mmmm_contracts::DigestError) -> Self {
+        Self {
+            code: "INVALID_INPUT",
+            message: "Canonical digest validation failed",
+            source: Some(Box::new(error)),
+        }
+    }
 }
 impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -53,6 +67,7 @@ impl std::error::Error for AppError {
 pub enum Access {
     ReadProject,
     ReadPlan,
+    ReadAction,
     Plan,
     Apply,
     ObserveOperation,
@@ -88,10 +103,27 @@ pub struct PreparedPlan {
 #[derive(Clone, Debug)]
 pub struct DirectChange {
     pub target: String,
-    /// Independent observation captures exact direct before/after bytes. These
-    /// are never an assertion that indirect game effects can be reversed.
+    /// Retained for adapter compatibility; post-dispatch before bytes do not
+    /// authorize recovery. Application loads independently captured durable
+    /// before images and combines them with these fresh after bytes.
     pub before: Vec<u8>,
     pub after: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BeforeImage {
+    pub target: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BeforeCapture {
+    pub invocation_id: InvocationId,
+    pub binding_id: BindingId,
+    pub context_digest: Sha256Digest,
+    pub implementation_digest: Sha256Digest,
+    pub arguments_digest: Sha256Digest,
+    pub images: Vec<BeforeImage>,
 }
 
 #[derive(Clone, Debug)]

@@ -345,6 +345,171 @@ impl Cas {
         }
         Ok(bytes)
     }
+    /// Capture a bounded range while verifying its whole immutable blob in one
+    /// streaming pass. Hashing followed by a seek/read would introduce a second
+    /// observation and could return bytes different from those just hashed.
+    pub(crate) fn read_verified_slice<E, F>(
+        &self,
+        blob: &BlobRef,
+        offset: u64,
+        limit: usize,
+        check: F,
+    ) -> Result<Vec<u8>, E>
+    where
+        E: From<StorageError>,
+        F: FnMut() -> Result<(), E>,
+    {
+        if limit == 0 || limit > 65_536 {
+            return Err(
+                StorageError::InvalidInput("CAS slice exceeds its byte budget".into()).into(),
+            );
+        }
+        self.read_verified_range(blob, offset, limit, check)
+    }
+
+    pub(crate) fn read_verified_document<E, F>(
+        &self,
+        blob: &BlobRef,
+        max_document_bytes: u64,
+        check: F,
+    ) -> Result<Vec<u8>, E>
+    where
+        E: From<StorageError>,
+        F: FnMut() -> Result<(), E>,
+    {
+        if blob.byte_length > max_document_bytes {
+            return Err(
+                StorageError::InvalidInput("CAS document exceeds its byte budget".into()).into(),
+            );
+        }
+        let limit = usize::try_from(blob.byte_length).map_err(|_| {
+            E::from(StorageError::InvalidInput(
+                "CAS document length exceeds addressable memory".into(),
+            ))
+        })?;
+        self.read_verified_range(blob, 0, limit, check)
+    }
+
+    fn read_verified_range<E, F>(
+        &self,
+        blob: &BlobRef,
+        offset: u64,
+        limit: usize,
+        mut check: F,
+    ) -> Result<Vec<u8>, E>
+    where
+        E: From<StorageError>,
+        F: FnMut() -> Result<(), E>,
+    {
+        check()?;
+        if blob.byte_length > self.max_bytes {
+            return Err(
+                StorageError::InvalidInput("CAS read exceeds its byte budget".into()).into(),
+            );
+        }
+        let end = offset
+            .checked_add(limit as u64)
+            .ok_or_else(|| {
+                E::from(StorageError::InvalidInput(
+                    "CAS slice range overflow".into(),
+                ))
+            })?
+            .min(blob.byte_length);
+        if offset > blob.byte_length {
+            return Err(
+                StorageError::InvalidInput("CAS slice starts beyond its blob".into()).into(),
+            );
+        }
+        let path = self.path(&blob.digest);
+        verify_plain_path(&path).map_err(E::from)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // A raced final symlink or FIFO is never followed/blockingly read.
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN,
+            };
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN);
+        }
+        check()?;
+        let mut file = options
+            .open(path)
+            .map_err(StorageError::from)
+            .map_err(E::from)?;
+        let metadata = file
+            .metadata()
+            .map_err(StorageError::from)
+            .map_err(E::from)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return Err(StorageError::UnsafePath.into());
+            }
+        }
+        if !metadata.is_file() || metadata.len() != blob.byte_length {
+            return Err(StorageError::Corrupt(
+                "CAS slice source differs from its length pin".into(),
+            )
+            .into());
+        }
+        let mut hasher = Sha256::new();
+        let mut buffer = [0; 65_536];
+        let mut position = 0u64;
+        let mut slice = Vec::with_capacity((end - offset) as usize);
+        loop {
+            check()?;
+            // Read at most the declared length plus one byte: even concurrent
+            // growth has a finite read bound and can never be silently ignored.
+            let allowance = blob.byte_length.saturating_sub(position).saturating_add(1);
+            let read_length = allowance.min(buffer.len() as u64) as usize;
+            let count = file
+                .read(&mut buffer[..read_length])
+                .map_err(StorageError::from)
+                .map_err(E::from)?;
+            check()?;
+            if count == 0 {
+                break;
+            }
+            let next = position.checked_add(count as u64).ok_or_else(|| {
+                E::from(StorageError::Corrupt(
+                    "CAS slice source length overflow".into(),
+                ))
+            })?;
+            if next > blob.byte_length {
+                return Err(StorageError::Corrupt(
+                    "CAS slice source grew beyond its length pin".into(),
+                )
+                .into());
+            }
+            hasher.update(&buffer[..count]);
+            let start_in_chunk = offset.max(position);
+            let end_in_chunk = end.min(next);
+            if start_in_chunk < end_in_chunk {
+                slice.extend_from_slice(
+                    &buffer
+                        [(start_in_chunk - position) as usize..(end_in_chunk - position) as usize],
+                );
+            }
+            position = next;
+        }
+        let digest = Sha256Digest::from_bytes(hasher.finalize().into());
+        if position != blob.byte_length || digest != blob.digest {
+            return Err(StorageError::Corrupt(
+                "CAS slice failed digest and length verification".into(),
+            )
+            .into());
+        }
+        check()?;
+        Ok(slice)
+    }
     pub(crate) fn collect(
         &self,
         keep: &std::collections::BTreeSet<Sha256Digest>,

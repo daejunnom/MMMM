@@ -313,6 +313,16 @@ impl DurableStore {
         step_id: &StepId,
         invocation: &Value,
     ) -> StorageResult<StepRecord> {
+        self.dispatch_intent_internal(operation, step_id, invocation, None)
+    }
+
+    pub(crate) fn dispatch_intent_internal(
+        &mut self,
+        operation: &OperationId,
+        step_id: &StepId,
+        invocation: &Value,
+        resolution_witness: Option<&BlobRef>,
+    ) -> StorageResult<StepRecord> {
         self.validator
             .validate("Invocation", invocation)
             .map_err(|e| StorageError::Contract(e.to_string()))?;
@@ -389,17 +399,39 @@ impl DurableStore {
         {
             return Err(StorageError::Conflict("Frozen context digest/policy"));
         }
-        if step["resultBindings"]
+        let result_bound = step["resultBindings"]
             .as_array()
-            .is_some_and(|bindings| !bindings.is_empty())
-        {
-            return Err(StorageError::InvalidTransition(
-                "Result-bound dispatch requires an application-verified resolution witness".into(),
-            ));
-        }
-        if invocation["arguments"] != step["arguments"] {
-            return Err(StorageError::Conflict("Frozen invocation arguments"));
-        }
+            .is_some_and(|bindings| !bindings.is_empty());
+        let resolution_refs = match (result_bound, resolution_witness) {
+            (true, Some(witness_blob)) => super::result_binding::verify_resolution(
+                &transaction,
+                &self.cas,
+                &self.validator,
+                super::result_binding::ResolutionInput {
+                    record: &record,
+                    plan: &plan,
+                    step,
+                    invocation,
+                    witness_blob,
+                },
+            )?,
+            (true, None) => {
+                return Err(StorageError::InvalidTransition(
+                    "Result-bound dispatch requires a registered resolution witness".into(),
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(StorageError::Conflict(
+                    "Resolution witness on an unbound step",
+                ));
+            }
+            (false, None) => {
+                if invocation["arguments"] != step["arguments"] {
+                    return Err(StorageError::Conflict("Frozen invocation arguments"));
+                }
+                Vec::new()
+            }
+        };
         for dependency in step["dependsOn"]
             .as_array()
             .ok_or_else(|| StorageError::Corrupt("Frozen dependency list missing".into()))?
@@ -433,6 +465,22 @@ impl DurableStore {
                 params![operation.as_str(),encode(&record.scope)?,i64::from(record.whole_project_fence)])?;
         }
         pin_blob(&transaction, "operation", operation.as_str(), &blob)?;
+        for source in &resolution_refs {
+            pin_blob(
+                &transaction,
+                "result_resolution",
+                invocation_id.as_str(),
+                source,
+            )?;
+        }
+        if let Some(witness) = resolution_witness {
+            pin_blob(
+                &transaction,
+                "result_resolution_witness",
+                invocation_id.as_str(),
+                witness,
+            )?;
+        }
         transaction.execute("INSERT INTO invocations(invocation_id,operation_id,step_id,invocation_hash,blob_digest) VALUES(?1,?2,?3,?4,?5)",
             params![invocation_id.as_str(),operation.as_str(),step_id.as_str(),raw_digest(&bytes).as_str(),blob.digest.as_str()])?;
         record.state = OperationState::Running;
@@ -797,7 +845,7 @@ fn aggregate_pending(record: &OperationRecord) -> OperationState {
     }
 }
 
-fn step_verified(step: &StepRecord) -> bool {
+pub(crate) fn step_verified(step: &StepRecord) -> bool {
     step.finished
         && !step.further_effects_possible
         && step.effect != EffectEvidence::Unknown

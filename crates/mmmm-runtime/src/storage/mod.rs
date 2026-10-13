@@ -4,8 +4,16 @@
 
 mod cas;
 mod journal;
+mod operation_summaries;
 mod records;
 mod types;
+
+pub mod artifact;
+pub mod authored_projection;
+pub mod host_setup;
+pub mod owned_documents;
+pub mod project_resources;
+pub mod result_binding;
 
 pub use types::*;
 
@@ -144,6 +152,25 @@ impl DurableStore {
     }
     pub fn read_blob(&self, blob: &BlobRef) -> StorageResult<Vec<u8>> {
         self.cas.read(blob)
+    }
+    /// Pure bounded CAS read for callers that already established current
+    /// authority. The same handle hashes/captures each <=64KiB chunk and checks
+    /// cancellation/deadline before, during and after verification.
+    pub fn read_blob_checked<F>(
+        &self,
+        blob: &BlobRef,
+        max_bytes: u64,
+        check: F,
+    ) -> StorageResult<Vec<u8>>
+    where
+        F: FnMut() -> StorageResult<()>,
+    {
+        if max_bytes == 0 || max_bytes > project_resources::MAX_SOURCE_RESOURCE_BYTES {
+            return Err(StorageError::InvalidInput(
+                "Checked CAS read ceiling is invalid".into(),
+            ));
+        }
+        self.cas.read_verified_document(blob, max_bytes, check)
     }
     pub fn verify_blob(&self, blob: &BlobRef) -> StorageResult<()> {
         self.cas.verify(blob)

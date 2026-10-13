@@ -57,7 +57,10 @@ impl Application<'_> {
         let record = match reservation {
             // Existing status retrieval stays valid after expiry/revocation of a
             // write grant, provided ReadPlan/journal authorization still exists.
-            Reservation::Existing(record) => return self.operation_report(&record),
+            Reservation::Existing(record) => {
+                self.authorize_report_release(principal, &plan, &record)?;
+                return self.operation_report(&record);
+            }
             Reservation::Created(record) => record,
         };
         self.execute_reserved(principal, &plan, &record.operation_id)?;
@@ -65,7 +68,21 @@ impl Application<'_> {
             .store
             .operation(&record.operation_id)
             .map_err(|e| AppError::storage("OPERATION_NOT_FOUND", e))?;
+        self.authorize_report_release(principal, &plan, &record)?;
         self.operation_report(&record)
+    }
+
+    fn authorize_report_release(
+        &mut self,
+        principal: &PrincipalId,
+        _plan: &Value,
+        record: &OperationRecord,
+    ) -> AppResult<()> {
+        // A current journal grant permits reading immutable historical state
+        // even when its host is offline or has a new epoch. Effectful observe
+        // and cancel callbacks retain their separate actual context checks.
+        self.authority
+            .authorize_operation(principal, record, Access::ObserveOperation)
     }
 
     fn execute_reserved(
@@ -130,6 +147,14 @@ impl Application<'_> {
                         "ID source returned an invalid invocation identity",
                     )
                 })?;
+            let (arguments, result_bindings) =
+                match self.resolve_step_arguments(principal, plan, step, operation, &context) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        self.note(operation, e.code, e.message)?;
+                        break;
+                    }
+                };
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let deadline =
                 invocation_deadline(self.clock, plan, budget.saturating_sub(elapsed_ms))?;
@@ -137,15 +162,66 @@ impl Application<'_> {
                 "contractVersion":"0.2.0", "invocationId":invocation_id, "operationId":operation,
                 "stepId":step["stepId"], "bindingId":step["bindingId"], "actionId":step["actionId"],
                 "actionContractVersion":step["actionContractVersion"], "actionDigest":step["actionDigest"],
-                "arguments":step["arguments"], "context":context, "deadlineAt":deadline,
+                "arguments":arguments, "context":context, "deadlineAt":deadline,
                 "idempotencyKey":record.idempotency_key, "implementationDigest":step["implementationDigest"],
-                "argumentsDigest":canonical_digest(&step["arguments"]).map_err(|_| AppError::new("STALE_PLAN", "Frozen arguments digest is invalid"))?,
+                "argumentsDigest":canonical_digest(&arguments).map_err(|_| AppError::new("STALE_PLAN", "Resolved arguments digest is invalid"))?,
                 "contextDigest":context["contextDigest"]
             });
             validate("Invocation", &invocation)?;
+            let resolution_witness = if result_bindings.is_empty() {
+                None
+            } else {
+                match self.retain_resolution_witness(
+                    plan,
+                    step,
+                    operation,
+                    &invocation,
+                    result_bindings,
+                ) {
+                    Ok(blob) => Some(blob),
+                    Err(e) => {
+                        self.note(operation, e.code, e.message)?;
+                        break;
+                    }
+                }
+            };
+            if let Err(e) =
+                self.retain_before_capture(plan, step, operation, &invocation, &record.scope)
+            {
+                self.note(operation, e.code, e.message)?;
+                break;
+            }
+            // Capture must match the durable phase digest itself, and a fresh
+            // preflight after capture checks policy, expiry and target drift.
+            // The native mutation still performs its atomic expected-state check.
+            if let Err(e) = self.preflight(principal, plan, step, operation) {
+                self.note(operation, e.code, e.message)?;
+                break;
+            }
+            if started.elapsed() >= Duration::from_millis(budget)
+                || self
+                    .store
+                    .operation(operation)
+                    .map_err(|e| AppError::storage("OPERATION_NOT_FOUND", e))?
+                    .cancellation_requested
+            {
+                self.note(
+                    operation,
+                    "BUDGET_EXCEEDED",
+                    "Execution stopped after capture before durable dispatch",
+                )?;
+                break;
+            }
             // This commits Invocation bytes, the fence, and intent before any
             // provider call. An error afterwards is never a retry permission.
-            if let Err(e) = self.store.dispatch_intent(operation, &step_id, &invocation) {
+            let intent = match resolution_witness.as_ref() {
+                Some(witness) => {
+                    self.store
+                        .dispatch_resolved_intent(operation, &step_id, &invocation, witness)
+                }
+                None => self.store.dispatch_intent(operation, &step_id, &invocation),
+            };
+            if let Err(e) = intent {
                 self.note(
                     operation,
                     "DISPATCH_REJECTED",
@@ -153,7 +229,7 @@ impl Application<'_> {
                 )?;
                 return Err(AppError::storage("DISPATCH_REJECTED", e));
             }
-            match self.provider.dispatch(&invocation) {
+            match self.provider.dispatch_with_store(self.store, &invocation) {
                 Ok(response) => {
                     if let Err(e) = self.accept_response(
                         operation,
@@ -199,11 +275,10 @@ impl Application<'_> {
                 .iter()
                 .find(|s| s.step_id == step_id)
                 .ok_or_else(|| AppError::new("OPERATION_NOT_FOUND", "Durable step is absent"))?;
-            let provider_failed = self.evidence_values(&current)?.iter().any(|v| {
-                v["kind"] == "provider_result"
-                    && v["stepId"] == step_id.as_str()
-                    && v["value"]["status"] == "failed"
-            });
+            let provider_failed = self
+                .evidence_values(&current)?
+                .iter()
+                .any(|v| crate::report::failure_blocks_step(v, step_id.as_str()));
             if provider_failed || !crate::report::step_verified(step) {
                 break;
             }
@@ -218,13 +293,14 @@ impl Application<'_> {
 
     pub fn operation_cancel(&mut self, principal: &PrincipalId, input: &Value) -> AppResult<Value> {
         let record = self.authorized_operation(principal, input, Access::Cancel)?;
-        if record.state.terminal() || record.cancellation_requested {
-            return self.operation_report(&record);
-        }
         let plan = self
             .store
             .plan(&record.plan_id, &record.plan_hash)
             .map_err(|e| AppError::storage("STALE_PLAN", e))?;
+        if record.state.terminal() || record.cancellation_requested {
+            self.authorize_report_release(principal, &plan, &record)?;
+            return self.operation_report(&record);
+        }
         let mut dispatched = Vec::new();
         for stored in &record.steps {
             if stored.dispatch == DispatchEvidence::NotSent || stored.finished {
@@ -274,6 +350,7 @@ impl Application<'_> {
             }
         }
         // A cooperative acknowledgment never marks a dispatched write cancelled.
+        self.authorize_report_release(principal, &plan, &requested)?;
         self.operation_report(&requested)
     }
 
@@ -313,10 +390,11 @@ impl Application<'_> {
                 .ok_or_else(|| AppError::new("STALE_PLAN", "Frozen step is absent"))?;
             let descriptor = self.provider.action_descriptor(step, &context)?;
             check_descriptor(step, &context, &descriptor)?;
-            match self
-                .provider
-                .poll(&invocation, stored.provider_receipt.as_deref())
-            {
+            match self.provider.poll_with_store(
+                self.store,
+                &invocation,
+                stored.provider_receipt.as_deref(),
+            ) {
                 Ok(Some(response)) => {
                     if let Err(e) = self.accept_response(
                         &record.operation_id,
@@ -355,6 +433,7 @@ impl Application<'_> {
             .store
             .operation(&record.operation_id)
             .map_err(|e| AppError::storage("OPERATION_NOT_FOUND", e))?;
+        self.authorize_report_release(principal, &plan, &final_record)?;
         self.operation_report(&final_record)
     }
 
@@ -393,10 +472,7 @@ impl Application<'_> {
     ) -> AppResult<()> {
         // Retain even malformed responses in the operation CAS evidence; they
         // remain data and cannot select another endpoint or operation arguments.
-        let bytes = encode_json(
-            &json!({"kind":"unvalidated_provider_result","stepId":step,"value":response}),
-        )
-        .map_err(|_| {
+        let bytes = encode_json(response).map_err(|_| {
             AppError::new(
                 "INVALID_PROVIDER_OUTPUT",
                 "Provider output exceeds the strict JSON boundary",
@@ -406,9 +482,22 @@ impl Application<'_> {
             .store
             .put_blob(&bytes)
             .map_err(|e| AppError::storage("OUTCOME_UNKNOWN", e))?;
-        self.store
-            .append_operation_evidence(operation, &blob)
-            .map_err(|e| AppError::storage("OUTCOME_UNKNOWN", e))?;
+        let envelope_validated = validate("ProviderResult", response).is_ok();
+        let mut raw_summary = json!({"kind":"unvalidated_provider_result", "stepId":step,"invocationId":invocation["invocationId"],
+            "sourceRefs":[blob],"resultBlob":blob, "bodyOmitted":true,
+            "envelopeValidated":envelope_validated,
+            "envelopeStatus":if envelope_validated {response["status"].clone()} else {Value::Null}});
+        if envelope_validated {
+            raw_summary["envelopeSummary"] = crate::report::compact_evidence(
+                &json!({
+                "kind":"provider_result","stepId":step,"invocationId":invocation["invocationId"],
+                "value":response,"outputValidated":false,"actionDigest":invocation["actionDigest"],
+                "outputSchemaDigest":canonical_digest(&descriptor["outputSchema"]).map_err(AppError::digest)?,
+                "resultBlob":blob,"sourceRefs":[blob]}),
+                &blob,
+            )?;
+        }
+        self.retain_summary(operation, &raw_summary, std::slice::from_ref(&blob))?;
         validate("ProviderResult", response).map_err(|_| {
             AppError::new(
                 "INVALID_PROVIDER_OUTPUT",
@@ -428,19 +517,14 @@ impl Application<'_> {
                     )
                 })?;
         }
-        let validated_bytes = encode_json(&json!({
-            "kind":"provider_result", "stepId":step, "value":response,
+        let validated = json!({
+            "kind":"provider_result", "stepId":step,"invocationId":invocation["invocationId"], "value":response,
             "outputValidated":response["status"] == "complete", "actionDigest":invocation["actionDigest"],
             "outputSchemaDigest":canonical_digest(&descriptor["outputSchema"])
                 .map_err(|_| AppError::new("INVALID_PROVIDER_OUTPUT", "Pinned output schema digest is invalid"))?
-        })).map_err(|_| AppError::new("INVALID_PROVIDER_OUTPUT", "Validated output exceeds the strict JSON boundary"))?;
-        let blob = self
-            .store
-            .put_blob(&validated_bytes)
-            .map_err(|e| AppError::storage("OUTCOME_UNKNOWN", e))?;
-        self.store
-            .append_operation_evidence(operation, &blob)
-            .map_err(|e| AppError::storage("OUTCOME_UNKNOWN", e))?;
+        });
+        let summary = crate::report::compact_evidence(&validated, &blob)?;
+        let summary_blob = self.retain_summary(operation, &summary, std::slice::from_ref(&blob))?;
         let record = self
             .store
             .operation(operation)
@@ -475,7 +559,7 @@ impl Application<'_> {
                     },
                     further_effects_possible: stored.further_effects_possible,
                     provider_receipt: receipt,
-                    observation_refs: vec![blob],
+                    observation_refs: vec![summary_blob],
                     finished,
                 },
             )
@@ -496,7 +580,9 @@ impl Application<'_> {
             .store
             .operation(operation)
             .map_err(|e| AppError::storage("OPERATION_NOT_FOUND", e))?;
-        let observed = self.observer.readback(invocation, &record.scope)?;
+        let observed = self
+            .observer
+            .readback_with_store(self.store, invocation, &record.scope)?;
         if observed.invocation_id.as_str() != invocation["invocationId"].as_str().unwrap_or("")
             || observed.binding_id.as_str() != invocation["bindingId"].as_str().unwrap_or("")
             || observed.context_digest.as_str()
@@ -534,11 +620,9 @@ impl Application<'_> {
                 && v["stepId"] == step.as_str()
                 && v["outputValidated"] == true
         });
-        let provider_failed = output_evidence.iter().any(|v| {
-            v["kind"] == "provider_result"
-                && v["stepId"] == step.as_str()
-                && v["value"]["status"] == "failed"
-        });
+        let provider_failed = output_evidence
+            .iter()
+            .any(|v| v["stepId"] == step.as_str() && crate::report::known_provider_failure(v));
         if observed.direct_changes.len() > 4096
             || observed
                 .direct_changes
@@ -565,12 +649,37 @@ impl Application<'_> {
                 "Direct changes contradict the reported effect evidence",
             ));
         }
+        let captured = self.captured_before(operation, step, invocation)?;
         let mut snapshots = Vec::new();
+        let mut changed_targets = std::collections::BTreeSet::new();
+        let mut after_bytes = 0usize;
         for change in observed.direct_changes {
-            let before = self
-                .store
-                .put_blob(&change.before)
-                .map_err(|e| AppError::storage("RECOVERY_EXPIRED", e))?;
+            if !changed_targets.insert(change.target.clone()) {
+                return Err(AppError::new(
+                    "RECONCILIATION_INSUFFICIENT",
+                    "Independent after target is duplicated",
+                ));
+            }
+            after_bytes = after_bytes
+                .checked_add(change.after.len())
+                .filter(|size| *size <= 128 * 1024 * 1024)
+                .ok_or_else(|| {
+                    AppError::new(
+                        "BUDGET_EXCEEDED",
+                        "Independent after images exceed their finite budget",
+                    )
+                })?;
+            let Some(before) = captured.get(&change.target).cloned() else {
+                // Legacy invocations without pre-dispatch capture cannot obtain
+                // recovery authority from a post-write observer before image.
+                if captured.is_empty() {
+                    continue;
+                }
+                return Err(AppError::new(
+                    "RECONCILIATION_INSUFFICIENT",
+                    "Independent after target has no original durable before capture",
+                ));
+            };
             let after = self
                 .store
                 .put_blob(&change.after)
@@ -578,10 +687,10 @@ impl Application<'_> {
             // These artifact pins precede the observation envelope: GC does not
             // infer recursive references from arbitrary JSON payloads.
             self.store
-                .pin_artifact(operation.as_str(), &before)
+                .pin_operation_artifact(operation, &before)
                 .map_err(|e| AppError::storage("RECOVERY_EXPIRED", e))?;
             self.store
-                .pin_artifact(operation.as_str(), &after)
+                .pin_operation_artifact(operation, &after)
                 .map_err(|e| AppError::storage("RECOVERY_EXPIRED", e))?;
             snapshots.push(RecoverySnapshot {
                 operation_id: operation.clone(),
@@ -596,7 +705,51 @@ impl Application<'_> {
                 after,
             });
         }
-        for retained in output_evidence.iter().filter(|v| {
+        if observed.settled
+            && matches!(
+                observed.effect,
+                EffectEvidence::SomeConfirmed | EffectEvidence::CompleteConfirmed
+            )
+        {
+            for (target, before) in &captured {
+                if snapshots.iter().any(|snapshot| &snapshot.target == target) {
+                    continue;
+                }
+                let bytes = self
+                    .observer
+                    .read_target_with_store(self.store, invocation, target)?;
+                after_bytes = after_bytes
+                    .checked_add(bytes.len())
+                    .filter(|size| *size <= 128 * 1024 * 1024)
+                    .ok_or_else(|| {
+                        AppError::new(
+                            "BUDGET_EXCEEDED",
+                            "Independent after images exceed their finite budget",
+                        )
+                    })?;
+                let after = self
+                    .store
+                    .put_blob(&bytes)
+                    .map_err(|e| AppError::storage("RECOVERY_EXPIRED", e))?;
+                self.store
+                    .pin_operation_artifact(operation, &after)
+                    .map_err(|e| AppError::storage("RECOVERY_EXPIRED", e))?;
+                snapshots.push(RecoverySnapshot {
+                    operation_id: operation.clone(),
+                    step_id: step.clone(),
+                    target: target.clone(),
+                    context_id: decode(&invocation["context"]["contextId"])?,
+                    binding_id: text(invocation, "bindingId")?.to_owned(),
+                    epoch: invocation["context"]["environment"]["sessionEpoch"]
+                        .as_str()
+                        .map(str::to_owned),
+                    before: before.clone(),
+                    after,
+                });
+            }
+        }
+        let retained_readbacks = self.readback_values(&record, step)?;
+        for retained in retained_readbacks.iter().filter(|v| {
             v["kind"] == "independent_readback"
                 && v["stepId"] == step.as_str()
                 && v["invocationId"] == invocation["invocationId"]
@@ -604,6 +757,15 @@ impl Application<'_> {
         }) {
             for entry in retained["directChanges"].as_array().into_iter().flatten() {
                 let prior: RecoverySnapshot = decode(entry)?;
+                let Some(before) = captured.get(&prior.target) else {
+                    continue;
+                };
+                if before != &prior.before {
+                    return Err(AppError::new(
+                        "RECOVERY_EXPIRED",
+                        "Retained readback before image differs from the original independent capture",
+                    ));
+                }
                 if let Some(current) = snapshots.iter_mut().find(|s| s.target == prior.target) {
                     if current.after == prior.after {
                         // A host may no longer carry its old before image after
@@ -613,7 +775,9 @@ impl Application<'_> {
                     }
                     continue;
                 }
-                let current = self.observer.read_target(invocation, &prior.target)?;
+                let current =
+                    self.observer
+                        .read_target_with_store(self.store, invocation, &prior.target)?;
                 if mmmm_contracts::raw_digest(&current) != prior.after.digest
                     || current.len() as u64 != prior.after.byte_length
                 {
@@ -625,10 +789,19 @@ impl Application<'_> {
                 snapshots.push(prior);
             }
         }
+        let evidence_blob = self
+            .store
+            .put_blob(&encode_json(&observed.evidence).map_err(|_| {
+                AppError::new(
+                    "RECONCILIATION_INSUFFICIENT",
+                    "Independent evidence exceeds its JSON budget",
+                )
+            })?)
+            .map_err(|e| AppError::storage("RECONCILIATION_INSUFFICIENT", e))?;
         let envelope = json!({"kind":"independent_readback", "stepId":step, "invocationId":observed.invocation_id,
             "bindingId":observed.binding_id,"contextDigest":observed.context_digest,
             "implementationDigest":observed.implementation_digest,"argumentsDigest":observed.arguments_digest,
-            "effect":observed.effect,"settled":observed.settled,"evidence":observed.evidence,"directChanges":snapshots});
+            "effect":observed.effect,"settled":observed.settled,"sourceRefs":[evidence_blob],"directChanges":snapshots});
         let blob = self
             .store
             .put_blob(&encode_json(&envelope).map_err(|_| {
@@ -638,6 +811,8 @@ impl Application<'_> {
                 )
             })?)
             .map_err(|e| AppError::storage("RECONCILIATION_INSUFFICIENT", e))?;
+        let summary = crate::report::compact_evidence(&envelope, &blob)?;
+        self.retain_summary(operation, &summary, &[blob.clone(), evidence_blob])?;
         self.store
             .record_observation(
                 operation,
@@ -724,9 +899,34 @@ impl Application<'_> {
             .store
             .put_blob(&bytes)
             .map_err(|e| AppError::storage("OUTCOME_UNKNOWN", e))?;
+        let summary = crate::report::compact_evidence(
+            &json!({"kind":"application_diagnostic","diagnostic":note}),
+            &blob,
+        )?;
+        self.retain_summary(operation, &summary, std::slice::from_ref(&blob))?;
+        Ok(())
+    }
+
+    pub(crate) fn retain_summary(
+        &mut self,
+        operation: &OperationId,
+        summary: &Value,
+        sources: &[mmmm_runtime::storage::BlobRef],
+    ) -> AppResult<mmmm_runtime::storage::BlobRef> {
+        let bytes = encode_json(summary).map_err(|_| {
+            AppError::new(
+                "OUTCOME_UNKNOWN",
+                "Operation summary exceeds its strict JSON boundary",
+            )
+        })?;
+        let blob = self
+            .store
+            .put_blob(&bytes)
+            .map_err(|e| AppError::storage("OUTCOME_UNKNOWN", e))?;
         self.store
-            .append_operation_evidence(operation, &blob)
-            .map_err(|e| AppError::storage("OUTCOME_UNKNOWN", e))
+            .append_operation_summary(operation, &blob, sources)
+            .map_err(|e| AppError::storage("OUTCOME_UNKNOWN", e))?;
+        Ok(blob)
     }
 
     fn settle(&mut self, operation: &OperationId) -> AppResult<()> {
@@ -737,13 +937,13 @@ impl Application<'_> {
         if record.state.terminal() {
             return Ok(());
         }
-        let failed = self.evidence_values(&record)?.iter().any(|v| {
+        let evidence = self.evidence_values(&record)?;
+        let failed = evidence.iter().any(|v| {
             v["kind"] == "application_diagnostic" && v["diagnostic"]["severity"] == "error"
         });
-        let provider_failed = self
-            .evidence_values(&record)?
-            .iter()
-            .any(|v| v["kind"] == "provider_result" && v["value"]["status"] == "failed");
+        let provider_failed = evidence.iter().any(|v| {
+            crate::report::known_provider_failure(v) || crate::report::unresolved_failure_history(v)
+        });
         let known_effect = record.steps.iter().any(|s| {
             matches!(
                 s.effect,
@@ -768,9 +968,10 @@ impl Application<'_> {
             Some(OperationState::Succeeded)
         } else if no_effect && record.cancellation_requested {
             Some(OperationState::Cancelled)
-        } else if no_effect && failed {
+        } else if no_effect && (failed || provider_failed) {
             Some(OperationState::FailedBeforeEffects)
-        } else if known_effect && (failed || unknown || record.cancellation_requested || !verified)
+        } else if known_effect
+            && (failed || provider_failed || unknown || record.cancellation_requested || !verified)
         {
             Some(OperationState::Partial)
         } else if unknown {

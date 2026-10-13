@@ -55,6 +55,11 @@ pub struct CaptureSourceAccess<'a> {
     access: &'a dyn AccessControl,
 }
 impl CaptureSourceAccess<'_> {
+    /// Authenticated caller supplied by the Coordinator. A source may use this
+    /// identity to resolve its approved bindings; request fields cannot replace it.
+    pub fn principal(&self) -> &ReadPrincipal {
+        self.principal
+    }
     pub fn authorize_before_read(&self, source: &Value) -> Result<(), CatalogError> {
         ContractValidator::shared()?.validate("SourceRef", source)?;
         self.access.authorize_source(self.principal, source)

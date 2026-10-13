@@ -5,6 +5,10 @@ members = [
     "crates/mmmm-adapters", "crates/mmmm-reference",
     "crates/mmmm-application",
     "crates/mmmm-policy",
+    "crates/mmmm-coordinator", "apps/mmmm",
+    "crates/mmmm-exchange",
+    "crates/mmmm-compiler",
+    "crates/mmmm-planner",
 ]
 resolver = "3"
 
@@ -26,7 +30,7 @@ ctrlc = "3.5"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation", "Win32_Security", "Win32_System_Threading",
     "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_Storage_FileSystem",
-    "Win32_System_IO",
+    "Win32_System_IO", "Win32_System_Console",
 ] }
 
 [workspace.lints.rust]

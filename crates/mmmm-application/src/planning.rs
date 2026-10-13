@@ -28,7 +28,9 @@ impl Application<'_> {
         check_context(principal, &project_id, &context_id, &context)?;
         self.authority
             .authorize(principal, &project_id, Access::Plan, Some(&context), None)?;
-        let prepared = self.planner.prepare(principal, input, &project, &context)?;
+        let prepared = self
+            .planner
+            .prepare_with_store(self.store, principal, input, &project, &context)?;
         self.freeze_plan(principal, &project, &context, prepared)
     }
 
@@ -109,6 +111,7 @@ impl Application<'_> {
         let pins: Vec<Value> = contexts.values().map(|c| json!({
             "contextId":c["contextId"], "contextDigest":c["contextDigest"], "environment":c["environment"]
         })).collect();
+        let mut descriptors = BTreeMap::new();
         for step in &prepared.steps {
             validate("PlanStep", step)?;
             let id: ContextId = decode(&step["contextId"])?;
@@ -117,17 +120,21 @@ impl Application<'_> {
             })?;
             let descriptor = self.provider.action_descriptor(step, context)?;
             check_descriptor(step, context, &descriptor)?;
-            // Resolver witnesses are not yet supported by DurableStore. Do not
-            // silently execute placeholder args or allow result-selected targets.
-            if !step["resultBindings"]
-                .as_array()
-                .is_some_and(|v| v.is_empty())
-            {
+            self.store
+                .register_result_action(&decode(&step["bindingId"])?, &descriptor)
+                .map_err(|e| AppError::storage("CAPABILITY_UNAVAILABLE", e))?;
+            let step_id = step["stepId"].as_str().ok_or_else(|| {
+                AppError::new("INVALID_INPUT", "Prepared step identity is absent")
+            })?;
+            if descriptors.insert(step_id.to_owned(), descriptor).is_some() {
                 return Err(AppError::new(
-                    "CAPABILITY_UNAVAILABLE",
-                    "A verified result-resolution witness is required before result-bound dispatch",
+                    "INVALID_INPUT",
+                    "Duplicate prepared step identity",
                 ));
             }
+        }
+        for step in &prepared.steps {
+            self.check_result_bindings(&prepared.steps, &descriptors, step)?;
         }
         let order = step_order(&prepared.steps)?;
         check_conflict_order(&prepared.steps, &order)?;
@@ -278,6 +285,40 @@ impl Application<'_> {
         let preconditions = plan["preconditions"]
             .as_array()
             .ok_or_else(|| AppError::new("STALE_PLAN", "Preconditions are absent"))?;
+        let phase_expected = self.phase_expected_digests(plan, step, operation)?;
+        for precondition in preconditions {
+            let expected: Sha256Digest = phase_expected
+                .get(&(
+                    text(precondition, "kind")?.to_owned(),
+                    text(precondition, "subject")?.to_owned(),
+                ))
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| decode(&precondition["expected"]))?;
+            let observed = self.provider.observe_precondition_with_store(
+                self.store,
+                precondition,
+                &context,
+            )?;
+            if observed != expected {
+                return Err(AppError::new(
+                    "TARGET_DRIFT",
+                    "A frozen precondition no longer matches the actual target",
+                ));
+            }
+        }
+        Ok((context, descriptor))
+    }
+    pub(crate) fn phase_expected_digests(
+        &self,
+        plan: &Value,
+        step: &Value,
+        operation: &mmmm_contracts::OperationId,
+    ) -> AppResult<BTreeMap<(String, String), Sha256Digest>> {
+        let id: ContextId = decode(&step["contextId"])?;
+        let preconditions = plan["preconditions"]
+            .as_array()
+            .ok_or_else(|| AppError::new("STALE_PLAN", "Preconditions are absent"))?;
         let mut phase_expected: BTreeMap<(String, String), Sha256Digest> = BTreeMap::new();
         for precondition in preconditions {
             if matches!(
@@ -316,6 +357,17 @@ impl Application<'_> {
                 .iter()
                 .map(|s| (s.step_id.as_str(), s))
                 .collect();
+            let evidence = self.evidence_values(&record)?;
+            let failed: BTreeSet<String> = record
+                .steps
+                .iter()
+                .filter(|step| {
+                    evidence.iter().any(|value| {
+                        crate::report::failure_blocks_step(value, step.step_id.as_str())
+                    })
+                })
+                .map(|step| step.step_id.as_str().to_owned())
+                .collect();
             let mut by_step: BTreeMap<&str, Vec<_>> = BTreeMap::new();
             for snapshot in &snapshots {
                 by_step
@@ -331,9 +383,10 @@ impl Application<'_> {
                     break;
                 }
                 let prior_id = text(&steps[prior], "stepId")?;
-                if !records
-                    .get(prior_id)
-                    .is_some_and(|stored| crate::report::step_verified(stored))
+                if failed.contains(prior_id)
+                    || !records
+                        .get(prior_id)
+                        .is_some_and(|stored| crate::report::step_verified(stored))
                 {
                     continue;
                 }
@@ -360,24 +413,7 @@ impl Application<'_> {
                 }
             }
         }
-        for precondition in preconditions {
-            let expected: Sha256Digest = phase_expected
-                .get(&(
-                    text(precondition, "kind")?.to_owned(),
-                    text(precondition, "subject")?.to_owned(),
-                ))
-                .cloned()
-                .map(Ok)
-                .unwrap_or_else(|| decode(&precondition["expected"]))?;
-            let observed = self.provider.observe_precondition(precondition, &context)?;
-            if observed != expected {
-                return Err(AppError::new(
-                    "TARGET_DRIFT",
-                    "A frozen precondition no longer matches the actual target",
-                ));
-            }
-        }
-        Ok((context, descriptor))
+        Ok(phase_expected)
     }
 }
 
@@ -467,12 +503,6 @@ pub(crate) fn check_descriptor(step: &Value, context: &Value, descriptor: &Value
         return Err(AppError::new(
             "STALE_PLAN",
             "Frozen action contract, implementation or behavior pins changed",
-        ));
-    }
-    if descriptor["planning"] != "pure" {
-        return Err(AppError::new(
-            "CAPABILITY_UNAVAILABLE",
-            "This action has no pure planning contract",
         ));
     }
     if descriptor["side"] != context["environment"]["side"] {

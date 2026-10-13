@@ -1,11 +1,14 @@
 //! Shared use cases for every facade. The durable runtime is the only operation
 //! authority. Ports are injected by the authenticated Coordinator composition;
 //! request JSON cannot supply an authority, observer, or implementation.
+mod before_capture;
 mod execution;
 mod planning;
 pub mod ports;
 mod recovery;
+mod registered_action;
 mod report;
+mod result_binding;
 pub mod types;
 
 pub use ports::*;
@@ -43,7 +46,9 @@ impl Application<'_> {
                 .project_revision(&project_id, &revision)
                 .map_err(|e| AppError::storage("REVISION_CONFLICT", e))?;
         }
-        let inspection = self.planner.inspect_project(principal, &project)?;
+        let inspection = self
+            .planner
+            .inspect_project_with_store(self.store, principal, &project)?;
         let output = serde_json::json!({
             "project": project,
             "diagnostics": inspection.diagnostics,

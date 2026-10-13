@@ -1,12 +1,15 @@
 use crate::types::*;
-use mmmm_contracts::{ContextId, PrincipalId, ProjectId, Sha256Digest};
-use mmmm_runtime::storage::WriteScope;
+use mmmm_contracts::{ContextId, ObjectId, PrincipalId, ProjectId, Sha256Digest};
+use mmmm_runtime::storage::result_binding::RegisteredResultCodec;
+use mmmm_runtime::storage::{DurableStore, WriteScope};
 use serde_json::Value;
 
 /// Authenticated composition supplies this port. It intersects the live user
 /// policy, explicit per-operation grant, actual game principal, and host
 /// capability. `planHash` binds explicit approvals; model JSON is not a grant.
 /// Observe/Recovery permissions remain distinct after Apply permission revocation.
+/// authorize_operation must enforce its current journal grant against the full
+/// original record scope; old invocation context/permission claims grant no read.
 pub trait AuthorityPort {
     fn authorize(
         &mut self,
@@ -54,11 +57,66 @@ pub trait PlanningPort {
         project: &Value,
         context: &Value,
     ) -> AppResult<PreparedPlan>;
+    fn inspect_project_with_store(
+        &mut self,
+        _store: &DurableStore,
+        principal: &PrincipalId,
+        project: &Value,
+    ) -> AppResult<ProjectInspection> {
+        self.inspect_project(principal, project)
+    }
+    /// A short borrow of the application's unique store permits owned document
+    /// reads and private CAS staging without another database or target effects.
+    fn prepare_with_store(
+        &mut self,
+        _store: &mut DurableStore,
+        principal: &PrincipalId,
+        request: &Value,
+        project: &Value,
+        context: &Value,
+    ) -> AppResult<PreparedPlan> {
+        self.prepare(principal, request, project, context)
+    }
+    fn prepare_recovery_with_store(
+        &mut self,
+        _store: &mut DurableStore,
+        principal: &PrincipalId,
+        recovery: &RecoveryPreparation,
+        project: &Value,
+        context: &Value,
+    ) -> AppResult<PreparedPlan> {
+        self.prepare_recovery(principal, recovery, project, context)
+    }
 }
 
 /// Implementations perform bounded calls using Invocation.deadlineAt and the
 /// frozen binding, never discover a replacement route after dispatch.
 pub trait ProviderPort {
+    /// Only the authenticated server's closed immutable codec registry can
+    /// implement this. Public/model JSON cannot register transformations.
+    fn result_codec(
+        &mut self,
+        _id: &ObjectId,
+        _digest: &Sha256Digest,
+    ) -> AppResult<RegisteredResultCodec> {
+        Err(AppError::new(
+            "CAPABILITY_UNAVAILABLE",
+            "No server-registered result codec is available",
+        ))
+    }
+    /// Validate resolved data against the original target/cost/route footprint
+    /// using the registered action's actual semantics. No target widening.
+    fn validate_resolved_footprint(
+        &mut self,
+        _step: &Value,
+        _arguments: &Value,
+        _context: &Value,
+    ) -> AppResult<()> {
+        Err(AppError::new(
+            "CAPABILITY_UNAVAILABLE",
+            "No registered result-slot footprint verifier is available",
+        ))
+    }
     fn context(&mut self, principal: &PrincipalId, context_id: &ContextId) -> AppResult<Value>;
     /// Return the currently observed descriptor for this exact binding/action.
     fn action_descriptor(&mut self, step: &Value, context: &Value) -> AppResult<Value>;
@@ -78,6 +136,45 @@ pub trait ProviderPort {
     /// A successful return acknowledges a request, not stopped effects. Apply
     /// revocation does not revoke a separately authorized current Cancel grant.
     fn request_cancel(&mut self, invocation: &Value, receipt: Option<&str>) -> AppResult<()>;
+    /// A dedicated registered read boundary enforces mutation prohibition. It
+    /// uses the current authenticated context, not a fabricated write operation.
+    fn registered_read_with_store(
+        &mut self,
+        _store: &DurableStore,
+        _request: &Value,
+        _context: &Value,
+    ) -> AppResult<Value> {
+        Err(AppError::new(
+            "CAPABILITY_UNAVAILABLE",
+            "No authenticated registered read boundary is available",
+        ))
+    }
+    fn observe_precondition_with_store(
+        &mut self,
+        _store: &DurableStore,
+        precondition: &Value,
+        context: &Value,
+    ) -> AppResult<Sha256Digest> {
+        self.observe_precondition(precondition, context)
+    }
+    /// This short unique-store borrow is granted only after durable intent. The
+    /// composition may commit authenticated owned projection evidence there;
+    /// it must never redispatch a world mutation after a local commit failure.
+    fn dispatch_with_store(
+        &mut self,
+        _store: &mut DurableStore,
+        invocation: &Value,
+    ) -> AppResult<Value> {
+        self.dispatch(invocation)
+    }
+    fn poll_with_store(
+        &mut self,
+        _store: &mut DurableStore,
+        invocation: &Value,
+        receipt: Option<&str>,
+    ) -> AppResult<Option<Value>> {
+        self.poll(invocation, receipt)
+    }
 }
 
 /// Separate readback composition observes the real target rather than treating
@@ -86,8 +183,66 @@ pub trait ProviderPort {
 /// fresh observation/recovery authority is enforced independently of its old
 /// policyRevision. This port must bound all reads and retain exact before images.
 pub trait IndependentObserverPort {
+    /// A composition with region target keys must independently validate their
+    /// dimension/position against this step's context and approved region. The
+    /// default supports only exact identifiers present in the durable scope.
+    fn validate_capture_target(
+        &mut self,
+        _invocation: &Value,
+        scope: &WriteScope,
+        target: &str,
+    ) -> AppResult<()> {
+        if scope.resource_ids.iter().any(|id| id.as_str() == target)
+            || scope.object_ids.iter().any(|id| id.as_str() == target)
+            || scope
+                .external_target_ids
+                .iter()
+                .any(|id| id.as_str() == target)
+        {
+            Ok(())
+        } else {
+            Err(AppError::new(
+                "PERMISSION_REQUIRED",
+                "Capture target is absent from the authorized scope",
+            ))
+        }
+    }
+    /// Actual independent target reads before dispatch. Default means this
+    /// composition has no direct before-image capability; direct-recovery writes
+    /// are rejected rather than inferring bytes from arguments/provider output.
+    fn capture_before(
+        &mut self,
+        _invocation: &Value,
+        _scope: &WriteScope,
+    ) -> AppResult<Option<BeforeCapture>> {
+        Ok(None)
+    }
     fn readback(&mut self, invocation: &Value, scope: &WriteScope) -> AppResult<ReadbackEvidence>;
     fn read_target(&mut self, stored_invocation: &Value, target: &str) -> AppResult<Vec<u8>>;
+    fn capture_before_with_store(
+        &mut self,
+        _store: &DurableStore,
+        invocation: &Value,
+        scope: &WriteScope,
+    ) -> AppResult<Option<BeforeCapture>> {
+        self.capture_before(invocation, scope)
+    }
+    fn readback_with_store(
+        &mut self,
+        _store: &mut DurableStore,
+        invocation: &Value,
+        scope: &WriteScope,
+    ) -> AppResult<ReadbackEvidence> {
+        self.readback(invocation, scope)
+    }
+    fn read_target_with_store(
+        &mut self,
+        _store: &DurableStore,
+        stored_invocation: &Value,
+        target: &str,
+    ) -> AppResult<Vec<u8>> {
+        self.read_target(stored_invocation, target)
+    }
 }
 
 pub trait IdSource {
