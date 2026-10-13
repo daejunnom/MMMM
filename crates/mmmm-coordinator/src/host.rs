@@ -2,14 +2,17 @@
 //! from an authenticated local bootstrap; public function DTOs cannot install
 //! a host, principal, context, authority or replacement binding.
 
-use crate::client::HostRpcClient;
+use crate::client::{ClientError, HostClientReply, HostRpcClient};
 use mmmm_application::{AppError, AppResult, ProviderPort};
 use mmmm_contracts::{
-    ContextId, ContractValidator, PrincipalId, Sha256Digest, verify_projected_digest,
+    ActionId, BindingId, ContextId, ContractValidator, InvocationId, OperationId, PrincipalId,
+    Sha256Digest, StepId, encode_json, raw_digest, verify_projected_digest,
 };
+use mmmm_runtime::storage::DurableStore;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -21,6 +24,8 @@ pub struct HostBridge {
 #[derive(Default)]
 struct BridgeState {
     hosts: BTreeMap<ContextId, PairedHost>,
+    retained_routes: BTreeMap<[u8; 16], PairedHost>,
+    invocations: BTreeMap<OriginalInvocationKey, [u8; 16]>,
     verified_dependencies: BTreeMap<String, VerifiedDependency>,
 }
 /// Actual source/build verification installs the complete dependency metadata.
@@ -90,13 +95,122 @@ impl VerifiedDependency {
             })
     }
 }
+#[derive(Clone)]
 struct PairedHost {
-    client: HostRpcClient,
+    client: Arc<HostRpcClient>,
     principal: PrincipalId,
     context: Value,
     hello: Value,
     expires: Instant,
     generation: [u8; 16],
+}
+const MAX_RETAINED_ROUTES: usize = 8;
+const MAX_RETAINED_INVOCATIONS: usize = 1024;
+const MAX_ORIGINAL_BYTES: u64 = 8 * 1024 * 1024;
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct OriginalInvocationKey {
+    data_root: PathBuf,
+    operation: OperationId,
+    step: StepId,
+    invocation: InvocationId,
+    digest: Sha256Digest,
+}
+
+/// A complete response actually received from one authenticated paired route.
+/// Receiving bytes does not extend permission, lease or the request deadline.
+/// Only a typed adapter may retain its validated reply as private truth before
+/// checking whether it may still release or use that truth for the caller.
+pub struct HostReplyAcquisition {
+    reply: HostClientReply,
+    deadline: Instant,
+    generation: [u8; 16],
+}
+impl HostReplyAcquisition {
+    pub fn validated_response(&self) -> Option<&Value> {
+        self.reply.response()
+    }
+    pub fn failure(&self) -> Option<&ClientError> {
+        self.reply.failure()
+    }
+    pub fn deadline_reached(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+    pub fn received_byte_length(&self) -> usize {
+        self.reply.received_bytes()
+    }
+    pub fn matches_witness(&self, witness: &HostContextWitness) -> bool {
+        self.generation == witness.generation
+    }
+    /// Internal received-truth consumption only. This never authorizes release
+    /// to a caller or a usable resource marker; those require fresh checks.
+    pub fn into_acquired_response(self) -> AppResult<Value> {
+        if self.reply.failure().is_some() {
+            return Err(AppError::caused_by(
+                "HOST_RESULT_UNKNOWN",
+                "Authenticated host response was not validated",
+                self,
+            ));
+        }
+        self.reply.into_response().map_err(|cause| {
+            AppError::caused_by(
+                "HOST_RESULT_UNKNOWN",
+                "Authenticated host response was not validated",
+                cause,
+            )
+        })
+    }
+    pub fn check_normal_deadline(&self) -> AppResult<()> {
+        if self.reply.failure().is_some() {
+            return Err(error(
+                "HOST_RESULT_UNKNOWN",
+                "Authenticated host response was not validated",
+            ));
+        }
+        bounded_host_deadline(self.deadline).map(|_| ())
+    }
+    pub fn into_response(self) -> AppResult<Value> {
+        if self.reply.failure().is_some() {
+            return Err(AppError::caused_by(
+                "HOST_RESULT_UNKNOWN",
+                "Authenticated host response was not validated",
+                self,
+            ));
+        }
+        if self.deadline_reached() {
+            return Err(AppError::caused_by(
+                "TIME_BUDGET_EXCEEDED",
+                "Host response was acquired after the request budget ended",
+                self,
+            ));
+        }
+        self.reply.into_response().map_err(|cause| {
+            AppError::caused_by(
+                "HOST_RESULT_UNKNOWN",
+                "Authenticated host response was not validated",
+                cause,
+            )
+        })
+    }
+}
+impl std::fmt::Debug for HostReplyAcquisition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostReplyAcquisition")
+            .field("received_bytes", &self.received_byte_length())
+            .field("validated", &self.reply.response().is_some())
+            .field("deadline_reached", &self.deadline_reached())
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for HostReplyAcquisition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Opaque actual paired host reply; body is private diagnostic evidence")
+    }
+}
+impl std::error::Error for HostReplyAcquisition {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.reply.failure_source()
+    }
 }
 /// Opaque in-process ownership of one actual attached route. Public context
 /// JSON and a reused context ID cannot remove a later route generation.
@@ -138,8 +252,8 @@ impl HostContextWitness {
 }
 impl HostBridge {
     /// Trusted bootstrap only. The host is independently queried before this
-    /// exact immutable context becomes routable. Replacement requires detach;
-    /// outstanding operations continue to identify the original epoch/binding.
+    /// exact immutable context becomes routable. An approval may rotate the
+    /// same actual context/runtime; original dispatch routes remain read-only.
     pub fn attach(
         &self,
         client: HostRpcClient,
@@ -238,10 +352,13 @@ impl HostBridge {
             .lock()
             .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
         state.hosts.retain(|_, host| Instant::now() < host.expires);
-        if state.hosts.contains_key(&id) || state.hosts.len() >= 64 {
+        if state.hosts.get(&id).is_some_and(|old| {
+            old.principal != principal || old.context != actual_context || old.hello != actual_hello
+        }) || (!state.hosts.contains_key(&id) && state.hosts.len() >= 64)
+        {
             return Err(error(
                 "HOST_CAPACITY",
-                "Host context is already paired or capacity is exhausted",
+                "Host context replacement differs or capacity is exhausted",
             ));
         }
         let mut generation = [0u8; 16];
@@ -254,7 +371,7 @@ impl HostBridge {
         state.hosts.insert(
             id,
             PairedHost {
-                client,
+                client: Arc::new(client),
                 principal,
                 context: actual_context,
                 hello: actual_hello,
@@ -600,6 +717,16 @@ impl HostBridge {
         selector: Value,
         deadline: Instant,
     ) -> AppResult<Value> {
+        self.inspect_acquired_with_deadline(principal, id, selector, deadline)?
+            .into_response()
+    }
+    pub fn inspect_acquired_with_deadline(
+        &self,
+        principal: &PrincipalId,
+        id: &ContextId,
+        selector: Value,
+        deadline: Instant,
+    ) -> AppResult<HostReplyAcquisition> {
         self.context_with_deadline(principal, id, deadline)?;
         let state = self
             .state
@@ -607,35 +734,204 @@ impl HostBridge {
             .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
         let host = checked_host(&state, id, Some(principal))?;
         let expires = bounded_host_deadline(deadline)?;
-        let response =
-            exchange_response(&host.client, "inspect", Some(id), selector, Some(&expires))?;
-        bounded_host_deadline(deadline)?;
-        Ok(response)
+        exchange_acquired(host, "inspect", Some(id), selector, &expires, deadline)
     }
-    pub(crate) fn job_observation(&self, invocation: &Value) -> AppResult<Value> {
-        self.job_observation_with_deadline(invocation, Instant::now() + Duration::from_secs(10))
-    }
-    pub(crate) fn job_observation_with_deadline(
+    /// Full original HostResponse, including actual host failure diagnostics.
+    pub fn describe_response_with_deadline(
         &self,
-        invocation: &Value,
+        principal: &PrincipalId,
+        id: &ContextId,
+        binding: &BindingId,
+        action: &ActionId,
         deadline: Instant,
     ) -> AppResult<Value> {
-        self.invocation_with_deadline(
-            "operation.get",
-            invocation,
-            json!({"invocationId":invocation["invocationId"]}),
-            false,
+        self.describe_acquired_with_deadline(principal, id, binding, action, deadline)?
+            .into_response()
+    }
+    pub fn describe_acquired_with_deadline(
+        &self,
+        principal: &PrincipalId,
+        id: &ContextId,
+        binding: &BindingId,
+        action: &ActionId,
+        deadline: Instant,
+    ) -> AppResult<HostReplyAcquisition> {
+        self.context_with_deadline(principal, id, deadline)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
+        let host = checked_host(&state, id, Some(principal))?;
+        let expires = bounded_host_deadline(deadline)?;
+        exchange_acquired(
+            host,
+            "describe",
+            Some(id),
+            json!({"bindingId":binding,"actionId":action}),
+            &expires,
             deadline,
         )
     }
-    fn invocation_with_deadline(
+    /// The supplied store must contain this exact intent. Current observation
+    /// permission is checked by trusted application composition before entry;
+    /// the old Invocation is identity only and never an old Apply capability.
+    pub fn inspect_original_acquired_with_deadline(
+        &self,
+        store: &DurableStore,
+        principal: &PrincipalId,
+        original: &Value,
+        current_context: &Value,
+        selector: Value,
+        deadline: Instant,
+    ) -> AppResult<HostReplyAcquisition> {
+        validate_original_selector(&selector, original)?;
+        let key = durable_invocation_key(store, original, deadline)?;
+        self.original_acquired(
+            principal,
+            original,
+            current_context,
+            &key,
+            "inspect",
+            selector,
+            deadline,
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // Both actual intent and current observation context are required.
+    pub fn describe_original_acquired_with_deadline(
+        &self,
+        store: &DurableStore,
+        principal: &PrincipalId,
+        original: &Value,
+        current_context: &Value,
+        binding: &BindingId,
+        action: &ActionId,
+        deadline: Instant,
+    ) -> AppResult<HostReplyAcquisition> {
+        if original["bindingId"] != binding.as_str() || original["actionId"] != action.as_str() {
+            return Err(error(
+                "STALE_CONTEXT",
+                "Original description route differs from its durable intent",
+            ));
+        }
+        let key = durable_invocation_key(store, original, deadline)?;
+        self.original_acquired(
+            principal,
+            original,
+            current_context,
+            &key,
+            "describe",
+            json!({"bindingId":binding,"actionId":action}),
+            deadline,
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // Original identity must remain distinct from current read authority.
+    fn original_acquired(
+        &self,
+        principal: &PrincipalId,
+        original: &Value,
+        current_context: &Value,
+        key: &OriginalInvocationKey,
+        method: &str,
+        payload: Value,
+        deadline: Instant,
+    ) -> AppResult<HostReplyAcquisition> {
+        validate("ExecutionContext", current_context)?;
+        let current_id = context_id(current_context)?;
+        let live = self.context_with_deadline(principal, &current_id, deadline)?;
+        if live != *current_context
+            || current_context["principalRef"] != principal.as_str()
+            || original["context"]["principalRef"] != principal.as_str()
+            || original["context"]["projectId"] != current_context["projectId"]
+            || original["context"]["environment"] != current_context["environment"]
+        {
+            return Err(error(
+                "STALE_CONTEXT",
+                "Current observation does not identify the original runtime",
+            ));
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
+        checked_host(&state, &current_id, Some(principal))?;
+        let host = retained_host(&state, key, original)?;
+        let original_id = context_id(&original["context"])?;
+        let expires = bounded_host_deadline(deadline)?;
+        exchange_acquired(
+            host,
+            method,
+            Some(&original_id),
+            payload,
+            &expires,
+            deadline,
+        )
+    }
+    pub(crate) fn job_observation_with_store_and_deadline(
+        &self,
+        store: &DurableStore,
+        principal: &PrincipalId,
+        original: &Value,
+        current_context: &Value,
+        deadline: Instant,
+    ) -> AppResult<Value> {
+        let key = durable_invocation_key(store, original, deadline)?;
+        let response = self.original_acquired(
+            principal,
+            original,
+            current_context,
+            &key,
+            "operation.get",
+            json!({"invocationId":original["invocationId"]}),
+            deadline,
+        )?;
+        response_payload(response.into_response()?)
+    }
+    fn dispatch_durable(
+        &self,
+        store: &mut DurableStore,
+        invocation: &Value,
+        deadline: Instant,
+    ) -> AppResult<Value> {
+        let key = durable_invocation_key(store, invocation, deadline)?;
+        let record = store
+            .operation(&key.operation)
+            .map_err(|cause| AppError::storage("STALE_CONTEXT", cause))?;
+        let step = record
+            .steps
+            .iter()
+            .find(|step| step.step_id == key.step)
+            .ok_or_else(|| error("STALE_CONTEXT", "Original durable step is absent"))?;
+        if record.state != mmmm_runtime::storage::OperationState::Running
+            || record.reconciliation_required
+            || record.cancellation_requested
+            || step.finished
+            || step.dispatch != mmmm_runtime::storage::DispatchEvidence::IntentDurable
+        {
+            return Err(error(
+                "DISPATCH_ALREADY_ATTEMPTED",
+                "Durable step cannot admit a first host dispatch",
+            ));
+        }
+        let acquired = self.invocation_acquired_with_deadline(
+            "dispatch",
+            invocation,
+            invocation.clone(),
+            true,
+            deadline,
+            &key,
+        )?;
+        let acquired = retain_acquired_operation_truth(store, &key, acquired)?;
+        response_payload(acquired.into_response()?)
+    }
+    fn invocation_acquired_with_deadline(
         &self,
         method: &str,
         invocation: &Value,
         payload: Value,
         preserve_deadline: bool,
         deadline: Instant,
-    ) -> AppResult<Value> {
+        durable_key: &OriginalInvocationKey,
+    ) -> AppResult<HostReplyAcquisition> {
         validate("Invocation", invocation)?;
         let id = context_id(&invocation["context"])?;
         let principal = PrincipalId::new(text(&invocation["context"], "principalRef")?)
@@ -656,11 +952,11 @@ impl HostBridge {
                 "New dispatch differs from its frozen context or policy",
             ));
         }
-        let state = self
+        let mut state = self
             .state
             .lock()
             .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
-        let host = checked_host(&state, &id, Some(&principal))?;
+        let active = checked_host(&state, &id, Some(&principal))?;
         let bounded = bounded_host_deadline(deadline)?;
         let bound_at =
             time::OffsetDateTime::parse(&bounded, &time::format_description::well_known::Rfc3339)
@@ -676,9 +972,14 @@ impl HostBridge {
         } else {
             &bounded
         };
-        let result = exchange(&host.client, method, Some(&id), payload, Some(requested))?;
-        bounded_host_deadline(deadline)?;
-        Ok(result)
+        if preserve_deadline {
+            let actual = active.clone();
+            // This association is installed before any consuming request byte.
+            // It is sticky even if transport subsequently becomes ambiguous.
+            retain_first_dispatch(&mut state, durable_key.clone(), actual)?;
+        }
+        let host = retained_host(&state, durable_key, invocation)?;
+        exchange_acquired(host, method, Some(&id), payload, requested, deadline)
     }
 }
 
@@ -716,6 +1017,35 @@ impl HttpProviderPort {
     fn deadline(&self) -> Instant {
         self.deadline
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(10))
+    }
+    /// Current Cancel admission remains the composition's responsibility. The
+    /// actual store proves which old route receives this cancellation request.
+    pub fn request_cancel_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        invocation: &Value,
+        _receipt: Option<&str>,
+    ) -> AppResult<()> {
+        let key = durable_invocation_key(store, invocation, self.deadline())?;
+        let acquired = self.bridge.invocation_acquired_with_deadline(
+            "operation.cancel",
+            invocation,
+            json!({"invocationId":invocation["invocationId"]}),
+            false,
+            self.deadline(),
+            &key,
+        )?;
+        let acquired = retain_acquired_operation_truth(store, &key, acquired)?;
+        let response = response_payload(acquired.into_response()?)?;
+        if response["invocationId"] != invocation["invocationId"]
+            || response["cancellationRequested"] != true
+        {
+            return Err(error(
+                "CANCEL_UNCONFIRMED",
+                "Original host did not acknowledge the cancellation request",
+            ));
+        }
+        Ok(())
     }
 }
 impl ProviderPort for HttpProviderPort {
@@ -760,20 +1090,18 @@ impl ProviderPort for HttpProviderPort {
         if live != *context {
             return Err(error("STALE_CONTEXT", "Action descriptor context changed"));
         }
-        let state = self
-            .bridge
-            .state
-            .lock()
-            .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
-        let host = checked_host(&state, &id, Some(&principal))?;
-        let expires = bounded_host_deadline(self.deadline())?;
-        let descriptor = exchange(
-            &host.client,
-            "describe",
-            Some(&id),
-            json!({"bindingId":step["bindingId"],"actionId":step["actionId"]}),
-            Some(&expires),
+        let binding = BindingId::new(text(step, "bindingId")?)
+            .map_err(|_| error("INVALID_INPUT", "Action binding is invalid"))?;
+        let action = ActionId::new(text(step, "actionId")?)
+            .map_err(|_| error("INVALID_INPUT", "Action identity is invalid"))?;
+        let response = self.bridge.describe_response_with_deadline(
+            &principal,
+            &id,
+            &binding,
+            &action,
+            self.deadline(),
         )?;
+        let descriptor = response_payload(response)?;
         validate("ActionDescriptor", &descriptor)?;
         Ok(descriptor)
     }
@@ -799,67 +1127,61 @@ impl ProviderPort for HttpProviderPort {
         self.bridge
             .verify_registered_dependencies_with_deadline(pins, context, self.deadline())
     }
-    fn dispatch(&mut self, invocation: &Value) -> AppResult<Value> {
-        let result = self.bridge.invocation_with_deadline(
-            "dispatch",
-            invocation,
-            invocation.clone(),
-            true,
-            self.deadline(),
-        )?;
+    fn dispatch(&mut self, _invocation: &Value) -> AppResult<Value> {
+        Err(error(
+            "STORE_REQUIRED",
+            "Host dispatch requires the actual durable intent",
+        ))
+    }
+    fn dispatch_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        invocation: &Value,
+    ) -> AppResult<Value> {
+        let result = self
+            .bridge
+            .dispatch_durable(store, invocation, self.deadline())?;
         validate("ProviderResult", &result)?;
         Ok(result)
     }
-    fn poll(&mut self, invocation: &Value, receipt: Option<&str>) -> AppResult<Option<Value>> {
-        let observed = self.bridge.invocation_with_deadline(
+    fn poll_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        invocation: &Value,
+        receipt: Option<&str>,
+    ) -> AppResult<Option<Value>> {
+        let key = durable_invocation_key(store, invocation, self.deadline())?;
+        let acquired = self.bridge.invocation_acquired_with_deadline(
             "operation.get",
             invocation,
             json!({"invocationId":invocation["invocationId"]}),
             false,
             self.deadline(),
+            &key,
         )?;
-        if observed["invocationId"] != invocation["invocationId"]
-            || !observed["providerCompleted"].is_boolean()
-        {
-            return Err(error(
-                "OBSERVATION_INVALID",
-                "Host job observation does not identify the original invocation",
-            ));
-        }
-        let Some(result) = observed.get("result") else {
-            return Ok(None);
-        };
-        validate("ProviderResult", result)?;
-        if receipt.is_some_and(|r| {
-            result["jobHandle"]
-                .as_str()
-                .is_some_and(|actual| actual != r)
-        }) {
-            return Err(error(
-                "OBSERVATION_INVALID",
-                "Host job handle differs from the retained receipt",
-            ));
-        }
-        Ok(Some(result.clone()))
+        let acquired = retain_acquired_operation_truth(store, &key, acquired)?;
+        let observed = response_payload(acquired.into_response()?)?;
+        validate_job_observation(invocation, receipt, observed)
     }
-    fn request_cancel(&mut self, invocation: &Value, _receipt: Option<&str>) -> AppResult<()> {
-        let response = self.bridge.invocation_with_deadline(
-            "operation.cancel",
-            invocation,
-            json!({"invocationId":invocation["invocationId"]}),
-            false,
-            self.deadline(),
-        )?;
-        if response["invocationId"] != invocation["invocationId"]
-            || response["cancellationRequested"] != true
-        {
-            return Err(error(
-                "CANCEL_UNCONFIRMED",
-                "Original host did not acknowledge the cancellation request",
-            ));
-        }
-        // This acknowledges a request only; no stopped-effect assertion.
-        Ok(())
+    fn poll(&mut self, _invocation: &Value, _receipt: Option<&str>) -> AppResult<Option<Value>> {
+        Err(error(
+            "STORE_REQUIRED",
+            "Original host polling requires its actual product store",
+        ))
+    }
+    fn request_cancel(&mut self, _invocation: &Value, _receipt: Option<&str>) -> AppResult<()> {
+        Err(error(
+            "STORE_REQUIRED",
+            "Original host cancellation requires its actual product store",
+        ))
+    }
+    fn request_cancel_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        invocation: &Value,
+        receipt: Option<&str>,
+    ) -> AppResult<()> {
+        HttpProviderPort::request_cancel_with_store(self, store, invocation, receipt)
     }
 }
 
@@ -880,6 +1202,294 @@ fn checked_host<'a>(
     }
     Ok(host)
 }
+fn durable_invocation_key(
+    store: &DurableStore,
+    invocation: &Value,
+    deadline: Instant,
+) -> AppResult<OriginalInvocationKey> {
+    validate("Invocation", invocation)?;
+    let bytes = encode_json(invocation).map_err(|cause| {
+        AppError::caused_by(
+            "INVALID_INPUT",
+            "Original Invocation cannot be encoded",
+            cause,
+        )
+    })?;
+    if bytes.len() as u64 > MAX_ORIGINAL_BYTES {
+        return Err(error(
+            "INVALID_INPUT",
+            "Original Invocation exceeds the finite byte limit",
+        ));
+    }
+    let operation = OperationId::new(text(invocation, "operationId")?)
+        .map_err(|_| error("INVALID_INPUT", "Original operation identity is invalid"))?;
+    let step = StepId::new(text(invocation, "stepId")?)
+        .map_err(|_| error("INVALID_INPUT", "Original step identity is invalid"))?;
+    let id = InvocationId::new(text(invocation, "invocationId")?)
+        .map_err(|_| error("INVALID_INPUT", "Original invocation identity is invalid"))?;
+    let actual = store
+        .stored_invocation_checked(&operation, &step, MAX_ORIGINAL_BYTES, || {
+            if Instant::now() >= deadline || crate::peer::fatal_stop_requested() {
+                return Err(mmmm_runtime::storage::StorageError::InvalidTransition(
+                    "Original host route admission budget ended".into(),
+                ));
+            }
+            Ok(())
+        })
+        .map_err(|cause| AppError::storage("STALE_CONTEXT", cause))?;
+    let blob = store
+        .stored_invocation_blob(&operation, &step)
+        .map_err(|cause| AppError::storage("STALE_CONTEXT", cause))?;
+    if actual != *invocation
+        || blob.digest != raw_digest(&bytes)
+        || blob.byte_length != bytes.len() as u64
+    {
+        return Err(error(
+            "STALE_CONTEXT",
+            "Supplied Invocation differs from its retained durable bytes",
+        ));
+    }
+    bounded_host_deadline(deadline)?;
+    Ok(OriginalInvocationKey {
+        data_root: store.data_root().to_path_buf(),
+        operation,
+        step,
+        invocation: id,
+        digest: blob.digest,
+    })
+}
+fn retain_first_dispatch(
+    state: &mut BridgeState,
+    key: OriginalInvocationKey,
+    host: PairedHost,
+) -> AppResult<()> {
+    if state.invocations.contains_key(&key) {
+        return Err(error(
+            "DISPATCH_ALREADY_ATTEMPTED",
+            "Original host dispatch association is already retained",
+        ));
+    }
+    if state.invocations.len() >= MAX_RETAINED_INVOCATIONS
+        || (!state.retained_routes.contains_key(&host.generation)
+            && state.retained_routes.len() >= MAX_RETAINED_ROUTES)
+    {
+        return Err(error(
+            "HOST_CAPACITY",
+            "Original host route retention capacity is exhausted",
+        ));
+    }
+    let generation = host.generation;
+    state.retained_routes.entry(generation).or_insert(host);
+    state.invocations.insert(key, generation);
+    Ok(())
+}
+/// Received truth may be retained after caller revocation or deadline. This
+/// narrow operation pin creates no ResourceRef, grant, result acceptance or
+/// effect-state transition. Its authority is the actual first-dispatch route
+/// and immutable intent already checked before the consuming request.
+fn retain_acquired_operation_truth(
+    store: &mut DurableStore,
+    key: &OriginalInvocationKey,
+    acquired: HostReplyAcquisition,
+) -> AppResult<HostReplyAcquisition> {
+    let Some(response) = acquired.validated_response() else {
+        // Unclassified raw bytes remain private zeroizing error evidence.
+        return Ok(acquired);
+    };
+    let retained = (|| -> mmmm_runtime::storage::StorageResult<()> {
+        if store.data_root() != key.data_root {
+            return Err(mmmm_runtime::storage::StorageError::Conflict(
+                "Acquired reply product store",
+            ));
+        }
+        let original = store.stored_invocation_blob(&key.operation, &key.step)?;
+        if original.digest != key.digest {
+            return Err(mmmm_runtime::storage::StorageError::Conflict(
+                "Acquired reply original intent digest",
+            ));
+        }
+        // Only the validated public HostResponse body is encoded. Bearer
+        // headers and malformed/unclassified HTTP bodies are never CAS input.
+        let bytes = encode_json(response)
+            .map_err(|cause| mmmm_runtime::storage::StorageError::Contract(cause.to_string()))?;
+        if bytes.len() > crate::rpc::MAX_CONTROL_BYTES {
+            return Err(mmmm_runtime::storage::StorageError::InvalidInput(
+                "Acquired host reply exceeds the finite byte limit".into(),
+            ));
+        }
+        let blob = store.put_blob(&bytes)?;
+        store.append_operation_evidence(&key.operation, &blob)
+    })();
+    match retained {
+        Ok(()) => Ok(acquired),
+        Err(cause) => Err(AppError::caused_by(
+            "EVIDENCE_RETENTION_FAILED",
+            "Actual host reply could not be durably retained",
+            HostTruthRetentionFailure { acquired, cause },
+        )),
+    }
+}
+struct HostTruthRetentionFailure {
+    acquired: HostReplyAcquisition,
+    cause: mmmm_runtime::storage::StorageError,
+}
+impl std::fmt::Debug for HostTruthRetentionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostTruthRetentionFailure")
+            .field("acquired", &self.acquired)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for HostTruthRetentionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Original acquired host response and storage failure are preserved privately")
+    }
+}
+impl std::error::Error for HostTruthRetentionFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+fn retained_host<'a>(
+    state: &'a BridgeState,
+    key: &OriginalInvocationKey,
+    invocation: &Value,
+) -> AppResult<&'a PairedHost> {
+    let generation = state.invocations.get(key).ok_or_else(|| {
+        error(
+            "ORIGINAL_ROUTE_UNAVAILABLE",
+            "Original durable intent has no retained first-dispatch route",
+        )
+    })?;
+    let host = state.retained_routes.get(generation).ok_or_else(|| {
+        error(
+            "ORIGINAL_ROUTE_UNAVAILABLE",
+            "Original paired generation is unavailable",
+        )
+    })?;
+    if host.generation != *generation
+        || host.context != invocation["context"]
+        || host.principal.as_str() != text(&invocation["context"], "principalRef")?
+    {
+        return Err(error(
+            "STALE_CONTEXT",
+            "Retained route differs from the immutable original Invocation",
+        ));
+    }
+    // The old Apply lease is deliberately not reused. Current composition
+    // grants the observation/cancellation; the actual old host also checks it.
+    Ok(host)
+}
+fn validate_original_selector(selector: &Value, original: &Value) -> AppResult<()> {
+    let object = selector
+        .as_object()
+        .ok_or_else(|| error("INVALID_INPUT", "Original inspection selector is invalid"))?;
+    if selector["kind"] == "block_read" {
+        // The actual legacy host's closed wire selector has no Invocation ID.
+        // Its route is still selected from the exact same-store durable key;
+        // its subject must equal the registered original action's native target.
+        if original["actionId"] != "mmmm:block_patch"
+            || object.len() != 3
+            || ["kind", "dimension", "position"]
+                .iter()
+                .any(|key| !object.contains_key(*key))
+        {
+            return Err(error(
+                "INVALID_INPUT",
+                "Original block read is outside its registered action",
+            ));
+        }
+        let source = crate::observer::BlockTarget::from_arguments(&original["arguments"])?;
+        let selected = crate::observer::BlockTarget::from_arguments(selector)?;
+        if selected != source {
+            return Err(error(
+                "PERMISSION_REQUIRED",
+                "Original block read target differs from its durable action",
+            ));
+        }
+        return Ok(());
+    }
+    let (allowed, identity_field) = match selector["kind"].as_str() {
+        Some("undo_material") => (
+            ["kind", "sourceInvocationId"].as_slice(),
+            "sourceInvocationId",
+        ),
+        Some("native_targets") => (
+            ["kind", "targets", "sourceInvocationId"].as_slice(),
+            "sourceInvocationId",
+        ),
+        Some("undo_job") => (["kind", "invocationId"].as_slice(), "invocationId"),
+        _ => {
+            return Err(error(
+                "INVALID_INPUT",
+                "Original inspection kind is not registered",
+            ));
+        }
+    };
+    if object.len() != allowed.len()
+        || allowed.iter().any(|key| !object.contains_key(*key))
+        || selector[identity_field] != original["invocationId"]
+    {
+        return Err(error(
+            "INVALID_INPUT",
+            "Original inspection does not identify the exact durable Invocation",
+        ));
+    }
+    Ok(())
+}
+fn exchange_acquired(
+    host: &PairedHost,
+    method: &str,
+    id: Option<&ContextId>,
+    payload: Value,
+    deadline_at: &str,
+    deadline: Instant,
+) -> AppResult<HostReplyAcquisition> {
+    let request = host_request(method, id, payload, deadline_at)?;
+    let reply = host.client.call_acquired(&request).map_err(|cause| {
+        AppError::caused_by(
+            "HOST_RESULT_UNKNOWN",
+            "Authenticated host call did not yield a complete response",
+            cause,
+        )
+    })?;
+    // No renewed grant or post-acquisition timeout can erase this received
+    // reply. Normal public success calls consume it through into_response.
+    Ok(HostReplyAcquisition {
+        reply,
+        deadline,
+        generation: host.generation,
+    })
+}
+fn response_payload(response: Value) -> AppResult<Value> {
+    if response["status"] != "ok" {
+        return Err(AppError::caused_by(
+            "HOST_REQUEST_FAILED",
+            "The original host rejected or could not complete the request",
+            HostRequestFailure { response },
+        ));
+    }
+    response
+        .get("payload")
+        .cloned()
+        .ok_or_else(|| error("HOST_RESPONSE_INVALID", "Host response payload is absent"))
+}
+struct HostRequestFailure {
+    response: Value,
+}
+impl std::fmt::Debug for HostRequestFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostRequestFailure")
+            .field("status", &self.response["status"])
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for HostRequestFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Original bounded host failure response is retained privately")
+    }
+}
+impl std::error::Error for HostRequestFailure {}
 fn exchange(
     client: &HostRpcClient,
     method: &str,
@@ -888,16 +1498,7 @@ fn exchange(
     deadline: Option<&str>,
 ) -> AppResult<Value> {
     let response = exchange_response(client, method, id, payload, deadline)?;
-    if response["status"] != "ok" {
-        return Err(error(
-            "HOST_REQUEST_FAILED",
-            "The original host rejected or could not complete the request",
-        ));
-    }
-    response
-        .get("payload")
-        .cloned()
-        .ok_or_else(|| error("HOST_RESPONSE_INVALID", "Host response payload is absent"))
+    response_payload(response)
 }
 fn exchange_response(
     client: &HostRpcClient,
@@ -906,24 +1507,42 @@ fn exchange_response(
     payload: Value,
     deadline: Option<&str>,
 ) -> AppResult<Value> {
-    let mut nonce = [0u8; 16];
-    getrandom::fill(&mut nonce)
-        .map_err(|_| error("HOST_UNAVAILABLE", "Request identity is unavailable"))?;
-    let request_id: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
     let deadline = match deadline {
         Some(deadline) => deadline.to_owned(),
         None => (time::OffsetDateTime::now_utc() + time::Duration::seconds(10))
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|_| error("HOST_UNAVAILABLE", "Host deadline is unavailable"))?,
     };
-    let request = json!({"protocolVersion":"0.2.0","requestId":request_id,"method":method,"contextId":id.map(ContextId::as_str),"payload":payload,"deadlineAt":deadline});
-    let response = client.call(&request).map_err(|_| {
-        error(
+    let request = host_request(method, id, payload, &deadline)?;
+    let acquired = client.call_acquired(&request).map_err(|cause| {
+        AppError::caused_by(
             "HOST_RESULT_UNKNOWN",
             "Authenticated host call did not yield a validated response",
+            cause,
+        )
+    })?;
+    let response = acquired.into_preserved_response().map_err(|cause| {
+        AppError::caused_by(
+            "HOST_RESULT_UNKNOWN",
+            "Authenticated host call did not yield a validated response",
+            cause,
         )
     })?;
     Ok(response)
+}
+fn host_request(
+    method: &str,
+    id: Option<&ContextId>,
+    payload: Value,
+    deadline: &str,
+) -> AppResult<Value> {
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce)
+        .map_err(|_| error("HOST_UNAVAILABLE", "Request identity is unavailable"))?;
+    let request_id: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(
+        json!({"protocolVersion":"0.2.0","requestId":request_id,"method":method,"contextId":id.map(ContextId::as_str),"payload":payload,"deadlineAt":deadline}),
+    )
 }
 fn context_id(context: &Value) -> AppResult<ContextId> {
     ContextId::new(text(context, "contextId")?)
@@ -962,6 +1581,35 @@ fn validate_registered_read_result(result: &Value) -> AppResult<()> {
     // A valid failed read preserves its original diagnostics and error status.
     Ok(())
 }
+fn validate_job_observation(
+    invocation: &Value,
+    receipt: Option<&str>,
+    observed: Value,
+) -> AppResult<Option<Value>> {
+    if observed["invocationId"] != invocation["invocationId"]
+        || !observed["providerCompleted"].is_boolean()
+    {
+        return Err(error(
+            "OBSERVATION_INVALID",
+            "Host job observation does not identify the original invocation",
+        ));
+    }
+    let Some(result) = observed.get("result") else {
+        return Ok(None);
+    };
+    validate("ProviderResult", result)?;
+    if receipt.is_some_and(|expected| {
+        result["jobHandle"]
+            .as_str()
+            .is_some_and(|actual| actual != expected)
+    }) {
+        return Err(error(
+            "OBSERVATION_INVALID",
+            "Host job handle differs from the retained receipt",
+        ));
+    }
+    Ok(Some(result.clone()))
+}
 
 #[cfg(test)]
 mod tests {
@@ -995,7 +1643,7 @@ mod tests {
         bridge.state.lock().unwrap().hosts.insert(
             id.clone(),
             PairedHost {
-                client,
+                client: Arc::new(client),
                 principal: principal.clone(),
                 context: context.clone(),
                 hello,
@@ -1087,5 +1735,272 @@ mod tests {
         let mut unsupported = failed.clone();
         unsupported["effects"] = json!("unknown");
         assert!(validate_registered_read_result(&unsupported).is_err());
+    }
+    fn route_fixture_invocation() -> Value {
+        mmmm_contracts::parse_json(include_bytes!("../../../examples/invocation.json")).unwrap()
+    }
+    fn route_fixture_key(invocation: &Value) -> OriginalInvocationKey {
+        // This local-map fixture does not assert durable admission or game
+        // effects. Production keys are issued only by actual stored intent.
+        OriginalInvocationKey {
+            data_root: std::env::temp_dir().join("mmmm-route-map-only-fixture"),
+            operation: OperationId::new(text(invocation, "operationId").unwrap()).unwrap(),
+            step: StepId::new(text(invocation, "stepId").unwrap()).unwrap(),
+            invocation: InvocationId::new(text(invocation, "invocationId").unwrap()).unwrap(),
+            digest: raw_digest(&encode_json(invocation).unwrap()),
+        }
+    }
+    #[test]
+    fn retained_original_generation_survives_rotation_without_new_dispatch() {
+        let (bridge, witness) = local_route_witness();
+        let original = route_fixture_invocation();
+        let key = route_fixture_key(&original);
+        let mut state = bridge.state.lock().unwrap();
+        let host = state.hosts[&witness.context_id].clone();
+        retain_first_dispatch(&mut state, key.clone(), host).unwrap();
+        state.hosts.get_mut(&witness.context_id).unwrap().generation[0] ^= 1;
+        let active = state.hosts[&witness.context_id].clone();
+        assert_eq!(
+            retained_host(&state, &key, &original).unwrap().generation,
+            witness.generation
+        );
+        assert_eq!(
+            retain_first_dispatch(&mut state, key.clone(), active)
+                .unwrap_err()
+                .code,
+            "DISPATCH_ALREADY_ATTEMPTED"
+        );
+        // An old Apply lease does not grant a new dispatch or erase received
+        // operation identity. Fresh observation permission is separate.
+        state
+            .retained_routes
+            .get_mut(&witness.generation)
+            .unwrap()
+            .expires = Instant::now();
+        assert!(retained_host(&state, &key, &original).is_ok());
+        drop(state);
+        assert_eq!(
+            witness.check_local().unwrap_err().code,
+            "SESSION_ROUTE_CHANGED"
+        );
+    }
+    #[test]
+    fn retained_route_rejects_another_store_and_changed_original_context() {
+        let (bridge, witness) = local_route_witness();
+        let mut original = route_fixture_invocation();
+        let key = route_fixture_key(&original);
+        let mut state = bridge.state.lock().unwrap();
+        let host = state.hosts[&witness.context_id].clone();
+        retain_first_dispatch(&mut state, key.clone(), host).unwrap();
+        let mut other_store = key.clone();
+        other_store.data_root = other_store.data_root.join("different-product-store");
+        assert_eq!(
+            retained_host(&state, &other_store, &original)
+                .err()
+                .unwrap()
+                .code,
+            "ORIGINAL_ROUTE_UNAVAILABLE"
+        );
+        original["context"]["environment"]["sessionEpoch"] = json!("different-host-epoch");
+        assert_eq!(
+            retained_host(&state, &key, &original).err().unwrap().code,
+            "STALE_CONTEXT"
+        );
+    }
+    #[test]
+    fn retained_generation_capacity_preserves_all_old_routes() {
+        let (bridge, witness) = local_route_witness();
+        let mut original = route_fixture_invocation();
+        let mut state = bridge.state.lock().unwrap();
+        let first = state.hosts[&witness.context_id].clone();
+        for index in 0..MAX_RETAINED_ROUTES {
+            original["invocationId"] = json!(format!("route-capacity-{index}"));
+            let key = route_fixture_key(&original);
+            let mut route = first.clone();
+            route.generation[0] = index as u8;
+            retain_first_dispatch(&mut state, key, route).unwrap();
+        }
+        let mut ninth = first;
+        ninth.generation[0] = MAX_RETAINED_ROUTES as u8;
+        original["invocationId"] = json!("route-capacity-overflow");
+        assert_eq!(
+            retain_first_dispatch(&mut state, route_fixture_key(&original), ninth)
+                .unwrap_err()
+                .code,
+            "HOST_CAPACITY"
+        );
+        assert_eq!(state.retained_routes.len(), MAX_RETAINED_ROUTES);
+        assert_eq!(state.invocations.len(), MAX_RETAINED_ROUTES);
+    }
+    #[test]
+    fn original_selector_cannot_select_a_different_job_or_mutation() {
+        let original = route_fixture_invocation();
+        validate_original_selector(
+            &json!({"kind":"undo_job","invocationId":original["invocationId"]}),
+            &original,
+        )
+        .unwrap();
+        validate_original_selector(
+            &json!({"kind":"undo_material","sourceInvocationId":original["invocationId"]}),
+            &original,
+        )
+        .unwrap();
+        assert!(
+            validate_original_selector(
+                &json!({"kind":"undo_job","invocationId":"another-job"}),
+                &original
+            )
+            .is_err()
+        );
+        assert!(
+            validate_original_selector(
+                &json!({"kind":"dispatch","sourceInvocationId":original["invocationId"]}),
+                &original
+            )
+            .is_err()
+        );
+        assert!(validate_original_selector(&json!({"kind":"undo_material","sourceInvocationId":original["invocationId"],"authority":true}), &original).is_err());
+    }
+    #[test]
+    fn storeless_write_poll_and_cancel_fail_before_transport() {
+        let mut provider = HttpProviderPort::new(HostBridge::default());
+        let original = route_fixture_invocation();
+        assert_eq!(
+            provider.dispatch(&original).unwrap_err().code,
+            "STORE_REQUIRED"
+        );
+        assert_eq!(
+            provider.poll(&original, None).unwrap_err().code,
+            "STORE_REQUIRED"
+        );
+        assert_eq!(
+            provider.request_cancel(&original, None).unwrap_err().code,
+            "STORE_REQUIRED"
+        );
+    }
+    #[test]
+    fn legacy_original_block_read_requires_the_exact_registered_subject() {
+        let mut original = route_fixture_invocation();
+        original["actionId"] = json!("mmmm:block_patch");
+        original["arguments"] = json!({"dimension":"minecraft:overworld","position":[1,2,3],"desiredState":"minecraft:stone"});
+        let selector =
+            json!({"kind":"block_read","dimension":"minecraft:overworld","position":[1,2,3]});
+        validate_original_selector(&selector, &original).unwrap();
+        let mut other_position = selector.clone();
+        other_position["position"] = json!([1, 2, 4]);
+        assert!(validate_original_selector(&other_position, &original).is_err());
+        let mut extra_identity = selector.clone();
+        extra_identity["sourceInvocationId"] = original["invocationId"].clone();
+        assert!(validate_original_selector(&extra_identity, &original).is_err());
+        original["actionId"] = json!("mmmm:unregistered_action");
+        assert!(validate_original_selector(&selector, &original).is_err());
+    }
+    fn received_loopback_reply() -> HostReplyAcquisition {
+        // Static handoff examples cannot exercise acquisition after validation.
+        // This bounded loopback protocol fixture receives real framed bytes;
+        // it neither pairs a native game nor issues an observation marker.
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(cause) if cause.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "bounded reply fixture accept");
+                        std::thread::yield_now();
+                    }
+                    Err(cause) => panic!("reply fixture accept: {cause}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let raw = crate::http::read_header(
+                &mut stream,
+                deadline,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap();
+            let (_, headers) =
+                crate::http::parse_headers(std::str::from_utf8(&raw).unwrap()).unwrap();
+            let length = crate::http::content_length(&headers).unwrap();
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).unwrap();
+            let request = mmmm_contracts::parse_json(&body).unwrap();
+            let response = json!({"protocolVersion":"0.2.0","requestId":request["params"]["requestId"],
+                "status":"ok","eventSequence":"0","payload":{"privateReceivedMarker":"received-fixture-truth"}});
+            let bytes = encode_json(&json!({"jsonrpc":"2.0","id":request["id"],"result":response}))
+                .unwrap();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            );
+            stream.write_all(header.as_bytes()).unwrap();
+            stream.write_all(&bytes).unwrap();
+            stream.shutdown(std::net::Shutdown::Both).unwrap();
+        });
+        let client = HostRpcClient::paired(
+            crate::endpoint::EndpointRecord {
+                schema_version: 1,
+                contract_version: "0.2.0".into(),
+                address,
+                path: "/rpc".into(),
+                coordinator_epoch: "received-reply-fixture".into(),
+                credential_ref: "MMMM.coordinator.received-fixture".into(),
+            },
+            crate::credential::SecretToken::generate().unwrap(),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let request = host_request(
+            "hello",
+            None,
+            json!({}),
+            &bounded_host_deadline(deadline).unwrap(),
+        )
+        .unwrap();
+        let reply = client.call_acquired(&request).unwrap();
+        server.join().unwrap();
+        // The receipt is now at its normal consumption checkpoint. An elapsed
+        // outer budget cannot erase bytes acquired and validated just above.
+        HostReplyAcquisition {
+            reply,
+            deadline: Instant::now(),
+            generation: [1; 16],
+        }
+    }
+    #[test]
+    fn elapsed_budget_preserves_received_reply_for_internal_truth_consumption() {
+        let acquired = received_loopback_reply();
+        assert!(acquired.received_byte_length() > 0);
+        assert_eq!(
+            acquired.check_normal_deadline().unwrap_err().code,
+            "TIME_BUDGET_EXCEEDED"
+        );
+        let response = acquired.into_acquired_response().unwrap();
+        assert_eq!(
+            response["payload"]["privateReceivedMarker"],
+            "received-fixture-truth"
+        );
+    }
+    #[test]
+    fn normal_deadline_error_owns_the_received_reply_without_printing_it() {
+        let error = received_loopback_reply().into_response().unwrap_err();
+        assert_eq!(error.code, "TIME_BUDGET_EXCEEDED");
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<HostReplyAcquisition>()
+            .unwrap();
+        assert_eq!(
+            source.validated_response().unwrap()["payload"]["privateReceivedMarker"],
+            "received-fixture-truth"
+        );
+        assert!(!format!("{error:?}").contains("received-fixture-truth"));
     }
 }

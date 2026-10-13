@@ -101,7 +101,7 @@ pub fn handle_rpc(
                 encode_response(json!({"jsonrpc":"2.0", "id":id, "result":output}))
             }
         }
-        Err(ServiceError { code, message }) => {
+        Err(ServiceError { code, message, .. }) => {
             encode_response(error(id, -32000, message, Some(code)))
         }
     }

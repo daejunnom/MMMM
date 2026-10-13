@@ -96,6 +96,32 @@ fn large_frame_invalid_utf8_raw_newline_and_limit_expansion_rejected() {
         .is_err()
     );
 }
+#[test]
+fn original_expired_deadline_rejects_before_executable_or_native_startup() {
+    let deadline = Instant::now();
+    for output in [StdioOutput::Stdout, StdioOutput::Stderr] {
+        let error = match NativeStdioPort::spawn_current_raw_output_with_deadline(
+            StdioLimits::default(),
+            output,
+            deadline,
+        ) {
+            Ok(_) => panic!("expired original budget must not create an owner"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "deadline");
+        assert!(!error.drained);
+        assert!(error.cleanup.is_none());
+    }
+    let limits = StdioLimits {
+        session: Duration::MAX,
+        ..StdioLimits::default()
+    };
+    let error = match NativeStdioPort::spawn_current_raw(limits) {
+        Ok(_) => panic!("invalid duration must not create an owner"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, "limits");
+}
 #[derive(Default)]
 struct Output {
     bytes: Vec<u8>,
@@ -255,7 +281,11 @@ fn actual_native_startup_failure_is_finite_and_drains_worker() {
         Ok(_) => panic!("test helper unexpectedly understood hidden app entry"),
         Err(error) => error,
     };
-    assert!(matches!(error.code, "worker_exit" | "startup_deadline"));
+    assert!(
+        matches!(error.code, "worker_exit" | "startup_deadline"),
+        "unexpected native startup rejection: {error}; drained={}",
+        error.drained
+    );
     assert!(
         error.drained,
         "native failure must preserve a verified drain result"

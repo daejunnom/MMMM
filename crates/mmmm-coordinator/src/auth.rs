@@ -170,9 +170,9 @@ fn validate_policy(policy: &SessionPolicy) -> Result<(), AuthError> {
         || policy.allowed_methods.iter().any(|m| {
             m.is_empty()
                 || m.len() > 96
-                || !m
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.')
+                || !m.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_')
+                })
         })
     {
         return Err(AuthError::InvalidPolicy);
@@ -201,6 +201,41 @@ fn capability_digest(token: &SecretToken) -> [u8; 32] {
 #[cfg(test)]
 mod replacement_tests {
     use super::*;
+    #[test]
+    fn canonical_function_index_can_install_the_bootstrap_session_policy() {
+        let methods = mmmm_contracts::ContractValidator::shared()
+            .unwrap()
+            .functions()
+            .iter()
+            .map(|function| function.name.clone())
+            .collect::<BTreeSet<_>>();
+        assert!(methods.contains("world.shape_query"));
+        let policy = SessionPolicy {
+            principal: PrincipalId::new("native-owner").unwrap(),
+            allowed_methods: methods,
+            allowed_contexts: BTreeSet::new(),
+            lifetime: Duration::from_secs(10),
+        };
+        let mut authority = SessionAuthority::new(1).unwrap();
+        let (token, _) = authority.install_with_handle(policy.clone()).unwrap();
+        let authenticated = authority.authenticate_token(&token).unwrap();
+        for method in &policy.allowed_methods {
+            assert!(authenticated.permits(method));
+        }
+        for invalid in [
+            "World.shape_query",
+            "world.shape query",
+            "world.shape\nquery",
+            "world.도형",
+        ] {
+            let mut invalid_policy = policy.clone();
+            invalid_policy.allowed_methods = [invalid.to_owned()].into();
+            assert_eq!(
+                validate_policy(&invalid_policy),
+                Err(AuthError::InvalidPolicy)
+            );
+        }
+    }
     #[test]
     fn private_pairing_handle_replaces_expired_policy_without_reviving_old_clone() {
         let mut authority = SessionAuthority::new(1).unwrap();

@@ -29,7 +29,14 @@ impl std::fmt::Display for CoordinatorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Endpoint(e) => write!(f, "Coordinator discovery failed: {e}"),
-            Self::Authentication(e) => write!(f, "Coordinator session failed: {e}"),
+            Self::Authentication(e) => {
+                let code = match e {
+                    AuthError::InvalidCapability => "AUTHENTICATION_REQUIRED",
+                    AuthError::SessionLimit => "SESSION_LIMIT",
+                    AuthError::InvalidPolicy => "INVALID_SESSION_POLICY",
+                };
+                write!(f, "Coordinator session failed ({code}): {e}")
+            }
             Self::Credential => f.write_str("Native local credential API is unavailable"),
             Self::Listener(_) => f.write_str("Coordinator loopback listener failed"),
             Self::Cleanup => f.write_str(
@@ -38,7 +45,16 @@ impl std::fmt::Display for CoordinatorError {
         }
     }
 }
-impl std::error::Error for CoordinatorError {}
+impl std::error::Error for CoordinatorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Endpoint(error) => Some(error),
+            Self::Authentication(error) => Some(error),
+            Self::Listener(error) => Some(error),
+            Self::Credential | Self::Cleanup => None,
+        }
+    }
+}
 
 /// The service has acquired its DurableStore lock before start() can publish
 /// anything. Runtime discovery is fixed beneath that same root, preventing a

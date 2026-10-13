@@ -16,17 +16,64 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct ServiceError {
     pub code: &'static str,
     pub message: &'static str,
+    // Internal diagnostic causes are never included in the public RPC body.
+    // Authority/session witnesses are not Send + Sync and cannot enter here.
+    source: Option<Arc<dyn std::error::Error + Send + Sync>>,
 }
 
 /// Trusted composition shares this slot with store-aware ports. Public request
 /// values cannot populate it; the authenticated service call owns its lifetime.
 #[derive(Clone, Default)]
 pub struct RequestContextSlot {
-    state: Rc<RefCell<Option<(AuthenticatedPrincipal, RequestBudget)>>>,
+    state: Rc<RefCell<Option<OccupiedRequest>>>,
+}
+struct OccupiedRequest {
+    principal: AuthenticatedPrincipal,
+    budget: RequestBudget,
+    method: Box<str>,
+    generation: Rc<()>,
+}
+/// An in-process witness for one exact service call. A session capability or a
+/// copied budget cannot recreate its private per-enter generation. Checkpoints
+/// inspect only local state and never perform host/native or storage I/O.
+#[derive(Clone)]
+pub struct RequestContextWitness {
+    slot: RequestContextSlot,
+    principal: AuthenticatedPrincipal,
+    budget: RequestBudget,
+    method: Box<str>,
+    generation: Rc<()>,
+}
+impl RequestContextWitness {
+    pub fn authenticated(&self) -> &AuthenticatedPrincipal {
+        &self.principal
+    }
+    pub fn budget(&self) -> &RequestBudget {
+        &self.budget
+    }
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+    pub fn check_local(&self) -> Result<(), ServiceError> {
+        let occupied = self.slot.state.try_borrow().map_err(|_| {
+            ServiceError::new("REQUEST_BUSY", "Authenticated request context is in use")
+        })?;
+        let current = occupied.as_ref().ok_or_else(request_retired)?;
+        if !Rc::ptr_eq(&current.generation, &self.generation)
+            || current.method != self.method
+            || !current.principal.same_session(&self.principal)
+            || current.budget.deadline() != self.budget.deadline()
+            || !std::ptr::eq(current.budget.cancellation(), self.budget.cancellation())
+            || !current.principal.permits(&self.method)
+        {
+            return Err(request_retired());
+        }
+        self.budget.check()
+    }
 }
 impl RequestContextSlot {
     pub fn current(&self) -> Result<(AuthenticatedPrincipal, RequestBudget), ServiceError> {
@@ -41,6 +88,33 @@ impl RequestContextSlot {
     ) -> Result<(AuthenticatedPrincipal, RequestBudget), ServiceError> {
         self.snapshot(false)
     }
+    /// The requested method must be the actual occupied dispatcher method.
+    /// This creates no authority and cannot be deserialized from a request.
+    pub fn current_witness(&self, method: &str) -> Result<RequestContextWitness, ServiceError> {
+        let witness = self.occupied_witness()?;
+        if witness.method() != method {
+            return Err(request_retired());
+        }
+        Ok(witness)
+    }
+    /// Read the actual dispatcher method and private generation, rather than
+    /// accepting a caller-supplied method as an authorization claim.
+    pub fn occupied_witness(&self) -> Result<RequestContextWitness, ServiceError> {
+        let occupied = self.state.try_borrow().map_err(|_| {
+            ServiceError::new("REQUEST_BUSY", "Authenticated request context is in use")
+        })?;
+        let current = occupied.as_ref().ok_or_else(request_retired)?;
+        let witness = RequestContextWitness {
+            slot: self.clone(),
+            principal: current.principal.clone(),
+            budget: current.budget.clone(),
+            method: current.method.clone(),
+            generation: current.generation.clone(),
+        };
+        drop(occupied);
+        witness.check_local()?;
+        Ok(witness)
+    }
     fn snapshot(
         &self,
         check_budget: bool,
@@ -48,27 +122,28 @@ impl RequestContextSlot {
         let current = self.state.try_borrow().map_err(|_| {
             ServiceError::new("REQUEST_BUSY", "Authenticated request context is in use")
         })?;
-        let (principal, budget) = current.as_ref().ok_or_else(|| {
+        let occupied = current.as_ref().ok_or_else(|| {
             ServiceError::new(
                 "AUTHENTICATION_REQUIRED",
                 "No authenticated service call is active",
             )
         })?;
         if check_budget {
-            budget.check()?;
+            occupied.budget.check()?;
         }
-        if !principal.is_current() {
+        if !occupied.principal.is_current() {
             return Err(ServiceError::new(
                 "PERMISSION_REQUIRED",
                 "Authenticated request session is no longer current",
             ));
         }
-        Ok((principal.clone(), budget.clone()))
+        Ok((occupied.principal.clone(), occupied.budget.clone()))
     }
     fn enter(
         &self,
         principal: &AuthenticatedPrincipal,
         budget: &RequestBudget,
+        method: &str,
     ) -> Result<RequestContextGuard, ServiceError> {
         let mut current = self.state.try_borrow_mut().map_err(|_| {
             ServiceError::new("REQUEST_BUSY", "Authenticated request context is in use")
@@ -79,34 +154,85 @@ impl RequestContextSlot {
                 "An authenticated service call is already active",
             ));
         }
-        *current = Some((principal.clone(), budget.clone()));
-        Ok(RequestContextGuard { slot: self.clone() })
+        if method.is_empty() || method.len() > 128 || !principal.permits(method) {
+            return Err(request_retired());
+        }
+        budget.check()?;
+        let generation = Rc::new(());
+        *current = Some(OccupiedRequest {
+            principal: principal.clone(),
+            budget: budget.clone(),
+            method: method.into(),
+            generation: generation.clone(),
+        });
+        Ok(RequestContextGuard {
+            slot: self.clone(),
+            generation,
+        })
     }
 }
 struct RequestContextGuard {
     slot: RequestContextSlot,
+    generation: Rc<()>,
 }
 impl Drop for RequestContextGuard {
     fn drop(&mut self) {
         // A port cannot keep a public RefCell borrow: current() returns clones.
         // If this invariant is broken internally, retaining the occupied slot
         // denies subsequent calls rather than exposing an earlier principal.
-        if let Ok(mut current) = self.slot.state.try_borrow_mut() {
+        if let Ok(mut current) = self.slot.state.try_borrow_mut()
+            && current
+                .as_ref()
+                .is_some_and(|occupied| Rc::ptr_eq(&occupied.generation, &self.generation))
+        {
             *current = None;
         }
     }
 }
+fn request_retired() -> ServiceError {
+    ServiceError::new(
+        "PERMISSION_REQUIRED",
+        "The original authenticated service call is no longer current",
+    )
+}
 impl ServiceError {
     pub fn new(code: &'static str, message: &'static str) -> Self {
-        Self { code, message }
+        Self {
+            code,
+            message,
+            source: None,
+        }
+    }
+    pub fn caused_by(
+        code: &'static str,
+        message: &'static str,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            code,
+            message,
+            source: Some(Arc::new(source)),
+        }
     }
 }
+impl PartialEq for ServiceError {
+    fn eq(&self, other: &Self) -> bool {
+        self.code == other.code && self.message == other.message
+    }
+}
+impl Eq for ServiceError {}
 impl std::fmt::Display for ServiceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.code, self.message)
     }
 }
-impl std::error::Error for ServiceError {}
+impl std::error::Error for ServiceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
 
 /// A synchronous port must cooperatively honor this budget and its own frozen
 /// operation deadline. The transport cannot safely preempt an in-progress write;
@@ -328,6 +454,12 @@ pub struct ApplicationService {
     ports: ApplicationPorts,
     extensions: ExtensionRouter,
     request_context: Option<RequestContextSlot>,
+    undo_execution: Option<UndoServiceComposition>,
+}
+#[derive(Clone)]
+struct UndoServiceComposition {
+    authority: crate::authority::LocalAuthority,
+    hosts: crate::host::HostBridge,
 }
 impl ApplicationService {
     pub fn open(config: StoreConfig, ports: ApplicationPorts) -> Result<Self, StorageError> {
@@ -341,6 +473,7 @@ impl ApplicationService {
             ports,
             extensions: ExtensionRouter::default(),
             request_context: None,
+            undo_execution: None,
         }
     }
     pub fn data_root(&self) -> &std::path::Path {
@@ -358,6 +491,22 @@ impl ApplicationService {
     }
     pub fn bind_request_context(&mut self, context: RequestContextSlot) {
         self.request_context = Some(context);
+    }
+    /// Install trusted lazy ports over this service's occupied request and
+    /// unique Store. Binding performs no native observation or SQL operation.
+    pub(crate) fn bind_undo_execution(
+        &mut self,
+        authority: crate::authority::LocalAuthority,
+        hosts: crate::host::HostBridge,
+    ) -> Result<(), ServiceError> {
+        if self.request_context.is_none() || self.undo_execution.is_some() {
+            return Err(ServiceError::new(
+                "INVALID_COMPOSITION",
+                "Undo execution requires one installed authenticated request slot",
+            ));
+        }
+        self.undo_execution = Some(UndoServiceComposition { authority, hosts });
+        Ok(())
     }
     /// Authenticated bootstrap composition may persist initial authoring data;
     /// this is intentionally not exposed as a JSON-RPC escape hatch.
@@ -389,7 +538,7 @@ impl ServiceDispatcher for ApplicationService {
         let _request_scope = self
             .request_context
             .as_ref()
-            .map(|slot| slot.enter(principal, budget))
+            .map(|slot| slot.enter(principal, budget, method))
             .transpose()?;
         let domain = match method {
             "prefab.validate" => Some(mmmm_domain::prefab_validate(input)),
@@ -402,9 +551,10 @@ impl ServiceDispatcher for ApplicationService {
         };
         if let Some(result) = domain {
             return result.map_err(|error| {
-                ServiceError::new(
+                ServiceError::caused_by(
                     error.code,
                     "Domain validation rejected the requested transformation",
+                    error,
                 )
             });
         }
@@ -417,6 +567,39 @@ impl ServiceDispatcher for ApplicationService {
             };
             return self.extensions.call(method, input, &mut context);
         }
+        let undo_method = match method {
+            "plan.create" => Some("plan.create"),
+            "plan.apply" => Some("plan.apply"),
+            "operation.reconcile" => Some("operation.reconcile"),
+            "recovery.plan" => Some("recovery.plan"),
+            "action.plan" => Some("action.plan"),
+            _ => None,
+        };
+        let mut undo_ports = match (
+            undo_method,
+            self.undo_execution.as_ref(),
+            self.request_context.as_ref(),
+        ) {
+            (Some(method), Some(composition), Some(request)) => Some((
+                crate::undo_context::CurrentUndoContextFactory::new(
+                    request.clone(),
+                    composition.authority.clone(),
+                    composition.hosts.clone(),
+                    method,
+                )
+                .map_err(|error| ServiceError::caused_by(error.code, error.message, error))?,
+                crate::undo_material::HostUndoMaterialAdapter::new(
+                    request.clone(),
+                    composition.authority.clone(),
+                    composition.hosts.clone(),
+                    method,
+                ),
+            )),
+            _ => None,
+        };
+        let mut undo = undo_ports.as_mut().map(|(contexts, material)| {
+            mmmm_application::undo_context::UndoExecutionContext { contexts, material }
+        });
         let mut provider = GuardedProvider {
             inner: self.ports.provider.as_mut(),
             budget,
@@ -440,15 +623,27 @@ impl ServiceDispatcher for ApplicationService {
         };
         let result = match method {
             "project.inspect" => application.project_inspect(principal.principal(), input),
-            "plan.create" => application.plan_create(principal.principal(), input),
+            "plan.create" => {
+                application.plan_create_with_undo(principal.principal(), input, undo.as_mut())
+            }
             "plan.inspect" => application.plan_inspect(principal.principal(), input),
-            "plan.apply" => application.plan_apply(principal.principal(), input),
+            "plan.apply" => {
+                application.plan_apply_with_undo(principal.principal(), input, undo.as_mut())
+            }
             "operation.get" => application.operation_get(principal.principal(), input),
             "operation.cancel" => application.operation_cancel(principal.principal(), input),
-            "operation.reconcile" => application.operation_reconcile(principal.principal(), input),
-            "recovery.plan" => application.recovery_plan(principal.principal(), input),
+            "operation.reconcile" => application.operation_reconcile_with_undo(
+                principal.principal(),
+                input,
+                undo.as_mut(),
+            ),
+            "recovery.plan" => {
+                application.recovery_plan_with_undo(principal.principal(), input, undo.as_mut())
+            }
             "action.read" => application.action_read(principal.principal(), input),
-            "action.plan" => application.action_plan(principal.principal(), input),
+            "action.plan" => {
+                application.action_plan_with_undo(principal.principal(), input, undo.as_mut())
+            }
             _ => {
                 return Err(ServiceError::new(
                     "IMPLEMENTATION_UNAVAILABLE",
@@ -458,7 +653,7 @@ impl ServiceDispatcher for ApplicationService {
         };
         // Do not replace a truthful durable write result with a transport timeout.
         // Runtime/host budgets determine actual effect completion and uncertainty.
-        result.map_err(|error| ServiceError::new(error.code, error.message))
+        result.map_err(|error| ServiceError::caused_by(error.code, error.message, error))
     }
 }
 
@@ -607,6 +802,16 @@ impl ProviderPort for GuardedProvider<'_> {
         self.admission()?;
         self.inner.request_cancel(invocation, receipt)
     }
+    fn request_cancel_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        invocation: &Value,
+        receipt: Option<&str>,
+    ) -> mmmm_application::AppResult<()> {
+        self.admission()?;
+        self.inner
+            .request_cancel_with_store(store, invocation, receipt)
+    }
 }
 struct GuardedObserver<'a> {
     inner: &'a mut dyn IndependentObserverPort,
@@ -707,6 +912,16 @@ impl IndependentObserverPort for GuardedObserver<'_> {
         self.admission()?;
         self.inner.read_target_with_store(store, invocation, target)
     }
+    fn read_target_retained_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        invocation: &Value,
+        target: &str,
+    ) -> mmmm_application::AppResult<Vec<u8>> {
+        self.admission()?;
+        self.inner
+            .read_target_retained_with_store(store, invocation, target)
+    }
 }
 
 #[cfg(test)]
@@ -714,6 +929,40 @@ mod request_context_tests {
     use super::*;
     use crate::auth::{SessionAuthority, SessionPolicy};
     use mmmm_contracts::PrincipalId;
+    #[test]
+    fn service_error_preserves_original_cause_without_changing_public_identity() {
+        use std::error::Error;
+        let original = mmmm_application::AppError::caused_by(
+            "OBSERVATION_INVALID",
+            "Original public message",
+            std::io::Error::other("Original local acquisition failure"),
+        );
+        let error = ServiceError::caused_by(original.code, original.message, original);
+        let clone = error.clone();
+        assert_eq!(error, ServiceError::new(error.code, error.message));
+        assert_eq!(
+            error.to_string(),
+            "OBSERVATION_INVALID: Original public message"
+        );
+        let original = clone
+            .source()
+            .unwrap()
+            .downcast_ref::<mmmm_application::AppError>()
+            .unwrap();
+        let acquisition = original
+            .source()
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .unwrap();
+        assert_eq!(
+            acquisition.to_string(),
+            "Original local acquisition failure"
+        );
+        assert!(std::ptr::eq(
+            error.source().unwrap(),
+            clone.source().unwrap()
+        ));
+    }
     #[test]
     fn actual_request_slot_retires_on_return_and_rejects_revoked_clones() {
         let mut authority = SessionAuthority::new(1).unwrap();
@@ -731,9 +980,9 @@ mod request_context_tests {
             RequestBudget::new(Duration::from_secs(5), Arc::new(AtomicBool::new(false))).unwrap();
         let slot = RequestContextSlot::default();
         assert!(slot.current().is_err());
-        let guard = slot.enter(&principal, &budget).unwrap();
+        let guard = slot.enter(&principal, &budget, "project.inspect").unwrap();
         assert_eq!(slot.current().unwrap().0.principal(), principal.principal());
-        assert!(slot.enter(&principal, &budget).is_err());
+        assert!(slot.enter(&principal, &budget, "project.inspect").is_err());
         authority.revoke_all();
         assert!(slot.current().is_err());
         drop(guard);
@@ -754,7 +1003,9 @@ mod request_context_tests {
         let budget =
             RequestBudget::new(Duration::from_secs(5), Arc::new(AtomicBool::new(false))).unwrap();
         let slot = RequestContextSlot::default();
-        let guard = slot.enter(&principal, &budget).unwrap();
+        let guard = slot
+            .enter(&principal, &budget, "reference.capture")
+            .unwrap();
         budget.cancellation().store(true, Ordering::Release);
         assert!(slot.current().is_err());
         let (retained, interrupted) = slot.current_retained().unwrap();
@@ -766,5 +1017,36 @@ mod request_context_tests {
         assert!(slot.current_retained().is_err());
         drop(guard);
         assert!(slot.current_retained().is_err());
+    }
+    #[test]
+    fn call_witness_rejects_another_method_and_reused_session_budget() {
+        // Existing session fixtures cannot distinguish calls with an identical
+        // budget. This regression exercises the actual slot's per-enter owner.
+        let mut authority = SessionAuthority::new(1).unwrap();
+        let token = authority
+            .install(SessionPolicy {
+                principal: PrincipalId::new("native-owner").unwrap(),
+                allowed_methods: ["project.inspect".to_owned(), "plan.inspect".to_owned()].into(),
+                allowed_contexts: BTreeSet::new(),
+                lifetime: Duration::from_secs(10),
+            })
+            .unwrap();
+        let principal = authority.authenticate_token(&token).unwrap();
+        let budget =
+            RequestBudget::new(Duration::from_secs(5), Arc::new(AtomicBool::new(false))).unwrap();
+        let slot = RequestContextSlot::default();
+        let first = slot.enter(&principal, &budget, "project.inspect").unwrap();
+        assert!(slot.current_witness("plan.inspect").is_err());
+        let old = slot.current_witness("project.inspect").unwrap();
+        old.check_local().unwrap();
+        drop(first);
+        assert!(old.check_local().is_err());
+        let second = slot.enter(&principal, &budget, "project.inspect").unwrap();
+        assert!(old.check_local().is_err());
+        let fresh = slot.current_witness("project.inspect").unwrap();
+        fresh.check_local().unwrap();
+        authority.revoke_all();
+        assert!(fresh.check_local().is_err());
+        drop(second);
     }
 }

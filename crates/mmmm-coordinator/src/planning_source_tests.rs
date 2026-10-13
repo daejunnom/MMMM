@@ -850,16 +850,28 @@ fn host_artifact_cannot_claim_rust_owned_component_provenance() {
     let binding = BindingId::new("binding-owned-source").unwrap();
     let action_id = "fixture:echo_text".to_owned();
     let contract_ids = BTreeSet::from(["FN09".to_owned()]);
-    assert!(
-        RegisteredPlanningDependency::host_artifact(
-            binding.clone(),
-            "mmmm-compiler".into(),
-            raw_digest(b"host jar"),
-            [action_id.clone()].into(),
-            contract_ids.clone()
-        )
-        .is_err()
-    );
+    for component in ["mmmm-compiler", "mmmm-rust-authored-projection"] {
+        assert!(
+            RegisteredPlanningDependency::host_artifact(
+                binding.clone(),
+                component.into(),
+                raw_digest(b"host jar"),
+                [action_id.clone()].into(),
+                contract_ids.clone()
+            )
+            .is_err()
+        );
+    }
+    let executable = RegisteredPlanningDependency::owned_executable(
+        BindingId::new("binding-rust-executable").unwrap(),
+        raw_digest(b"actual Rust executable fixture bytes"),
+        [action_id.clone()].into(),
+        contract_ids.clone(),
+    )
+    .unwrap();
+    assert_eq!(executable.component, "mmmm-rust-authored-projection");
+    assert_eq!(executable.provenance, "owned_domain");
+    assert_ne!(executable.digest, raw_digest(b"host jar"));
     let mut registry = PlanningDependencyRegistry::default();
     let dependency = RegisteredPlanningDependency::owned(
         binding.clone(),

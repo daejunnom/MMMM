@@ -1,6 +1,6 @@
 //! Native Windows ownership: atomic Job association and an inherited handle
 //! allowlist. The parent never starts an overlapped or blocking stdio operation.
-use super::{Executable, StdioError};
+use super::{Executable, StdioError, StdioOutput, WorkerReservation};
 use std::{
     fs::{File, OpenOptions},
     mem::{size_of, size_of_val, zeroed},
@@ -28,7 +28,7 @@ use windows_sys::Win32::{
         GetFileType, OPEN_EXISTING, ReadFile, WriteFile,
     },
     System::{
-        Console::{GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
+        Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
         JobObjects::{
             CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
             JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -37,7 +37,7 @@ use windows_sys::Win32::{
             QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
         },
         Pipes::{CreatePipe, PeekNamedPipe},
-        SystemInformation::GetSystemWindowsDirectoryW,
+        SystemInformation::{GetSystemWindowsDirectoryW, GetTickCount64},
         Threading::{
             CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
             DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
@@ -48,6 +48,14 @@ use windows_sys::Win32::{
         },
     },
 };
+
+// The system-wide tick clock does not use wall-time adjustments. Its documented
+// 10-16 ms resolution is conservatively removed from the inherited deadline.
+// https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-gettickcount64
+pub(super) const MONOTONIC_MARGIN_MILLIS: u64 = 20;
+pub(super) fn monotonic_millis() -> Result<u64, StdioError> {
+    Ok(unsafe { GetTickCount64() })
+}
 
 struct Handle(HANDLE);
 // A handle is uniquely owned; operations are serialized by the parent Mutex.
@@ -198,7 +206,7 @@ fn duplicate_stdio(which: u32) -> Result<Handle, StdioError> {
     }
     Ok(Handle(copy))
 }
-pub(super) fn worker_stdio() -> Result<(File, File), StdioError> {
+pub(super) fn worker_stdio(output: StdioOutput) -> Result<(File, File), StdioError> {
     fn file(which: u32) -> Result<File, StdioError> {
         let source = unsafe { GetStdHandle(which) };
         if source.is_null() || source == INVALID_HANDLE_VALUE {
@@ -223,7 +231,13 @@ pub(super) fn worker_stdio() -> Result<(File, File), StdioError> {
         // or output buffer can capture a raw capability beyond the request.
         Ok(unsafe { File::from_raw_handle(copy) })
     }
-    Ok((file(STD_INPUT_HANDLE)?, file(STD_OUTPUT_HANDLE)?))
+    Ok((
+        file(STD_INPUT_HANDLE)?,
+        file(match output {
+            StdioOutput::Stdout => STD_OUTPUT_HANDLE,
+            StdioOutput::Stderr => STD_ERROR_HANDLE,
+        })?,
+    ))
 }
 fn bootstrap(packet: &[u8]) -> Result<(Handle, Handle), StdioError> {
     let attributes = SECURITY_ATTRIBUTES {
@@ -241,18 +255,28 @@ fn bootstrap(packet: &[u8]) -> Result<(Handle, Handle), StdioError> {
     if unsafe { SetHandleInformation(write.0, HANDLE_FLAG_INHERIT, 0) } == 0 {
         return Err(StdioError::new("bootstrap_pipe"));
     }
-    // A fresh 4 KiB pipe contains no previous data. This fixed 96-byte packet
+    // A fresh 4 KiB pipe contains no previous data. This fixed 104-byte packet
     // fits before the worker exists; no external sink or pipe writer competes.
     let mut n = 0;
-    if packet.len() != 96
-        || unsafe { WriteFile(write.0, packet.as_ptr(), 96, &mut n, null_mut()) } == 0
-        || n != 96
+    if packet.len() != super::BOOTSTRAP_LENGTH
+        || unsafe {
+            WriteFile(
+                write.0,
+                packet.as_ptr(),
+                super::BOOTSTRAP_LENGTH as u32,
+                &mut n,
+                null_mut(),
+            )
+        } == 0
+        || n != super::BOOTSTRAP_LENGTH as u32
     {
         return Err(StdioError::new("bootstrap_pipe"));
     }
     Ok((read, write))
 }
-pub(super) fn read_bootstrap(value: usize) -> Result<zeroize::Zeroizing<[u8; 96]>, StdioError> {
+pub(super) fn read_bootstrap(
+    value: usize,
+) -> Result<zeroize::Zeroizing<[u8; super::BOOTSTRAP_LENGTH]>, StdioError> {
     if value == 0 || value == usize::MAX {
         return Err(StdioError::new("bootstrap_handle"));
     }
@@ -286,18 +310,27 @@ pub(super) fn read_bootstrap(value: usize) -> Result<zeroize::Zeroizing<[u8; 96]
             std::io::Error::last_os_error(),
         ));
     }
-    if available != 96 {
+    if available != super::BOOTSTRAP_LENGTH as u32 {
         return Err(StdioError::new("bootstrap_length"));
     }
-    let mut packet = zeroize::Zeroizing::new([0u8; 96]);
+    let mut packet = zeroize::Zeroizing::new([0u8; super::BOOTSTRAP_LENGTH]);
     let mut n = 0;
-    if unsafe { ReadFile(handle, packet.as_mut_ptr(), 96, &mut n, null_mut()) } == 0 {
+    if unsafe {
+        ReadFile(
+            handle,
+            packet.as_mut_ptr(),
+            super::BOOTSTRAP_LENGTH as u32,
+            &mut n,
+            null_mut(),
+        )
+    } == 0
+    {
         return Err(StdioError::io(
             "bootstrap_read",
             std::io::Error::last_os_error(),
         ));
     }
-    if n != 96 {
+    if n != super::BOOTSTRAP_LENGTH as u32 {
         return Err(StdioError::new("bootstrap_length"));
     }
     Ok(packet)
@@ -308,13 +341,21 @@ pub(super) struct Process {
     leader: Handle,
     pid: u32,
     reaped: bool,
+    reaped_code: Option<i32>,
+    owner_deadline: Instant,
+    reservation: Option<WorkerReservation>,
 }
 impl Process {
     pub(super) fn spawn(
         executable: &Executable,
         address: SocketAddr,
         packet: &[u8],
+        output: StdioOutput,
+        owner_deadline: Instant,
+        startup_deadline: Instant,
+        reservation: WorkerReservation,
     ) -> Result<Self, StdioError> {
+        super::deadline_check(startup_deadline)?;
         let job = Handle(unsafe { CreateJobObjectW(null(), null()) });
         if job.0.is_null() {
             return Err(StdioError::new("native_job"));
@@ -338,13 +379,16 @@ impl Process {
         }
         let (read, write) = bootstrap(packet)?;
         let stdin = duplicate_stdio(STD_INPUT_HANDLE)?;
-        let stdout = duplicate_stdio(STD_OUTPUT_HANDLE)?;
+        let selected = duplicate_stdio(match output {
+            StdioOutput::Stdout => STD_OUTPUT_HANDLE,
+            StdioOutput::Stderr => STD_ERROR_HANDLE,
+        })?;
         let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: null_mut(),
             bInheritHandle: 1,
         };
-        let stderr = Handle(unsafe {
+        let unused = Handle(unsafe {
             CreateFileW(
                 wide(std::ffi::OsStr::new("NUL")).as_ptr(),
                 GENERIC_WRITE,
@@ -355,10 +399,14 @@ impl Process {
                 null_mut(),
             )
         });
-        if stderr.0 == INVALID_HANDLE_VALUE {
+        if unused.0 == INVALID_HANDLE_VALUE {
             return Err(StdioError::new("external_stdio"));
         }
-        let mut handles = [stdin.0, stdout.0, stderr.0, read.0];
+        let (stdout, stderr) = match output {
+            StdioOutput::Stdout => (selected.0, unused.0),
+            StdioOutput::Stderr => (unused.0, selected.0),
+        };
+        let mut handles = [stdin.0, stdout, stderr, read.0];
         let mut jobs = [job.0];
         let mut attrs = Attributes::new()?;
         if unsafe {
@@ -390,8 +438,8 @@ impl Process {
         startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
         startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
         startup.StartupInfo.hStdInput = stdin.0;
-        startup.StartupInfo.hStdOutput = stdout.0;
-        startup.StartupInfo.hStdError = stderr.0;
+        startup.StartupInfo.hStdOutput = stdout;
+        startup.StartupInfo.hStdError = stderr;
         startup.lpAttributeList = attrs.ptr();
         // Only the trusted executable path can need quoting. Numeric handle and
         // IPv4 endpoint arguments cannot contain shell syntax. No shell runs.
@@ -414,6 +462,7 @@ impl Process {
         let application = wide(executable.path.as_os_str());
         let environment = system_environment()?;
         let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
+        super::deadline_check(startup_deadline)?;
         if unsafe {
             CreateProcessW(
                 application.as_ptr(),
@@ -437,11 +486,14 @@ impl Process {
                 std::io::Error::last_os_error(),
             ));
         }
-        let mut process = Self {
+        let process = Self {
             job,
             leader: Handle(info.hProcess),
             pid: info.dwProcessId,
             reaped: false,
+            reaped_code: None,
+            owner_deadline,
+            reservation: Some(reservation),
         };
         let thread = Handle(info.hThread);
         drop(write);
@@ -455,23 +507,30 @@ impl Process {
             unsafe {
                 TerminateProcess(process.leader.0, 125);
             }
-            let mut error = StdioError::new("native_identity");
-            error.drained = process
-                .drain_blocking(Instant::now() + Duration::from_secs(5))
-                .is_ok();
-            return Err(error);
+            return Err(super::cleanup_failed_process(
+                process,
+                StdioError::new("native_identity"),
+            ));
+        }
+        if let Err(error) = super::deadline_check(startup_deadline) {
+            return Err(super::cleanup_failed_process(process, error));
         }
         if unsafe { ResumeThread(thread.0) } != 1 {
-            let mut error = StdioError::new("native_resume");
-            error.drained = process
-                .drain_blocking(Instant::now() + Duration::from_secs(5))
-                .is_ok();
-            return Err(error);
+            return Err(super::cleanup_failed_process(
+                process,
+                StdioError::new("native_resume"),
+            ));
         }
         Ok(process)
     }
     pub(super) fn id(&self) -> u64 {
         self.pid as u64
+    }
+    pub(super) fn owner_deadline(&self) -> Instant {
+        self.owner_deadline
+    }
+    pub(super) fn reaped_exit_code(&self) -> Option<i32> {
+        self.reaped_code
     }
     pub(super) fn exit_code(&mut self) -> Result<Option<i32>, StdioError> {
         match unsafe { WaitForSingleObject(self.leader.0, 0) } {
@@ -487,7 +546,8 @@ impl Process {
             _ => Err(StdioError::new("native_observe")),
         }
     }
-    pub(super) fn scope_empty(&self) -> Result<bool, StdioError> {
+    pub(super) fn scope_empty(&self, deadline: Instant) -> Result<bool, StdioError> {
+        super::drain_deadline_check(deadline)?;
         let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { zeroed() };
         if unsafe {
             QueryInformationJobObject(
@@ -501,6 +561,7 @@ impl Process {
         {
             Err(StdioError::new("native_observe"))
         } else {
+            super::drain_deadline_check(deadline)?;
             Ok(accounting.ActiveProcesses == 0)
         }
     }
@@ -519,13 +580,21 @@ impl Process {
             .exit_code()?
             .ok_or_else(|| StdioError::new("native_reap"))?;
         self.reaped = true;
+        self.reaped_code = Some(code);
+        self.reservation.take();
         Ok(Some(code))
     }
     pub(super) fn drain_blocking(&mut self, deadline: Instant) -> Result<(), StdioError> {
+        if self.reaped {
+            return Ok(());
+        }
         self.terminate()?;
+        if Instant::now() >= deadline {
+            return Err(StdioError::new("drain_uncertain"));
+        }
         let mut empty = None;
         loop {
-            if self.exit_code()?.is_some() && self.scope_empty()? {
+            if self.exit_code()?.is_some() && self.scope_empty(deadline)? {
                 if empty.is_some_and(|t: Instant| t.elapsed() >= Duration::from_millis(10)) {
                     if Instant::now() >= deadline {
                         return Err(StdioError::new("drain_uncertain"));
@@ -537,6 +606,7 @@ impl Process {
                             drained: true,
                             native_code: None,
                             native_code_unknown: false,
+                            cleanup: None,
                         });
                     }
                     return Ok(());
@@ -554,8 +624,21 @@ impl Process {
 }
 impl Drop for Process {
     fn drop(&mut self) {
-        if !self.reaped {
-            let _ = self.drain_blocking(Instant::now() + Duration::from_secs(5));
+        if !self.reaped
+            && let Err(error) = self.drain_blocking(self.owner_deadline)
+            && !error.drained
+        {
+            let retained = Self {
+                job: std::mem::replace(&mut self.job, Handle(null_mut())),
+                leader: std::mem::replace(&mut self.leader, Handle(null_mut())),
+                pid: self.pid,
+                reaped: false,
+                reaped_code: self.reaped_code,
+                owner_deadline: self.owner_deadline,
+                reservation: self.reservation.take(),
+            };
+            self.reaped = true;
+            super::retain_uncertain_process(retained);
         }
     }
 }

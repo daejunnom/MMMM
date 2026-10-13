@@ -1,6 +1,6 @@
 //! Trusted self-worker session ownership. This is not a sandbox against a
 //! deliberately escaping program. Keep the leader unreaped until group drain.
-use super::{Executable, StdioError};
+use super::{Executable, StdioError, StdioOutput, WorkerReservation};
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
@@ -16,6 +16,28 @@ use std::{
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
+
+// POSIX CLOCK_MONOTONIC is system-wide and cannot be reset by wall-clock writes.
+// https://pubs.opengroup.org/onlinepubs/000095399/functions/clock_getres.html
+pub(super) const MONOTONIC_MARGIN_MILLIS: u64 = 1;
+pub(super) fn monotonic_millis() -> Result<u64, StdioError> {
+    let mut time: libc::timespec = unsafe { std::mem::zeroed() };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } == -1 {
+        return Err(StdioError::io(
+            "native_clock",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let seconds = u64::try_from(time.tv_sec).map_err(|_| StdioError::new("native_clock"))?;
+    let nanos = u64::try_from(time.tv_nsec).map_err(|_| StdioError::new("native_clock"))?;
+    if nanos >= 1_000_000_000 {
+        return Err(StdioError::new("native_clock"));
+    }
+    seconds
+        .checked_mul(1000)
+        .and_then(|millis| millis.checked_add(nanos / 1_000_000))
+        .ok_or_else(|| StdioError::new("native_clock"))
+}
 
 pub(super) fn open_executable(path: &Path) -> Result<File, StdioError> {
     let file = OpenOptions::new()
@@ -44,7 +66,7 @@ pub(super) fn same_file(file: &File, path: &Path) -> Result<bool, StdioError> {
         && original.mtime() == current.mtime()
         && original.mtime_nsec() == current.mtime_nsec())
 }
-pub(super) fn worker_stdio() -> Result<(File, File), StdioError> {
+pub(super) fn worker_stdio(output: StdioOutput) -> Result<(File, File), StdioError> {
     fn file(source: i32) -> Result<File, StdioError> {
         let fd = unsafe { libc::dup(source) };
         if fd == -1 {
@@ -58,7 +80,13 @@ pub(super) fn worker_stdio() -> Result<(File, File), StdioError> {
     }
     // File reads and writes are unbuffered. A requested public prefix cannot
     // eagerly fill a global Stdin buffer with the following raw capability.
-    Ok((file(libc::STDIN_FILENO)?, file(libc::STDOUT_FILENO)?))
+    Ok((
+        file(libc::STDIN_FILENO)?,
+        file(match output {
+            StdioOutput::Stdout => libc::STDOUT_FILENO,
+            StdioOutput::Stderr => libc::STDERR_FILENO,
+        })?,
+    ))
 }
 fn bootstrap(packet: &[u8]) -> Result<(File, File), StdioError> {
     let mut fds = [-1; 2];
@@ -74,7 +102,7 @@ fn bootstrap(packet: &[u8]) -> Result<(File, File), StdioError> {
     }
     // Nonblocking fresh pipe, one fixed packet below POSIX PIPE_BUF minimum.
     if unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } == -1
-        || packet.len() != 96
+        || packet.len() != super::BOOTSTRAP_LENGTH
     {
         return Err(StdioError::new("bootstrap_pipe"));
     }
@@ -83,7 +111,9 @@ fn bootstrap(packet: &[u8]) -> Result<(File, File), StdioError> {
         .map_err(|_| StdioError::new("bootstrap_pipe"))?;
     Ok((read, write))
 }
-pub(super) fn read_bootstrap(value: usize) -> Result<zeroize::Zeroizing<[u8; 96]>, StdioError> {
+pub(super) fn read_bootstrap(
+    value: usize,
+) -> Result<zeroize::Zeroizing<[u8; super::BOOTSTRAP_LENGTH]>, StdioError> {
     let fd = i32::try_from(value).map_err(|_| StdioError::new("bootstrap_handle"))?;
     if fd < 3 {
         return Err(StdioError::new("bootstrap_handle"));
@@ -108,7 +138,7 @@ pub(super) fn read_bootstrap(value: usize) -> Result<zeroize::Zeroizing<[u8; 96]
             std::io::Error::last_os_error(),
         ));
     }
-    let mut packet = zeroize::Zeroizing::new([0; 96]);
+    let mut packet = zeroize::Zeroizing::new([0; super::BOOTSTRAP_LENGTH]);
     file.read_exact(&mut packet[..])
         .map_err(|e| StdioError::io("bootstrap_read", e))?;
     Ok(packet)
@@ -245,10 +275,13 @@ impl Drop for MacExec {
 }
 
 pub(super) struct Process {
-    child: Child,
+    child: Option<Child>,
     pid: libc::pid_t,
     reaped: bool,
     reserved: bool,
+    reaped_code: Option<i32>,
+    owner_deadline: Instant,
+    reservation: Option<WorkerReservation>,
     #[cfg(target_os = "macos")]
     identity: (u64, u64),
 }
@@ -257,7 +290,12 @@ impl Process {
         executable: &Executable,
         address: SocketAddr,
         packet: &[u8],
+        output: StdioOutput,
+        owner_deadline: Instant,
+        startup_deadline: Instant,
+        reservation: WorkerReservation,
     ) -> Result<Self, StdioError> {
+        super::deadline_check(startup_deadline)?;
         let (read, write) = bootstrap(packet)?;
         let boot = read.as_raw_fd();
         let args = [
@@ -270,8 +308,16 @@ impl Process {
             .args(&args)
             .env_clear()
             .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::null());
+            .stdout(if output == StdioOutput::Stdout {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
+            .stderr(if output == StdioOutput::Stderr {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            });
         #[cfg(target_os = "linux")]
         let exec_fd = executable.file.as_raw_fd();
         #[cfg(target_os = "linux")]
@@ -332,6 +378,7 @@ impl Process {
                 mac_exec.exec()
             });
         }
+        super::deadline_check(startup_deadline)?;
         let child = command
             .spawn()
             .map_err(|error| StdioError::io("native_spawn", error))?;
@@ -339,33 +386,55 @@ impl Process {
         drop(read);
         drop(write);
         let mut process = Self {
-            child,
+            child: Some(child),
             pid,
             reaped: false,
             reserved: true,
+            reaped_code: None,
+            owner_deadline,
+            reservation: Some(reservation),
             #[cfg(target_os = "macos")]
             identity: (0, 0),
         };
         #[cfg(target_os = "macos")]
         {
-            let info = bsd_info(pid, true)?.ok_or_else(|| StdioError::new("native_identity"))?;
+            let info = match bsd_info(pid, true) {
+                Ok(Some(info)) => info,
+                Ok(None) => {
+                    return Err(super::cleanup_failed_process(
+                        process,
+                        StdioError::new("native_identity"),
+                    ));
+                }
+                Err(error) => return Err(super::cleanup_failed_process(process, error)),
+            };
             if info.pid != pid as u32 || info.pgid != pid as u32 {
-                let _ = process.drain_blocking(Instant::now() + Duration::from_secs(5));
-                return Err(StdioError::new("native_identity"));
+                return Err(super::cleanup_failed_process(
+                    process,
+                    StdioError::new("native_identity"),
+                ));
             }
             process.identity = (info.start_sec, info.start_usec);
         }
         if !matches!(same_file(&executable.file, &executable.path), Ok(true)) {
-            let mut error = StdioError::new("executable_changed");
-            error.drained = process
-                .drain_blocking(Instant::now() + Duration::from_secs(5))
-                .is_ok();
-            return Err(error);
+            return Err(super::cleanup_failed_process(
+                process,
+                StdioError::new("executable_changed"),
+            ));
+        }
+        if let Err(error) = super::deadline_check(startup_deadline) {
+            return Err(super::cleanup_failed_process(process, error));
         }
         Ok(process)
     }
     pub(super) fn id(&self) -> u64 {
         self.pid as u64
+    }
+    pub(super) fn owner_deadline(&self) -> Instant {
+        self.owner_deadline
+    }
+    pub(super) fn reaped_exit_code(&self) -> Option<i32> {
+        self.reaped_code
     }
     pub(super) fn exit_code(&mut self) -> Result<Option<i32>, StdioError> {
         if self.reaped {
@@ -400,17 +469,18 @@ impl Process {
             Ok(Some(-status))
         }
     }
-    pub(super) fn scope_empty(&self) -> Result<bool, StdioError> {
+    pub(super) fn scope_empty(&self, deadline: Instant) -> Result<bool, StdioError> {
+        super::drain_deadline_check(deadline)?;
         if !self.reserved {
             return Err(StdioError::new("native_identity"));
         }
         #[cfg(target_os = "linux")]
         {
-            Ok(linux_members(self.pid)? == 0)
+            Ok(linux_members(self.pid, deadline)? == 0)
         }
         #[cfg(target_os = "macos")]
         {
-            Ok(mac_members(self.pid, self.identity)? == 0)
+            Ok(mac_members(self.pid, self.identity, deadline)? == 0)
         }
     }
     pub(super) fn terminate(&mut self) -> Result<(), StdioError> {
@@ -432,11 +502,18 @@ impl Process {
         if self.exit_code()?.is_none() {
             return Err(StdioError::new("native_reap"));
         }
-        let status = self.child.wait().map_err(|_| {
-            self.reserved = false;
-            StdioError::new("native_reap")
-        })?;
+        let status = self
+            .child
+            .as_mut()
+            .ok_or_else(|| StdioError::new("native_identity"))?
+            .wait()
+            .map_err(|_| {
+                self.reserved = false;
+                StdioError::new("native_reap")
+            })?;
         self.reaped = true;
+        self.reaped_code = status.code();
+        self.reservation.take();
         Ok(status.code())
     }
     pub(super) fn drain_blocking(&mut self, deadline: Instant) -> Result<(), StdioError> {
@@ -444,9 +521,12 @@ impl Process {
             return Ok(());
         }
         self.terminate()?;
+        if Instant::now() >= deadline {
+            return Err(StdioError::new("drain_uncertain"));
+        }
         let mut empty = None;
         loop {
-            if self.exit_code()?.is_some() && self.scope_empty()? {
+            if self.exit_code()?.is_some() && self.scope_empty(deadline)? {
                 if empty.is_some_and(|t: Instant| t.elapsed() >= Duration::from_millis(10)) {
                     if Instant::now() >= deadline {
                         return Err(StdioError::new("drain_uncertain"));
@@ -458,6 +538,7 @@ impl Process {
                             drained: true,
                             native_code: None,
                             native_code_unknown: false,
+                            cleanup: None,
                         });
                     }
                     return Ok(());
@@ -476,17 +557,35 @@ impl Process {
 impl Drop for Process {
     fn drop(&mut self) {
         if !self.reaped {
-            let _ = self.drain_blocking(Instant::now() + Duration::from_secs(5));
+            if let Err(error) = self.drain_blocking(self.owner_deadline) {
+                if !error.drained {
+                    let retained = Self {
+                        child: self.child.take(),
+                        pid: self.pid,
+                        reaped: false,
+                        reserved: self.reserved,
+                        reaped_code: self.reaped_code,
+                        owner_deadline: self.owner_deadline,
+                        reservation: self.reservation.take(),
+                        #[cfg(target_os = "macos")]
+                        identity: self.identity,
+                    };
+                    self.reaped = true;
+                    super::retain_uncertain_process(retained);
+                }
+            }
         }
     }
 }
 
 #[cfg(target_os = "linux")]
-fn linux_members(group: i32) -> Result<usize, StdioError> {
+fn linux_members(group: i32, deadline: Instant) -> Result<usize, StdioError> {
     let mut members = 0;
     let mut leader = false;
     let mut count = 0;
+    super::drain_deadline_check(deadline)?;
     for entry in std::fs::read_dir("/proc").map_err(|_| StdioError::new("native_observe"))? {
+        super::drain_deadline_check(deadline)?;
         count += 1;
         if count > 100_000 {
             return Err(StdioError::new("native_observe_budget"));
@@ -500,6 +599,7 @@ fn linux_members(group: i32) -> Result<usize, StdioError> {
             continue;
         };
         let mut bytes = Vec::new();
+        super::drain_deadline_check(deadline)?;
         match File::open(entry.path().join("stat"))
             .and_then(|f| f.take(8193).read_to_end(&mut bytes))
         {
@@ -507,6 +607,7 @@ fn linux_members(group: i32) -> Result<usize, StdioError> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             _ => return Err(StdioError::new("native_observe")),
         }
+        super::drain_deadline_check(deadline)?;
         let end = bytes
             .iter()
             .rposition(|b| *b == b')')
@@ -539,6 +640,7 @@ fn linux_members(group: i32) -> Result<usize, StdioError> {
             members += 1;
         }
     }
+    super::drain_deadline_check(deadline)?;
     if !leader {
         return Err(StdioError::new("native_identity"));
     }
@@ -603,7 +705,7 @@ fn bsd_info(pid: i32, zombie: bool) -> Result<Option<BsdInfo>, StdioError> {
     Ok(Some(info))
 }
 #[cfg(target_os = "macos")]
-fn mac_members(group: i32, identity: (u64, u64)) -> Result<usize, StdioError> {
+fn mac_members(group: i32, identity: (u64, u64), deadline: Instant) -> Result<usize, StdioError> {
     #[link(name = "proc")]
     unsafe extern "C" {
         fn proc_listpids(
@@ -615,8 +717,10 @@ fn mac_members(group: i32, identity: (u64, u64)) -> Result<usize, StdioError> {
     }
     let mut capacity = 1024;
     let pids = loop {
+        super::drain_deadline_check(deadline)?;
         let mut pids = vec![0i32; capacity];
         let n = unsafe { proc_listpids(1, 0, pids.as_mut_ptr().cast(), (capacity * 4) as i32) };
+        super::drain_deadline_check(deadline)?;
         if n <= 0 || n % 4 != 0 {
             return Err(StdioError::new("native_observe"));
         }
@@ -633,9 +737,12 @@ fn mac_members(group: i32, identity: (u64, u64)) -> Result<usize, StdioError> {
     let mut count = 0;
     let mut leader = false;
     for pid in pids.into_iter().filter(|p| *p > 0) {
+        super::drain_deadline_check(deadline)?;
         if pid == group {
             let before = bsd_info(pid, true)?.ok_or_else(|| StdioError::new("native_identity"))?;
+            super::drain_deadline_check(deadline)?;
             let after = bsd_info(pid, true)?.ok_or_else(|| StdioError::new("native_identity"))?;
+            super::drain_deadline_check(deadline)?;
             if before.pid != group as u32
                 || after.pid != group as u32
                 || before.pgid != group as u32
@@ -652,6 +759,7 @@ fn mac_members(group: i32, identity: (u64, u64)) -> Result<usize, StdioError> {
             continue;
         }
         let session = unsafe { libc::getsid(pid) };
+        super::drain_deadline_check(deadline)?;
         if session == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
             continue;
         }
@@ -664,10 +772,13 @@ fn mac_members(group: i32, identity: (u64, u64)) -> Result<usize, StdioError> {
         let Some(before) = bsd_info(pid, false)? else {
             continue;
         };
+        super::drain_deadline_check(deadline)?;
         let after_session = unsafe { libc::getsid(pid) };
+        super::drain_deadline_check(deadline)?;
         let Some(after) = bsd_info(pid, false)? else {
             continue;
         };
+        super::drain_deadline_check(deadline)?;
         if after_session != group
             || before.pid != pid as u32
             || after.pid != pid as u32
@@ -684,6 +795,7 @@ fn mac_members(group: i32, identity: (u64, u64)) -> Result<usize, StdioError> {
             count += 1;
         }
     }
+    super::drain_deadline_check(deadline)?;
     if !leader {
         return Err(StdioError::new("native_identity"));
     }

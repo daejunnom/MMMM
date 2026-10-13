@@ -667,6 +667,25 @@ impl RegisteredPlanningDependency {
             contract_ids,
         })
     }
+    /// The native process composer supplies the hash read from its actual
+    /// installed Rust executable. This fixed component owns authored projection
+    /// execution; it never labels a Java host handler or its artifact as Rust.
+    pub fn owned_executable(
+        binding: BindingId,
+        executable_digest: Sha256Digest,
+        action_ids: BTreeSet<String>,
+        contract_ids: BTreeSet<String>,
+    ) -> AppResult<Self> {
+        registration_sets(&action_ids, &contract_ids)?;
+        Ok(Self {
+            binding,
+            component: "mmmm-rust-authored-projection".into(),
+            digest: executable_digest,
+            provenance: "owned_domain",
+            action_ids,
+            contract_ids,
+        })
+    }
     /// A trusted artifact verifier calls this with its actual observed jar hash.
     /// This constructor never assigns owned Rust implementation provenance.
     pub fn host_artifact(
@@ -677,7 +696,14 @@ impl RegisteredPlanningDependency {
         contract_ids: BTreeSet<String>,
     ) -> AppResult<Self> {
         mmmm_contracts::ComponentId::new(&component).map_err(|_| forbidden())?;
-        if ["mmmm-domain", "mmmm-planner", "mmmm-compiler"].contains(&component.as_str()) {
+        if [
+            "mmmm-domain",
+            "mmmm-planner",
+            "mmmm-compiler",
+            "mmmm-rust-authored-projection",
+        ]
+        .contains(&component.as_str())
+        {
             return Err(forbidden());
         }
         registration_sets(&action_ids, &contract_ids)?;

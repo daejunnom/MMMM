@@ -123,6 +123,15 @@ impl CoordinatorClient {
         input: &Value,
         timeout: Duration,
     ) -> Result<Value, ClientError> {
+        self.raw_exchange(method, id, input, timeout)?.outcome
+    }
+    fn raw_exchange(
+        &self,
+        method: &str,
+        id: &str,
+        input: &Value,
+        timeout: Duration,
+    ) -> Result<RawRpcAcquisition, ClientError> {
         if crate::peer::fatal_stop_requested() {
             return Err(ClientError::LocalTransportUncertain);
         }
@@ -175,50 +184,81 @@ impl CoordinatorClient {
         let length = content_length(&headers).map_err(|_| ClientError::InvalidResponse)?;
         let bytes = read_response_body(&mut stream, length, deadline)
             .map_err(|_| ClientError::DeliveryUnknown)?;
-        let response = parse_json_with_limits(
-            &bytes,
-            JsonLimits {
-                max_bytes: MAX_CONTROL_BYTES,
-                max_depth: 64,
-                max_nodes: 4096,
-            },
-        )
-        .map_err(|_| ClientError::InvalidResponse)?;
-        let object = response.as_object().ok_or(ClientError::InvalidResponse)?;
-        if object.len() != 3
-            || object.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
-            || object.get("id").and_then(Value::as_str) != Some(id)
-        {
-            return Err(ClientError::InvalidResponse);
-        }
-        if let Some(result) = object.get("result") {
-            Ok(result.clone())
-        } else if let Some(error) = object.get("error") {
-            let error = error.as_object().ok_or(ClientError::InvalidResponse)?;
-            let code = error
-                .get("code")
-                .and_then(Value::as_i64)
-                .ok_or(ClientError::InvalidResponse)?;
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .filter(|s| s.len() <= 256)
-                .ok_or(ClientError::InvalidResponse)?
-                .to_owned();
-            let application_code = error
-                .get("data")
-                .and_then(|d| d.get("code"))
-                .and_then(Value::as_str)
-                .filter(|s| s.len() <= 64)
-                .map(str::to_owned);
-            Err(ClientError::Remote {
-                code,
-                message,
-                application_code,
-            })
-        } else {
-            Err(ClientError::InvalidResponse)
-        }
+        let body = Zeroizing::new(bytes);
+        let (outcome, source) = decode_rpc_reply_preserving(&body, id);
+        Ok(RawRpcAcquisition {
+            body,
+            outcome,
+            source,
+        })
+    }
+}
+
+/// Complete bodies only. Headers and bearer credentials are never retained.
+/// An invalid body remains opaque and zeroized, rather than becoming a CAS
+/// artifact whose arbitrary fields could expose secrets.
+struct RawRpcAcquisition {
+    body: Zeroizing<Vec<u8>>,
+    outcome: Result<Value, ClientError>,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+type ReplyDecode = (
+    Result<Value, ClientError>,
+    Option<Box<dyn std::error::Error + Send + Sync>>,
+);
+#[cfg(test)]
+fn decode_rpc_reply(bytes: &[u8], id: &str) -> Result<Value, ClientError> {
+    decode_rpc_reply_preserving(bytes, id).0
+}
+fn decode_rpc_reply_preserving(bytes: &[u8], id: &str) -> ReplyDecode {
+    let response = match parse_json_with_limits(
+        bytes,
+        JsonLimits {
+            max_bytes: MAX_CONTROL_BYTES,
+            max_depth: 64,
+            max_nodes: 4096,
+        },
+    ) {
+        Ok(value) => value,
+        Err(cause) => return (Err(ClientError::InvalidResponse), Some(Box::new(cause))),
+    };
+    (decode_rpc_value(&response, id), None)
+}
+fn decode_rpc_value(response: &Value, id: &str) -> Result<Value, ClientError> {
+    let object = response.as_object().ok_or(ClientError::InvalidResponse)?;
+    if object.len() != 3
+        || object.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || object.get("id").and_then(Value::as_str) != Some(id)
+    {
+        return Err(ClientError::InvalidResponse);
+    }
+    if let Some(result) = object.get("result") {
+        Ok(result.clone())
+    } else if let Some(error) = object.get("error") {
+        let error = error.as_object().ok_or(ClientError::InvalidResponse)?;
+        let code = error
+            .get("code")
+            .and_then(Value::as_i64)
+            .ok_or(ClientError::InvalidResponse)?;
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|s| s.len() <= 256)
+            .ok_or(ClientError::InvalidResponse)?
+            .to_owned();
+        let application_code = error
+            .get("data")
+            .and_then(|d| d.get("code"))
+            .and_then(Value::as_str)
+            .filter(|s| s.len() <= 64)
+            .map(str::to_owned);
+        Err(ClientError::Remote {
+            code,
+            message,
+            application_code,
+        })
+    } else {
+        Err(ClientError::InvalidResponse)
     }
 }
 
@@ -231,6 +271,9 @@ impl HostRpcClient {
         Ok(Self(CoordinatorClient::paired(endpoint, token)?))
     }
     pub fn call(&self, request: &Value) -> Result<Value, ClientError> {
+        self.call_acquired(request)?.outcome
+    }
+    pub(crate) fn call_acquired(&self, request: &Value) -> Result<HostClientReply, ClientError> {
         let validator = ContractValidator::shared().map_err(|_| ClientError::InvalidInput)?;
         validator
             .validate("HostRequest", request)
@@ -250,13 +293,125 @@ impl HostRpcClient {
             return Err(ClientError::Unavailable);
         }
         let timeout = Duration::from_nanos(remaining.min(35_000_000_000) as u64);
-        let response = self.0.raw_call("mmmm.host", id, request, timeout)?;
-        validator
-            .validate("HostResponse", &response)
-            .map_err(|_| ClientError::InvalidResponse)?;
-        if response["requestId"] != request["requestId"] {
-            return Err(ClientError::InvalidResponse);
+        let acquired = self.0.raw_exchange("mmmm.host", id, request, timeout)?;
+        let mut source = acquired.source;
+        let outcome = acquired.outcome.and_then(|response| {
+            if let Err(cause) = validator.validate("HostResponse", &response) {
+                source = Some(Box::new(cause));
+                return Err(ClientError::InvalidResponse);
+            }
+            if response["requestId"] != request["requestId"] {
+                return Err(ClientError::InvalidResponse);
+            }
+            Ok(response)
+        });
+        Ok(HostClientReply {
+            body: acquired.body,
+            outcome,
+            source,
+        })
+    }
+}
+
+pub(crate) struct HostClientReply {
+    // Private even to host adapters: unclassified response bytes are not a
+    // public diagnostic or CAS API. The enclosing error retains this source.
+    body: Zeroizing<Vec<u8>>,
+    outcome: Result<Value, ClientError>,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+impl HostClientReply {
+    pub(crate) fn response(&self) -> Option<&Value> {
+        self.outcome.as_ref().ok()
+    }
+    pub(crate) fn failure(&self) -> Option<&ClientError> {
+        self.outcome.as_ref().err()
+    }
+    pub(crate) fn received_bytes(&self) -> usize {
+        self.body.len()
+    }
+    pub(crate) fn failure_source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|cause| cause as &(dyn std::error::Error + 'static))
+            .or_else(|| {
+                self.failure()
+                    .map(|cause| cause as &(dyn std::error::Error + 'static))
+            })
+    }
+    pub(crate) fn into_response(self) -> Result<Value, ClientError> {
+        self.outcome
+    }
+    pub(crate) fn into_preserved_response(self) -> Result<Value, HostReplyFailure> {
+        let Self {
+            body,
+            outcome,
+            source,
+        } = self;
+        match outcome {
+            Ok(value) => Ok(value),
+            Err(cause) => Err(HostReplyFailure(Self {
+                body,
+                outcome: Err(cause),
+                source,
+            })),
         }
-        Ok(response)
+    }
+}
+
+pub(crate) struct HostReplyFailure(HostClientReply);
+impl std::fmt::Debug for HostReplyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostReplyFailure")
+            .field("received_bytes", &self.0.received_bytes())
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for HostReplyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Authenticated host reply was received but could not be validated")
+    }
+}
+impl std::error::Error for HostReplyFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.failure_source()
+    }
+}
+
+#[cfg(test)]
+mod acquisition_tests {
+    use super::*;
+    #[test]
+    fn malformed_complete_reply_preserves_bytes_without_printing_them() {
+        let bytes = Zeroizing::new(b"{invalid authenticated reply".to_vec());
+        let (outcome, source) = decode_rpc_reply_preserving(&bytes, "original");
+        let acquired = RawRpcAcquisition {
+            outcome,
+            body: bytes,
+            source,
+        };
+        assert!(matches!(
+            acquired.outcome,
+            Err(ClientError::InvalidResponse)
+        ));
+        assert_eq!(acquired.body.as_slice(), b"{invalid authenticated reply");
+        assert!(acquired.source.is_some());
+        let failure = HostClientReply {
+            body: acquired.body,
+            outcome: acquired.outcome,
+            source: acquired.source,
+        }
+        .into_preserved_response()
+        .unwrap_err();
+        assert!(std::error::Error::source(&failure).is_some());
+        assert!(!format!("{failure:?}").contains("invalid authenticated reply"));
+    }
+    #[test]
+    fn wrong_rpc_identity_is_not_relabelled_as_the_requested_response() {
+        let bytes = encode_json(&json!({"jsonrpc":"2.0","id":"other","result":{}})).unwrap();
+        assert!(matches!(
+            decode_rpc_reply(&bytes, "original"),
+            Err(ClientError::InvalidResponse)
+        ));
     }
 }

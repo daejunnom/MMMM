@@ -2,7 +2,8 @@
 //! hidden worker without adding a product CLI probe or an unrelated driver.
 //! Small contract fixtures cannot prove blocked kernel pipe cancellation.
 use mmmm_coordinator::stdio_io::{
-    NativeStdioPort, StdioDrain, StdioError, StdioLimits, WORKER_COMMAND, worker_entry_exit,
+    NativeStdioPort, StdioDrain, StdioError, StdioLimits, StdioOutput, WORKER_COMMAND,
+    worker_entry_exit,
 };
 use std::{
     fs::File,
@@ -36,10 +37,12 @@ fn main() {
     truncated_raw_capability_is_failure();
     held_raw_payload_deadline();
     blocked_raw_stdout_never_acknowledges();
+    raw_stderr_roundtrip();
+    blocked_raw_stderr_never_acknowledges();
     #[cfg(target_os = "macos")]
     descriptor_above_lowered_soft_limit_is_not_inherited();
     eprintln!(
-        "native stdio acceptance: line and raw roundtrip, EOF, truncated raw capability, held input deadline/cancel, blocked output and verified drain passed"
+        "native stdio acceptance: line and raw roundtrip, raw stderr, EOF, truncated raw capability, held input deadline/cancel, blocked stdout/stderr and verified drain passed"
     );
 }
 
@@ -114,6 +117,7 @@ struct Scenario {
     port: NativeStdioPort,
     input: Option<File>,
     output: File,
+    owner_deadline: Instant,
 }
 impl Scenario {
     fn start() -> Self {
@@ -123,22 +127,29 @@ impl Scenario {
         Self::start_mode(true)
     }
     fn start_mode(raw: bool) -> Self {
+        Self::start_output(raw, StdioOutput::Stdout)
+    }
+    fn start_output(raw: bool, sink: StdioOutput) -> Self {
+        let owner_deadline = Instant::now() + Duration::from_secs(15);
         let (port, input, output) = redirect::spawn(
             StdioLimits {
                 session: Duration::from_secs(15),
                 ..StdioLimits::default()
             },
             raw,
+            sink,
+            owner_deadline,
         )
         .expect("native fixture must start real hidden worker");
         Self {
             port,
             input: Some(input),
             output,
+            owner_deadline,
         }
     }
     fn drain(&self) -> StdioDrain {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = (Instant::now() + Duration::from_secs(5)).min(self.owner_deadline);
         loop {
             match self
                 .port
@@ -424,6 +435,35 @@ fn blocked_raw_stdout_never_acknowledges() {
     assert!(delivered.iter().all(|b| *b == 0xA5));
 }
 
+fn raw_stderr_roundtrip() {
+    // The previous stdout-only fixtures do not exercise inherited stderr or
+    // prove that raw diagnostics use the same flush acknowledgement boundary.
+    let mut scenario = Scenario::start_output(true, StdioOutput::Stderr);
+    let bytes = b"bounded diagnostic without implicit LF\n";
+    raw_write(&scenario.port, bytes, Duration::from_secs(2)).unwrap();
+    let mut delivered = vec![0; bytes.len()];
+    output_exact(&mut scenario.output, &mut delivered);
+    assert_eq!(delivered, bytes);
+    scenario.drain();
+    let mut tail = Vec::new();
+    output_eof(&mut scenario.output, &mut tail);
+    assert!(tail.is_empty());
+}
+
+fn blocked_raw_stderr_never_acknowledges() {
+    // Keep the actual kernel stderr pipe unread until after cancellation.
+    // Private socket acceptance cannot acknowledge a blocked external sink.
+    let mut scenario = Scenario::start_output(true, StdioOutput::Stderr);
+    let bytes = vec![0x5Au8; 1_048_576];
+    let error = raw_write(&scenario.port, &bytes, Duration::from_millis(200)).unwrap_err();
+    assert_eq!(error.code, "deadline");
+    scenario.drain();
+    let mut delivered = Vec::new();
+    output_eof(&mut scenario.output, &mut delivered);
+    assert!(!delivered.is_empty() && delivered.len() < bytes.len());
+    assert!(delivered.iter().all(|b| *b == 0x5A));
+}
+
 #[cfg(unix)]
 mod redirect {
     use super::*;
@@ -444,11 +484,15 @@ mod redirect {
     struct Restore {
         input: File,
         output: File,
+        sink: i32,
     }
     impl Drop for Restore {
         fn drop(&mut self) {
             assert_ne!(unsafe { libc::dup2(self.input.as_raw_fd(), 0) }, -1);
-            assert_ne!(unsafe { libc::dup2(self.output.as_raw_fd(), 1) }, -1);
+            assert_ne!(
+                unsafe { libc::dup2(self.output.as_raw_fd(), self.sink) },
+                -1
+            );
         }
     }
     pub(super) fn poll_read(output: &mut File, bytes: &mut [u8]) -> std::io::Result<Option<usize>> {
@@ -468,6 +512,8 @@ mod redirect {
     pub(super) fn spawn(
         limits: StdioLimits,
         raw: bool,
+        sink: StdioOutput,
+        owner_deadline: Instant,
     ) -> Result<(NativeStdioPort, File, File), StdioError> {
         let (input_read, input_write) = pipe();
         let (output_read, output_write) = pipe();
@@ -484,18 +530,24 @@ mod redirect {
             -1
         );
         let input = unsafe { libc::dup(0) };
-        let output = unsafe { libc::dup(1) };
+        let sink_fd = match sink {
+            StdioOutput::Stdout => libc::STDOUT_FILENO,
+            StdioOutput::Stderr => libc::STDERR_FILENO,
+        };
+        let output = unsafe { libc::dup(sink_fd) };
         assert!(input >= 0 && output >= 0);
         let restore = Restore {
             input: unsafe { File::from_raw_fd(input) },
             output: unsafe { File::from_raw_fd(output) },
+            sink: sink_fd,
         };
         assert_ne!(unsafe { libc::dup2(input_read.as_raw_fd(), 0) }, -1);
-        assert_ne!(unsafe { libc::dup2(output_write.as_raw_fd(), 1) }, -1);
+        assert_ne!(unsafe { libc::dup2(output_write.as_raw_fd(), sink_fd) }, -1);
         let result = if raw {
-            NativeStdioPort::spawn_current_raw(limits)
+            NativeStdioPort::spawn_current_raw_output_with_deadline(limits, sink, owner_deadline)
         } else {
-            NativeStdioPort::spawn_current(limits)
+            assert_eq!(sink, StdioOutput::Stdout);
+            NativeStdioPort::spawn_current_with_deadline(limits, owner_deadline)
         };
         drop(restore);
         drop(input_read);
@@ -513,7 +565,9 @@ mod redirect {
     use windows_sys::Win32::{
         Foundation::{ERROR_BROKEN_PIPE, HANDLE, INVALID_HANDLE_VALUE},
         System::{
-            Console::{GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle},
+            Console::{
+                GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+            },
             Pipes::{CreatePipe, PeekNamedPipe},
         },
     };
@@ -531,11 +585,12 @@ mod redirect {
     struct Restore {
         input: HANDLE,
         output: HANDLE,
+        sink: u32,
     }
     impl Drop for Restore {
         fn drop(&mut self) {
             assert_ne!(unsafe { SetStdHandle(STD_INPUT_HANDLE, self.input) }, 0);
-            assert_ne!(unsafe { SetStdHandle(STD_OUTPUT_HANDLE, self.output) }, 0);
+            assert_ne!(unsafe { SetStdHandle(self.sink, self.output) }, 0);
         }
     }
     pub(super) fn poll_read(output: &mut File, bytes: &mut [u8]) -> std::io::Result<Option<usize>> {
@@ -570,30 +625,41 @@ mod redirect {
     pub(super) fn spawn(
         limits: StdioLimits,
         raw: bool,
+        sink: StdioOutput,
+        owner_deadline: Instant,
     ) -> Result<(NativeStdioPort, File, File), StdioError> {
         let (input_read, input_write) = pipe();
         let (output_read, output_write) = pipe();
         let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-        let output = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        let sink_handle = match sink {
+            StdioOutput::Stdout => STD_OUTPUT_HANDLE,
+            StdioOutput::Stderr => STD_ERROR_HANDLE,
+        };
+        let output = unsafe { GetStdHandle(sink_handle) };
         assert!(
             !input.is_null()
                 && input != INVALID_HANDLE_VALUE
                 && !output.is_null()
                 && output != INVALID_HANDLE_VALUE
         );
-        let restore = Restore { input, output };
+        let restore = Restore {
+            input,
+            output,
+            sink: sink_handle,
+        };
         assert_ne!(
             unsafe { SetStdHandle(STD_INPUT_HANDLE, input_read.as_raw_handle().cast()) },
             0
         );
         assert_ne!(
-            unsafe { SetStdHandle(STD_OUTPUT_HANDLE, output_write.as_raw_handle().cast()) },
+            unsafe { SetStdHandle(sink_handle, output_write.as_raw_handle().cast()) },
             0
         );
         let result = if raw {
-            NativeStdioPort::spawn_current_raw(limits)
+            NativeStdioPort::spawn_current_raw_output_with_deadline(limits, sink, owner_deadline)
         } else {
-            NativeStdioPort::spawn_current(limits)
+            assert_eq!(sink, StdioOutput::Stdout);
+            NativeStdioPort::spawn_current_with_deadline(limits, owner_deadline)
         };
         drop(restore);
         drop(input_read);

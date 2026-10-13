@@ -1,6 +1,6 @@
 //! Finite MCP stdio boundary. Blocking external stdio belongs exclusively to
 //! an owned helper process; the Coordinator polls a private nonblocking socket.
-//! Output is acknowledged only after the helper flushed the actual stdout.
+//! Output is acknowledged only after the helper flushed the selected stdio.
 use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
@@ -45,6 +45,9 @@ const RAW_INPUT: u8 = 8;
 const TRUNCATED: u8 = 9;
 const RAW_EOF: u8 = 10;
 const RAW_MODE_FLAG: u64 = 1 << 63;
+const STDERR_FLAG: u64 = 1 << 62;
+const BOOTSTRAP_FLAGS: u64 = RAW_MODE_FLAG | STDERR_FLAG;
+const BOOTSTRAP_LENGTH: usize = 104;
 const WORKER_STAGES: &[&str] = &[
     "worker_arguments",
     "bootstrap_handle",
@@ -73,12 +76,98 @@ const WORKER_STAGES: &[&str] = &[
     "output_budget",
     "worker_io",
     "channel_frame",
+    "deadline",
+    "native_clock",
     "worker_unknown",
 ];
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Mode {
     Lines,
     Raw,
+}
+
+/// The authenticated bootstrap selects exactly one inherited standard sink.
+/// The unused sink is null; a caller cannot provide an arbitrary descriptor.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StdioOutput {
+    #[default]
+    Stdout,
+    Stderr,
+}
+
+static OWNERSHIP_UNCERTAIN: AtomicBool = AtomicBool::new(false);
+static OWNER_RESERVED: AtomicBool = AtomicBool::new(false);
+// One uncertain native owner stays explicit until process shutdown. New
+// workers are denied after this fatal condition; this is not a retry queue.
+static RETAINED_PROCESS: Mutex<Option<native::Process>> = Mutex::new(None);
+
+struct WorkerReservation;
+impl WorkerReservation {
+    fn acquire() -> Result<Self, StdioError> {
+        if OWNER_RESERVED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(StdioError::new("owner_busy"));
+        }
+        if OWNERSHIP_UNCERTAIN.load(Ordering::Acquire) {
+            OWNER_RESERVED.store(false, Ordering::Release);
+            return Err(StdioError::new("ownership_uncertain"));
+        }
+        Ok(Self)
+    }
+}
+impl Drop for WorkerReservation {
+    fn drop(&mut self) {
+        OWNER_RESERVED.store(false, Ordering::Release);
+    }
+}
+
+fn retain_uncertain_process(process: native::Process) {
+    OWNERSHIP_UNCERTAIN.store(true, Ordering::Release);
+    let Ok(mut retained) = RETAINED_PROCESS.lock() else {
+        std::process::abort();
+    };
+    if retained.is_some() {
+        // Each native owner holds the sole reservation from before spawn.
+        // A second owner here is an ownership invariant failure, not timeout.
+        std::process::abort();
+    }
+    *retained = Some(process);
+}
+
+fn deadline_check(deadline: Instant) -> Result<(), StdioError> {
+    if Instant::now() >= deadline {
+        Err(StdioError::new("deadline"))
+    } else {
+        Ok(())
+    }
+}
+fn drain_deadline_check(deadline: Instant) -> Result<(), StdioError> {
+    if Instant::now() >= deadline {
+        Err(StdioError::new("drain_uncertain"))
+    } else {
+        Ok(())
+    }
+}
+
+fn cleanup_failed_process(mut process: native::Process, mut error: StdioError) -> StdioError {
+    let deadline = process.owner_deadline();
+    match process.drain_blocking(deadline) {
+        Ok(()) => error.drained = true,
+        Err(drain) => {
+            error.drained = drain.drained;
+            error.cleanup = Some(StdioCleanupFailure {
+                code: drain.code,
+                native_code: drain.native_code,
+                native_code_unknown: drain.native_code_unknown,
+            });
+            if !drain.drained {
+                retain_uncertain_process(process);
+            }
+        }
+    }
+    error
 }
 
 /// Deployment policy supplies finite limits; callers cannot expand them past
@@ -129,28 +218,17 @@ pub struct StdioError {
     pub drained: bool,
     pub native_code: Option<i32>,
     pub native_code_unknown: bool,
+    pub cleanup: Option<StdioCleanupFailure>,
 }
-impl StdioError {
-    fn new(code: &'static str) -> Self {
-        Self {
-            code,
-            drained: false,
-            native_code: None,
-            native_code_unknown: false,
-        }
-    }
-    fn io(code: &'static str, error: io::Error) -> Self {
-        Self {
-            code,
-            drained: false,
-            native_code: error.raw_os_error(),
-            native_code_unknown: false,
-        }
-    }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StdioCleanupFailure {
+    pub code: &'static str,
+    pub native_code: Option<i32>,
+    pub native_code_unknown: bool,
 }
-impl std::fmt::Display for StdioError {
+impl std::fmt::Display for StdioCleanupFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "finite stdio: {}", self.code)?;
+        write!(f, "finite stdio cleanup: {}", self.code)?;
         if self.native_code_unknown {
             write!(f, " (UnknownNative)")
         } else if let Some(code) = self.native_code {
@@ -160,7 +238,48 @@ impl std::fmt::Display for StdioError {
         }
     }
 }
-impl std::error::Error for StdioError {}
+impl std::error::Error for StdioCleanupFailure {}
+impl StdioError {
+    fn new(code: &'static str) -> Self {
+        Self {
+            code,
+            drained: false,
+            native_code: None,
+            native_code_unknown: false,
+            cleanup: None,
+        }
+    }
+    fn io(code: &'static str, error: io::Error) -> Self {
+        Self {
+            code,
+            drained: false,
+            native_code: error.raw_os_error(),
+            native_code_unknown: false,
+            cleanup: None,
+        }
+    }
+}
+impl std::fmt::Display for StdioError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "finite stdio: {}", self.code)?;
+        if self.native_code_unknown {
+            write!(f, " (UnknownNative)")?;
+        } else if let Some(code) = self.native_code {
+            write!(f, " (native {code})")?;
+        }
+        if let Some(cleanup) = &self.cleanup {
+            write!(f, "; {cleanup}")?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for StdioError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cleanup
+            .as_ref()
+            .map(|error| error as &(dyn std::error::Error + 'static))
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StdioDrain {
@@ -174,12 +293,14 @@ struct Executable {
     digest: [u8; 32],
 }
 impl Executable {
-    fn current() -> Result<Self, StdioError> {
+    fn current(deadline: Instant) -> Result<Self, StdioError> {
+        deadline_check(deadline)?;
         let path = std::env::current_exe().map_err(|e| StdioError::io("executable_path", e))?;
         let path = path
             .canonicalize()
             .map_err(|e| StdioError::io("executable_path", e))?;
         let mut file = native::open_executable(&path)?;
+        deadline_check(deadline)?;
         let metadata = file
             .metadata()
             .map_err(|e| StdioError::io("executable_metadata", e))?;
@@ -190,6 +311,7 @@ impl Executable {
         let mut buffer = [0u8; WORK_BATCH];
         let mut bytes = 0u64;
         loop {
+            deadline_check(deadline)?;
             let n = file
                 .read(&mut buffer)
                 .map_err(|e| StdioError::io("executable_read", e))?;
@@ -201,10 +323,12 @@ impl Executable {
                 return Err(StdioError::new("executable_changed"));
             }
             hasher.update(&buffer[..n]);
+            deadline_check(deadline)?;
         }
         if bytes != metadata.len() || !native::same_file(&file, &path)? {
             return Err(StdioError::new("executable_changed"));
         }
+        deadline_check(deadline)?;
         Ok(Self {
             path,
             file,
@@ -227,12 +351,13 @@ struct PendingRead {
     response: Option<Option<zeroize::Zeroizing<Vec<u8>>>>,
 }
 struct Bridge {
-    process: native::Process,
+    process: Option<native::Process>,
     _executable: Executable,
     socket: TcpStream,
     limits: StdioLimits,
     mode: Mode,
     expires: Instant,
+    owner_deadline: Instant,
     receive: zeroize::Zeroizing<Vec<u8>>,
     lines: VecDeque<Vec<u8>>,
     queued: usize,
@@ -256,16 +381,54 @@ pub struct NativeStdioPort {
 }
 impl NativeStdioPort {
     pub fn spawn_current(limits: StdioLimits) -> Result<Self, StdioError> {
-        Self::spawn(limits, Mode::Lines)
+        let limits = limits.validate()?;
+        Self::spawn_current_with_deadline(limits, Instant::now() + limits.session)
+    }
+    pub fn spawn_current_with_deadline(
+        limits: StdioLimits,
+        owner_deadline: Instant,
+    ) -> Result<Self, StdioError> {
+        Self::spawn(limits, Mode::Lines, StdioOutput::Stdout, owner_deadline)
     }
     /// Raw stdio uses pull-based exact reads and writes with no terminator or
     /// Unicode transformation. Capability bytes never enter public JSON.
     pub fn spawn_current_raw(limits: StdioLimits) -> Result<Self, StdioError> {
-        Self::spawn(limits, Mode::Raw)
-    }
-    fn spawn(limits: StdioLimits, mode: Mode) -> Result<Self, StdioError> {
         let limits = limits.validate()?;
-        let executable = Executable::current()?;
+        Self::spawn_current_raw_with_deadline(limits, Instant::now() + limits.session)
+    }
+    pub fn spawn_current_raw_with_deadline(
+        limits: StdioLimits,
+        owner_deadline: Instant,
+    ) -> Result<Self, StdioError> {
+        Self::spawn_current_raw_output_with_deadline(limits, StdioOutput::Stdout, owner_deadline)
+    }
+    pub fn spawn_current_raw_output_with_deadline(
+        limits: StdioLimits,
+        output: StdioOutput,
+        owner_deadline: Instant,
+    ) -> Result<Self, StdioError> {
+        Self::spawn(limits, Mode::Raw, output, owner_deadline)
+    }
+    fn spawn(
+        limits: StdioLimits,
+        mode: Mode,
+        output: StdioOutput,
+        owner_deadline: Instant,
+    ) -> Result<Self, StdioError> {
+        deadline_check(owner_deadline)?;
+        if OWNERSHIP_UNCERTAIN.load(Ordering::Acquire) {
+            return Err(StdioError::new("ownership_uncertain"));
+        }
+        let limits = limits.validate()?;
+        let reservation = WorkerReservation::acquire()?;
+        let started = Instant::now();
+        deadline_check(owner_deadline)?;
+        if owner_deadline.saturating_duration_since(started) > Duration::from_secs(3610) {
+            return Err(StdioError::new("limits"));
+        }
+        let session_deadline = (started + limits.session).min(owner_deadline);
+        let startup_deadline = (started + limits.startup).min(owner_deadline);
+        let executable = Executable::current(startup_deadline)?;
         let listener =
             TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|_| StdioError::new("channel"))?;
         listener
@@ -276,18 +439,48 @@ impl NativeStdioPort {
             .map_err(|_| StdioError::new("channel"))?;
         let mut capability = zeroize::Zeroizing::new([0u8; 32]);
         getrandom::fill(&mut capability[..]).map_err(|_| StdioError::new("random"))?;
-        let mut packet = zeroize::Zeroizing::new(Vec::with_capacity(96));
+        let native_now = native::monotonic_millis()?;
+        let native_deadline = native_now
+            .checked_add(
+                session_deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as u64,
+            )
+            .and_then(|deadline| deadline.checked_sub(native::MONOTONIC_MARGIN_MILLIS))
+            .ok_or_else(|| StdioError::new("deadline"))?;
+        if native_deadline <= native_now {
+            return Err(StdioError::new("deadline"));
+        }
+        let mut packet = zeroize::Zeroizing::new(Vec::with_capacity(BOOTSTRAP_LENGTH));
         packet.extend_from_slice(&capability[..]);
         packet.extend_from_slice(&executable.digest);
         for value in [
-            limits.session.as_millis() as u64 | if mode == Mode::Raw { RAW_MODE_FLAG } else { 0 },
+            session_deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64
+                | if mode == Mode::Raw { RAW_MODE_FLAG } else { 0 }
+                | if output == StdioOutput::Stderr {
+                    STDERR_FLAG
+                } else {
+                    0
+                },
             limits.max_frames,
             limits.max_input_bytes,
             limits.max_output_bytes,
+            native_deadline,
         ] {
             packet.extend_from_slice(&value.to_be_bytes());
         }
-        let spawned = native::Process::spawn(&executable, address, &packet);
+        deadline_check(startup_deadline)?;
+        let spawned = native::Process::spawn(
+            &executable,
+            address,
+            &packet,
+            output,
+            owner_deadline,
+            startup_deadline,
+            reservation,
+        );
         packet.zeroize();
         let mut process = match spawned {
             Ok(p) => p,
@@ -296,32 +489,31 @@ impl NativeStdioPort {
                 return Err(e);
             }
         };
-        let deadline = Instant::now() + limits.startup;
         let result = authenticate_worker(
             &listener,
             &mut process,
             &capability,
             &executable.digest,
-            deadline,
+            startup_deadline,
         );
         capability.zeroize();
         let socket = match result {
             Ok(socket) => socket,
-            Err(mut error) => {
-                error.drained = process
-                    .drain_blocking(Instant::now() + Duration::from_secs(5))
-                    .is_ok();
-                return Err(error);
-            }
+            Err(error) => return Err(cleanup_failed_process(process, error)),
         };
+        if let Err(error) = deadline_check(startup_deadline) {
+            let _ = socket.shutdown(Shutdown::Both);
+            return Err(cleanup_failed_process(process, error));
+        }
         Ok(Self {
             bridge: Mutex::new(Bridge {
-                process,
+                process: Some(process),
                 _executable: executable,
                 socket,
                 limits,
                 mode,
-                expires: Instant::now() + limits.session,
+                expires: session_deadline,
+                owner_deadline,
                 // The private channel may carry a raw capability. Reserving
                 // the entire finite frame before reading prevents a later
                 // allocation from abandoning an unwiped sensitive prefix.
@@ -437,6 +629,7 @@ impl NativeStdioPort {
             return bridge.fail("concurrent_output");
         }
         bridge.pump()?;
+        bridge.check(deadline, cancel)?;
         let mut pending = bridge
             .pending
             .take()
@@ -554,6 +747,7 @@ impl NativeStdioPort {
         if let Some(done) = &bridge.drained {
             return Ok(Poll::Ready(done.clone()));
         }
+        let deadline = deadline.min(bridge.owner_deadline);
         if !bridge.draining {
             bridge.draining = true;
             bridge.receive.zeroize();
@@ -565,17 +759,20 @@ impl NativeStdioPort {
             bridge.lines.clear();
             bridge.queued = 0;
             let _ = bridge.socket.shutdown(Shutdown::Both);
-            bridge.process.terminate()?;
+            bridge.process_mut()?.terminate()?;
         }
-        let exited = bridge.process.exit_code()?;
-        let empty = bridge.process.scope_empty()?;
+        if Instant::now() >= deadline {
+            return Err(StdioError::new("drain_uncertain"));
+        }
+        let exited = bridge.process_mut()?.exit_code()?;
+        let empty = bridge.process_mut()?.scope_empty(deadline)?;
         if empty && exited.is_some() {
             if let Some(observed) = bridge.empty_observed {
                 if observed.elapsed() >= Duration::from_millis(10) {
                     if Instant::now() >= deadline {
                         return Err(StdioError::new("drain_uncertain"));
                     }
-                    let code = bridge.process.reap()?;
+                    let code = bridge.process_mut()?.reap()?;
                     let done = StdioDrain {
                         exit_code: code,
                         terminated: true,
@@ -587,6 +784,7 @@ impl NativeStdioPort {
                             drained: true,
                             native_code: None,
                             native_code_unknown: false,
+                            cleanup: None,
                         });
                     }
                     return Ok(Poll::Ready(done));
@@ -602,22 +800,63 @@ impl NativeStdioPort {
         }
         Ok(Poll::Pending)
     }
+
+    /// Explicit recovery of the same retained native identity with a newly
+    /// supplied finite cleanup budget. No worker or request is retried.
+    pub fn cleanup_retained(deadline: Instant) -> Result<StdioDrain, StdioError> {
+        deadline_check(deadline)?;
+        if deadline.saturating_duration_since(Instant::now()) > Duration::from_secs(10) {
+            return Err(StdioError::new("limits"));
+        }
+        let mut process = RETAINED_PROCESS
+            .lock()
+            .map_err(|_| StdioError::new("poisoned"))?
+            .take()
+            .ok_or_else(|| StdioError::new("no_retained_owner"))?;
+        match process.drain_blocking(deadline) {
+            Ok(()) => {
+                OWNERSHIP_UNCERTAIN.store(false, Ordering::Release);
+                Ok(StdioDrain {
+                    exit_code: process.reaped_exit_code(),
+                    terminated: true,
+                })
+            }
+            Err(error) if error.drained => {
+                OWNERSHIP_UNCERTAIN.store(false, Ordering::Release);
+                Err(error)
+            }
+            Err(error) => {
+                retain_uncertain_process(process);
+                Err(error)
+            }
+        }
+    }
 }
 impl Drop for NativeStdioPort {
     fn drop(&mut self) {
-        // Drop is an emergency finite drain, never a success report. Callers
+        // Drop uses the original owner deadline, never a fresh grace period.
+        // It is not a success report. Callers
         // explicitly poll_cancel_and_drain and preserve its result first.
         if let Ok(bridge) = self.bridge.get_mut() {
             let _ = bridge.socket.shutdown(Shutdown::Both);
-            if bridge.drained.is_none() {
-                let _ = bridge
-                    .process
-                    .drain_blocking(Instant::now() + Duration::from_secs(5));
+            if bridge.drained.is_none()
+                && let Some(mut process) = bridge.process.take()
+            {
+                match process.drain_blocking(bridge.owner_deadline) {
+                    Ok(()) => {}
+                    Err(error) if error.drained => {}
+                    Err(_) => retain_uncertain_process(process),
+                }
             }
         }
     }
 }
 impl Bridge {
+    fn process_mut(&mut self) -> Result<&mut native::Process, StdioError> {
+        self.process
+            .as_mut()
+            .ok_or_else(|| StdioError::new("ownership_uncertain"))
+    }
     fn fail<T>(&mut self, code: &'static str) -> Result<T, StdioError> {
         let error = StdioError::new(code);
         self.failure = Some(error.clone());
@@ -636,7 +875,7 @@ impl Bridge {
         if Instant::now() >= deadline || Instant::now() >= self.expires {
             return self.fail("deadline");
         }
-        if self.process.exit_code()?.is_some() {
+        if self.process_mut()?.exit_code()?.is_some() {
             return self.fail("worker_exit");
         }
         Ok(())
@@ -856,9 +1095,11 @@ fn authenticate_worker(
                     ) == process.id();
                 hello.zeroize();
                 if matches {
+                    deadline_check(deadline)?;
                     socket
                         .set_nodelay(true)
                         .map_err(|_| StdioError::new("channel"))?;
+                    deadline_check(deadline)?;
                     return Ok(socket);
                 }
             }
@@ -954,11 +1195,6 @@ pub fn worker_entry(args: &[String]) -> Result<(), StdioError> {
         .parse::<usize>()
         .map_err(|_| StdioError::new("worker_arguments"))?;
     let mut packet = native::read_bootstrap(handle)?;
-    let executable = Executable::current()?;
-    if packet[32..64] != executable.digest {
-        packet.zeroize();
-        return Err(StdioError::new("executable_changed"));
-    }
     let values: Vec<u64> = packet[64..]
         .chunks_exact(8)
         .map(|c| u64::from_be_bytes(c.try_into().expect("fixed bootstrap field")))
@@ -968,16 +1204,67 @@ pub fn worker_entry(args: &[String]) -> Result<(), StdioError> {
     } else {
         Mode::Lines
     };
+    let output = if values[0] & STDERR_FLAG != 0 {
+        StdioOutput::Stderr
+    } else {
+        StdioOutput::Stdout
+    };
+    if output == StdioOutput::Stderr && mode != Mode::Raw {
+        return Err(StdioError::new("limits"));
+    }
     let limits = StdioLimits {
-        session: Duration::from_millis(values[0] & !RAW_MODE_FLAG),
+        session: Duration::from_millis(values[0] & !BOOTSTRAP_FLAGS),
         startup: Duration::from_secs(5),
         max_frames: values[1],
         max_input_bytes: values[2],
         max_output_bytes: values[3],
     }
     .validate()?;
-    let mut socket = TcpStream::connect_timeout(&address, Duration::from_secs(5))
+    let anchor = Instant::now();
+    let native_now = native::monotonic_millis()?;
+    let native_deadline = values[4];
+    if native_now >= native_deadline
+        || native_deadline - native_now > limits.session.as_millis() as u64
+    {
+        return Err(StdioError::new("deadline"));
+    }
+    let expires = anchor + Duration::from_millis(native_deadline - native_now);
+    // Start the bounded watchdog before executable hashing or private socket
+    // writes. The same system monotonic absolute deadline crosses exec, so
+    // image loading and authentication cannot create a fresh child session.
+    let _watchdog = std::thread::Builder::new()
+        .name("mmmm-stdio-watchdog".into())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            loop {
+                let now = match native::monotonic_millis() {
+                    Ok(now) => now,
+                    Err(_) => std::process::exit(125),
+                };
+                if now >= native_deadline {
+                    std::process::exit(124);
+                }
+                std::thread::sleep(
+                    Duration::from_millis(100).min(Duration::from_millis(native_deadline - now)),
+                );
+            }
+        })
+        .map_err(|_| StdioError::new("worker_thread"))?;
+    let executable = Executable::current(expires)?;
+    if packet[32..64] != executable.digest {
+        packet.zeroize();
+        return Err(StdioError::new("executable_changed"));
+    }
+    deadline_check(expires)?;
+    let startup = Duration::from_secs(5).min(expires.saturating_duration_since(Instant::now()));
+    let mut socket = TcpStream::connect_timeout(&address, startup)
         .map_err(|e| StdioError::io("worker_connect", e))?;
+    deadline_check(expires)?;
+    socket
+        .set_write_timeout(Some(
+            Duration::from_secs(5).min(expires.saturating_duration_since(Instant::now())),
+        ))
+        .map_err(|e| StdioError::io("worker_hello", e))?;
     let mut hello = zeroize::Zeroizing::new(Vec::with_capacity(80));
     hello.extend_from_slice(MAGIC);
     hello.extend_from_slice(&packet[..32]);
@@ -987,30 +1274,17 @@ pub fn worker_entry(args: &[String]) -> Result<(), StdioError> {
     let sent = socket.write_all(&hello);
     hello.zeroize();
     sent.map_err(|e| StdioError::io("worker_hello", e))?;
+    deadline_check(expires)?;
+    socket
+        .set_write_timeout(None)
+        .map_err(|e| StdioError::io("worker_hello", e))?;
     let mut receiver = socket
         .try_clone()
         .map_err(|e| StdioError::io("worker_clone", e))?;
     let sender = std::sync::Arc::new(Mutex::new(socket));
     let output_sender = sender.clone();
-    // All three helper threads belong to this owned process. The watchdog
-    // enforces the session even if the parent disappears while stdin blocks.
-    let _watchdog = std::thread::Builder::new()
-        .name("mmmm-stdio-watchdog".into())
-        .stack_size(256 * 1024)
-        .spawn(move || {
-            let expires = Instant::now() + limits.session;
-            loop {
-                if Instant::now() >= expires {
-                    std::process::exit(124);
-                }
-                std::thread::sleep(
-                    Duration::from_millis(100)
-                        .min(expires.saturating_duration_since(Instant::now())),
-                );
-            }
-        })
-        .map_err(|_| StdioError::new("worker_thread"))?;
-    let (mut input, mut external_output) = native::worker_stdio()?;
+    // Every helper thread remains inside the same native-owned process.
+    let (mut input, mut external_output) = native::worker_stdio(output)?;
     if mode == Mode::Raw {
         // Rust's global Stdin uses a BufReader and can capture a capability
         // past the requested public prefix. Raw mode owns unbuffered native

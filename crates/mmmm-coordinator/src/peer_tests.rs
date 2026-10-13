@@ -154,7 +154,7 @@ fn native_peer_delivery_cleanup_and_default_coordinator_lifecycle() {
         // byte. Repeat that exact close -> accept -> authenticated delivery
         // transition within this one owned server; never replay a delivered
         // request or label a native timing gap as an observed cause.
-        for _ in 0..3 {
+        for attempt in 0..3 {
             let deadline = Instant::now() + Duration::from_secs(3);
             assert!(matches!(
                 retry_prewrite_peer_busy(deadline, || {
@@ -175,7 +175,15 @@ fn native_peer_delivery_cleanup_and_default_coordinator_lifecycle() {
                     deadline,
                 )
             })
-            .unwrap();
+            .unwrap_or_else(|error| {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                panic!(
+                    "authenticated native delivery failed on attempt {attempt}: {error:?}; owned server: {:?}",
+                    peer.native_test_state()
+                );
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                panic!("authenticated native delivery failed on attempt {attempt}: {error:?}");
+            });
             assert_eq!(witnessed.server_pid(), std::process::id());
             let received = witnessed.into_token();
             assert!(
@@ -183,6 +191,15 @@ fn native_peer_delivery_cleanup_and_default_coordinator_lifecycle() {
                 "authenticated native token differs"
             );
             drop(received);
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                let state = peer.native_test_state().unwrap();
+                assert!(!state.worker_finished, "owned peer listener stopped");
+                assert_eq!(
+                    state.last_exchange,
+                    Some((crate::peer::PeerNativeStage::Complete, Ok(())))
+                );
+            }
         }
         let deadline = Instant::now() + Duration::from_secs(3);
         let verified = retry_prewrite_peer_busy(deadline, || {

@@ -2,44 +2,262 @@
 //! Before images come from actual loaded-world observations; after images use
 //! fresh read authority and the original job identity, including on reconcile.
 
-use crate::host::HostBridge;
+use crate::{
+    authority::LocalAuthority,
+    host::{HostBridge, HostContextWitness},
+    service::{RequestContextSlot, RequestContextWitness},
+};
 use mmmm_application::{
-    AppError, AppResult, BeforeCapture, BeforeImage, DirectChange, IndependentObserverPort,
-    ReadbackEvidence,
+    Access, AppError, AppResult, AuthorityPort, BeforeCapture, BeforeImage, DirectChange,
+    IndependentObserverPort, ReadbackEvidence,
 };
 use mmmm_contracts::{
-    BindingId, ContextId, ContractValidator, InvocationId, PrincipalId, ResourceLocation,
-    Sha256Digest, canonical_bytes, canonical_digest,
+    BindingId, ContextId, ContractValidator, InvocationId, OperationId, ResourceLocation,
+    Sha256Digest, StepId, canonical_bytes, canonical_digest,
 };
-use mmmm_runtime::storage::{EffectEvidence, WriteScope};
+use mmmm_runtime::storage::{
+    DispatchEvidence, DurableStore, EffectEvidence, OperationRecord, OperationState, StorageError,
+    WriteScope,
+};
 use serde_json::{Value, json};
 
 pub struct NativeObserver {
     bridge: HostBridge,
+    authentication: Option<ObserverAuthentication>,
+}
+struct ObserverAuthentication {
+    authority: LocalAuthority,
+    request: RequestContextSlot,
+}
+struct ObservationAdmission {
+    request: RequestContextWitness,
+    host: HostContextWitness,
+    scope: WriteScope,
+    operation: OperationRecord,
+    original: Option<Value>,
 }
 impl NativeObserver {
     pub fn new(bridge: HostBridge) -> Self {
-        Self { bridge }
+        Self {
+            bridge,
+            authentication: None,
+        }
     }
-    fn observe(&self, invocation: &Value, target: &BlockTarget) -> AppResult<(Vec<u8>, Value)> {
+    /// The service owns the occupied request. A principal string in a stored
+    /// Invocation cannot supply authentication or current observation authority.
+    pub fn authenticated(
+        bridge: HostBridge,
+        authority: LocalAuthority,
+        request: RequestContextSlot,
+    ) -> Self {
+        Self {
+            bridge,
+            authentication: Some(ObserverAuthentication { authority, request }),
+        }
+    }
+    fn authentication(&self) -> AppResult<&ObserverAuthentication> {
+        self.authentication.as_ref().ok_or_else(|| {
+            failure(
+                "AUTHENTICATION_REQUIRED",
+                "Native observation requires the actual authenticated service request",
+            )
+        })
+    }
+    fn admission(
+        &self,
+        store: &DurableStore,
+        invocation: &Value,
+        scope: &WriteScope,
+        original_required: bool,
+    ) -> AppResult<ObservationAdmission> {
         validate("Invocation", invocation)?;
-        let principal = PrincipalId::new(text(&invocation["context"], "principalRef")?)
-            .map_err(|_| failure("STALE_CONTEXT", "Stored principal identity is invalid"))?;
+        let authentication = self.authentication()?;
+        let request = authentication
+            .request
+            .occupied_witness()
+            .map_err(service_error)?;
+        let principal = request.authenticated().principal();
         let context = ContextId::new(text(&invocation["context"], "contextId")?)
             .map_err(|_| failure("STALE_CONTEXT", "Stored context identity is invalid"))?;
-        let live = self.bridge.context(&principal, &context)?;
-        if live["environment"] != invocation["context"]["environment"] {
+        if invocation["context"]["principalRef"] != principal.as_str()
+            || !request.authenticated().permits_context(context.as_str())
+        {
+            return Err(failure(
+                "PERMISSION_REQUIRED",
+                "Original native observation belongs to another authenticated caller",
+            ));
+        }
+        let operation = store
+            .operation(&id::<OperationId>(invocation, "operationId")?)
+            .map_err(storage_error)?;
+        if scope != &operation.scope
+            || operation.project_id.as_str() != text(&invocation["context"], "projectId")?
+        {
+            return Err(failure(
+                "PERMISSION_REQUIRED",
+                "Native observation must cover the exact durable operation scope",
+            ));
+        }
+        let mut authority = authentication.authority.clone();
+        authority.authorize_operation(principal, &operation, Access::ObserveOperation)?;
+        let host = self.bridge.observe_context_witness(
+            principal,
+            &context,
+            request.budget().deadline(),
+        )?;
+        if host.context()["environment"] != invocation["context"]["environment"]
+            || host.context()["projectId"] != operation.project_id.as_str()
+            || host.context()["principalRef"] != principal.as_str()
+        {
             return Err(failure(
                 "STALE_CONTEXT",
                 "Independent read belongs to another native epoch",
             ));
         }
-        let observed = self.bridge.inspect(
-            &principal,
-            &context,
-            json!({"kind":"block_read","dimension":target.dimension,"position":target.position}),
+        let mut admission = ObservationAdmission {
+            request,
+            host,
+            scope: scope.clone(),
+            operation,
+            original: None,
+        };
+        self.check_admission(&admission)?;
+        let step = id::<StepId>(invocation, "stepId")?;
+        match store.stored_invocation_blob(&admission.operation.operation_id, &step) {
+            Ok(_) => {
+                let mut callback_failure = None;
+                let original = store.stored_invocation_checked(
+                    &admission.operation.operation_id,
+                    &step,
+                    8 * 1024 * 1024,
+                    || {
+                        self.check_admission(&admission).map_err(|error| {
+                            callback_failure = Some(error);
+                            StorageError::InvalidTransition(
+                                "Original native observation request ended".into(),
+                            )
+                        })
+                    },
+                );
+                let original = match original {
+                    Ok(original) => original,
+                    Err(error) => {
+                        return Err(callback_failure.unwrap_or_else(|| storage_error(error)));
+                    }
+                };
+                if original != *invocation {
+                    return Err(failure(
+                        "STALE_CONTEXT",
+                        "Supplied native Invocation differs from its exact durable source",
+                    ));
+                }
+                admission.original = Some(original);
+            }
+            Err(StorageError::NotFound("Durable invocation")) if !original_required => {
+                let step = admission
+                    .operation
+                    .steps
+                    .iter()
+                    .find(|stored| stored.step_id == step)
+                    .ok_or_else(|| failure("STALE_CONTEXT", "Before-capture step is absent"))?;
+                if step.dispatch != DispatchEvidence::NotSent
+                    || step.invocation_id.is_some()
+                    || step.invocation_digest.is_some()
+                    || step.finished
+                    || admission.operation.cancellation_requested
+                    || admission.operation.reconciliation_required
+                    || !matches!(
+                        admission.operation.state,
+                        OperationState::Queued | OperationState::Running
+                    )
+                    || admission.host.context() != &invocation["context"]
+                {
+                    return Err(failure(
+                        "STALE_CONTEXT",
+                        "Current before capture must precede durable intent in its frozen context",
+                    ));
+                }
+            }
+            Err(error) => return Err(storage_error(error)),
+        }
+        self.check_admission(&admission)?;
+        Ok(admission)
+    }
+    fn check_admission(&self, admission: &ObservationAdmission) -> AppResult<()> {
+        admission.request.check_local().map_err(service_error)?;
+        admission.host.check_local()?;
+        let authentication = self.authentication()?;
+        let principal = admission.request.authenticated().principal();
+        let context = admission.host.context();
+        let scope = serde_json::to_value(&admission.scope).map_err(|_| {
+            failure(
+                "PERMISSION_REQUIRED",
+                "Actual operation scope cannot be encoded",
+            )
+        })?;
+        if !crate::authority::scope_contains(&context["scope"], &scope) {
+            return Err(failure(
+                "PERMISSION_REQUIRED",
+                "Current paired context no longer covers the complete durable operation scope",
+            ));
+        }
+        let mut authority = authentication.authority.clone();
+        authority.authorize_operation(principal, &admission.operation, Access::ObserveOperation)?;
+        authority.authorize_retained_scope(
+            principal,
+            &admission.operation.project_id,
+            &id::<ContextId>(context, "contextId")?,
+            &digest(context, "policyRevision")?,
+            &scope,
         )?;
+        admission.request.check_local().map_err(service_error)
+    }
+    fn observe(
+        &self,
+        store: &DurableStore,
+        admission: &ObservationAdmission,
+        target: &BlockTarget,
+    ) -> AppResult<(Vec<u8>, Value)> {
+        self.check_admission(admission)?;
+        let principal = admission.request.authenticated().principal();
+        let context = admission.host.context();
+        let selector =
+            json!({"kind":"block_read","dimension":target.dimension,"position":target.position});
+        let observed = if let Some(original) = &admission.original {
+            let response = self
+                .bridge
+                .inspect_original_acquired_with_deadline(
+                    store,
+                    principal,
+                    original,
+                    context,
+                    selector,
+                    admission.request.budget().deadline(),
+                )?
+                .into_response()?;
+            if response["status"] != "ok" {
+                return Err(AppError::caused_by(
+                    "NATIVE_OBSERVATION_FAILED",
+                    "Original paired host could not observe the native block",
+                    NativeObservationFailure(response),
+                ));
+            }
+            response.get("payload").cloned().ok_or_else(|| {
+                failure(
+                    "OBSERVATION_INVALID",
+                    "Original native observation payload is absent",
+                )
+            })?
+        } else {
+            self.bridge.inspect_with_deadline(
+                principal,
+                &id::<ContextId>(context, "contextId")?,
+                selector,
+                admission.request.budget().deadline(),
+            )?
+        };
         let projection = validate_block_observation(target, &observed)?;
+        self.check_admission(admission)?;
         Ok((
             canonical_bytes(&projection).map_err(|_| {
                 failure(
@@ -64,6 +282,17 @@ impl IndependentObserverPort for NativeObserver {
     fn capture_before(
         &mut self,
         invocation: &Value,
+        _scope: &WriteScope,
+    ) -> AppResult<Option<BeforeCapture>> {
+        if invocation["actionId"] != "mmmm:block_patch" {
+            return Ok(None);
+        }
+        Err(store_required())
+    }
+    fn capture_before_with_store(
+        &mut self,
+        store: &DurableStore,
+        invocation: &Value,
         scope: &WriteScope,
     ) -> AppResult<Option<BeforeCapture>> {
         if invocation["actionId"] != "mmmm:block_patch" {
@@ -71,7 +300,8 @@ impl IndependentObserverPort for NativeObserver {
         }
         let target = BlockTarget::from_arguments(&invocation["arguments"])?;
         validate_region(invocation, scope, &target)?;
-        let (bytes, _) = self.observe(invocation, &target)?;
+        let admission = self.admission(store, invocation, scope, false)?;
+        let (bytes, _) = self.observe(store, &admission, &target)?;
         Ok(Some(BeforeCapture {
             invocation_id: id::<InvocationId>(invocation, "invocationId")?,
             binding_id: id::<BindingId>(invocation, "bindingId")?,
@@ -84,7 +314,19 @@ impl IndependentObserverPort for NativeObserver {
             }],
         }))
     }
-    fn readback(&mut self, invocation: &Value, scope: &WriteScope) -> AppResult<ReadbackEvidence> {
+    fn readback(
+        &mut self,
+        _invocation: &Value,
+        _scope: &WriteScope,
+    ) -> AppResult<ReadbackEvidence> {
+        Err(store_required())
+    }
+    fn readback_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        invocation: &Value,
+        scope: &WriteScope,
+    ) -> AppResult<ReadbackEvidence> {
         if invocation["actionId"] != "mmmm:block_patch" {
             return Err(failure(
                 "CAPABILITY_UNAVAILABLE",
@@ -93,7 +335,15 @@ impl IndependentObserverPort for NativeObserver {
         }
         let target = BlockTarget::from_arguments(&invocation["arguments"])?;
         validate_region(invocation, scope, &target)?;
-        let job = self.bridge.job_observation(invocation)?;
+        let admission = self.admission(store, invocation, scope, true)?;
+        let original = admission.original.as_ref().ok_or_else(store_required)?;
+        let job = self.bridge.job_observation_with_store_and_deadline(
+            store,
+            admission.request.authenticated().principal(),
+            original,
+            admission.host.context(),
+            admission.request.budget().deadline(),
+        )?;
         if job["invocationId"] != invocation["invocationId"]
             || !job["providerCompleted"].is_boolean()
         {
@@ -102,7 +352,7 @@ impl IndependentObserverPort for NativeObserver {
                 "Original native completion identity is absent",
             ));
         }
-        let (after, observed) = self.observe(invocation, &target)?;
+        let (after, observed) = self.observe(store, &admission, &target)?;
         let desired = json!({"dimension":target.dimension,"position":target.position,"blockState":invocation["arguments"]["desiredState"]});
         let desired = canonical_bytes(&desired)
             .map_err(|_| failure("INVALID_INPUT", "Desired native state cannot be encoded"))?;
@@ -112,6 +362,7 @@ impl IndependentObserverPort for NativeObserver {
         } else {
             EffectEvidence::Unknown
         };
+        self.check_admission(&admission)?;
         Ok(ReadbackEvidence {
             invocation_id: id::<InvocationId>(invocation, "invocationId")?,
             binding_id: id::<BindingId>(invocation, "bindingId")?,
@@ -128,7 +379,21 @@ impl IndependentObserverPort for NativeObserver {
             }],
         })
     }
-    fn read_target(&mut self, invocation: &Value, target: &str) -> AppResult<Vec<u8>> {
+    fn read_target(&mut self, _invocation: &Value, _target: &str) -> AppResult<Vec<u8>> {
+        Err(store_required())
+    }
+    fn read_target_with_store(
+        &mut self,
+        store: &DurableStore,
+        invocation: &Value,
+        target: &str,
+    ) -> AppResult<Vec<u8>> {
+        if invocation["actionId"] != "mmmm:block_patch" {
+            return Err(failure(
+                "CAPABILITY_UNAVAILABLE",
+                "No original native target codec is installed for this action",
+            ));
+        }
         let target = BlockTarget::parse(target)?;
         let original = BlockTarget::from_arguments(&invocation["arguments"])?;
         if target != original {
@@ -137,10 +402,14 @@ impl IndependentObserverPort for NativeObserver {
                 "Recovery target differs from the original native footprint",
             ));
         }
-        let scope: WriteScope = serde_json::from_value(invocation["context"]["scope"].clone())
-            .map_err(|_| failure("STALE_CONTEXT", "Original invocation scope is invalid"))?;
+        let operation = store
+            .operation(&id::<OperationId>(invocation, "operationId")?)
+            .map_err(storage_error)?;
+        let scope = operation.scope;
         validate_region(invocation, &scope, &target)?;
-        self.observe(invocation, &target).map(|(bytes, _)| bytes)
+        let admission = self.admission(store, invocation, &scope, true)?;
+        self.observe(store, &admission, &target)
+            .map(|(bytes, _)| bytes)
     }
 }
 
@@ -334,6 +603,31 @@ fn validate(name: &str, value: &Value) -> AppResult<()> {
         .and_then(|validator| validator.validate(name, value))
         .map_err(|_| failure("INVALID_INPUT", "Original native contract is invalid"))
 }
+struct NativeObservationFailure(Value);
+impl std::fmt::Debug for NativeObservationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("NativeObservationFailure")
+    }
+}
+impl std::fmt::Display for NativeObservationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _ = &self.0;
+        formatter.write_str("Original bounded native failure response is retained privately")
+    }
+}
+impl std::error::Error for NativeObservationFailure {}
+fn service_error(error: crate::service::ServiceError) -> AppError {
+    AppError::caused_by(error.code, error.message, error)
+}
+fn storage_error(error: StorageError) -> AppError {
+    AppError::storage("NATIVE_SOURCE_UNAVAILABLE", error)
+}
+fn store_required() -> AppError {
+    failure(
+        "STORE_REQUIRED",
+        "Native observation requires the original invocation in the application's actual Store",
+    )
+}
 fn failure(code: &'static str, message: &'static str) -> AppError {
     AppError::new(code, message)
 }
@@ -353,6 +647,14 @@ mod tests {
         ] {
             assert!(BlockTarget::parse(value).is_err());
         }
+        let mut legacy = NativeObserver::new(HostBridge::default());
+        assert_eq!(
+            legacy
+                .read_target(&Value::Null, &target.subject())
+                .unwrap_err()
+                .code,
+            "STORE_REQUIRED"
+        );
     }
     #[test]
     fn observation_hash_is_actual_projection_and_tick_is_metadata() {

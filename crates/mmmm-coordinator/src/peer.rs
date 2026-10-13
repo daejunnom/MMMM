@@ -37,6 +37,8 @@ pub enum PeerError {
     Busy,
     PeerDenied,
     Protocol,
+    UnexpectedEof { expected: usize, received: usize },
+    UnexpectedBytesAfterAck,
     Timeout,
     Stopped,
     UncertainDrain,
@@ -55,6 +57,13 @@ impl fmt::Display for PeerError {
             Self::Busy => formatter.write_str("peer channel is already occupied"),
             Self::PeerDenied => formatter.write_str("native peer identity is denied"),
             Self::Protocol => formatter.write_str("peer bootstrap protocol is invalid"),
+            Self::UnexpectedEof { expected, received } => write!(
+                formatter,
+                "peer message ended after {received} of {expected} bytes"
+            ),
+            Self::UnexpectedBytesAfterAck => {
+                formatter.write_str("peer sent unexpected bytes after acknowledgement")
+            }
             Self::Timeout => formatter.write_str("peer bootstrap deadline expired"),
             Self::Stopped => formatter.write_str("peer bootstrap stopped"),
             Self::UncertainDrain => {
@@ -115,6 +124,36 @@ fn management_budget(
 
 pub struct PeerBootstrap {
     inner: platform::Server,
+}
+
+// Native fixture diagnostics contain only closed stages and typed status. They
+// never retain a credential reference, request, token byte or runtime path.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PeerNativeStage {
+    Accept,
+    SetNonblocking,
+    ConfigureStream,
+    PeerIdentity,
+    RequestMagic,
+    RequestLength,
+    RequestReference,
+    RequestValidation,
+    TokenWrite,
+    AckRead,
+    AckValue,
+    HostExchange,
+    Complete,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+type PeerNativeExchange = (PeerNativeStage, Result<(), PeerError>);
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PeerNativeTestState {
+    pub last_exchange: Option<PeerNativeExchange>,
+    pub worker_finished: bool,
 }
 
 /// 기존 private peer에서 두 단계 호스트 연결을 수행한다. 새 daemon/작업 원장이나
@@ -1765,6 +1804,11 @@ impl PeerBootstrap {
         self.inner.stop_and_join()
     }
 
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn native_test_state(&self) -> Result<PeerNativeTestState, PeerError> {
+        self.inner.native_test_state()
+    }
+
     /// A pending native I/O allocation may have been retained after a finite
     /// cancellation drain. Stop new admissions and end the process only after
     /// durable in-flight application work has reached its safe stopping point.
@@ -1998,6 +2042,8 @@ mod platform {
         stop: Arc<AtomicBool>,
         worker: Option<JoinHandle<Result<(), PeerError>>>,
         socket: SocketOwner,
+        #[cfg(test)]
+        terminal: Arc<std::sync::Mutex<Option<PeerNativeExchange>>>,
     }
 
     impl Server {
@@ -2056,6 +2102,10 @@ mod platform {
             listener.set_nonblocking(true)?;
             let stop = Arc::new(AtomicBool::new(false));
             let worker_stop = Arc::clone(&stop);
+            #[cfg(test)]
+            let terminal = Arc::new(std::sync::Mutex::new(None));
+            #[cfg(test)]
+            let worker_terminal = Arc::clone(&terminal);
             let worker =
                 match thread::Builder::new()
                     .name("mmmm-peer".to_owned())
@@ -2063,25 +2113,51 @@ mod platform {
                         while !worker_stop.load(Ordering::Acquire) {
                             match listener.accept() {
                                 Ok((stream, _)) => {
-                                    stream.set_nonblocking(true)?;
-                                    configure_stream(&stream)?;
                                     let deadline = Instant::now() + IO_BUDGET;
-                                    // A bad peer only loses its own connection. No application,
-                                    // provider or credential-store action is invoked here.
-                                    let _ = serve(
-                                        &stream,
-                                        &reference,
-                                        &token,
-                                        deadline,
-                                        &worker_stop,
-                                        management.as_ref(),
+                                    #[cfg(test)]
+                                    let mut stage = PeerNativeStage::SetNonblocking;
+                                    // Accepted-socket configuration is also connection-local:
+                                    // a peer that closed before protocol must not stop the
+                                    // listener serving later independently verified peers.
+                                    let result: Result<(), PeerError> = (|| {
+                                        stream.set_nonblocking(true)?;
+                                        #[cfg(test)]
+                                        {
+                                            stage = PeerNativeStage::ConfigureStream;
+                                        }
+                                        configure_stream(&stream)?;
+                                        serve(
+                                            &stream,
+                                            &reference,
+                                            &token,
+                                            deadline,
+                                            &worker_stop,
+                                            management.as_ref(),
+                                            #[cfg(test)]
+                                            &mut stage,
+                                        )
+                                    })(
                                     );
+                                    #[cfg(test)]
+                                    if let Ok(mut terminal) = worker_terminal.lock() {
+                                        *terminal = Some((stage, result));
+                                    }
+                                    // No application, provider or credential-store action
+                                    // is invoked by a rejected bootstrap connection.
+                                    let _ = result;
                                 }
                                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                                     thread::sleep(POLL_SLICE)
                                 }
                                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                                Err(error) => return Err(error.into()),
+                                Err(error) => {
+                                    let error = PeerError::from(error);
+                                    #[cfg(test)]
+                                    if let Ok(mut terminal) = worker_terminal.lock() {
+                                        *terminal = Some((PeerNativeStage::Accept, Err(error)));
+                                    }
+                                    return Err(error);
+                                }
                             }
                         }
                         Ok(())
@@ -2096,6 +2172,20 @@ mod platform {
                 stop,
                 worker: Some(worker),
                 socket,
+                #[cfg(test)]
+                terminal,
+            })
+        }
+
+        #[cfg(test)]
+        pub(super) fn native_test_state(&self) -> Result<PeerNativeTestState, PeerError> {
+            let last_exchange = *self
+                .terminal
+                .lock()
+                .map_err(|_| PeerError::WorkerPanicked)?;
+            Ok(PeerNativeTestState {
+                last_exchange,
+                worker_finished: self.worker.as_ref().is_none_or(JoinHandle::is_finished),
             })
         }
 
@@ -2658,12 +2748,25 @@ mod platform {
         deadline: Instant,
         stop: &Arc<AtomicBool>,
         management: Option<&ManagementSender>,
+        #[cfg(test)] stage: &mut PeerNativeStage,
     ) -> Result<(), PeerError> {
+        #[cfg(test)]
+        {
+            *stage = PeerNativeStage::PeerIdentity;
+        }
         verify_peer(stream, None)?;
         let started = Instant::now();
         let mut magic = [0_u8; 8];
+        #[cfg(test)]
+        {
+            *stage = PeerNativeStage::RequestMagic;
+        }
         read_exact(stream, &mut magic, deadline, stop)?;
         if &magic == crate::peer_management::HOST_MAGIC {
+            #[cfg(test)]
+            {
+                *stage = PeerNativeStage::HostExchange;
+            }
             let sender = management.ok_or(PeerError::Protocol)?;
             let budget = BootstrapBudget::for_peer(started, Arc::clone(stop));
             let mut io = SocketIo {
@@ -2679,19 +2782,47 @@ mod platform {
         }
         let mut header = [0_u8; 10];
         header[..8].copy_from_slice(&magic);
+        #[cfg(test)]
+        {
+            *stage = PeerNativeStage::RequestLength;
+        }
         read_exact(stream, &mut header[8..], deadline, stop)?;
         let length = usize::from(u16::from_be_bytes([header[8], header[9]]));
         if &header[..8] != MAGIC || length == 0 || length > REFERENCE_LIMIT {
             return Err(PeerError::Protocol);
         }
         let mut reference_bytes = [0_u8; REFERENCE_LIMIT];
+        #[cfg(test)]
+        {
+            *stage = PeerNativeStage::RequestReference;
+        }
         read_exact(stream, &mut reference_bytes[..length], deadline, stop)?;
+        #[cfg(test)]
+        {
+            *stage = PeerNativeStage::RequestValidation;
+        }
         validate_request(&header, reference, &reference_bytes[..length])?;
+        #[cfg(test)]
+        {
+            *stage = PeerNativeStage::TokenWrite;
+        }
         write_all(stream, token.expose_secret(), deadline, stop)?;
         let mut acknowledgement = [0_u8; 1];
+        #[cfg(test)]
+        {
+            *stage = PeerNativeStage::AckRead;
+        }
         read_exact(stream, &mut acknowledgement, deadline, stop)?;
+        #[cfg(test)]
+        {
+            *stage = PeerNativeStage::AckValue;
+        }
         if acknowledgement != [ACK] {
             return Err(PeerError::Protocol);
+        }
+        #[cfg(test)]
+        {
+            *stage = PeerNativeStage::Complete;
         }
         Ok(())
     }
@@ -2711,7 +2842,7 @@ mod platform {
                 return Ok(());
             }
             if result > 0 {
-                return Err(PeerError::Protocol);
+                return Err(PeerError::UnexpectedBytesAfterAck);
             }
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::Interrupted {
@@ -2775,6 +2906,7 @@ mod platform {
         if bytes.len() > MESSAGE_LIMIT {
             return Err(PeerError::Protocol);
         }
+        let expected = bytes.len();
         while !bytes.is_empty() {
             check_budget(deadline, stop)?;
             // SAFETY: writable bounded buffer and nonblocking connected socket.
@@ -2787,7 +2919,10 @@ mod platform {
                 )
             };
             if count == 0 {
-                return Err(PeerError::Protocol);
+                return Err(PeerError::UnexpectedEof {
+                    expected,
+                    received: expected - bytes.len(),
+                });
             }
             if count > 0 {
                 bytes = &mut bytes[count as usize..];
@@ -2847,5 +2982,46 @@ mod platform {
             poll(stream, libc::POLLOUT, deadline, stop)?;
         }
         check_budget(deadline, stop)
+    }
+
+    #[cfg(test)]
+    mod native_eof_tests {
+        use super::*;
+
+        // The handoff has no local IPC EOF diagnostics fixture. Real socket
+        // pairs distinguish partial token reads from forbidden post-ACK bytes
+        // without a credential, filesystem entry or framing fault shim.
+        #[test]
+        fn native_partial_message_and_post_ack_bytes_remain_distinct_failures() {
+            let (sender, receiver) = UnixStream::pair().unwrap();
+            sender.set_nonblocking(true).unwrap();
+            receiver.set_nonblocking(true).unwrap();
+            configure_stream(&sender).unwrap();
+            configure_stream(&receiver).unwrap();
+            let stop = AtomicBool::new(false);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            write_all(&sender, &[0xa5; 7], deadline, &stop).unwrap();
+            sender.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut destination = [0_u8; 32];
+            assert_eq!(
+                read_exact(&receiver, &mut destination, deadline, &stop),
+                Err(PeerError::UnexpectedEof {
+                    expected: 32,
+                    received: 7,
+                })
+            );
+
+            let (sender, receiver) = UnixStream::pair().unwrap();
+            sender.set_nonblocking(true).unwrap();
+            receiver.set_nonblocking(true).unwrap();
+            configure_stream(&sender).unwrap();
+            configure_stream(&receiver).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            write_all(&sender, &[0xa5], deadline, &stop).unwrap();
+            assert_eq!(
+                wait_eof(&receiver, deadline, &stop),
+                Err(PeerError::UnexpectedBytesAfterAck)
+            );
+        }
     }
 }
