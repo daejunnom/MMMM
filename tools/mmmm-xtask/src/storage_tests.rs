@@ -1,0 +1,742 @@
+use super::*;
+
+struct Fixture {
+    root: PathBuf,
+    checkout: PathBuf,
+    config: StorageConfig,
+}
+
+impl Fixture {
+    fn new(purpose: &str) -> Self {
+        // The supervised test runner maps temp_dir to its owned scratch slot.
+        let temp = fs::canonicalize(std::env::temp_dir()).expect("physical managed temp root");
+        let root = temp.join(format!("mmmm-storage-test-{}", new_token()));
+        fs::create_dir(&root).unwrap();
+        let checkout = root.join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        Self {
+            checkout,
+            config: StorageConfig {
+                output_root: Some(root.join("output")),
+                evidence_root: root.join("evidence"),
+                purpose: purpose.into(),
+                budgets: Budgets::default(),
+            },
+            root,
+        }
+    }
+    fn acquire(&self) -> ManagedBuild {
+        ManagedBuild::acquire(self.config.clone(), &self.checkout).unwrap()
+    }
+    fn catalog(&self) -> PathBuf {
+        self.config
+            .output_root
+            .as_ref()
+            .unwrap()
+            .join("build/managed-v1")
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // This root was newly created and solely owns authored test data.
+        // Never remove an escaped root or a replaced junction.
+        let parent = fs::canonicalize(std::env::temp_dir()).expect("temp root still resolves");
+        if let Ok(resolved) = fs::canonicalize(&self.root) {
+            if resolved.parent() == Some(parent.as_path()) && reject_link(&self.root).is_ok() {
+                fs::remove_dir_all(&self.root).expect("remove owned test fixture");
+            }
+        }
+    }
+}
+
+fn outcome(exit: i32) -> FinishOutcome {
+    FinishOutcome {
+        command_exit: Some(exit),
+        supervisor_errors: Vec::new(),
+        drained: true,
+        evidence_exported: true,
+    }
+}
+
+fn error_kind<T>(result: Result<T, StorageError>) -> &'static str {
+    match result {
+        Err(error) => error.kind,
+        Ok(_) => panic!("expected storage failure"),
+    }
+}
+
+#[test]
+fn successful_finish_removes_scratch_preserves_cache_and_command_failure() {
+    let fixture = Fixture::new("test");
+    let build = fixture.acquire();
+    let paths = build.paths().clone();
+    fs::write(paths.scratch.join("temporary"), b"scratch").unwrap();
+    fs::write(paths.cargo_target.join("compiled"), b"cache").unwrap();
+    let receipt = build.finish(outcome(23)).unwrap();
+    assert_eq!(receipt.command_exit, Some(23));
+    assert!(receipt.scratch_removed && receipt.lease_released);
+    assert!(receipt.cleanup_errors.is_empty());
+    assert!(!paths.scratch.exists());
+    assert_eq!(
+        fs::read(paths.cargo_target.join("compiled")).unwrap(),
+        b"cache"
+    );
+    assert!(!paths.catalog.join("lease.json").exists());
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&fs::read(paths.evidence.join("finish.json")).unwrap()).unwrap();
+    assert_eq!(persisted["command_exit"], 23);
+    assert_eq!(persisted["lease_released"], true);
+    assert!(
+        !persisted
+            .to_string()
+            .contains(&fixture.checkout.to_string_lossy().to_string())
+    );
+}
+
+#[test]
+fn fixed_slot_is_reused_without_timestamp_or_pid_directory_growth() {
+    let fixture = Fixture::new("test");
+    let first = fixture.acquire();
+    let first_path = first.paths().slot.clone();
+    fs::write(first.paths().cargo_target.join("compiled"), b"cache").unwrap();
+    first.finish(outcome(0)).unwrap();
+    let second = fixture.acquire();
+    assert_eq!(second.paths().slot, first_path);
+    assert_eq!(
+        fs::read(second.paths().cargo_target.join("compiled")).unwrap(),
+        b"cache"
+    );
+    assert_eq!(
+        fs::read_dir(second.paths().catalog.join("slots"))
+            .unwrap()
+            .count(),
+        1
+    );
+    second.finish(outcome(0)).unwrap();
+}
+
+#[test]
+fn absent_drain_or_export_proof_preserves_exact_active_lease_and_files() {
+    for (drained, evidence_exported, expected) in
+        [(false, true, "undrained"), (true, false, "evidence")]
+    {
+        let fixture = Fixture::new("proof");
+        let build = fixture.acquire();
+        let paths = build.paths().clone();
+        let before = fs::read(paths.catalog.join("lease.json")).unwrap();
+        fs::write(paths.scratch.join("diagnostic"), b"preserve").unwrap();
+        assert_eq!(
+            error_kind(build.finish(FinishOutcome {
+                command_exit: Some(9),
+                supervisor_errors: vec!["failure".into()],
+                drained,
+                evidence_exported,
+            })),
+            expected
+        );
+        assert_eq!(fs::read(paths.catalog.join("lease.json")).unwrap(), before);
+        assert_eq!(
+            fs::read(paths.scratch.join("diagnostic")).unwrap(),
+            b"preserve"
+        );
+    }
+}
+
+#[test]
+fn disappeared_owner_process_does_not_authorize_busy_lease_adoption() {
+    let fixture = Fixture::new("busy");
+    let build = fixture.acquire();
+    let paths = build.paths().clone();
+    let mut interrupted = build.lease.clone();
+    interrupted.pid = u32::MAX;
+    fs::write(
+        paths.catalog.join("lease.json"),
+        record_bytes(&interrupted).unwrap(),
+    )
+    .unwrap();
+    drop(build);
+    let before = fs::read(paths.catalog.join("lease.json")).unwrap();
+    assert_eq!(
+        error_kind(ManagedBuild::acquire(
+            fixture.config.clone(),
+            &fixture.checkout
+        )),
+        "busy"
+    );
+    assert_eq!(fs::read(paths.catalog.join("lease.json")).unwrap(), before);
+    assert!(paths.slot.join("owner.json").exists());
+}
+
+#[test]
+fn changed_slot_or_catalog_token_blocks_cleanup() {
+    for catalog_change in [false, true] {
+        let fixture = Fixture::new("ownership");
+        let build = fixture.acquire();
+        let paths = build.paths().clone();
+        fs::write(paths.scratch.join("keep"), b"original").unwrap();
+        if catalog_change {
+            let mut changed = build.catalog.clone();
+            changed.catalog_id = new_token();
+            fs::write(
+                paths.catalog.join("catalog.json"),
+                record_bytes(&changed).unwrap(),
+            )
+            .unwrap();
+        } else {
+            let mut changed = build.slot.clone();
+            changed.token = new_token();
+            fs::write(
+                paths.slot.join("owner.json"),
+                record_bytes(&changed).unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(error_kind(build.finish(outcome(0))), "ownership");
+        assert_eq!(fs::read(paths.scratch.join("keep")).unwrap(), b"original");
+        assert!(paths.catalog.join("lease.json").exists());
+    }
+}
+
+#[test]
+fn unknown_slot_data_is_not_renamed_registered_or_removed() {
+    let fixture = Fixture::new("unknown");
+    let build = fixture.acquire();
+    let paths = build.paths().clone();
+    let unknown = paths.slot.join("user-original");
+    fs::write(&unknown, b"user").unwrap();
+    assert_eq!(error_kind(build.finish(outcome(0))), "unknown");
+    assert_eq!(fs::read(unknown).unwrap(), b"user");
+    assert!(paths.catalog.join("lease.json").exists());
+}
+
+#[test]
+fn existing_unowned_catalog_is_never_adopted() {
+    let fixture = Fixture::new("unknown");
+    let catalog = fixture.catalog();
+    fs::create_dir_all(&catalog).unwrap();
+    fs::write(catalog.join("user.sqlite"), b"database").unwrap();
+    assert_eq!(
+        error_kind(ManagedBuild::acquire(
+            fixture.config.clone(),
+            &fixture.checkout
+        )),
+        "unknown"
+    );
+    assert_eq!(fs::read(catalog.join("user.sqlite")).unwrap(), b"database");
+    assert!(!catalog.join("catalog.json").exists());
+}
+
+#[test]
+fn stale_active_slot_without_lease_is_preserved() {
+    let fixture = Fixture::new("interrupted");
+    let build = fixture.acquire();
+    let paths = build.paths().clone();
+    fs::write(paths.scratch.join("keep"), b"interrupted").unwrap();
+    fs::remove_file(paths.catalog.join("lease.json")).unwrap();
+    drop(build);
+    assert_eq!(
+        error_kind(ManagedBuild::acquire(
+            fixture.config.clone(),
+            &fixture.checkout
+        )),
+        "interrupted"
+    );
+    assert_eq!(
+        fs::read(paths.scratch.join("keep")).unwrap(),
+        b"interrupted"
+    );
+    assert!(paths.slot.join("owner.json").exists());
+}
+
+#[test]
+fn additional_active_slot_even_with_copied_token_is_preserved_and_blocks_finish() {
+    let mut fixture = Fixture::new("completed");
+    let completed = fixture.acquire();
+    let previous = completed.paths().slot.clone();
+    completed.finish(outcome(0)).unwrap();
+    fixture.config.purpose = "active".into();
+    let build = fixture.acquire();
+    let mut changed: SlotRecord = read_record(&previous.join("owner.json")).unwrap();
+    changed.state = SlotState::Active;
+    changed.completed_ms = None;
+    changed.token = build.lease.token.clone();
+    changed.pid = build.lease.pid;
+    fs::write(previous.join("owner.json"), record_bytes(&changed).unwrap()).unwrap();
+    let scratch = build.paths().scratch.clone();
+    fs::write(scratch.join("keep"), b"diagnostic").unwrap();
+    assert_eq!(error_kind(build.measure()), "interrupted");
+    assert_eq!(error_kind(build.finish(outcome(0))), "interrupted");
+    assert!(previous.join("owner.json").exists());
+    assert_eq!(fs::read(scratch.join("keep")).unwrap(), b"diagnostic");
+    assert!(fixture.catalog().join("lease.json").exists());
+}
+
+#[test]
+fn zero_completed_retention_evicts_only_owned_cache_after_successful_drain() {
+    let mut fixture = Fixture::new("eviction");
+    fixture.config.budgets.completed_slots = 0;
+    let product = fixture
+        .config
+        .output_root
+        .as_ref()
+        .unwrap()
+        .join("product-state");
+    fs::create_dir_all(&product).unwrap();
+    fs::write(product.join("state.sqlite"), b"persistent").unwrap();
+    let build = fixture.acquire();
+    let slot = build.paths().slot.clone();
+    fs::write(build.paths().cargo_target.join("cache"), b"compiled").unwrap();
+    let evidence = build.paths().evidence.clone();
+    let receipt = build.finish(outcome(0)).unwrap();
+    assert!(receipt.slot_evicted && receipt.lease_released);
+    assert!(!slot.exists());
+    assert_eq!(
+        fs::read(product.join("state.sqlite")).unwrap(),
+        b"persistent"
+    );
+    assert!(evidence.join("finish.json").exists());
+}
+
+#[test]
+fn completed_count_eviction_keeps_newest_and_preserves_other_output_data() {
+    let mut fixture = Fixture::new("first");
+    fixture.config.budgets.completed_slots = 1;
+    let first = fixture.acquire();
+    let older_slot = first.paths().slot.clone();
+    first.finish(outcome(0)).unwrap();
+    fixture.config.purpose = "second".into();
+    let second = fixture.acquire();
+    let newer_slot = second.paths().slot.clone();
+    let receipt = second.finish(outcome(0)).unwrap();
+    assert!(!older_slot.exists());
+    assert!(newer_slot.exists());
+    assert_eq!(receipt.evicted_completed_slots.len(), 1);
+    assert!(receipt.lease_released);
+}
+
+#[test]
+fn size_measurement_detects_growth_and_completed_oversized_slot_is_evicted() {
+    let mut fixture = Fixture::new("size");
+    fixture.config.budgets.slot_bytes = 4096;
+    fixture.config.budgets.catalog_bytes = 8192;
+    let build = fixture.acquire();
+    let paths = build.paths().clone();
+    fs::write(paths.cargo_target.join("large"), vec![0u8; 8192]).unwrap();
+    let measurement = build.measure().unwrap();
+    assert!(!measurement.within_budget && measurement.slot_bytes >= 8192);
+    let receipt = build.finish(outcome(4)).unwrap();
+    assert_eq!(receipt.command_exit, Some(4));
+    assert!(receipt.slot_evicted && receipt.lease_released);
+    assert!(!paths.slot.exists());
+}
+
+#[test]
+fn checkout_and_evidence_overlap_is_rejected_before_creation() {
+    let mut fixture = Fixture::new("overlap");
+    fixture.config.output_root = Some(fixture.checkout.join("generated"));
+    assert_eq!(
+        error_kind(ManagedBuild::acquire(
+            fixture.config.clone(),
+            &fixture.checkout
+        )),
+        "overlap"
+    );
+    assert!(!fixture.checkout.join("generated").exists());
+    fixture.config.output_root = Some(fixture.root.join("output"));
+    fixture.config.evidence_root = fixture.checkout.join("reports");
+    assert_eq!(
+        error_kind(ManagedBuild::acquire(
+            fixture.config.clone(),
+            &fixture.checkout
+        )),
+        "overlap"
+    );
+    assert!(!fixture.checkout.join("reports").exists());
+}
+
+#[test]
+fn secret_named_tree_entry_is_not_opened_or_removed() {
+    let fixture = Fixture::new("names");
+    let build = fixture.acquire();
+    let scratch = build.paths().scratch.clone();
+    // A directory exercises name rejection without creating a secret file.
+    fs::create_dir(scratch.join(".env.test")).unwrap();
+    assert_eq!(error_kind(build.measure()), "secret_path");
+    assert_eq!(error_kind(build.finish(outcome(0))), "secret_path");
+    assert!(scratch.join(".env.test").is_dir());
+}
+
+#[test]
+fn public_api_source_namespace_is_not_misclassified_as_a_credential_file() {
+    let fixture = Fixture::new("source-names");
+    let build = fixture.acquire();
+    let namespace = build
+        .paths()
+        .cargo_home
+        .join("registry/source/Security/Credentials");
+    fs::create_dir_all(&namespace).unwrap();
+    fs::write(namespace.join("mod.rs"), b"pub struct PublicApi;").unwrap();
+    assert!(build.measure().unwrap().within_budget);
+    let receipt = build.finish(outcome(0)).unwrap();
+    assert!(receipt.lease_released);
+}
+
+#[test]
+fn bounded_walk_rejects_overdeep_tree_without_removing_it() {
+    let fixture = Fixture::new("depth");
+    let build = fixture.acquire();
+    let mut deepest = build.paths().scratch.clone();
+    for _ in 0..MAX_DEPTH + 1 {
+        deepest.push("d");
+        fs::create_dir(&deepest).unwrap();
+    }
+    assert_eq!(error_kind(build.measure()), "walk_limit");
+    assert!(deepest.is_dir());
+}
+
+#[test]
+fn ownership_record_length_limit_is_checked_before_reading() {
+    let fixture = Fixture::new("record");
+    let build = fixture.acquire();
+    let owner = build.paths().slot.join("owner.json");
+    fs::write(&owner, vec![b' '; RECORD_LIMIT as usize + 1]).unwrap();
+    assert_eq!(error_kind(build.measure()), "record");
+    assert_eq!(fs::metadata(owner).unwrap().len(), RECORD_LIMIT + 1);
+}
+
+#[test]
+fn multiply_linked_owner_record_is_not_opened_as_valid_ownership() {
+    let fixture = Fixture::new("record-links");
+    let build = fixture.acquire();
+    let owner = build.paths().slot.join("owner.json");
+    fs::hard_link(&owner, fixture.root.join("record-alias")).unwrap();
+    assert_eq!(error_kind(build.measure()), "link");
+    assert!(owner.exists());
+    assert!(build.paths().catalog.join("lease.json").exists());
+}
+
+#[test]
+fn tiny_budget_rejects_command_admission_and_preserves_owned_lease() {
+    let mut fixture = Fixture::new("tiny-budget");
+    fixture.config.budgets.slot_bytes = 16;
+    fixture.config.budgets.catalog_bytes = 32;
+    assert_eq!(
+        error_kind(ManagedBuild::acquire(
+            fixture.config.clone(),
+            &fixture.checkout
+        )),
+        "budget"
+    );
+    assert!(fixture.catalog().join("lease.json").exists());
+}
+
+#[test]
+fn explicit_managed_environment_override_must_match_owned_path() {
+    let fixture = Fixture::new("env");
+    let build = fixture.acquire();
+    let expected = build.environment();
+    assert_eq!(
+        expected["CARGO_HOME"],
+        build.paths().cargo_home.to_string_lossy()
+    );
+    assert!(build.validate_explicit_overrides(&expected).is_ok());
+    let mut wrong = expected;
+    wrong.insert(
+        "TMP".into(),
+        fixture
+            .root
+            .join("user-temp")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    assert_eq!(
+        error_kind(build.validate_explicit_overrides(&wrong)),
+        "override"
+    );
+    build.finish(outcome(0)).unwrap();
+}
+
+#[test]
+fn bootstrap_adoption_requires_exact_identity_and_drain_then_updates_owner() {
+    let fixture = Fixture::new("bootstrap");
+    let original = fixture.acquire();
+    let paths = original.paths().clone();
+    let identity = BootstrapOwnership {
+        schema: SCHEMA.into(),
+        catalog_id: original.catalog.catalog_id.clone(),
+        slot_id: original.slot.slot_id.clone(),
+        checkout_digest: original.slot.checkout_digest.clone(),
+        os: original.slot.os.clone(),
+        arch: original.slot.arch.clone(),
+        purpose: original.slot.purpose.clone(),
+        token: original.slot.token.clone(),
+        pid: original.slot.pid,
+        started_ms: original.lease.started_ms,
+    };
+    let old = fs::read(paths.catalog.join("lease.json")).unwrap();
+    drop(original);
+    assert_eq!(
+        error_kind(ManagedBuild::adopt_bootstrap(
+            fixture.config.clone(),
+            &fixture.checkout,
+            identity.clone(),
+            false,
+            true
+        )),
+        "bootstrap_proof"
+    );
+    let mut wrong = identity.clone();
+    wrong.token = new_token();
+    assert_eq!(
+        error_kind(ManagedBuild::adopt_bootstrap(
+            fixture.config.clone(),
+            &fixture.checkout,
+            wrong,
+            true,
+            true
+        )),
+        "bootstrap_identity"
+    );
+    assert_eq!(fs::read(paths.catalog.join("lease.json")).unwrap(), old);
+    let mut wrong_record: SlotRecord = read_record(&paths.slot.join("owner.json")).unwrap();
+    let replacement = if wrong_record.checkout_digest.ends_with('a') {
+        'b'
+    } else {
+        'a'
+    };
+    wrong_record.checkout_digest.pop();
+    wrong_record.checkout_digest.push(replacement);
+    fs::write(
+        paths.slot.join("owner.json"),
+        record_bytes(&wrong_record).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        error_kind(ManagedBuild::adopt_bootstrap(
+            fixture.config.clone(),
+            &fixture.checkout,
+            identity.clone(),
+            true,
+            true
+        )),
+        "bootstrap_identity"
+    );
+    wrong_record.checkout_digest = identity.checkout_digest.clone();
+    fs::write(
+        paths.slot.join("owner.json"),
+        record_bytes(&wrong_record).unwrap(),
+    )
+    .unwrap();
+    let adopted = ManagedBuild::adopt_bootstrap(
+        fixture.config.clone(),
+        &fixture.checkout,
+        identity.clone(),
+        true,
+        true,
+    )
+    .unwrap();
+    assert_ne!(adopted.lease.token, identity.token);
+    assert_eq!(adopted.lease.token, adopted.slot.token);
+    assert_eq!(adopted.paths().slot, paths.slot);
+    adopted.finish(outcome(0)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn external_link_is_preserved_with_its_target_and_blocks_finish() {
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new("link");
+    let build = fixture.acquire();
+    let outside = fixture.root.join("user-original");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("keep"), b"user").unwrap();
+    let link = build.paths().scratch.join("escape");
+    symlink(&outside, &link).unwrap();
+    assert_eq!(error_kind(build.measure()), "link_escape");
+    assert_eq!(error_kind(build.finish(outcome(0))), "link_escape");
+    assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+    assert_eq!(fs::read(outside.join("keep")).unwrap(), b"user");
+}
+
+#[cfg(unix)]
+#[test]
+fn internal_link_to_retained_cache_is_removed_without_following_target() {
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new("internal-link");
+    let build = fixture.acquire();
+    let cache = build.paths().cargo_target.clone();
+    fs::write(cache.join("keep"), b"compiled").unwrap();
+    symlink(&cache, build.paths().scratch.join("link")).unwrap();
+    let receipt = build.finish(outcome(0)).unwrap();
+    assert!(receipt.scratch_removed && receipt.lease_released);
+    assert_eq!(fs::read(cache.join("keep")).unwrap(), b"compiled");
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_subtree_internal_links_are_unlinked_before_eviction_removes_targets() {
+    use std::os::unix::fs::symlink;
+    let mut fixture = Fixture::new("cross-links");
+    fixture.config.budgets.completed_slots = 0;
+    let build = fixture.acquire();
+    let slot = build.paths().slot.clone();
+    let source = build.paths().cargo_target.join("a-source");
+    let target = build.paths().cargo_target.join("z-target");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("compiled"), b"cache").unwrap();
+    symlink(&target, source.join("target-link")).unwrap();
+    symlink(
+        source.join("target-link"),
+        build.paths().cargo_target.join("chain-link"),
+    )
+    .unwrap();
+    let receipt = build.finish(outcome(0)).unwrap();
+    assert!(receipt.slot_evicted && receipt.lease_released);
+    assert!(receipt.cleanup_errors.is_empty());
+    assert!(!slot.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn replaced_catalog_ancestor_link_is_rejected_before_cleanup() {
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new("ancestor");
+    let build = fixture.acquire();
+    let parent = fixture.config.output_root.as_ref().unwrap().join("build");
+    let renamed = fixture.root.join("moved-owned-build");
+    fs::rename(&parent, &renamed).unwrap();
+    symlink(&renamed, &parent).unwrap();
+    assert_eq!(error_kind(build.finish(outcome(0))), "link");
+    assert!(renamed.join("managed-v1/lease.json").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_forward_slash_overlap_is_rejected_before_creation() {
+    let mut fixture = Fixture::new("slash-overlap");
+    let checkout = fixture.checkout.to_string_lossy().replace('\\', "/");
+    fixture.config.output_root = Some(PathBuf::from(format!("{checkout}/generated")));
+    assert_eq!(
+        error_kind(ManagedBuild::acquire(
+            fixture.config.clone(),
+            &fixture.checkout
+        )),
+        "overlap"
+    );
+    assert!(!fixture.checkout.join("generated").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_junction_escape_is_preserved_and_target_is_never_deleted() {
+    let fixture = Fixture::new("junction");
+    let build = fixture.acquire();
+    let outside = fixture.root.join("user-original");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("keep"), b"user").unwrap();
+    let junction = build.paths().scratch.join("escape");
+    create_junction(&junction, &outside);
+    assert_eq!(error_kind(build.measure()), "link_escape");
+    assert_eq!(error_kind(build.finish(outcome(0))), "link_escape");
+    assert!(junction.exists());
+    assert_eq!(fs::read(outside.join("keep")).unwrap(), b"user");
+    fs::remove_dir(&junction).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_internal_junction_is_unlinked_without_following_cache_target() {
+    let fixture = Fixture::new("internal-junction");
+    let build = fixture.acquire();
+    let cache = build.paths().cargo_target.clone();
+    fs::write(cache.join("compiled"), b"cache").unwrap();
+    create_junction(&build.paths().scratch.join("cache-link"), &cache);
+    let receipt = build.finish(outcome(0)).unwrap();
+    assert!(receipt.lease_released && receipt.cleanup_errors.is_empty());
+    assert_eq!(fs::read(cache.join("compiled")).unwrap(), b"cache");
+}
+
+#[cfg(windows)]
+fn create_junction(link: &Path, target: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    fs::create_dir(link).unwrap();
+    let target = fs::canonicalize(target).unwrap();
+    let target_text = target.to_string_lossy();
+    let substitute = format!(r"\??\{}", target_text.trim_start_matches(r"\\?\"));
+    let substitute: Vec<u16> = substitute.encode_utf16().collect();
+    let printable: Vec<u16> = target.as_os_str().encode_wide().collect();
+    let substitute_bytes = u16::try_from(substitute.len() * 2).unwrap();
+    let print_bytes = u16::try_from(printable.len() * 2).unwrap();
+    let data_len = 8u16
+        .checked_add(substitute_bytes)
+        .unwrap()
+        .checked_add(2)
+        .unwrap()
+        .checked_add(print_bytes)
+        .unwrap()
+        .checked_add(2)
+        .unwrap();
+    let mut buffer = Vec::new();
+    buffer.extend_from_slice(&0xA0000003u32.to_le_bytes()); // IO_REPARSE_TAG_MOUNT_POINT
+    buffer.extend_from_slice(&data_len.to_le_bytes());
+    buffer.extend_from_slice(&0u16.to_le_bytes());
+    for value in [0u16, substitute_bytes, substitute_bytes + 2, print_bytes] {
+        buffer.extend_from_slice(&value.to_le_bytes());
+    }
+    for value in substitute
+        .into_iter()
+        .chain([0])
+        .chain(printable)
+        .chain([0])
+    {
+        buffer.extend_from_slice(&value.to_le_bytes());
+    }
+    let path: Vec<u16> = link.as_os_str().encode_wide().chain([0]).collect();
+    // SAFETY: path is NUL-terminated and lives through the call. The directory
+    // was freshly created as owned test data; no shared handles are inherited.
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(
+        handle,
+        INVALID_HANDLE_VALUE,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: successful CreateFileW returned an owned handle and this File
+    // takes sole responsibility for closing it after the fixture operation.
+    let directory = unsafe { File::from_raw_handle(handle) };
+    let mut returned = 0u32;
+    // SAFETY: the bounded reparse buffer follows MOUNT_POINT layout. The
+    // input and returned-byte pointers live for this synchronous native call.
+    let ok = unsafe {
+        DeviceIoControl(
+            directory.as_raw_handle(),
+            0x000900A4,
+            buffer.as_ptr().cast(),
+            u32::try_from(buffer.len()).unwrap(),
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+}
