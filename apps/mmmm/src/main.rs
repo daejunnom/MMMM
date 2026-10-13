@@ -26,8 +26,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // This owned helper handles inherited external stdio only. Its channel
         // bootstrap is private; stdout cannot contain application diagnostics.
         let remaining: Vec<_> = args.collect();
-        mmmm_coordinator::stdio_io::worker_entry(&remaining)?;
-        return Ok(());
+        mmmm_coordinator::stdio_io::worker_entry_exit(&remaining);
     }
     if command == "--version" {
         println!(

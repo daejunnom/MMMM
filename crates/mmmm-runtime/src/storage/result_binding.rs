@@ -497,7 +497,7 @@ impl DurableStore {
         invocation: &Value,
         witness: &BlobRef,
     ) -> StorageResult<super::StepRecord> {
-        self.dispatch_intent_internal(operation, step, invocation, Some(witness))
+        self.dispatch_intent_internal(operation, step, invocation, Some(witness), None)
     }
 
     /// Retrieve retained original resolution evidence for an existing intent.

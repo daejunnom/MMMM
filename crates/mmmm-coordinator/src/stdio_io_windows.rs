@@ -24,8 +24,8 @@ use windows_sys::Win32::{
     Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_NORMAL,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_TYPE_PIPE, GetFileInformationByHandle, GetFileType, OPEN_EXISTING,
-        ReadFile, WriteFile,
+        FILE_SHARE_WRITE, FILE_TYPE_PIPE, FILE_TYPE_UNKNOWN, GetFileInformationByHandle,
+        GetFileType, OPEN_EXISTING, ReadFile, WriteFile,
     },
     System::{
         Console::{GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
@@ -37,6 +37,7 @@ use windows_sys::Win32::{
             QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
         },
         Pipes::{CreatePipe, PeekNamedPipe},
+        SystemInformation::GetSystemWindowsDirectoryW,
         Threading::{
             CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
             DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
@@ -100,22 +101,25 @@ pub(super) fn open_executable(path: &Path) -> Result<File, StdioError> {
         .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
-        .map_err(|_| StdioError::new("executable"))?;
+        .map_err(|e| StdioError::io("executable_open", e))?;
     if file
         .metadata()
-        .map_err(|_| StdioError::new("executable"))?
+        .map_err(|e| StdioError::io("executable_metadata", e))?
         .file_attributes()
         & FILE_ATTRIBUTE_REPARSE_POINT
         != 0
     {
-        return Err(StdioError::new("executable"));
+        return Err(StdioError::new("executable_limits"));
     }
     Ok(file)
 }
 fn identity(file: &File) -> Result<(u32, u32, u32), StdioError> {
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
     if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) } == 0 {
-        return Err(StdioError::new("executable_identity"));
+        return Err(StdioError::io(
+            "executable_identity",
+            std::io::Error::last_os_error(),
+        ));
     }
     Ok((
         info.dwVolumeSerialNumber,
@@ -128,6 +132,49 @@ pub(super) fn same_file(file: &File, path: &Path) -> Result<bool, StdioError> {
 }
 fn wide(value: &std::ffi::OsStr) -> Vec<u16> {
     value.encode_wide().chain(Some(0)).collect()
+}
+pub(super) fn minimal_environment(directory: &[u16]) -> Result<Vec<u16>, StdioError> {
+    // Winsock provider paths can contain %SystemRoot%. Derive this value from
+    // the OS API, never from the parent environment, a file or worker args.
+    if directory.len() < 3
+        || directory.len() > 32_767
+        || !matches!(directory[0], 65..=90 | 97..=122)
+        || directory[1] != b':' as u16
+        || directory[2] != b'\\' as u16
+        || directory.contains(&0)
+    {
+        return Err(StdioError::new("system_directory"));
+    }
+    let mut block = Vec::with_capacity(2 * directory.len() + 22);
+    // Case-insensitive alphabetical order, with one terminating NUL per entry
+    // and a final second NUL. No inherited variables or capability are copied.
+    for name in ["SystemRoot=", "windir="] {
+        block.extend(name.encode_utf16());
+        block.extend_from_slice(directory);
+        block.push(0);
+    }
+    block.push(0);
+    Ok(block)
+}
+fn system_environment() -> Result<Vec<u16>, StdioError> {
+    let mut directory = vec![0u16; 32_768];
+    let n = unsafe { GetSystemWindowsDirectoryW(directory.as_mut_ptr(), directory.len() as u32) };
+    if n == 0 {
+        return Err(StdioError::io(
+            "system_directory",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    if n as usize >= directory.len() {
+        return Err(StdioError::new("system_directory"));
+    }
+    directory.truncate(n as usize);
+    // The OS API documents a bare drive prefix when Windows is installed at
+    // the volume root. Normalize that case to an absolute root directory.
+    if directory.len() == 2 {
+        directory.push(b'\\' as u16);
+    }
+    minimal_environment(&directory)
 }
 fn duplicate_stdio(which: u32) -> Result<Handle, StdioError> {
     let source = unsafe { GetStdHandle(which) };
@@ -207,11 +254,16 @@ fn bootstrap(packet: &[u8]) -> Result<(Handle, Handle), StdioError> {
 }
 pub(super) fn read_bootstrap(value: usize) -> Result<zeroize::Zeroizing<[u8; 96]>, StdioError> {
     if value == 0 || value == usize::MAX {
-        return Err(StdioError::new("bootstrap_pipe"));
+        return Err(StdioError::new("bootstrap_handle"));
     }
     let handle = value as HANDLE;
-    if unsafe { GetFileType(handle) } != FILE_TYPE_PIPE {
-        return Err(StdioError::new("bootstrap_pipe"));
+    let kind = unsafe { GetFileType(handle) };
+    if kind != FILE_TYPE_PIPE {
+        return Err(if kind == FILE_TYPE_UNKNOWN {
+            StdioError::io("bootstrap_type", std::io::Error::last_os_error())
+        } else {
+            StdioError::new("bootstrap_type")
+        });
     }
     // Reject ordinary file handles before any read. The hidden entry owns the
     // single pipe read end explicitly inherited by its parent. The full fixed
@@ -228,14 +280,25 @@ pub(super) fn read_bootstrap(value: usize) -> Result<zeroize::Zeroizing<[u8; 96]
             null_mut(),
         )
     } == 0
-        || available != 96
     {
-        return Err(StdioError::new("bootstrap_pipe"));
+        return Err(StdioError::io(
+            "bootstrap_peek",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    if available != 96 {
+        return Err(StdioError::new("bootstrap_length"));
     }
     let mut packet = zeroize::Zeroizing::new([0u8; 96]);
     let mut n = 0;
-    if unsafe { ReadFile(handle, packet.as_mut_ptr(), 96, &mut n, null_mut()) } == 0 || n != 96 {
-        return Err(StdioError::new("bootstrap_pipe"));
+    if unsafe { ReadFile(handle, packet.as_mut_ptr(), 96, &mut n, null_mut()) } == 0 {
+        return Err(StdioError::io(
+            "bootstrap_read",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    if n != 96 {
+        return Err(StdioError::new("bootstrap_length"));
     }
     Ok(packet)
 }
@@ -349,7 +412,7 @@ impl Process {
             return Err(StdioError::new("executable"));
         }
         let application = wide(executable.path.as_os_str());
-        let environment = [0u16, 0];
+        let environment = system_environment()?;
         let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
         if unsafe {
             CreateProcessW(
@@ -473,6 +536,7 @@ impl Process {
                             code: "drain_deadline",
                             drained: true,
                             native_code: None,
+                            native_code_unknown: false,
                         });
                     }
                     return Ok(());

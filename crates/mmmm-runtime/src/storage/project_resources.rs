@@ -9,7 +9,7 @@ use mmmm_contracts::{
     ContextId, PrincipalId, ProjectId, ResourceId, Sha256Digest, parse_json,
     verify_projected_digest,
 };
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
@@ -17,6 +17,34 @@ const MAX_PROJECT_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_SOURCE_RESOURCE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 16_384;
 const MAX_PROJECT_ENTRIES: usize = 4096;
+
+pub(crate) const PROJECT_RESOURCE_OWNER_KIND: &str = "project_resource";
+/// One immutable resource-version retention identity shared by every writer
+/// and checked reader. A Project ID alone cannot identify a resource version.
+pub(crate) fn resource_version_owner(
+    project: &ProjectId,
+    resource: &ResourceId,
+    digest: &Sha256Digest,
+) -> StorageResult<Sha256Digest> {
+    mmmm_contracts::canonical_digest(
+        &serde_json::json!({"projectId":project,"resourceId":resource,"sha256":digest}),
+    )
+    .map_err(contract)
+}
+pub(crate) fn pin_resource_version(
+    transaction: &Transaction<'_>,
+    project: &ProjectId,
+    resource: &ResourceId,
+    blob: &BlobRef,
+) -> StorageResult<()> {
+    let owner = resource_version_owner(project, resource, &blob.digest)?;
+    super::journal::pin_blob(
+        transaction,
+        PROJECT_RESOURCE_OWNER_KIND,
+        owner.as_str(),
+        blob,
+    )
+}
 
 /// Opaque actual transport identity and the same per-request budget. Read-only
 /// Project inspection may have no game context; no fake context is created.
@@ -514,11 +542,12 @@ fn version(
         ));
     }
     retained_blob(store, &blob)?;
-    let owner = mmmm_contracts::canonical_digest(
-        &serde_json::json!({"projectId":project,"resourceId":id,"sha256":digest}),
-    )
-    .map_err(contract)?;
-    let retained:i64=store.connection.query_row("SELECT EXISTS(SELECT 1 FROM blob_refs WHERE owner_kind='project_resource' AND owner_id=?1 AND digest=?2)",params![owner.as_str(),digest.as_str()],|r|r.get(0))?;
+    let owner = resource_version_owner(project, id, digest)?;
+    let retained: i64 = store.connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM blob_refs WHERE owner_kind=?1 AND owner_id=?2 AND digest=?3)",
+        params![PROJECT_RESOURCE_OWNER_KIND, owner.as_str(), digest.as_str()],
+        |r| r.get(0),
+    )?;
     if retained != 1 {
         return Err(StorageError::Corrupt(
             "Project resource version retention is missing".into(),

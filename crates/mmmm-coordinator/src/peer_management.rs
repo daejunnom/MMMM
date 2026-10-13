@@ -264,7 +264,7 @@ fn validate_public(value: &Value) -> Result<ManagementKind, ManagementError> {
                 SourceId::new(id.as_str()).map_err(|_| ManagementError::InvalidFrame)?;
                 digest(sha.as_str().ok_or(ManagementError::InvalidFrame)?)?;
             }
-            unique_strings(array(value, "approvedActions")?, |value| digest(value))?;
+            unique_strings(array(value, "approvedActions")?, digest)?;
             unique_strings(array(value, "permissions")?, |permission| {
                 if matches!(
                     permission,
@@ -412,8 +412,13 @@ impl Default for BootstrapBudget {
 }
 impl BootstrapBudget {
     pub fn new() -> Self {
+        Self::with_deadline(Instant::now() + BOOTSTRAP_LIMIT)
+    }
+    /// 이미 시작한 caller 마감을 유지한다. 생성 시 최대 30초로 한 번만
+    /// 제한하며 각 전송/relay/drain 단계에서 전체 예산을 다시 시작하지 않는다.
+    pub fn with_deadline(deadline: Instant) -> Self {
         Self {
-            deadline: Instant::now() + BOOTSTRAP_LIMIT,
+            deadline: deadline.min(Instant::now() + BOOTSTRAP_LIMIT),
             cancelled: Arc::new(AtomicBool::new(false)),
             peer_stop: None,
         }
@@ -841,6 +846,16 @@ impl ManagementSender {
     }
 }
 
+impl ManagementReceiver {
+    pub fn try_receive(&self) -> Result<Option<ManagementEnvelope>, ManagementError> {
+        match self.0.try_recv() {
+            Ok(envelope) => Ok(Some(envelope)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(ManagementError::Disconnected),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -877,6 +892,22 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn caller_absolute_deadline_is_kept_and_future_deadline_is_capped_once() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let budget = BootstrapBudget::with_deadline(deadline);
+        assert_eq!(budget.deadline(), deadline);
+        assert!(budget.native_io_deadline().unwrap() <= deadline);
+        assert!(budget.application_wait_deadline().unwrap() <= deadline);
+        let before = Instant::now();
+        let capped = BootstrapBudget::with_deadline(before + Duration::from_secs(300));
+        assert!(capped.deadline() <= Instant::now() + BOOTSTRAP_LIMIT);
+        assert!(capped.deadline() < before + Duration::from_secs(300));
+        let expired = BootstrapBudget::with_deadline(before);
+        assert_eq!(expired.deadline(), before);
+        assert_eq!(expired.check(), Err(ManagementError::Deadline));
+        assert_eq!(expired.native_io_deadline(), Err(ManagementError::Deadline));
+    }
     #[test]
     fn public_frames_reject_unknown_duplicate_secret_and_size_boundaries() {
         let host = offer("pair-fixture");
@@ -968,14 +999,5 @@ mod tests {
         assert!(!finished.delivered());
         assert_eq!(finished.witness().id(), witness.id());
         assert_eq!(finished.witness().offer_digest(), witness.offer_digest());
-    }
-}
-impl ManagementReceiver {
-    pub fn try_receive(&self) -> Result<Option<ManagementEnvelope>, ManagementError> {
-        match self.0.try_recv() {
-            Ok(envelope) => Ok(Some(envelope)),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err(ManagementError::Disconnected),
-        }
     }
 }

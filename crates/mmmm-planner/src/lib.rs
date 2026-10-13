@@ -57,15 +57,14 @@ pub(crate) fn normalize_resource_lengths(value: &mut Value) {
                 && ["resourceId", "sha256", "mediaType", "sizeBytes"]
                     .iter()
                     .all(|key| values.contains_key(*key))
-            {
-                if let Some(length) = values["sizeBytes"].as_f64().filter(|length| {
+                && let Some(length) = values["sizeBytes"].as_f64().filter(|length| {
                     length.is_finite()
                         && length.fract() == 0.0
                         && *length >= 0.0
                         && *length <= 9_007_199_254_740_991.0
-                }) {
-                    values.insert("sizeBytes".into(), Value::from(length as u64));
-                }
+                })
+            {
+                values.insert("sizeBytes".into(), Value::from(length as u64));
             }
             values.values_mut().for_each(normalize_resource_lengths);
         }

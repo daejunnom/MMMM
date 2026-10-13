@@ -336,6 +336,61 @@ impl LocalAuthority {
         }
         Ok(())
     }
+    /// Local-only writer checkpoint for a previously observed immutable paired
+    /// context and an actual stored frozen plan. Native freshness belongs to a
+    /// pre-transaction witness/SDK mutation guard; this does not perform I/O or
+    /// infer approval from the public plan hash.
+    pub fn authorize_retained_apply(
+        &self,
+        principal: &PrincipalId,
+        context: &Value,
+        plan: &Value,
+    ) -> AppResult<()> {
+        validate("ExecutionContext", context)?;
+        validate("ExecutionPlan", plan)?;
+        verify_projected_digest("ExecutionContext", context)
+            .map_err(|_| error("STALE_CONTEXT", "Retained context digest is invalid"))?;
+        let hash = verify_projected_digest("ExecutionPlan", plan)
+            .map_err(|_| error("STALE_PLAN", "Stored frozen plan digest is invalid"))?;
+        let project = ProjectId::new(text(context, "projectId")?)
+            .map_err(|_| error("STALE_CONTEXT", "Retained context Project is invalid"))?;
+        let id = ContextId::new(text(context, "contextId")?)
+            .map_err(|_| error("STALE_CONTEXT", "Retained context identity is invalid"))?;
+        let state = self.state.lock().map_err(|_| {
+            error(
+                "AUTHORITY_UNAVAILABLE",
+                "Current authority state is unavailable",
+            )
+        })?;
+        let current = grant(&state, principal, &project)?;
+        let approval = state
+            .approvals
+            .get(&(principal.clone(), project.clone(), hash))
+            .filter(|approval| {
+                Instant::now() < approval.expires && approval.policy == current.revision
+            })
+            .ok_or_else(|| {
+                error(
+                    "PERMISSION_REQUIRED",
+                    "No current explicit approval exists for the stored frozen plan",
+                )
+            })?;
+        if context["principalRef"] != principal.as_str()
+            || context["policyRevision"] != current.revision.as_str()
+            || plan["projectId"] != project.as_str()
+            || plan["policyRevision"] != current.revision.as_str()
+            || !current.contexts.contains(&id)
+            || !approval.contexts.contains(&id)
+            || !scope_contains(&current.scope, &context["scope"])
+            || !scope_contains(&current.scope, &plan["scope"])
+        {
+            return Err(error(
+                "PERMISSION_REQUIRED",
+                "Stored Apply exceeds current context, scope or explicit approval",
+            ));
+        }
+        Ok(())
+    }
     pub fn revoke_project(&self, principal: &PrincipalId, project: &ProjectId) -> AppResult<()> {
         let mut state = self.state.lock().map_err(|_| {
             error(
@@ -729,7 +784,7 @@ fn grant<'a>(
             )
         })
 }
-fn scope_contains(allowed: &Value, requested: &Value) -> bool {
+pub(crate) fn scope_contains(allowed: &Value, requested: &Value) -> bool {
     if allowed["projectId"] != requested["projectId"] {
         return false;
     }

@@ -198,6 +198,10 @@ pub(crate) fn serve_host_exchange<I: ManagementIo>(
         .submit(ManagementRequest::installed(installed, witness)?, budget)?
         .wait()?;
     write_public(io, &complete, budget)?;
+    // Complete를 외부 Java stdout에 flush하고 stdin EOF 및 stdio helper의
+    // 실제 native drain을 관측하는 동안 consuming read를 발행하지 않는다.
+    // 대기는 원래 전체 마감, 준비된 뒤 actual native ACK read는 최대 5초다.
+    io.wait_readable(budget.deadline(), budget)?;
     let mut acknowledgement = [0_u8; 1];
     read_exact(io, &mut acknowledgement, budget)?;
     if acknowledgement != [MANAGEMENT_ACK] {
@@ -214,7 +218,14 @@ pub(crate) struct HostAttachClient<I: ManagementIo> {
     io: I,
     nonce: String,
     budget: BootstrapBudget,
-    completed: bool,
+    phase: ClientPhase,
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ClientPhase {
+    Offered,
+    CompleteReceived,
+    DeliveryAttempted,
+    Completed,
 }
 impl<I: ManagementIo> HostAttachClient<I> {
     pub(crate) fn offer(
@@ -227,7 +238,7 @@ impl<I: ManagementIo> HostAttachClient<I> {
             io,
             nonce: public.nonce().to_owned(),
             budget,
-            completed: false,
+            phase: ClientPhase::Offered,
         };
         write_all(&mut pending.io, HOST_MAGIC, &pending.budget)?;
         write_public(&mut pending.io, &public, &pending.budget)?;
@@ -242,8 +253,18 @@ impl<I: ManagementIo> HostAttachClient<I> {
         }
         Ok((pending, authority))
     }
-    pub(crate) fn installed(mut self, public: PublicFrame) -> Result<PublicFrame, ExchangeError> {
-        if public.kind() != ManagementKind::Installed || public.nonce() != self.nonce {
+    pub(crate) fn deadline(&self) -> Instant {
+        self.budget.deadline()
+    }
+    pub(crate) fn installed_staged(
+        &mut self,
+        public: PublicFrame,
+    ) -> Result<PublicFrame, ExchangeError> {
+        self.budget.check()?;
+        if self.phase != ClientPhase::Offered
+            || public.kind() != ManagementKind::Installed
+            || public.nonce() != self.nonce
+        {
             return Err(ManagementError::WrongReply.into());
         }
         write_public(&mut self.io, &public, &self.budget)?;
@@ -253,18 +274,201 @@ impl<I: ManagementIo> HostAttachClient<I> {
         if complete.kind() != ManagementKind::Complete || complete.nonce() != self.nonce {
             return Err(ManagementError::WrongReply.into());
         }
+        self.phase = ClientPhase::CompleteReceived;
+        Ok(complete)
+    }
+    pub(crate) fn complete_delivery(&mut self) -> Result<(), ExchangeError> {
+        self.budget.check()?;
+        if self.phase != ClientPhase::CompleteReceived {
+            return Err(PeerError::Protocol.into());
+        }
+        // ACK가 일부라도 전달되었을 수 있는 실패를 같은 연결에서 replay하지 않는다.
+        self.phase = ClientPhase::DeliveryAttempted;
         write_all(&mut self.io, &[MANAGEMENT_ACK], &self.budget)?;
         self.io
             .wait_disconnect(self.budget.native_io_deadline()?, &self.budget)?;
         self.budget.check()?;
-        self.completed = true;
-        Ok(complete)
+        self.phase = ClientPhase::Completed;
+        Ok(())
+    }
+    pub(crate) fn abort(&self) {
+        self.budget.cancel();
     }
 }
 impl<I: ManagementIo> Drop for HostAttachClient<I> {
     fn drop(&mut self) {
-        if !self.completed {
+        if self.phase != ClientPhase::Completed {
             self.budget.cancel();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    // Native store/pipe를 대체하는 production fallback이 아니다. 이번 authored
+    // fixture는 기존 자료에 없는 staged ACK 경계와 절대마감의 byte 관측을 검사한다.
+    struct ObservedIo {
+        input: VecDeque<u8>,
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        eof_error: Option<PeerError>,
+    }
+    impl ManagementIo for ObservedIo {
+        fn read_chunk(
+            &mut self,
+            destination: &mut [u8],
+            _: Instant,
+            _: &BootstrapBudget,
+        ) -> Result<usize, PeerError> {
+            let count = destination.len().min(self.input.len());
+            for byte in &mut destination[..count] {
+                *byte = self.input.pop_front().unwrap();
+            }
+            Ok(count)
+        }
+        fn write_chunk(
+            &mut self,
+            source: &[u8],
+            _: Instant,
+            _: &BootstrapBudget,
+        ) -> Result<usize, PeerError> {
+            self.writes.lock().unwrap().push(source.to_vec());
+            Ok(source.len())
+        }
+        fn wait_readable(
+            &mut self,
+            deadline: Instant,
+            budget: &BootstrapBudget,
+        ) -> Result<(), PeerError> {
+            assert!(deadline <= budget.deadline());
+            Ok(())
+        }
+        fn disconnect(&mut self, _: &BootstrapBudget) -> Result<(), PeerError> {
+            panic!("client fixture never invokes server disconnect")
+        }
+        fn wait_disconnect(
+            &mut self,
+            deadline: Instant,
+            budget: &BootstrapBudget,
+        ) -> Result<(), PeerError> {
+            assert!(deadline <= budget.deadline());
+            match self.eof_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+    }
+    fn installed() -> PublicFrame {
+        PublicFrame::from_value(json!({
+            "kind":"host_pairing_installed", "protocolVersion":"0.2.0", "nonce":"pair-staged",
+            "hostEndpoint":{"address":"127.0.0.1:32123", "path":"/rpc", "hostEpoch":"host-staged"}
+        }))
+        .unwrap()
+    }
+    fn complete_bytes() -> VecDeque<u8> {
+        let public = PublicFrame::from_value(json!({
+            "kind":"host_pairing_complete", "protocolVersion":"0.2.0", "nonce":"pair-staged",
+            "ready":true, "coordinatorEpoch":"coordinator-staged", "hostEpoch":"host-staged", "contextId":"context-staged"
+        })).unwrap().encode().unwrap();
+        public
+            .length_prefix()
+            .into_iter()
+            .chain(public.payload().iter().copied())
+            .collect()
+    }
+    fn client(budget: BootstrapBudget) -> HostAttachClient<ObservedIo> {
+        HostAttachClient {
+            io: ObservedIo {
+                input: complete_bytes(),
+                writes: Arc::new(Mutex::new(Vec::new())),
+                eof_error: None,
+            },
+            nonce: "pair-staged".to_owned(),
+            budget,
+            phase: ClientPhase::Offered,
+        }
+    }
+    fn ack_count(writes: &Arc<Mutex<Vec<Vec<u8>>>>) -> usize {
+        writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|bytes| bytes.as_slice() == [MANAGEMENT_ACK])
+            .count()
+    }
+
+    #[test]
+    fn complete_receive_is_staged_until_one_terminal_delivery_and_original_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let budget = BootstrapBudget::with_deadline(deadline);
+        let mut client = client(budget.clone());
+        let writes = Arc::clone(&client.io.writes);
+        let complete = client.installed_staged(installed()).unwrap();
+        assert_eq!(complete.kind(), ManagementKind::Complete);
+        assert_eq!(client.deadline(), deadline);
+        assert_eq!(ack_count(&writes), 0);
+        assert!(matches!(
+            client.installed_staged(installed()),
+            Err(ExchangeError::Management(ManagementError::WrongReply))
+        ));
+        client.complete_delivery().unwrap();
+        assert_eq!(ack_count(&writes), 1);
+        assert!(matches!(
+            client.complete_delivery(),
+            Err(ExchangeError::Native(PeerError::Protocol))
+        ));
+        assert_eq!(ack_count(&writes), 1);
+        drop(client);
+        assert!(budget.check().is_ok());
+    }
+
+    #[test]
+    fn drop_and_expired_original_budget_send_no_terminal_ack() {
+        let budget = BootstrapBudget::new();
+        let mut abandoned = client(budget.clone());
+        let writes = Arc::clone(&abandoned.io.writes);
+        abandoned.installed_staged(installed()).unwrap();
+        drop(abandoned);
+        assert_eq!(ack_count(&writes), 0);
+        assert_eq!(budget.check(), Err(ManagementError::Cancelled));
+
+        let budget = BootstrapBudget::with_deadline(Instant::now());
+        let mut expired = client(budget);
+        let writes = Arc::clone(&expired.io.writes);
+        expired.phase = ClientPhase::CompleteReceived;
+        assert!(matches!(
+            expired.complete_delivery(),
+            Err(ExchangeError::Management(ManagementError::Deadline))
+        ));
+        assert!(writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ack_attempt_then_eof_failure_preserves_uncertainty_and_cancels_on_drop() {
+        let budget = BootstrapBudget::new();
+        let mut pending = client(budget.clone());
+        let writes = Arc::clone(&pending.io.writes);
+        pending.installed_staged(installed()).unwrap();
+        pending.io.eof_error = Some(PeerError::Timeout);
+        assert!(matches!(
+            pending.complete_delivery(),
+            Err(ExchangeError::Native(PeerError::Timeout))
+        ));
+        assert_eq!(ack_count(&writes), 1);
+        assert!(pending.phase != ClientPhase::Completed);
+        assert!(matches!(
+            pending.complete_delivery(),
+            Err(ExchangeError::Native(PeerError::Protocol))
+        ));
+        assert_eq!(ack_count(&writes), 1);
+        drop(pending);
+        assert_eq!(budget.check(), Err(ManagementError::Cancelled));
     }
 }

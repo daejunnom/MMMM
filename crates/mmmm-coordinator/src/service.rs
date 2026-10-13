@@ -533,6 +533,35 @@ impl ProviderPort for GuardedProvider<'_> {
         self.inner
             .observe_precondition_with_store(store, precondition, context)
     }
+    fn observe_plan_precondition_with_store(
+        &mut self,
+        store: &DurableStore,
+        plan: &Value,
+        step: &Value,
+        precondition: &Value,
+        context: &Value,
+    ) -> mmmm_application::AppResult<mmmm_contracts::Sha256Digest> {
+        self.admission()?;
+        self.inner
+            .observe_plan_precondition_with_store(store, plan, step, precondition, context)
+    }
+    fn observe_plan_precondition_retained_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        plan: &Value,
+        step: &Value,
+        precondition: &Value,
+        context: &Value,
+    ) -> mmmm_application::AppResult<mmmm_contracts::Sha256Digest> {
+        self.admission()?;
+        self.inner.observe_plan_precondition_retained_with_store(
+            store,
+            plan,
+            step,
+            precondition,
+            context,
+        )
+    }
     fn verify_dependencies(
         &mut self,
         pins: &[Value],
@@ -634,6 +663,16 @@ impl IndependentObserverPort for GuardedObserver<'_> {
         self.inner
             .capture_before_with_store(store, invocation, scope)
     }
+    fn capture_before_retained_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        invocation: &Value,
+        scope: &mmmm_runtime::storage::WriteScope,
+    ) -> mmmm_application::AppResult<Option<mmmm_application::BeforeCapture>> {
+        self.admission()?;
+        self.inner
+            .capture_before_retained_with_store(store, invocation, scope)
+    }
     fn readback(
         &mut self,
         invocation: &Value,
@@ -716,7 +755,7 @@ mod request_context_tests {
             RequestBudget::new(Duration::from_secs(5), Arc::new(AtomicBool::new(false))).unwrap();
         let slot = RequestContextSlot::default();
         let guard = slot.enter(&principal, &budget).unwrap();
-        budget.cancel();
+        budget.cancellation().store(true, Ordering::Release);
         assert!(slot.current().is_err());
         let (retained, interrupted) = slot.current_retained().unwrap();
         assert!(retained.same_session(&principal));

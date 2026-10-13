@@ -26,7 +26,7 @@ impl Application<'_> {
         );
         let capture = self
             .observer
-            .capture_before_with_store(self.store, invocation, scope)?;
+            .capture_before_retained_with_store(self.store, invocation, scope)?;
         let Some(capture) = capture else {
             return if required {
                 Err(AppError::new(

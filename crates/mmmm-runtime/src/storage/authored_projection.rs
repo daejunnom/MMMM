@@ -1341,13 +1341,10 @@ fn insert_resource_version(
             return Err(invalid("Project resource version capacity exhausted"));
         }
     }
-    let owner = digest(
-        &json!({"projectId":project,"resourceId":resource.id,"sha256":resource.blob.digest}),
-    )?;
-    pin_blob(
+    super::project_resources::pin_resource_version(
         transaction,
-        "project_resource",
-        owner.as_str(),
+        project,
+        &resource.id,
         &resource.blob,
     )?;
     transaction.execute(

@@ -104,6 +104,38 @@ pub struct HostRouteOwner {
     context_id: ContextId,
     generation: [u8; 16],
 }
+/// An actual bounded native context observation bound to this exact installed
+/// route. Runtime transaction checkpoints may validate this witness locally;
+/// they must not perform another transport/native call while SQLite is locked.
+#[derive(Clone)]
+pub struct HostContextWitness {
+    state: Arc<Mutex<BridgeState>>,
+    context_id: ContextId,
+    principal: PrincipalId,
+    context: Value,
+    generation: [u8; 16],
+}
+impl HostContextWitness {
+    pub fn context(&self) -> &Value {
+        &self.context
+    }
+    /// No native or transport I/O: exact route ownership, finite lease and
+    /// immutable paired identity are checked under one local lock.
+    pub fn check_local(&self) -> AppResult<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
+        let host = checked_host(&state, &self.context_id, Some(&self.principal))?;
+        if host.generation != self.generation || host.context != self.context {
+            return Err(error(
+                "SESSION_ROUTE_CHANGED",
+                "Original paired context generation is no longer current",
+            ));
+        }
+        Ok(())
+    }
+}
 impl HostBridge {
     /// Trusted bootstrap only. The host is independently queried before this
     /// exact immutable context becomes routable. Replacement requires detach;
@@ -323,29 +355,103 @@ impl HostBridge {
         bounded_host_deadline(deadline)?;
         Ok(context)
     }
+    /// Fresh native observation happens before a writer transaction. The local
+    /// route lock prevents replacing the observed generation while issuing it.
+    pub fn observe_context_witness(
+        &self,
+        principal: &PrincipalId,
+        id: &ContextId,
+        deadline: Instant,
+    ) -> AppResult<HostContextWitness> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
+        let host = checked_host(&state, id, Some(principal))?;
+        let expires = bounded_host_deadline(deadline)?;
+        let context = exchange(
+            &host.client,
+            "inspect",
+            Some(id),
+            json!({"kind":"execution_context"}),
+            Some(&expires),
+        )?;
+        validate("ExecutionContext", &context)?;
+        verify_projected_digest("ExecutionContext", &context)
+            .map_err(|_| error("STALE_CONTEXT", "Live host context digest is invalid"))?;
+        if context != host.context
+            || context["principalRef"] != principal.as_str()
+            || context["environment"] != host.hello["environment"]
+        {
+            return Err(error(
+                "STALE_CONTEXT",
+                "Actual native context differs from its immutable paired route",
+            ));
+        }
+        bounded_host_deadline(deadline)?;
+        Ok(HostContextWitness {
+            state: self.state.clone(),
+            context_id: id.clone(),
+            principal: principal.clone(),
+            context,
+            generation: host.generation,
+        })
+    }
     pub fn inspect(
         &self,
         principal: &PrincipalId,
         id: &ContextId,
         selector: Value,
     ) -> AppResult<Value> {
-        // Always validate live read permission/context before an inspection.
-        self.context(principal, id)?;
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
-        let host = checked_host(&state, id, Some(principal))?;
-        exchange(&host.client, "inspect", Some(id), selector, None)
+        self.inspect_with_deadline(
+            principal,
+            id,
+            selector,
+            Instant::now() + Duration::from_secs(10),
+        )
+    }
+    pub fn inspect_with_deadline(
+        &self,
+        principal: &PrincipalId,
+        id: &ContextId,
+        selector: Value,
+        deadline: Instant,
+    ) -> AppResult<Value> {
+        let response = self.inspect_response_with_deadline(principal, id, selector, deadline)?;
+        if response["status"] != "ok" {
+            return Err(error(
+                "HOST_REQUEST_FAILED",
+                "The original host rejected or could not complete the request",
+            ));
+        }
+        response
+            .get("payload")
+            .cloned()
+            .ok_or_else(|| error("HOST_RESPONSE_INVALID", "Host response payload is absent"))
     }
     pub fn inventory(&self, principal: &PrincipalId, id: &ContextId) -> AppResult<Value> {
-        self.context(principal, id)?;
+        self.inventory_with_deadline(principal, id, Instant::now() + Duration::from_secs(10))
+    }
+    pub fn inventory_with_deadline(
+        &self,
+        principal: &PrincipalId,
+        id: &ContextId,
+        deadline: Instant,
+    ) -> AppResult<Value> {
+        self.context_with_deadline(principal, id, deadline)?;
         let state = self
             .state
             .lock()
             .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
         let host = checked_host(&state, id, Some(principal))?;
-        let inventory = exchange(&host.client, "inventory", Some(id), json!({}), None)?;
+        let expires = bounded_host_deadline(deadline)?;
+        let inventory = exchange(
+            &host.client,
+            "inventory",
+            Some(id),
+            json!({}),
+            Some(&expires),
+        )?;
         validate("ProviderInventory", &inventory)?;
         if inventory["providers"].as_array().is_none_or(|providers| {
             providers
@@ -357,7 +463,94 @@ impl HostBridge {
                 "Host inventory contains a foreign environment",
             ));
         }
+        bounded_host_deadline(deadline)?;
         Ok(inventory)
+    }
+    /// Verify real in-process source registrations. Only platform/external
+    /// provider pins need current native inventory. Offline owned-domain pins
+    /// never invent a host merely to check their actual Rust source identity.
+    pub fn verify_registered_dependencies_with_deadline(
+        &self,
+        pins: &[Value],
+        context: &Value,
+        deadline: Instant,
+    ) -> AppResult<()> {
+        if pins.len() > 128 {
+            return Err(error(
+                "BUDGET_EXCEEDED",
+                "Dependency pin count exceeds its budget",
+            ));
+        }
+        validate("ExecutionContext", context)?;
+        bounded_host_deadline(deadline)?;
+        let needs_host = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
+            let mut needs_host = false;
+            for pin in pins {
+                validate("DependencyPin", pin)?;
+                let approved = state
+                    .verified_dependencies
+                    .get(text(pin, "componentId")?)
+                    .filter(|source| source.matches(pin))
+                    .ok_or_else(|| {
+                        error(
+                            "STALE_DEPENDENCY",
+                            "Pinned dependency metadata has no approved source registration",
+                        )
+                    })?;
+                needs_host |= matches!(
+                    approved.provenance,
+                    DependencyProvenance::PlatformShim | DependencyProvenance::UserExternalTool
+                );
+            }
+            needs_host
+        };
+        if needs_host {
+            if context["environment"]["kind"] != "game" {
+                return Err(error(
+                    "STALE_DEPENDENCY",
+                    "Native dependency has no actual paired game context",
+                ));
+            }
+            let principal = PrincipalId::new(text(context, "principalRef")?)
+                .map_err(|_| error("STALE_CONTEXT", "Context principal is invalid"))?;
+            let inventory =
+                self.inventory_with_deadline(&principal, &context_id(context)?, deadline)?;
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
+            for pin in pins {
+                let approved = state
+                    .verified_dependencies
+                    .get(text(pin, "componentId")?)
+                    .filter(|source| source.matches(pin))
+                    .ok_or_else(|| {
+                        error("STALE_DEPENDENCY", "Pinned source registration changed")
+                    })?;
+                if matches!(
+                    approved.provenance,
+                    DependencyProvenance::PlatformShim | DependencyProvenance::UserExternalTool
+                ) && !inventory["providers"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|provider| provider["bindingId"] == pin["componentId"])
+                    .flat_map(|provider| provider["actions"].as_array().into_iter().flatten())
+                    .any(|action| action["implementationDigest"] == pin["implementationDigest"])
+                {
+                    return Err(error(
+                        "STALE_DEPENDENCY",
+                        "Pinned implementation has no current approved native registration",
+                    ));
+                }
+            }
+        }
+        bounded_host_deadline(deadline)?;
+        Ok(())
     }
     pub fn hello(&self, principal: &PrincipalId, id: &ContextId) -> AppResult<Value> {
         self.hello_with_deadline(principal, id, Instant::now() + Duration::from_secs(10))
@@ -420,25 +613,34 @@ impl HostBridge {
         Ok(response)
     }
     pub(crate) fn job_observation(&self, invocation: &Value) -> AppResult<Value> {
-        self.invocation(
+        self.job_observation_with_deadline(invocation, Instant::now() + Duration::from_secs(10))
+    }
+    pub(crate) fn job_observation_with_deadline(
+        &self,
+        invocation: &Value,
+        deadline: Instant,
+    ) -> AppResult<Value> {
+        self.invocation_with_deadline(
             "operation.get",
             invocation,
             json!({"invocationId":invocation["invocationId"]}),
             false,
+            deadline,
         )
     }
-    fn invocation(
+    fn invocation_with_deadline(
         &self,
         method: &str,
         invocation: &Value,
         payload: Value,
         preserve_deadline: bool,
+        deadline: Instant,
     ) -> AppResult<Value> {
         validate("Invocation", invocation)?;
         let id = context_id(&invocation["context"])?;
         let principal = PrincipalId::new(text(&invocation["context"], "principalRef")?)
             .map_err(|_| error("STALE_CONTEXT", "Stored invocation principal is invalid"))?;
-        let current = self.context(&principal, &id)?;
+        let current = self.context_with_deadline(&principal, &id, deadline)?;
         if current["environment"] != invocation["context"]["environment"] {
             return Err(error(
                 "STALE_CONTEXT",
@@ -459,15 +661,24 @@ impl HostBridge {
             .lock()
             .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
         let host = checked_host(&state, &id, Some(&principal))?;
-        exchange(
-            &host.client,
-            method,
-            Some(&id),
-            payload,
-            preserve_deadline
-                .then(|| invocation["deadlineAt"].as_str())
-                .flatten(),
-        )
+        let bounded = bounded_host_deadline(deadline)?;
+        let bound_at =
+            time::OffsetDateTime::parse(&bounded, &time::format_description::well_known::Rfc3339)
+                .map_err(|_| error("HOST_UNAVAILABLE", "Bounded host deadline is unavailable"))?;
+        let requested = if preserve_deadline {
+            let original = text(invocation, "deadlineAt")?;
+            let at = time::OffsetDateTime::parse(
+                original,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .map_err(|_| error("INVALID_INPUT", "Frozen invocation deadline is invalid"))?;
+            if at < bound_at { original } else { &bounded }
+        } else {
+            &bounded
+        };
+        let result = exchange(&host.client, method, Some(&id), payload, Some(requested))?;
+        bounded_host_deadline(deadline)?;
+        Ok(result)
     }
 }
 
@@ -486,10 +697,25 @@ fn bounded_host_deadline(deadline: Instant) -> AppResult<String> {
 
 pub struct HttpProviderPort {
     bridge: HostBridge,
+    deadline: Option<Instant>,
 }
 impl HttpProviderPort {
     pub fn new(bridge: HostBridge) -> Self {
-        Self { bridge }
+        Self {
+            bridge,
+            deadline: None,
+        }
+    }
+    /// Construct per actual application request, never with a refreshed budget.
+    pub fn with_deadline(bridge: HostBridge, deadline: Instant) -> Self {
+        Self {
+            bridge,
+            deadline: Some(deadline),
+        }
+    }
+    fn deadline(&self) -> Instant {
+        self.deadline
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(10))
     }
 }
 impl ProviderPort for HttpProviderPort {
@@ -503,26 +729,34 @@ impl ProviderPort for HttpProviderPort {
         let id = context_id(context)?;
         let principal = PrincipalId::new(text(context, "principalRef")?)
             .map_err(|_| error("STALE_CONTEXT", "Context principal is invalid"))?;
-        if request["contextId"] != id.as_str() || self.bridge.context(&principal, &id)? != *context
+        if request["contextId"] != id.as_str()
+            || self
+                .bridge
+                .context_with_deadline(&principal, &id, self.deadline())?
+                != *context
         {
             return Err(error("STALE_CONTEXT", "Registered read context changed"));
         }
-        let result = self.bridge.inspect(
+        let result = self.bridge.inspect_with_deadline(
             &principal,
             &id,
             json!({"kind":"registered_read","request":request}),
+            self.deadline(),
         )?;
         validate_registered_read_result(&result)?;
         Ok(result)
     }
     fn context(&mut self, principal: &PrincipalId, id: &ContextId) -> AppResult<Value> {
-        self.bridge.context(principal, id)
+        self.bridge
+            .context_with_deadline(principal, id, self.deadline())
     }
     fn action_descriptor(&mut self, step: &Value, context: &Value) -> AppResult<Value> {
         let id = context_id(context)?;
         let principal = PrincipalId::new(text(context, "principalRef")?)
             .map_err(|_| error("STALE_CONTEXT", "Context principal is invalid"))?;
-        let live = self.bridge.context(&principal, &id)?;
+        let live = self
+            .bridge
+            .context_with_deadline(&principal, &id, self.deadline())?;
         if live != *context {
             return Err(error("STALE_CONTEXT", "Action descriptor context changed"));
         }
@@ -532,12 +766,13 @@ impl ProviderPort for HttpProviderPort {
             .lock()
             .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
         let host = checked_host(&state, &id, Some(&principal))?;
+        let expires = bounded_host_deadline(self.deadline())?;
         let descriptor = exchange(
             &host.client,
             "describe",
             Some(&id),
             json!({"bindingId":step["bindingId"],"actionId":step["actionId"]}),
-            None,
+            Some(&expires),
         )?;
         validate("ActionDescriptor", &descriptor)?;
         Ok(descriptor)
@@ -551,80 +786,37 @@ impl ProviderPort for HttpProviderPort {
         let id = context_id(context)?;
         let principal = PrincipalId::new(text(context, "principalRef")?)
             .map_err(|_| error("STALE_CONTEXT", "Context principal is invalid"))?;
-        let observed = self.bridge.inspect(
+        let observed = self.bridge.inspect_with_deadline(
             &principal,
             &id,
             json!({"kind":"precondition", "precondition":precondition}),
+            self.deadline(),
         )?;
         Sha256Digest::new(text(&observed, "observedDigest")?)
             .map_err(|_| error("OBSERVATION_INVALID", "Host precondition digest is invalid"))
     }
     fn verify_dependencies(&mut self, pins: &[Value], context: &Value) -> AppResult<()> {
-        if pins.len() > 128 {
-            return Err(error(
-                "BUDGET_EXCEEDED",
-                "Dependency pin count exceeds its budget",
-            ));
-        }
-        let id = context_id(context)?;
-        let principal = PrincipalId::new(text(context, "principalRef")?)
-            .map_err(|_| error("STALE_CONTEXT", "Context principal is invalid"))?;
-        let inventory = self.bridge.inventory(&principal, &id)?;
-        let state = self
-            .bridge
-            .state
-            .lock()
-            .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
-        for pin in pins {
-            validate("DependencyPin", pin)?;
-            let component = text(pin, "componentId")?;
-            let digest = text(pin, "implementationDigest")?;
-            let approved = state
-                .verified_dependencies
-                .get(component)
-                .filter(|dependency| dependency.matches(pin))
-                .ok_or_else(|| {
-                    error(
-                        "STALE_DEPENDENCY",
-                        "Pinned dependency metadata has no approved source registration",
-                    )
-                })?;
-            let host = inventory["providers"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|p| p["bindingId"] == component)
-                .flat_map(|p| p["actions"].as_array().into_iter().flatten())
-                .any(|a| a["implementationDigest"] == digest);
-            // Platform and external registrations also require the currently
-            // paired host to expose the exact binding implementation. An owned
-            // source cannot be relabeled as a native or third-party provider.
-            if matches!(
-                approved.provenance,
-                DependencyProvenance::PlatformShim | DependencyProvenance::UserExternalTool
-            ) && !host
-            {
-                return Err(error(
-                    "STALE_DEPENDENCY",
-                    "Pinned implementation has no current approved registration",
-                ));
-            }
-        }
-        Ok(())
+        self.bridge
+            .verify_registered_dependencies_with_deadline(pins, context, self.deadline())
     }
     fn dispatch(&mut self, invocation: &Value) -> AppResult<Value> {
-        let result = self
-            .bridge
-            .invocation("dispatch", invocation, invocation.clone(), true)?;
+        let result = self.bridge.invocation_with_deadline(
+            "dispatch",
+            invocation,
+            invocation.clone(),
+            true,
+            self.deadline(),
+        )?;
         validate("ProviderResult", &result)?;
         Ok(result)
     }
     fn poll(&mut self, invocation: &Value, receipt: Option<&str>) -> AppResult<Option<Value>> {
-        let observed = self.bridge.invocation(
+        let observed = self.bridge.invocation_with_deadline(
             "operation.get",
             invocation,
             json!({"invocationId":invocation["invocationId"]}),
             false,
+            self.deadline(),
         )?;
         if observed["invocationId"] != invocation["invocationId"]
             || !observed["providerCompleted"].is_boolean()
@@ -651,11 +843,12 @@ impl ProviderPort for HttpProviderPort {
         Ok(Some(result.clone()))
     }
     fn request_cancel(&mut self, invocation: &Value, _receipt: Option<&str>) -> AppResult<()> {
-        let response = self.bridge.invocation(
+        let response = self.bridge.invocation_with_deadline(
             "operation.cancel",
             invocation,
             json!({"invocationId":invocation["invocationId"]}),
             false,
+            self.deadline(),
         )?;
         if response["invocationId"] != invocation["invocationId"]
             || response["cancellationRequested"] != true
@@ -773,6 +966,96 @@ fn validate_registered_read_result(result: &Value) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn local_route_witness() -> (HostBridge, HostContextWitness) {
+        // This fixture checks local transaction fencing only. No listener or
+        // native game is started, and no native observation is claimed.
+        let bridge = HostBridge::default();
+        let context: Value =
+            mmmm_contracts::parse_json(include_bytes!("../../../examples/execution-context.json"))
+                .unwrap();
+        let hello: Value =
+            mmmm_contracts::parse_json(include_bytes!("../../../examples/host-hello.json"))
+                .unwrap();
+        let id = context_id(&context).unwrap();
+        let principal = PrincipalId::new(text(&context, "principalRef").unwrap()).unwrap();
+        let client = HostRpcClient::paired(
+            crate::endpoint::EndpointRecord {
+                schema_version: 1,
+                contract_version: "0.2.0".into(),
+                address: "127.0.0.1:9".parse().unwrap(),
+                path: "/rpc".into(),
+                coordinator_epoch: "host-fixture-epoch".into(),
+                credential_ref: "MMMM.coordinator.peer-fixture".into(),
+            },
+            crate::credential::SecretToken::generate().unwrap(),
+        )
+        .unwrap();
+        let mut generation = [0; 16];
+        getrandom::fill(&mut generation).unwrap();
+        bridge.state.lock().unwrap().hosts.insert(
+            id.clone(),
+            PairedHost {
+                client,
+                principal: principal.clone(),
+                context: context.clone(),
+                hello,
+                expires: Instant::now() + Duration::from_secs(30),
+                generation,
+            },
+        );
+        let witness = HostContextWitness {
+            state: bridge.state.clone(),
+            context_id: id,
+            principal,
+            context,
+            generation,
+        };
+        (bridge, witness)
+    }
+    #[test]
+    fn local_checkpoint_accepts_exact_route_without_transport() {
+        let (_bridge, witness) = local_route_witness();
+        witness.check_local().unwrap();
+        witness.clone().check_local().unwrap();
+    }
+    #[test]
+    fn same_context_and_principal_do_not_revive_a_replaced_route() {
+        let (bridge, witness) = local_route_witness();
+        bridge
+            .state
+            .lock()
+            .unwrap()
+            .hosts
+            .get_mut(&witness.context_id)
+            .unwrap()
+            .generation[0] ^= 1;
+        assert_eq!(
+            witness.check_local().unwrap_err().code,
+            "SESSION_ROUTE_CHANGED"
+        );
+        bridge.detach(&witness.context_id).unwrap();
+        assert!(witness.check_local().is_err());
+    }
+    #[test]
+    fn local_checkpoint_rejects_expired_route_and_changed_epoch() {
+        let (bridge, witness) = local_route_witness();
+        {
+            let mut state = bridge.state.lock().unwrap();
+            let host = state.hosts.get_mut(&witness.context_id).unwrap();
+            host.context["environment"]["sessionEpoch"] = json!("new-host-epoch");
+        }
+        assert_eq!(
+            witness.check_local().unwrap_err().code,
+            "SESSION_ROUTE_CHANGED"
+        );
+        {
+            let mut state = bridge.state.lock().unwrap();
+            let host = state.hosts.get_mut(&witness.context_id).unwrap();
+            host.context = witness.context.clone();
+            host.expires = Instant::now();
+        }
+        assert!(witness.check_local().is_err());
+    }
     #[test]
     fn dependency_pin_cannot_change_provenance_or_claim_an_unimplemented_contract() {
         let digest = mmmm_contracts::raw_digest(b"actual owned implementation source");

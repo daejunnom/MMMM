@@ -247,6 +247,8 @@ mod platform {
         flags: i32,
         mode: libc::mode_t,
     ) -> Result<File, EndpointError> {
+        #[cfg(target_os = "macos")]
+        let mode = libc::c_uint::from(mode);
         // SAFETY: name is NUL-terminated; parent is a live directory handle.
         // O_NOFOLLOW is always requested, and FromRawFd owns the successful fd.
         let fd = unsafe {
@@ -736,13 +738,12 @@ mod platform {
         if let Some(suffix) = stem
             .strip_prefix("COM")
             .or_else(|| stem.strip_prefix("LPT"))
-        {
-            if matches!(
+            && matches!(
                 suffix,
                 "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
-            ) {
-                return false;
-            }
+            )
+        {
+            return false;
         }
         true
     }

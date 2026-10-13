@@ -276,6 +276,10 @@ impl NativePlanner<'_> {
         Ok(dependencies)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Authenticated source context, accumulated pins/change, and exact authored command inputs retain separate roles"
+    )]
     pub(crate) fn prepare_command_variant(
         &mut self,
         principal: &PrincipalId,
@@ -322,6 +326,10 @@ impl NativePlanner<'_> {
         append_variant(project, change, before, definition, variant)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Actual source authority and pin collection remain separate from original/candidate documents and optional selection"
+    )]
     fn variant_sources(
         &mut self,
         principal: &PrincipalId,
@@ -743,6 +751,10 @@ fn variant_id(kind: &str, original: &str, seed: &Sha256Digest) -> AppResult<Stri
     Ok(id)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Exact original and candidate state plus separately owned module, clip, physics and edit inputs form the variant digest"
+)]
 fn build_variant(
     before: &Instance,
     mut after: Instance,
@@ -881,10 +893,11 @@ fn insert_resource(prefab: &mut Prefab, resource: &ResourceRef) -> AppResult<()>
 }
 
 fn rebind_reference(reference: &mut SymbolReference, map: &BTreeMap<String, String>) {
-    if reference.scope == ReferenceScope::Local && reference.kind == "object" {
-        if let Some(target) = map.get(&reference.target_id) {
-            reference.target_id = target.clone();
-        }
+    if reference.scope == ReferenceScope::Local
+        && reference.kind == "object"
+        && let Some(target) = map.get(&reference.target_id)
+    {
+        reference.target_id = target.clone();
     }
 }
 
@@ -917,10 +930,11 @@ fn rebind_instance(
                 .iter()
                 .find(|reference| reference.symbol_id == *symbol_id)
                 .ok_or_else(unresolved)?;
-            if reference.scope == ReferenceScope::Local && reference.kind == "object" {
-                if let Some(target) = map.get(target_id.as_str()) {
-                    *target_id = TargetId::new(target).map_err(|_| invalid())?;
-                }
+            if reference.scope == ReferenceScope::Local
+                && reference.kind == "object"
+                && let Some(target) = map.get(target_id.as_str())
+            {
+                *target_id = TargetId::new(target).map_err(|_| invalid())?;
             }
         }
     }

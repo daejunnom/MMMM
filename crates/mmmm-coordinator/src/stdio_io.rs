@@ -28,6 +28,10 @@ pub const WORKER_COMMAND: &str = "--mmmm-stdio-worker";
 const MAGIC: &[u8; 8] = b"MMMMIO01";
 const FRAME_LIMIT: usize = 1_048_576;
 const WORK_BATCH: usize = 65_536;
+// A completed native pipe write must fit a small finite sink range. Sending
+// an entire 1 MiB transaction in one synchronous WriteFile can stay pending
+// without leaving a completed observable prefix when its owner is terminated.
+const EXTERNAL_WRITE_CHUNK: usize = 4096;
 const QUEUE_LIMIT: usize = 4 * FRAME_LIMIT;
 const HEADER: usize = 13;
 const INPUT: u8 = 1;
@@ -41,6 +45,36 @@ const RAW_INPUT: u8 = 8;
 const TRUNCATED: u8 = 9;
 const RAW_EOF: u8 = 10;
 const RAW_MODE_FLAG: u64 = 1 << 63;
+const WORKER_STAGES: &[&str] = &[
+    "worker_arguments",
+    "bootstrap_handle",
+    "bootstrap_type",
+    "bootstrap_peek",
+    "bootstrap_length",
+    "bootstrap_read",
+    "bootstrap_pipe",
+    "executable_path",
+    "executable_open",
+    "executable_metadata",
+    "executable_limits",
+    "executable_read",
+    "executable_identity",
+    "executable_changed",
+    "limits",
+    "worker_connect",
+    "worker_hello",
+    "worker_clone",
+    "worker_thread",
+    "external_stdio",
+    "channel",
+    "input_frame",
+    "input_budget",
+    "output_frame",
+    "output_budget",
+    "worker_io",
+    "channel_frame",
+    "worker_unknown",
+];
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Mode {
     Lines,
@@ -94,6 +128,7 @@ pub struct StdioError {
     pub code: &'static str,
     pub drained: bool,
     pub native_code: Option<i32>,
+    pub native_code_unknown: bool,
 }
 impl StdioError {
     fn new(code: &'static str) -> Self {
@@ -101,6 +136,7 @@ impl StdioError {
             code,
             drained: false,
             native_code: None,
+            native_code_unknown: false,
         }
     }
     fn io(code: &'static str, error: io::Error) -> Self {
@@ -108,12 +144,20 @@ impl StdioError {
             code,
             drained: false,
             native_code: error.raw_os_error(),
+            native_code_unknown: false,
         }
     }
 }
 impl std::fmt::Display for StdioError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "finite stdio: {}", self.code)
+        write!(f, "finite stdio: {}", self.code)?;
+        if self.native_code_unknown {
+            write!(f, " (UnknownNative)")
+        } else if let Some(code) = self.native_code {
+            write!(f, " (native {code})")
+        } else {
+            Ok(())
+        }
     }
 }
 impl std::error::Error for StdioError {}
@@ -131,14 +175,16 @@ struct Executable {
 }
 impl Executable {
     fn current() -> Result<Self, StdioError> {
-        let path = std::env::current_exe().map_err(|_| StdioError::new("executable"))?;
+        let path = std::env::current_exe().map_err(|e| StdioError::io("executable_path", e))?;
         let path = path
             .canonicalize()
-            .map_err(|_| StdioError::new("executable"))?;
+            .map_err(|e| StdioError::io("executable_path", e))?;
         let mut file = native::open_executable(&path)?;
-        let metadata = file.metadata().map_err(|_| StdioError::new("executable"))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| StdioError::io("executable_metadata", e))?;
         if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 256 * 1024 * 1024 {
-            return Err(StdioError::new("executable"));
+            return Err(StdioError::new("executable_limits"));
         }
         let mut hasher = Sha256::new();
         let mut buffer = [0u8; WORK_BATCH];
@@ -146,7 +192,7 @@ impl Executable {
         loop {
             let n = file
                 .read(&mut buffer)
-                .map_err(|_| StdioError::new("executable"))?;
+                .map_err(|e| StdioError::io("executable_read", e))?;
             if n == 0 {
                 break;
             }
@@ -276,7 +322,10 @@ impl NativeStdioPort {
                 limits,
                 mode,
                 expires: Instant::now() + limits.session,
-                receive: zeroize::Zeroizing::new(Vec::with_capacity(WORK_BATCH)),
+                // The private channel may carry a raw capability. Reserving
+                // the entire finite frame before reading prevents a later
+                // allocation from abandoning an unwiped sensitive prefix.
+                receive: zeroize::Zeroizing::new(Vec::with_capacity(FRAME_LIMIT + HEADER)),
                 lines: VecDeque::new(),
                 queued: 0,
                 input_count: 0,
@@ -537,6 +586,7 @@ impl NativeStdioPort {
                             code: "drain_deadline",
                             drained: true,
                             native_code: None,
+                            native_code_unknown: false,
                         });
                     }
                     return Ok(Poll::Ready(done));
@@ -766,8 +816,8 @@ fn authenticate_worker(
         if Instant::now() >= deadline {
             return Err(StdioError::new("startup_deadline"));
         }
-        if process.exit_code()?.is_some() {
-            return Err(StdioError::new("worker_exit"));
+        if let Some(code) = process.exit_code()? {
+            return Err(worker_exit_error(code));
         }
         match listener.accept() {
             Ok((mut socket, address)) if address.ip().is_loopback() => {
@@ -824,6 +874,72 @@ fn authenticate_worker(
 
 /// Hidden app entry. No secret is accepted in args: only loopback address and
 /// one inherited bootstrap handle/fd. The app must immediately exit afterwards.
+pub fn worker_entry_exit(args: &[String]) -> ! {
+    let code = match worker_entry(args) {
+        Ok(()) => 0,
+        Err(error) => worker_failure_exit(&error),
+    };
+    // The sole diagnostic channel is a fixed status. No stderr write can block
+    // and no frame, path, argument, capability or environment is emitted.
+    std::process::exit(code)
+}
+fn worker_failure_exit(error: &StdioError) -> i32 {
+    let stage = WORKER_STAGES
+        .iter()
+        .position(|s| *s == error.code)
+        .unwrap_or(WORKER_STAGES.len() - 1) as u32
+        + 1;
+    #[cfg(windows)]
+    {
+        let native = match error.native_code {
+            Some(n) if !error.native_code_unknown && (0..=65_533).contains(&n) => n as u32,
+            None if !error.native_code_unknown => 65_535,
+            _ => 65_534,
+        };
+        (0x4D00_0000 | stage << 16 | native) as i32
+    }
+    #[cfg(unix)]
+    {
+        // POSIX retains only eight status bits. Preserve the fixed stage and
+        // explicitly mark native diagnostics unavailable rather than truncate.
+        (if error.native_code.is_some() || error.native_code_unknown {
+            128
+        } else {
+            64
+        } + stage) as i32
+    }
+}
+fn worker_exit_error(status: i32) -> StdioError {
+    #[cfg(windows)]
+    let encoded = if status as u32 & 0xFF00_0000 == 0x4D00_0000 {
+        Some(((status as u32 >> 16) & 255, status as u32 & 65_535))
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    let encoded = if (65..=64 + WORKER_STAGES.len() as i32).contains(&status) {
+        Some(((status - 64) as u32, 65_535))
+    } else if (129..=128 + WORKER_STAGES.len() as i32).contains(&status) {
+        Some(((status - 128) as u32, 65_534))
+    } else {
+        None
+    };
+    if let Some((stage, native)) = encoded
+        && let Some(code) = stage
+            .checked_sub(1)
+            .and_then(|n| WORKER_STAGES.get(n as usize))
+    {
+        let mut error = StdioError::new(code);
+        error.native_code = (native < 65_534).then_some(native as i32);
+        error.native_code_unknown = native == 65_534;
+        return error;
+    }
+    // Preserve unexpected loader, signal or runtime termination as the actual
+    // bounded numeric status. It is never treated as an encoded helper report.
+    let mut error = StdioError::new("worker_exit");
+    error.native_code = Some(status);
+    error
+}
 pub fn worker_entry(args: &[String]) -> Result<(), StdioError> {
     if args.len() != 2 {
         return Err(StdioError::new("worker_arguments"));
@@ -861,7 +977,7 @@ pub fn worker_entry(args: &[String]) -> Result<(), StdioError> {
     }
     .validate()?;
     let mut socket = TcpStream::connect_timeout(&address, Duration::from_secs(5))
-        .map_err(|_| StdioError::new("channel"))?;
+        .map_err(|e| StdioError::io("worker_connect", e))?;
     let mut hello = zeroize::Zeroizing::new(Vec::with_capacity(80));
     hello.extend_from_slice(MAGIC);
     hello.extend_from_slice(&packet[..32]);
@@ -870,8 +986,10 @@ pub fn worker_entry(args: &[String]) -> Result<(), StdioError> {
     packet.zeroize();
     let sent = socket.write_all(&hello);
     hello.zeroize();
-    sent.map_err(|_| StdioError::new("channel"))?;
-    let mut receiver = socket.try_clone().map_err(|_| StdioError::new("channel"))?;
+    sent.map_err(|e| StdioError::io("worker_hello", e))?;
+    let mut receiver = socket
+        .try_clone()
+        .map_err(|e| StdioError::io("worker_clone", e))?;
     let sender = std::sync::Arc::new(Mutex::new(socket));
     let output_sender = sender.clone();
     // All three helper threads belong to this owned process. The watchdog
@@ -892,18 +1010,25 @@ pub fn worker_entry(args: &[String]) -> Result<(), StdioError> {
             }
         })
         .map_err(|_| StdioError::new("worker_thread"))?;
+    let (mut input, mut external_output) = native::worker_stdio()?;
     if mode == Mode::Raw {
         // Rust's global Stdin uses a BufReader and can capture a capability
         // past the requested public prefix. Raw mode owns unbuffered native
         // handles so each read requests exactly the caller's remaining range.
-        let (mut input, mut output) = native::worker_stdio()?;
-        return worker_raw(&mut receiver, &sender, &mut input, &mut output, limits);
+        return worker_raw(
+            &mut receiver,
+            &sender,
+            &mut input,
+            &mut external_output,
+            limits,
+        );
     }
+    drop(input);
     let output = std::thread::Builder::new()
         .name("mmmm-stdio-output".into())
         .stack_size(2 * 1024 * 1024)
         .spawn(move || -> Result<(), StdioError> {
-            let result = worker_output(receiver, output_sender, limits);
+            let result = worker_output(receiver, output_sender, limits, external_output);
             // EOF or output failure terminates the whole owned helper, including
             // an input thread currently blocked in external stdin.
             std::process::exit(if result.is_ok() { 0 } else { 3 });
@@ -922,6 +1047,12 @@ fn worker_send(sender: &Mutex<TcpStream>, tag: u8, id: u64, line: &[u8]) -> Resu
         .map_err(|_| StdioError::new("worker_thread"))?
         .write_all(&zeroize::Zeroizing::new(frame(tag, id, line)))
         .map_err(|_| StdioError::new("channel"))
+}
+fn worker_write_chunks(output: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    for chunk in bytes.chunks(EXTERNAL_WRITE_CHUNK) {
+        output.write_all(chunk)?;
+    }
+    Ok(())
 }
 fn worker_raw(
     receiver: &mut TcpStream,
@@ -984,8 +1115,7 @@ fn worker_raw(
             }
             output_count += 1;
             output_bytes += size as u64;
-            if output
-                .write_all(&payload)
+            if worker_write_chunks(output, &payload)
                 .and_then(|_| output.flush())
                 .is_err()
             {
@@ -1106,8 +1236,11 @@ fn worker_output(
     mut receiver: TcpStream,
     sender: std::sync::Arc<Mutex<TcpStream>>,
     limits: StdioLimits,
+    mut output: File,
 ) -> Result<(), StdioError> {
-    worker_output_to(&mut receiver, &sender, limits, &mut io::stdout().lock())
+    // The owned unbuffered native duplicate keeps every external call within
+    // the chunk bound. A global LineWriter may combine or buffer writes.
+    worker_output_to(&mut receiver, &sender, limits, &mut output)
 }
 fn worker_output_to(
     receiver: &mut TcpStream,
@@ -1154,8 +1287,7 @@ fn worker_output_to(
             .read_exact(&mut line)
             .map_err(|_| StdioError::new("channel"))?;
         validate_line(&line, false)?;
-        if output
-            .write_all(&line)
+        if worker_write_chunks(output, &line)
             .and_then(|_| output.write_all(b"\n"))
             .and_then(|_| output.flush())
             .is_err()

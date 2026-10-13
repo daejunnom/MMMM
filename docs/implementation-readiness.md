@@ -81,6 +81,16 @@ Windows의 빌드 관리 도구 bootstrap은 실제로 통과했으며, 제품 �
 | 일반 자원 정책과 저장 관측 진단 | Windows 관리 도구 81 통과, 1 ignored | 실제 소유 자식의 Job 설정·readback과 bounded 진단 검사 포함. 이 실행의 부모는 이전 감독 도구이며 새 정책을 모든 제품 실행에 적용했다고 표시하지 않음 |
 | 여덟 번째 3개 OS 기반 CI | 3개 OS bootstrap·구조·formatting 통과; 제품 검사와 집계 실패 | source `8d2ac7f49132eea55ba527f53232958f966abdc1`; Windows·Linux의 테스트 취소 호출 컴파일 오류와 Darwin의 variadic `mode_t` 승격 오류를 보존·수정. 제품 테스트 성공으로 표시하지 않음 |
 | 격리 stdio worker 실제 검사 | Windows worker 시작 실패, native `10106`, drain 확인 | bootstrap과 실행 파일 확인 이후 `worker_connect`에서 실패. OS에서 도출한 최소 환경 수정은 재검사 대상이며 메모리 또는 process 상한을 변경하지 않음 |
+| 격리 stdio worker 수정 후 실제 검사 | Windows native 시나리오 8개 통과, 명령 종료 0 | OS에서 도출한 최소 Windows 환경과 유한한 쓰기 chunk, 최종 flush 이후 ACK를 사용. 256 MiB·process 1의 worker 한도와 blocked stdout의 원래 deadline을 유지; macOS 높은 FD 회귀는 미실행 |
+| 정본 calibration 프로그램 및 교환 root | compiler 78, exchange 61 검사 통과 | 47개 고정 수치 프로그램과 세 entry의 pack 구성, 별도 필수 ZIP root 검증. 실제 게임 calibration 또는 target profile 승인이 아님 |
+| 초기 Project 정책과 undo 첫 집중 검사 | runtime 67 통과, undo 10 실패 | 정책의 생성·재시작·정확한 version pin·공통 reader 검사는 통과. undo route의 CAS blob 등록 전 외래 키 참조 오류를 수정했으며 수정 후 재검사는 별도 |
+| Coordinator 보존·workspace 및 host checkpoint | CLI 12 통과; Coordinator 124 통과, 1 실패, 1 ignored | 실제 native owner와 같은 Store의 정책 보존 경로 및 외부 I/O 없는 host checkpoint 통과. Windows native peer의 후속 연결에서 오류 2가 발생하여 원래 실패와 종료·drain을 보존 |
+| 일반 자원 정책 아래 JVM 전체 재실행 | SDK 107, host-core 56, public-java-adapter 17 통과; Fabric 13 통과, 17 실패 | 모든 Java 소스 컴파일과 16개 Gradle task의 실제 재실행 확인. Fabric 두 fixture가 공통 JCS scalar 정본화에서 실패해 수정 중; Job commit peak 1,525,178,368 bytes, process 6, drain·export·scratch 정리·lease 해제 확인 |
+| JVM scalar 정본화 및 profile 숫자 수정 후 | SDK 108, host-core 56, public-java-adapter 17, Fabric 33 검사 통과 | 같은 고정 Java·Gradle 도구와 2 GiB Job 한도 아래 전체 16개 task 실제 재실행, 실패·오류·skip 없음. primitive JCS와 mathematical integer 계약 검사 포함; 실제 loaded-definition 발급, calibration producer와 게임 인수는 별도 |
+| undo 보존 및 application 경계 수정 후 | runtime 77, application 52 검사 통과 | 실제 SQLite/CAS·GC·재시작, 원래 receipt 보존, 정확한 source association, atomic claim, 새 epoch·drift·권한 거절과 독립 복원 fixture 확인. application undo는 테스트에서만 연결한 상태이며 실제 Service·호스트·게임 통합은 미완료 |
+| 확장된 Rust 소스의 엄격 검사 | 등록된 workspace 전체 all-targets Clippy `-D warnings` 통과 | compiler calibration, runtime undo·bootstrap, Coordinator source·context·target profile과 CLI 포함. 아직 등록하지 않은 production composition, observer agent와 실제 게임 경로의 검증으로 확대하지 않음 |
+| 실제 peer와 target profile의 집중 검사 | CLI 12 통과; Coordinator 140 통과, 1 실패, 1 ignored 후 target profile 12개 재검사 통과 | 실제 Windows native peer의 잘못된 PID 거절과 정상 연결 세 번 반복 통과. reference-only profile의 nullable artifact를 suite fixture로 잘못 역직렬화한 테스트만 수정했으며, 전체 최초 실패와 집중 재검사 성공을 구분. 실제 게임 calibration 또는 profile 승인 결과가 아님 |
+| 첫 JVM 3개 OS CI | 세 OS와 집계 실패, 각 artifact의 bytes·SHA-256 확인 | source `1498ea14f253b03bf97a72323feddad934118b03`; macOS의 읽기 전용 PowerShell 변수 대입, Windows bootstrap의 활성 cache 경합과 Linux helper 시작 전 signal 6을 보존. Linux ICU 메시지를 패키지 부재로 단정하지 않으며 수정 후 성공은 별도 검증 |
 
 실패한 실행의 원본 판정은 유지한다. native drain과 정확한 소유 기록을 확인하고
 로그를 별도로 내보내며 digest를 대조한 경우에만 해당 실행의 알려진 임시 파일을

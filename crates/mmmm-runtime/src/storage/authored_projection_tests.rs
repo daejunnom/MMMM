@@ -246,10 +246,10 @@ impl ProjectionAuthority for Observer {
                 format!("fresh fixture world observation {}", self.observations).as_bytes(),
             )?;
         }
-        if self.observations == 2 {
-            if let Some(cancelled) = &self.cancel_at_second_observation {
-                cancelled.set(true);
-            }
+        if self.observations == 2
+            && let Some(cancelled) = &self.cancel_at_second_observation
+        {
+            cancelled.set(true);
         }
         Ok(WorldPhaseObservation {
             invocation_id: if self.wrong_binding {

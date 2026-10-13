@@ -330,13 +330,29 @@ fn preflight(bytes: &[u8], limits: ArchiveLimits) -> ExchangeResult<Vec<Member>>
     preflight_with_cancel(bytes, limits, &mut || false)
 }
 
+#[cfg(test)]
 fn preflight_with_cancel(
     bytes: &[u8],
     limits: ArchiveLimits,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> ExchangeResult<Vec<Member>> {
+    preflight_with_required_root(bytes, limits, MANIFEST, cancelled)
+}
+
+fn preflight_with_required_root(
+    bytes: &[u8],
+    limits: ArchiveLimits,
+    required_root: &str,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> ExchangeResult<Vec<Member>> {
     limits.validate()?;
     check_cancel(cancelled)?;
+    validate_member_path(required_root, limits)?;
+    if required_root.contains('/') || !required_root.nfc().eq(required_root.chars()) {
+        return Err(invalid(
+            "Required ZIP root must be one canonical portable file name",
+        ));
+    }
     if bytes.len() as u64 > limits.max_archive_bytes {
         return Err(limit("ZIP archive bytes exceed their budget"));
     }
@@ -399,7 +415,7 @@ fn preflight_with_cancel(
         .try_reserve_exact(count)
         .map_err(|_| limit("ZIP member index allocation failed"))?;
     let mut total_decoded = 0usize;
-    let mut has_manifest = false;
+    let mut has_required_root = false;
     for _ in 0..count {
         check_cancel(cancelled)?;
         range(directory, offset, 46)?;
@@ -451,7 +467,7 @@ fn preflight_with_cancel(
             return Err(invalid("Non-ASCII ZIP names must explicitly declare UTF-8"));
         }
         names.insert(name, limits)?;
-        has_manifest |= name == MANIFEST;
+        has_required_root |= name == required_root;
         check_extra(range(directory, offset + 46 + name_len, extra_len)?)?;
         range(directory, offset + 46 + name_len + extra_len, comment_len)?;
         let local_start = u32_at(directory, offset + 42)?;
@@ -471,9 +487,9 @@ fn preflight_with_cancel(
         });
         offset += 46 + name_len + extra_len + comment_len;
     }
-    if offset != directory.len() || !has_manifest {
+    if offset != directory.len() || !has_required_root {
         return Err(invalid(
-            "ZIP directory count is inexact or the root exchange manifest is missing",
+            "ZIP directory count is inexact or the required root file is missing",
         ));
     }
     for member in &mut members {
@@ -609,9 +625,22 @@ pub fn read_zip(bytes: &[u8], limits: ArchiveLimits) -> ExchangeResult<BTreeMap<
 pub fn read_zip_with_cancel(
     bytes: &[u8],
     limits: ArchiveLimits,
+    cancelled: impl FnMut() -> bool,
+) -> ExchangeResult<BTreeMap<String, Vec<u8>>> {
+    read_zip_with_required_root(bytes, limits, MANIFEST, cancelled)
+}
+
+/// Trusted codecs select their exact required root (for example, pack.mcmeta).
+/// It must be one bounded portable NFC file name, with literal case matching.
+/// All other members pass the same exchange ZIP preflight and byte decoder;
+/// choosing a root does not approve member contents or authorize source use.
+pub fn read_zip_with_required_root(
+    bytes: &[u8],
+    limits: ArchiveLimits,
+    required_root: &str,
     mut cancelled: impl FnMut() -> bool,
 ) -> ExchangeResult<BTreeMap<String, Vec<u8>>> {
-    let metadata = preflight_with_cancel(bytes, limits, &mut cancelled)?;
+    let metadata = preflight_with_required_root(bytes, limits, required_root, &mut cancelled)?;
     check_cancel(&mut cancelled)?;
     let mut archive = ZipArchive::new(Cursor::new(bytes))
         .map_err(|e| invalid(format!("ZIP decoder rejected directory: {e}")))?;
@@ -1046,23 +1075,124 @@ mod tests {
         rejected(&archive);
     }
 
+    // Existing exchange fixtures intentionally require mmmm-exchange.json.
+    // A second in-memory root exercises the production pack reader without
+    // changing that contract or extracting any member to the filesystem.
+    #[test]
+    fn required_root_reader_reuses_deflate_crc_and_cancellation_checks() {
+        let data = BTreeMap::from([
+            (
+                "pack.mcmeta".into(),
+                br#"{"pack":{"pack_format":1}}"#.to_vec(),
+            ),
+            ("assets/triangle.bin".into(), vec![1, 2, 3, 4]),
+        ]);
+        let archive = deflated(&data);
+        assert_eq!(
+            read_zip_with_required_root(&archive, ArchiveLimits::default(), "pack.mcmeta", || {
+                false
+            })
+            .unwrap(),
+            data
+        );
+        assert_eq!(
+            read_zip(&archive, ArchiveLimits::default())
+                .unwrap_err()
+                .code,
+            "ARCHIVE_INVALID"
+        );
+        assert_eq!(
+            read_zip_with_required_root(&archive, ArchiveLimits::default(), "pack.mcmeta", || true)
+                .unwrap_err()
+                .code,
+            "CANCELLED"
+        );
+
+        let metadata = preflight_with_required_root(
+            &archive,
+            ArchiveLimits::default(),
+            "pack.mcmeta",
+            &mut || false,
+        )
+        .unwrap();
+        let first = &metadata[0];
+        let mut corrupt = archive.clone();
+        corrupt[first.data_start] ^= 1;
+        assert_eq!(
+            read_zip_with_required_root(&corrupt, ArchiveLimits::default(), "pack.mcmeta", || {
+                false
+            })
+            .unwrap_err()
+            .code,
+            "ARCHIVE_INVALID"
+        );
+    }
+
+    #[test]
+    fn selected_root_requires_exact_canonical_root_file_before_decoding() {
+        for name in ["mmmm-exchange.json", "PACK.MCMETA", "packs/pack.mcmeta"] {
+            let data = BTreeMap::from([(name.to_owned(), vec![1, 2, 3])]);
+            let archive = deflated(&data);
+            assert_eq!(
+                read_zip_with_required_root(
+                    &archive,
+                    ArchiveLimits::default(),
+                    "pack.mcmeta",
+                    || false
+                )
+                .unwrap_err()
+                .code,
+                "ARCHIVE_INVALID"
+            );
+        }
+        let data = BTreeMap::from([("pack.mcmeta".to_owned(), vec![1, 2, 3])]);
+        let archive = deflated(&data);
+        for required in [
+            "packs/pack.mcmeta",
+            "../pack.mcmeta",
+            "pack.mcmeta/",
+            "PACK.MCMETA",
+            "e\u{301}.json",
+        ] {
+            assert_eq!(
+                read_zip_with_required_root(&archive, ArchiveLimits::default(), required, || false)
+                    .unwrap_err()
+                    .code,
+                "ARCHIVE_INVALID"
+            );
+        }
+        let oversized = "a".repeat(ArchiveLimits::default().max_path_bytes + 1);
+        assert_eq!(
+            read_zip_with_required_root(&archive, ArchiveLimits::default(), &oversized, || false)
+                .unwrap_err()
+                .code,
+            "BUDGET_EXCEEDED"
+        );
+    }
+
     #[test]
     fn bounded_writer_checks_encoded_size_and_aggregate_before_output() {
         let data = members();
-        let mut limits = ArchiveLimits::default();
-        limits.max_archive_bytes = 50;
+        let limits = ArchiveLimits {
+            max_archive_bytes: 50,
+            ..ArchiveLimits::default()
+        };
         assert_eq!(
             write_zip(&data, limits).unwrap_err().code,
             "BUDGET_EXCEEDED"
         );
-        limits = ArchiveLimits::default();
-        limits.max_member_bytes = 1;
+        let limits = ArchiveLimits {
+            max_member_bytes: 1,
+            ..ArchiveLimits::default()
+        };
         assert_eq!(
             write_zip(&data, limits).unwrap_err().code,
             "BUDGET_EXCEEDED"
         );
-        limits = ArchiveLimits::default();
-        limits.max_members = 1;
+        let limits = ArchiveLimits {
+            max_members: 1,
+            ..ArchiveLimits::default()
+        };
         assert_eq!(
             read_zip(&bytes(), limits).unwrap_err().code,
             "BUDGET_EXCEEDED"

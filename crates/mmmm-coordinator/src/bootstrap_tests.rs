@@ -722,3 +722,112 @@ fn timely_true_receipt_without_host_observations_never_activates() {
             .is_err()
     );
 }
+
+// This fixture supplies only the trusted owner-installation seam. It checks
+// actual kernel identity and the one locked Store; it is not a game session or
+// proof that live source/profile acquisition has passed.
+struct WorkspacePermit(OwnerSetupRpcContext);
+impl workspace_seal::Sealed for WorkspacePermit {}
+impl NativeWorkspacePermit for WorkspacePermit {
+    fn check_project(
+        &self,
+        store: &DurableStore,
+        project: &ProjectId,
+    ) -> StorageResult<PrincipalId> {
+        self.0.check_store(store)?;
+        store.project(project)?;
+        self.0.authenticated_local_owner()
+    }
+}
+fn install_owner_workspace(
+    store: &DurableStore,
+    processor: &mut HostBootstrapProcessor,
+    authority: &LocalAuthority,
+) -> (ContextId, Sha256Digest) {
+    let owner = local_owner_principal().unwrap();
+    let project = ProjectId::new("project-fixture").unwrap();
+    let context = ContextId::new("native-owner-workspace-fixture").unwrap();
+    let scope = json!({"projectId":project,"resourceIds":[],"objectIds":[],"regions":[],"externalTargetIds":[]});
+    let policy = authority
+        .install_project_access(
+            owner.clone(),
+            project.clone(),
+            scope.clone(),
+            BTreeSet::from([context.clone()]),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    let mut value = json!({"contractVersion":"0.2.0","contextId":context,"principalRef":owner,"projectId":project,"environment":{"kind":"offline","workspaceId":"actual-owned-fixture","side":"offline"},"policyRevision":policy,"scope":scope,"contextDigest":"0".repeat(64)});
+    value["contextDigest"] = json!(projected_digest("ExecutionContext", &value).unwrap());
+    processor
+        .install_workspace_context(
+            &WorkspacePermit(OwnerSetupRpcContext::for_store(store, None).unwrap()),
+            store,
+            &value,
+        )
+        .unwrap();
+    (context, policy)
+}
+#[test]
+fn native_owner_workspace_session_checks_current_generation_and_retirement() {
+    let root = Root::new();
+    let mut store = root.open();
+    let project = project(&mut store);
+    let (mut processor, authority) = processor();
+    let (context, policy) = install_owner_workspace(&store, &mut processor, &authority);
+    let current = processor.current_session_policy().unwrap();
+    assert_eq!(current.principal, local_owner_principal().unwrap());
+    assert_eq!(current.allowed_contexts, BTreeSet::from([context]));
+    authority
+        .revoke_staged_project(&current.principal, &project, &policy)
+        .unwrap();
+    assert!(
+        processor
+            .current_session_policy()
+            .unwrap()
+            .allowed_contexts
+            .is_empty()
+    );
+    processor.cleanup_expired().unwrap();
+    assert!(processor.workspace.is_empty());
+    processor.shutdown().unwrap();
+    drop(store);
+}
+#[test]
+fn game_principal_session_cannot_union_native_owner_workspace_contexts() {
+    let root = Root::new();
+    let mut store = root.open();
+    let project = project(&mut store);
+    let (mut processor, authority) = processor();
+    let (owner_context, _) = install_owner_workspace(&store, &mut processor, &authority);
+    let player = PrincipalId::new("actual-game-fixture-player").unwrap();
+    let game_context = ContextId::new("actual-game-fixture-context").unwrap();
+    let scope = json!({"projectId":project,"resourceIds":[],"objectIds":[],"regions":[],"externalTargetIds":[]});
+    let policy = authority
+        .install_project_access(
+            player.clone(),
+            project.clone(),
+            scope,
+            BTreeSet::from([game_context.clone()]),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    processor.active.insert(
+        game_context.clone(),
+        ActiveBootstrap {
+            principal: player.clone(),
+            project,
+            policy,
+            context_id: game_context.clone(),
+            route_owner: None,
+            expires: Instant::now() + Duration::from_secs(60),
+        },
+    );
+    let current = processor.current_session_policy().unwrap();
+    assert_eq!(current.principal, player);
+    assert_eq!(current.allowed_contexts, BTreeSet::from([game_context]));
+    assert!(!current.allowed_contexts.contains(&owner_context));
+    processor.shutdown().unwrap();
+    assert!(processor.workspace.is_empty());
+    drop(store);
+}

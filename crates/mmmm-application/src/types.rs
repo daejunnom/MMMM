@@ -21,6 +21,19 @@ impl AppError {
             source: None,
         }
     }
+    /// Keep the concrete local cause while exposing only bounded, non-secret
+    /// static text at the facade boundary.
+    pub fn caused_by(
+        code: &'static str,
+        message: &'static str,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            code,
+            message,
+            source: Some(Box::new(source)),
+        }
+    }
     pub fn storage(code: &'static str, error: StorageError) -> Self {
         Self {
             code,

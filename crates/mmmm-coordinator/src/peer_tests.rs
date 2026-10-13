@@ -95,6 +95,26 @@ impl Drop for RunningCoordinator {
     }
 }
 
+fn retry_prewrite_peer_busy<T>(
+    deadline: Instant,
+    mut attempt: impl FnMut() -> Result<T, PeerError>,
+) -> Result<T, PeerError> {
+    loop {
+        match attempt() {
+            Err(PeerError::Busy) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            #[cfg(windows)]
+            Err(PeerError::Native(231)) if Instant::now() < deadline => {
+                // This control path reports PIPE_BUSY only from CreateFile,
+                // before any request/token byte. Keep the same absolute deadline.
+                thread::sleep(Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
+}
+
 // One test deliberately owns both stages: Windows has one process-wide peer
 // server reservation. Parallel global-fatal fault injection is not registered.
 #[test]
@@ -110,6 +130,75 @@ fn native_peer_delivery_cleanup_and_default_coordinator_lifecycle() {
         let token = SecretToken::generate().unwrap();
         let expected = Zeroizing::new(*token.expose_secret());
         let peer = PeerBootstrap::start(&runtime, &reference, token).unwrap();
+
+        assert!(matches!(
+            PeerBootstrap::connect_verified_with_deadline(
+                runtime.path(),
+                &reference,
+                None,
+                Instant::now()
+            ),
+            Err(PeerError::Timeout)
+        ));
+        assert!(matches!(
+            PeerBootstrap::connect_verified_with_deadline(
+                runtime.path(),
+                &reference,
+                Some(0),
+                Instant::now() + Duration::from_secs(3)
+            ),
+            Err(PeerError::PeerDenied)
+        ));
+        let wrong_pid = std::process::id().checked_add(1).unwrap();
+        // PID verification denies the opened client before any request/token
+        // byte. Repeat that exact close -> accept -> authenticated delivery
+        // transition within this one owned server; never replay a delivered
+        // request or label a native timing gap as an observed cause.
+        for _ in 0..3 {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            assert!(matches!(
+                retry_prewrite_peer_busy(deadline, || {
+                    PeerBootstrap::connect_verified_with_deadline(
+                        runtime.path(),
+                        &reference,
+                        Some(wrong_pid),
+                        deadline,
+                    )
+                }),
+                Err(PeerError::PeerDenied)
+            ));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let witnessed = retry_prewrite_peer_busy(deadline, || {
+                PeerBootstrap::connect_authenticated_with_deadline(
+                    runtime.path(),
+                    &reference,
+                    deadline,
+                )
+            })
+            .unwrap();
+            assert_eq!(witnessed.server_pid(), std::process::id());
+            let received = witnessed.into_token();
+            assert!(
+                received.expose_secret() == &*expected,
+                "authenticated native token differs"
+            );
+            drop(received);
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let verified = retry_prewrite_peer_busy(deadline, || {
+            PeerBootstrap::connect_verified_with_deadline(
+                runtime.path(),
+                &reference,
+                Some(std::process::id()),
+                deadline,
+            )
+        })
+        .unwrap();
+        assert!(
+            verified.expose_secret() == &*expected,
+            "PID-bound native token differs"
+        );
+        drop(verified);
 
         assert!(PeerBootstrap::connect(runtime.path(), &wrong).is_err());
         let received = PeerBootstrap::connect(runtime.path(), &reference).unwrap();
@@ -327,8 +416,14 @@ fn wait_owned_leaf_child(
 
 #[cfg(windows)]
 fn persistent_evidence_parent(kind: &str) -> std::io::Result<PathBuf> {
-    use std::os::windows::fs::MetadataExt;
+    use std::mem::{MaybeUninit, size_of};
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::AsRawHandle;
     use std::path::{Component, Prefix};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+    type DirectoryIdentity = (u64, [u8; 16]);
     let reject = |stage: &'static str| {
         std::io::Error::other(format!(
             "native evidence directory boundary rejected at {stage}"
@@ -350,6 +445,48 @@ fn persistent_evidence_parent(kind: &str) -> std::io::Result<PathBuf> {
         }
         Ok(())
     };
+    let pin =
+        |path: &Path, stage: &'static str| -> std::io::Result<(fs::File, DirectoryIdentity)> {
+            ordinary(path, stage)?;
+            // Attributes-only access and no DELETE sharing keep this exact ordinary
+            // directory alive through parent/child verification without content I/O.
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .access_mode(0x80)
+                .share_mode(3)
+                .custom_flags(0x0200_0000 | 0x0020_0000)
+                .open(path)
+                .map_err(|error| observe_error(stage, error))?;
+            let metadata = file
+                .metadata()
+                .map_err(|error| observe_error(stage, error))?;
+            if !metadata.is_dir() || metadata.file_attributes() & 0x400 != 0 {
+                return Err(reject(stage));
+            }
+            let mut information = MaybeUninit::<FILE_ID_INFO>::uninit();
+            // SAFETY: a live owned directory handle, exact FileIdInfo output class,
+            // properly aligned structure storage and its precise native byte size.
+            if unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle(),
+                    FileIdInfo,
+                    information.as_mut_ptr().cast(),
+                    size_of::<FILE_ID_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(observe_error(stage, std::io::Error::last_os_error()));
+            }
+            // SAFETY: successful native call initialized the entire FILE_ID_INFO.
+            let information = unsafe { information.assume_init() };
+            Ok((
+                file,
+                (
+                    information.VolumeSerialNumber,
+                    information.FileId.Identifier,
+                ),
+            ))
+        };
     let resolve = |path: &Path, stage: &'static str| -> std::io::Result<PathBuf> {
         ordinary(path, stage)?;
         let resolved = fs::canonicalize(path).map_err(|error| observe_error(stage, error))?;
@@ -378,10 +515,14 @@ fn persistent_evidence_parent(kind: &str) -> std::io::Result<PathBuf> {
     // 정확히 지정된 APPDATA ancestry만 검사한다. Junction을 따라 다른
     // evidence root를 채택하거나 다른 directory를 열거하지 않는다.
     let mut ancestry = PathBuf::new();
+    let mut pins = Vec::new();
     for component in app_data.components() {
         ancestry.push(component.as_os_str());
         if !matches!(component, Component::Prefix(_)) {
-            ordinary(&ancestry, "appdata_ancestry")?;
+            if pins.len() >= 64 {
+                return Err(reject("appdata_ancestry_budget"));
+            }
+            pins.push(pin(&ancestry, "appdata_ancestry")?.0);
         }
     }
     let mut path = resolve(&app_data, "appdata")?;
@@ -402,22 +543,38 @@ fn persistent_evidence_parent(kind: &str) -> std::io::Result<PathBuf> {
             "native-peer-unconfirmed-drain" => "export_parent",
             _ => return Err(reject("kind")),
         };
+        let (parent_pin, parent_identity) = pin(&path, "parent_pin")?;
+        pins.push(parent_pin);
         let candidate = path.join(name);
         match fs::create_dir(&candidate) {
             Ok(()) => (),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
             Err(error) => return Err(observe_error(stage, error)),
         }
+        let (child_pin, child_identity) = pin(&candidate, stage)?;
+        pins.push(child_pin);
         let resolved = resolve(&candidate, stage)?;
-        // VerbatimDisk/DOS나 기존 ASCII leaf의 casing 차이를 전체 경로의
-        // 문자열 불일치로 거부하지 않는다. Canonical parent는 정확히 같고
-        // 고정 leaf만 같아야 하므로 다른 물리적 경계로 완화하지 않는다.
-        if resolved.parent() != Some(path.as_path())
+        let (resolved_child_pin, resolved_child_identity) = pin(&resolved, "resolved_child")?;
+        pins.push(resolved_child_pin);
+        let (resolved_parent_pin, resolved_parent_identity) = pin(
+            resolved
+                .parent()
+                .ok_or_else(|| reject("child_parent_missing"))?,
+            "resolved_parent",
+        )?;
+        pins.push(resolved_parent_pin);
+        let (reopened_parent_pin, reopened_parent_identity) = pin(&path, "parent_recheck")?;
+        pins.push(reopened_parent_pin);
+        // Windows 경로 casing/VerbatimDisk 문자열 대신 열린 객체의 실제
+        // volume serial + 128-bit file ID를 비교한다. 고정 부모와 자식 핸들을
+        // 유지하므로 문자열 차이를 허용해도 물리적 경계는 완화하지 않는다.
+        if resolved_parent_identity != parent_identity
+            || reopened_parent_identity != parent_identity
+            || resolved_child_identity != child_identity
             || !resolved
                 .file_name()
                 .and_then(|leaf| leaf.to_str())
                 .is_some_and(|leaf| leaf.eq_ignore_ascii_case(name))
-            || resolve(&path, "parent_recheck")? != path
         {
             return Err(reject("child_parent_identity"));
         }

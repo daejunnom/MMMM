@@ -4,6 +4,9 @@
 //! A successful fake-target check is never evidence of actual game acceptance.
 
 use crate::*;
+
+#[path = "undo_tests.rs"]
+mod undo_tests;
 use mmmm_contracts::{
     BindingId, ContextId, InvocationId, ObjectId, OperationId, PlanId, Sha256Digest, StepId,
     canonical_digest, encode_json, parse_json, projected_digest, raw_digest,

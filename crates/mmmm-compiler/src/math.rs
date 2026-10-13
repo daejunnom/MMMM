@@ -776,7 +776,7 @@ fn storage_provider(storage: &ResourceLocation, path: &str, numeric_type: Numeri
     )
 }
 
-fn provider(
+pub(crate) fn provider(
     node: &ExprNode,
     inputs: &[String],
     binding: Option<&SymbolBinding>,

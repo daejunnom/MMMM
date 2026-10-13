@@ -157,6 +157,34 @@ pub trait ProviderPort {
     ) -> AppResult<Sha256Digest> {
         self.observe_precondition(precondition, context)
     }
+    /// Admission supplies the actual immutable plan loaded from this store and
+    /// its selected step. A prepared private CAS reference can be read only
+    /// through its authenticated producer/plan association, never from a hash,
+    /// media type or project permission alone.
+    fn observe_plan_precondition_with_store(
+        &mut self,
+        store: &DurableStore,
+        _plan: &Value,
+        _step: &Value,
+        precondition: &Value,
+        context: &Value,
+    ) -> AppResult<Sha256Digest> {
+        self.observe_precondition_with_store(store, precondition, context)
+    }
+    /// Same admission boundary with a short mutable store borrow for retaining
+    /// actual private CAS evidence and pins. This permits no target mutation or
+    /// authored project/head commit; the frozen plan and current grant remain
+    /// the authorities for the independently acquired evidence.
+    fn observe_plan_precondition_retained_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        plan: &Value,
+        step: &Value,
+        precondition: &Value,
+        context: &Value,
+    ) -> AppResult<Sha256Digest> {
+        self.observe_plan_precondition_with_store(store, plan, step, precondition, context)
+    }
     /// This short unique-store borrow is granted only after durable intent. The
     /// composition may commit authenticated owned projection evidence there;
     /// it must never redispatch a world mutation after a local commit failure.
@@ -226,6 +254,18 @@ pub trait IndependentObserverPort {
         scope: &WriteScope,
     ) -> AppResult<Option<BeforeCapture>> {
         self.capture_before(invocation, scope)
+    }
+    /// Before durable intent, a trusted observer can retain its actual private
+    /// observation evidence using the application's unique store. Only private
+    /// CAS/pins may change here; target and authored projection writes remain
+    /// behind the separately approved durable dispatch boundary.
+    fn capture_before_retained_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        invocation: &Value,
+        scope: &WriteScope,
+    ) -> AppResult<Option<BeforeCapture>> {
+        self.capture_before_with_store(store, invocation, scope)
     }
     fn readback_with_store(
         &mut self,

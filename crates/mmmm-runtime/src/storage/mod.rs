@@ -1,6 +1,7 @@
 //! Durable local state for one Coordinator. The caller remains responsible for
 //! authentication, grants, expiry, live preconditions and independent observers.
-//! None of these methods invokes a provider or automatically replays a write.
+//! Trusted ports may inspect a provider. Storage never dispatches a provider
+//! mutation or automatically replays a write.
 
 mod cas;
 mod journal;
@@ -10,10 +11,12 @@ mod types;
 
 pub mod artifact;
 pub mod authored_projection;
+pub mod bootstrap;
 pub mod host_setup;
 pub mod owned_documents;
 pub mod project_resources;
 pub mod result_binding;
+pub mod undo;
 
 pub use types::*;
 

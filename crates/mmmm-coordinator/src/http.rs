@@ -142,7 +142,7 @@ impl LoopbackServer {
                 }
                 stream.set_nodelay(true)?;
                 let deadline = cap(Instant::now() + self.ingress_timeout);
-                let request = read_request(&mut stream, self.address, &self.epoch, deadline, &stop);
+                let request = read_request(&mut stream, self.address, &self.epoch, deadline, stop);
                 match request {
                     Ok(request) => {
                         // Authentication occurs before parsing function DTOs,
@@ -315,10 +315,7 @@ fn read_exact_deadline(
                     io::ErrorKind::WouldBlock
                         | io::ErrorKind::TimedOut
                         | io::ErrorKind::Interrupted
-                ) =>
-            {
-                ()
-            }
+                ) => {}
             Err(_) => return Err(HttpError::Io),
         }
     }
@@ -414,10 +411,7 @@ pub(crate) fn write_deadline(
                     io::ErrorKind::WouldBlock
                         | io::ErrorKind::TimedOut
                         | io::ErrorKind::Interrupted
-                ) =>
-            {
-                ()
-            }
+                ) => {}
             Err(_) => return Err(HttpError::Io),
         }
     }

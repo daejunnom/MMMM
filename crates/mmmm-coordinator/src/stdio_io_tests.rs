@@ -101,9 +101,18 @@ struct Output {
     bytes: Vec<u8>,
     flushed: bool,
     fail_flush: bool,
+    max_write: Option<usize>,
+    fail_after: Option<usize>,
+    writes: usize,
 }
 impl Write for Output {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.max_write.is_some_and(|n| bytes.len() > n)
+            || self.fail_after.is_some_and(|n| self.writes >= n)
+        {
+            return Err(io::Error::other("bounded output fixture"));
+        }
+        self.writes += 1;
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
@@ -113,6 +122,62 @@ impl Write for Output {
         } else {
             self.flushed = true;
             Ok(())
+        }
+    }
+}
+#[test]
+fn external_line_and_raw_writes_are_bounded_and_mid_write_failure_never_acknowledges() {
+    // A Vec sink and flush failure cannot expose an oversized native write.
+    // This strict sink accepts only a pipe-sized write and can fail after one
+    // completed chunk, preserving the partial-effect/no-ACK distinction.
+    for raw in [false, true] {
+        for fail_after in [None, Some(1)] {
+            let (mut local, mut peer) = sockets();
+            let sender = Mutex::new(local.try_clone().unwrap());
+            let data = vec![b'x'; EXTERNAL_WRITE_CHUNK * 2 + 1];
+            peer.write_all(&frame(if raw { RAW_OUTPUT } else { OUTPUT }, 1, &data))
+                .unwrap();
+            peer.shutdown(Shutdown::Write).unwrap();
+            let mut output = Output {
+                max_write: Some(EXTERNAL_WRITE_CHUNK),
+                fail_after,
+                ..Output::default()
+            };
+            let result = if raw {
+                worker_raw(
+                    &mut local,
+                    &sender,
+                    &mut Cursor::new([]),
+                    &mut output,
+                    StdioLimits::default(),
+                )
+            } else {
+                worker_output_to(&mut local, &sender, StdioLimits::default(), &mut output)
+            };
+            if fail_after.is_some() {
+                if raw {
+                    result.unwrap();
+                } else {
+                    assert_eq!(result.unwrap_err().code, "worker_io");
+                }
+                assert_eq!(output.bytes.len(), EXTERNAL_WRITE_CHUNK);
+                assert_eq!(output.bytes.as_slice(), &data[..EXTERNAL_WRITE_CHUNK]);
+                assert!(!output.flushed);
+                assert_eq!(receive(&mut peer), (FAULT, 0, Vec::new()));
+            } else {
+                result.unwrap();
+                assert!(output.flushed);
+                assert_eq!(output.bytes.len(), data.len() + usize::from(!raw));
+                assert_eq!(&output.bytes[..data.len()], data.as_slice());
+                if !raw {
+                    assert_eq!(output.bytes.last(), Some(&b'\n'));
+                }
+                assert_eq!(receive(&mut peer), (ACK, 1, Vec::new()));
+            }
+            drop(sender);
+            drop(local);
+            let mut trailing = [0];
+            assert_eq!(peer.read(&mut trailing).unwrap(), 0, "unexpected extra ACK");
         }
     }
 }
@@ -317,5 +382,69 @@ fn raw_budget_is_checked_before_external_io() {
         );
         assert_eq!(input.position(), 0);
         assert!(output.bytes.is_empty());
+    }
+}
+
+#[test]
+fn worker_failure_status_preserves_stage_and_marks_native_overflow_unknown() {
+    for native in [None, Some(5), Some(i32::MAX), Some(-1)] {
+        let mut error = StdioError::new("bootstrap_peek");
+        error.native_code = native;
+        let decoded = worker_exit_error(worker_failure_exit(&error));
+        assert_eq!(decoded.code, "bootstrap_peek");
+        assert!(!decoded.drained, "exit status cannot prove native drain");
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                decoded.native_code,
+                native.filter(|n| (0..=65_533).contains(n))
+            );
+            assert_eq!(
+                decoded.native_code_unknown,
+                native.is_some_and(|n| !(0..=65_533).contains(&n))
+            );
+        }
+        #[cfg(unix)]
+        {
+            assert_eq!(decoded.native_code, None);
+            assert_eq!(decoded.native_code_unknown, native.is_some());
+        }
+    }
+    let unexpected = worker_exit_error(3);
+    assert_eq!(unexpected.code, "worker_exit");
+    assert_eq!(unexpected.native_code, Some(3));
+    assert!(!unexpected.native_code_unknown);
+    let signal = worker_exit_error(-11);
+    assert_eq!(signal.code, "worker_exit");
+    assert_eq!(signal.native_code, Some(-11));
+    #[cfg(windows)]
+    {
+        let invalid_stage = worker_exit_error(0x4DFF_0005);
+        assert_eq!(invalid_stage.code, "worker_exit");
+        assert_eq!(invalid_stage.native_code, Some(0x4DFF_0005));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_worker_environment_has_only_os_root_keys_and_no_injection() {
+    let directory: Vec<u16> = "X:\\Windows".encode_utf16().collect();
+    let block = native::minimal_environment(&directory).unwrap();
+    let expected: Vec<u16> = "SystemRoot=X:\\Windows\0windir=X:\\Windows\0\0"
+        .encode_utf16()
+        .collect();
+    assert_eq!(block, expected);
+    for invalid in [
+        "",
+        "relative",
+        "X:\\Windows\0OTHER=value",
+        "\\\\host\\Windows",
+    ] {
+        assert_eq!(
+            native::minimal_environment(&invalid.encode_utf16().collect::<Vec<_>>())
+                .unwrap_err()
+                .code,
+            "system_directory"
+        );
     }
 }

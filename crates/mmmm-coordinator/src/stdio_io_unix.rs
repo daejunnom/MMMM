@@ -22,10 +22,12 @@ pub(super) fn open_executable(path: &Path) -> Result<File, StdioError> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
-        .map_err(|_| StdioError::new("executable"))?;
-    let metadata = file.metadata().map_err(|_| StdioError::new("executable"))?;
+        .map_err(|e| StdioError::io("executable_open", e))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| StdioError::io("executable_metadata", e))?;
     if !metadata.is_file() || metadata.mode() & 0o022 != 0 {
-        return Err(StdioError::new("executable"));
+        return Err(StdioError::new("executable_limits"));
     }
     Ok(file)
 }
@@ -82,26 +84,166 @@ fn bootstrap(packet: &[u8]) -> Result<(File, File), StdioError> {
     Ok((read, write))
 }
 pub(super) fn read_bootstrap(value: usize) -> Result<zeroize::Zeroizing<[u8; 96]>, StdioError> {
-    let fd = i32::try_from(value).map_err(|_| StdioError::new("bootstrap_pipe"))?;
+    let fd = i32::try_from(value).map_err(|_| StdioError::new("bootstrap_handle"))?;
     if fd < 3 {
-        return Err(StdioError::new("bootstrap_pipe"));
+        return Err(StdioError::new("bootstrap_handle"));
     }
     let mut info: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &mut info) } == -1 || info.st_mode & libc::S_IFMT != libc::S_IFIFO {
-        return Err(StdioError::new("bootstrap_pipe"));
+    if unsafe { libc::fstat(fd, &mut info) } == -1 {
+        return Err(StdioError::io(
+            "bootstrap_type",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    if info.st_mode & libc::S_IFMT != libc::S_IFIFO {
+        return Err(StdioError::new("bootstrap_type"));
     }
     let mut file = unsafe { File::from_raw_fd(fd) };
     // Only an inherited anonymous pipe is eligible. Nonblocking avoids a
     // hidden entry hanging when invoked without its trusted parent packet.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
-        return Err(StdioError::new("bootstrap_pipe"));
+        return Err(StdioError::io(
+            "bootstrap_read",
+            std::io::Error::last_os_error(),
+        ));
     }
     let mut packet = zeroize::Zeroizing::new([0; 96]);
     file.read_exact(&mut packet[..])
-        .map_err(|_| StdioError::new("bootstrap_pipe"))?;
+        .map_err(|e| StdioError::io("bootstrap_read", e))?;
     Ok(packet)
 }
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    // Public Darwin extension, available since macOS 10.7. The libc crate
+    // exposes the opaque action type and spawn flags, but not this function.
+    fn posix_spawn_file_actions_addinherit_np(
+        actions: *mut libc::posix_spawn_file_actions_t,
+        fd: libc::c_int,
+    ) -> libc::c_int;
+}
+
+/// All allocation and action construction happens in the parent. SETEXEC
+/// overlays the already-owned Command child instead of spawning a new child.
+#[cfg(target_os = "macos")]
+struct MacExec {
+    attr: libc::posix_spawnattr_t,
+    actions: libc::posix_spawn_file_actions_t,
+    attr_ready: bool,
+    actions_ready: bool,
+    _arguments: Vec<std::ffi::CString>,
+    path: usize,
+    argv: Vec<usize>,
+    env: [usize; 1],
+}
+// The opaque objects are exclusively constructed/destroyed in the parent.
+// Command's pre_exec closure only reads its forked copy; no native mutation or
+// concurrent access to the parent objects occurs after construction.
+#[cfg(target_os = "macos")]
+unsafe impl Send for MacExec {}
+#[cfg(target_os = "macos")]
+unsafe impl Sync for MacExec {}
+
+#[cfg(target_os = "macos")]
+impl MacExec {
+    fn new(path: &Path, args: &[String], boot: i32) -> Result<Self, StdioError> {
+        use std::os::unix::ffi::OsStrExt;
+        let arguments = std::iter::once(path.as_os_str())
+            .chain(args.iter().map(std::ffi::OsStr::new))
+            .map(|arg| {
+                std::ffi::CString::new(arg.as_bytes()).map_err(|_| StdioError::new("executable"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let path = arguments[0].as_ptr() as usize;
+        let argv = arguments
+            .iter()
+            .map(|arg| arg.as_ptr() as usize)
+            .chain(Some(0))
+            .collect();
+        let mut plan = Self {
+            attr: std::ptr::null_mut(),
+            actions: std::ptr::null_mut(),
+            attr_ready: false,
+            actions_ready: false,
+            _arguments: arguments,
+            path,
+            argv,
+            env: [0],
+        };
+        fn check(result: i32) -> Result<(), StdioError> {
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(StdioError::io(
+                    "native_descriptors",
+                    std::io::Error::from_raw_os_error(result),
+                ))
+            }
+        }
+        check(unsafe { libc::posix_spawnattr_init(&mut plan.attr) })?;
+        plan.attr_ready = true;
+        check(unsafe { libc::posix_spawn_file_actions_init(&mut plan.actions) })?;
+        plan.actions_ready = true;
+        check(unsafe {
+            libc::posix_spawnattr_setflags(
+                &mut plan.attr,
+                libc::POSIX_SPAWN_SETEXEC | libc::POSIX_SPAWN_CLOEXEC_DEFAULT,
+            )
+        })?;
+        for fd in [
+            libc::STDIN_FILENO,
+            libc::STDOUT_FILENO,
+            libc::STDERR_FILENO,
+            boot,
+        ] {
+            check(unsafe { posix_spawn_file_actions_addinherit_np(&mut plan.actions, fd) })?;
+        }
+        Ok(plan)
+    }
+
+    fn exec(&self) -> std::io::Result<()> {
+        // Apple's SETEXEC wrapper reads the prepared objects and submits one
+        // native spawn syscall. This child path allocates, locks and drops no
+        // Rust objects. CLOEXEC_DEFAULT acts on the actual exec descriptor
+        // table, including open descriptors above a subsequently lowered limit.
+        let result = unsafe {
+            libc::posix_spawn(
+                std::ptr::null_mut(),
+                self.path as *const libc::c_char,
+                &self.actions,
+                &self.attr,
+                self.argv.as_ptr().cast(),
+                self.env.as_ptr().cast(),
+            )
+        };
+        // Successful SETEXEC never returns. On failure, return the native
+        // errno through Command's original CLOEXEC startup-error pipe, which
+        // remains open until successful image activation actually closes it.
+        Err(std::io::Error::from_raw_os_error(if result == 0 {
+            libc::EIO
+        } else {
+            result
+        }))
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacExec {
+    fn drop(&mut self) {
+        // This destructor runs only in the parent after Command::spawn, or
+        // when preparation fails before any child exists.
+        unsafe {
+            if self.actions_ready {
+                libc::posix_spawn_file_actions_destroy(&mut self.actions);
+            }
+            if self.attr_ready {
+                libc::posix_spawnattr_destroy(&mut self.attr);
+            }
+        }
+    }
+}
+
 pub(super) struct Process {
     child: Child,
     pid: libc::pid_t,
@@ -118,16 +260,6 @@ impl Process {
     ) -> Result<Self, StdioError> {
         let (read, write) = bootstrap(packet)?;
         let boot = read.as_raw_fd();
-        #[cfg(target_os = "macos")]
-        let max_fd = {
-            let mut descriptor_limit: libc::rlimit = unsafe { std::mem::zeroed() };
-            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut descriptor_limit) } == -1
-                || descriptor_limit.rlim_cur > 65_536
-            {
-                return Err(StdioError::new("native_descriptors"));
-            }
-            descriptor_limit.rlim_cur as i32
-        };
         let args = [
             super::WORKER_COMMAND.to_owned(),
             address.to_string(),
@@ -156,6 +288,8 @@ impl Process {
             .map(|a| a.as_ptr() as usize)
             .chain(Some(0))
             .collect();
+        #[cfg(target_os = "macos")]
+        let mac_exec = MacExec::new(&executable.path, &args, boot)?;
         // pre_exec contains only async-signal-safe syscalls and preallocated
         // argv pointers. Rust's startup error pipe remains CLOEXEC, not closed.
         unsafe {
@@ -169,14 +303,7 @@ impl Process {
                     // silently inheriting descriptors or looping a huge limit.
                     return Err(std::io::Error::last_os_error());
                 }
-                #[cfg(target_os = "macos")]
-                for fd in 3..max_fd {
-                    if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) == -1
-                        && std::io::Error::last_os_error().raw_os_error() != Some(libc::EBADF)
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
+                #[cfg(target_os = "linux")]
                 if libc::fcntl(boot, libc::F_SETFD, 0) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -202,7 +329,7 @@ impl Process {
                     Err(std::io::Error::last_os_error())
                 }
                 #[cfg(target_os = "macos")]
-                Ok(())
+                mac_exec.exec()
             });
         }
         let child = command
@@ -268,7 +395,9 @@ impl Process {
         } else if info.si_code == libc::CLD_EXITED {
             Ok(Some(status))
         } else {
-            Ok(Some(128 + status))
+            // Keep signal termination distinct from a normal eight-bit exit
+            // status; it must not look like an encoded helper stage.
+            Ok(Some(-status))
         }
     }
     pub(super) fn scope_empty(&self) -> Result<bool, StdioError> {
@@ -328,6 +457,7 @@ impl Process {
                             code: "drain_deadline",
                             drained: true,
                             native_code: None,
+                            native_code_unknown: false,
                         });
                     }
                     return Ok(());

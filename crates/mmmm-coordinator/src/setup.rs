@@ -352,6 +352,8 @@ mod platform {
         flags: i32,
         mode: libc::mode_t,
     ) -> Result<File, io::Error> {
+        #[cfg(target_os = "macos")]
+        let mode = libc::c_uint::from(mode);
         let name = child_name(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: live parent descriptor, one NUL-terminated child name and
         // bounded fixed flags. O_NONBLOCK avoids waiting on a swapped FIFO;

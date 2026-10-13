@@ -1057,13 +1057,13 @@ fn deduplicate(values: Vec<Value>, definition: &str, key: &str) -> AppResult<Vec
     for value in values {
         validate(definition, &value)?;
         let id = text(&value, key)?.to_owned();
-        if let Some(previous) = map.insert(id, value.clone()) {
-            if previous != value {
-                return Err(AppError::new(
-                    "REVISION_CONFLICT",
-                    "Frozen metadata includes conflicting pins for one subject",
-                ));
-            }
+        if let Some(previous) = map.insert(id, value.clone())
+            && previous != value
+        {
+            return Err(AppError::new(
+                "REVISION_CONFLICT",
+                "Frozen metadata includes conflicting pins for one subject",
+            ));
         }
     }
     Ok(map.into_values().collect())
@@ -1171,11 +1171,10 @@ fn validate_projection_scope(
             .map_err(domain)?;
             for node in &definition.nodes {
                 let matrix = transforms.get(&node.node_id).ok_or_else(invalid)?;
-                let bounds = if let Some(geometry) = &node.block_geometry {
-                    Some((geometry.bounds.min, geometry.bounds.max_exclusive))
-                } else {
-                    None
-                };
+                let bounds = node
+                    .block_geometry
+                    .as_ref()
+                    .map(|geometry| (geometry.bounds.min, geometry.bounds.max_exclusive));
                 let Some((min, max)) = bounds else { continue };
                 let mut low = [f64::INFINITY; 3];
                 let mut high = [f64::NEG_INFINITY; 3];

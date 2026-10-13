@@ -122,17 +122,77 @@ pub struct PeerBootstrap {
 pub struct PeerHostAttach {
     inner: platform::HostClient,
 }
+/// Complete 수신 후에도 검증한 연결과 native guard를 계속 소유한다.
+/// 외부 relay의 실제 flush/EOF/helper drain 이후에만 완료를 요청해야 한다.
+/// Drop/abort는 ACK를 보내지 않는다. 반대편 rollback 완료의 증인은 아니다.
+#[must_use = "Complete 전달과 native drain 뒤 complete_delivery를 호출하거나 취소해야 합니다"]
+pub struct PendingHostCompletion {
+    inner: platform::HostClient,
+}
+impl PendingHostCompletion {
+    pub fn deadline(&self) -> Instant {
+        self.inner.deadline()
+    }
+    /// 원래 절대 마감 안에서 ACK를 한 번 보내고 실제 native EOF를 확인한다.
+    /// ACK 시도 뒤 실패는 상대의 수신 여부가 불확실할 수 있어 재전송하지 않는다.
+    pub fn complete_delivery(self) -> Result<(), PeerError> {
+        self.inner.complete_delivery()
+    }
+    pub fn abort(self) {
+        self.inner.abort();
+    }
+}
+/// actual kernel peer PID와 same-account 검증 후에만 생성하는 불투명 결과다.
+/// caller가 제공한 PID/label로 이 witness를 생성하는 공개 생성자는 없다.
+pub struct AuthenticatedPeerToken {
+    token: SecretToken,
+    server_pid: u32,
+}
+impl AuthenticatedPeerToken {
+    pub fn server_pid(&self) -> u32 {
+        self.server_pid
+    }
+    pub fn into_token(self) -> SecretToken {
+        self.token
+    }
+}
 impl PeerHostAttach {
     pub fn offer(
         runtime: &Path,
         reference: &CredentialRef,
         offer: HostOffer,
     ) -> Result<(Self, PublicFrame), PeerError> {
-        let (inner, authority) = platform::offer_host(runtime, reference, offer)?;
+        Self::offer_with_deadline(
+            runtime,
+            reference,
+            offer,
+            Instant::now() + crate::peer_management::BOOTSTRAP_LIMIT,
+        )
+    }
+    pub fn offer_with_deadline(
+        runtime: &Path,
+        reference: &CredentialRef,
+        offer: HostOffer,
+        deadline: Instant,
+    ) -> Result<(Self, PublicFrame), PeerError> {
+        let budget = BootstrapBudget::with_deadline(deadline);
+        budget
+            .check()
+            .map_err(|error| PeerError::from(ExchangeError::from(error)))?;
+        let (inner, authority) = platform::offer_host(runtime, reference, offer, budget)?;
         Ok((Self { inner }, authority))
     }
+    pub fn installed_staged(
+        self,
+        public: PublicFrame,
+    ) -> Result<(PendingHostCompletion, PublicFrame), PeerError> {
+        let (inner, complete) = self.inner.installed_staged(public)?;
+        Ok((PendingHostCompletion { inner }, complete))
+    }
     pub fn installed(self, public: PublicFrame) -> Result<PublicFrame, PeerError> {
-        self.inner.installed(public)
+        let (pending, complete) = self.installed_staged(public)?;
+        pending.complete_delivery()?;
+        Ok(complete)
     }
 }
 
@@ -188,6 +248,7 @@ mod platform {
     const IO_INCOMPLETE: u32 = 996;
     const PIPE_CONNECTED: u32 = 535;
     const PIPE_NOT_CONNECTED: u32 = 233;
+    const NO_DATA: u32 = 232;
     const BROKEN_PIPE: u32 = 109;
     const WAIT_TIMEOUT: u32 = 258;
     const WAIT_OBJECT: u32 = 0;
@@ -399,6 +460,66 @@ mod platform {
             .chain(std::iter::once(0))
             .collect()
     }
+    /// Native open 첫 접촉에만 사용한다. 성공한 핸들을 얻으면 이 반복을
+    /// 끝내고 PID/SID 검사 및 단 한 번의 교환으로 진행한다. Read/Write/ACK나
+    /// 불확실한 completion 오류를 이 함수로 되돌려 재생하지 않는다.
+    fn open_before_io<T>(
+        deadline: Instant,
+        stop: &AtomicBool,
+        exchange: Option<&BootstrapBudget>,
+        mut open: impl FnMut() -> Result<T, PeerError>,
+    ) -> Result<T, PeerError> {
+        loop {
+            budget(deadline, stop)?;
+            management_budget(deadline, stop, exchange)?;
+            match open() {
+                Ok(opened) => {
+                    // Native open이 늦게 끝나도 원래 마감이 늘어나지 않는다.
+                    // 만료 시 opened 소유자는 여기서 Drop하며 어떤 byte도 보내지 않는다.
+                    budget(deadline, stop)?;
+                    management_budget(deadline, stop, exchange)?;
+                    return Ok(opened);
+                }
+                Err(PeerError::Native(2 | 231)) => {
+                    // ERROR_FILE_NOT_FOUND 또는 ERROR_PIPE_BUSY만 아직 핸들이
+                    // 없는 첫 접촉에서 재시도한다. 다른 native 오류는 그대로 반환한다.
+                    budget(deadline, stop)?;
+                    management_budget(deadline, stop, exchange)?;
+                    thread::sleep(
+                        POLL_SLICE.min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    fn open_client_pipe(
+        name: &[u16],
+        deadline: Instant,
+        stop: &AtomicBool,
+        exchange: Option<&BootstrapBudget>,
+    ) -> Result<Arc<OwnedHandle>, PeerError> {
+        open_before_io(deadline, stop, exchange, || {
+            // SAFETY: canonical local NUL-terminated name remains live through
+            // synchronous CreateFile, non-inheritance and identification-only
+            // SQOS. This closure performs no consuming pipe I/O or token delivery.
+            let handle = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                    ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+                return Err(native_error());
+            }
+            owned(handle).map(Arc::new)
+        })
+    }
     fn runtime_guard(path: &Path) -> Result<RuntimeDirectory, PeerError> {
         // Metadata guards absence before RuntimeDirectory::open, which otherwise
         // permits creation. Its native path/owner/DACL pins remain held throughout.
@@ -459,8 +580,23 @@ mod platform {
                 .spawn(move || {
                     while !worker_stop.load(Ordering::Acquire) && !fatal_stop_requested() {
                         let deadline = Instant::now() + IO_BUDGET;
-                        let connected =
-                            operation(&pipe, IoKind::Connect, &[], 0, deadline, &worker_stop);
+                        let connected = accept_before_protocol(
+                            deadline,
+                            &worker_stop,
+                            || {
+                                native_operation(
+                                    &pipe,
+                                    IoKind::Connect,
+                                    &[],
+                                    0,
+                                    deadline,
+                                    &worker_stop,
+                                    None,
+                                )
+                                .map(|_| ())
+                            },
+                            || disconnect_after_terminal(&pipe),
+                        );
                         match connected {
                             Err(PeerError::Timeout) => continue,
                             Err(PeerError::Stopped) => break,
@@ -482,13 +618,7 @@ mod platform {
                         }
                         // No pending I/O remains here. Never FlushFileBuffers: that
                         // synchronous operation can wait indefinitely for a client.
-                        // SAFETY: owned connected server instance with terminal I/O.
-                        if unsafe { DisconnectNamedPipe(raw(&pipe)) } == 0 {
-                            let code = unsafe { GetLastError() };
-                            if !matches!(code, PIPE_NOT_CONNECTED | BROKEN_PIPE) {
-                                return Err(PeerError::Native(code as i32));
-                            }
-                        }
+                        disconnect_after_terminal(&pipe)?;
                     }
                     if fatal_stop_requested() {
                         Err(PeerError::UncertainDrain)
@@ -564,30 +694,20 @@ mod platform {
     pub(super) fn connect(
         runtime: &Path,
         reference: &CredentialRef,
-    ) -> Result<SecretToken, PeerError> {
+        expected_server_pid: Option<u32>,
+        deadline: Instant,
+    ) -> Result<AuthenticatedPeerToken, PeerError> {
         if fatal_stop_requested() {
             return Err(PeerError::UncertainDrain);
         }
         let _single = CLIENT_CHANNEL.try_lock().map_err(|_| PeerError::Busy)?;
         let _runtime = runtime_guard(runtime)?;
         let user = UserSid::current()?;
-        let deadline = Instant::now() + IO_BUDGET;
         let stop = AtomicBool::new(false);
+        budget(deadline, &stop)?;
         let name = pipe_name(reference);
-        // SAFETY: fixed local named-pipe namespace, no remote path; identification
-        // SQOS permits SID inspection without yielding impersonation authority.
-        let pipe = Arc::new(owned(unsafe {
-            CreateFileW(
-                name.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                0,
-                ptr::null(),
-                OPEN_EXISTING,
-                FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-                ptr::null_mut(),
-            )
-        })?);
-        let _server_process = verify_process(&pipe, &user, true)?;
+        let pipe = open_client_pipe(&name, deadline, &stop, None)?;
+        let server_process = verify_process(&pipe, &user, true, expected_server_pid)?;
         write_all(&pipe, &request(reference), deadline, &stop)?;
         let mut response = Zeroizing::new([0_u8; 32]);
         read_exact(&pipe, &mut *response, deadline, &stop)?;
@@ -600,7 +720,11 @@ mod platform {
             Err(error) => return Err(error),
             _ => return Err(PeerError::Protocol),
         }
-        response_token(&response)
+        budget(deadline, &stop)?;
+        Ok(AuthenticatedPeerToken {
+            token: response_token(&response)?,
+            server_pid: server_process.pid,
+        })
     }
 
     struct PipeIo {
@@ -724,18 +848,35 @@ mod platform {
     pub(super) struct HostClient {
         inner: HostAttachClient<PipeIo>,
         _runtime: RuntimeDirectory,
-        _server_process: OwnedHandle,
+        _server_process: VerifiedProcess,
         _reservation: std::sync::MutexGuard<'static, ()>,
     }
     impl HostClient {
-        pub(super) fn installed(self, public: PublicFrame) -> Result<PublicFrame, PeerError> {
-            self.inner.installed(public).map_err(PeerError::from)
+        pub(super) fn deadline(&self) -> Instant {
+            self.inner.deadline()
+        }
+        pub(super) fn installed_staged(
+            mut self,
+            public: PublicFrame,
+        ) -> Result<(Self, PublicFrame), PeerError> {
+            let complete = self
+                .inner
+                .installed_staged(public)
+                .map_err(PeerError::from)?;
+            Ok((self, complete))
+        }
+        pub(super) fn complete_delivery(mut self) -> Result<(), PeerError> {
+            self.inner.complete_delivery().map_err(PeerError::from)
+        }
+        pub(super) fn abort(self) {
+            self.inner.abort();
         }
     }
     pub(super) fn offer_host(
         runtime: &Path,
         reference: &CredentialRef,
         offer: HostOffer,
+        exchange: BootstrapBudget,
     ) -> Result<(HostClient, PublicFrame), PeerError> {
         if fatal_stop_requested() {
             return Err(PeerError::UncertainDrain);
@@ -744,36 +885,12 @@ mod platform {
         let runtime = runtime_guard(runtime)?;
         let user = UserSid::current()?;
         let stop = Arc::new(AtomicBool::new(false));
-        let exchange = BootstrapBudget::new();
         let deadline = exchange
             .native_io_deadline()
-            .map_err(PeerError::Management)?;
+            .map_err(|error| PeerError::from(ExchangeError::from(error)))?;
         let name = pipe_name(reference);
-        let pipe = loop {
-            budget(deadline, &stop)?;
-            // SAFETY: same canonical local name/DACL boundary as control client;
-            // retries only PIPE_BUSY before any byte/token/application is sent.
-            let handle = unsafe {
-                CreateFileW(
-                    name.as_ptr(),
-                    GENERIC_READ | GENERIC_WRITE,
-                    0,
-                    ptr::null(),
-                    OPEN_EXISTING,
-                    FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-                    ptr::null_mut(),
-                )
-            };
-            if handle != INVALID_HANDLE_VALUE && !handle.is_null() {
-                break Arc::new(owned(handle)?);
-            }
-            let code = unsafe { GetLastError() };
-            if code != 231 {
-                return Err(PeerError::Native(code as i32));
-            }
-            thread::sleep(POLL_SLICE);
-        };
-        let server_process = verify_process(&pipe, &user, true)?;
+        let pipe = open_client_pipe(&name, deadline, &stop, Some(&exchange))?;
+        let server_process = verify_process(&pipe, &user, true, None)?;
         let io = PipeIo {
             pipe,
             stop,
@@ -792,11 +909,16 @@ mod platform {
         ))
     }
 
+    struct VerifiedProcess {
+        _handle: OwnedHandle,
+        pid: u32,
+    }
     fn verify_process(
         pipe: &OwnedHandle,
         expected: &UserSid,
         server: bool,
-    ) -> Result<OwnedHandle, PeerError> {
+        expected_pid: Option<u32>,
+    ) -> Result<VerifiedProcess, PeerError> {
         let mut pid = 0;
         // SAFETY: connected live pipe handle; PID is kernel-provided, not payload.
         let result = unsafe {
@@ -806,7 +928,7 @@ mod platform {
                 GetNamedPipeClientProcessId(raw(pipe), &mut pid)
             }
         };
-        if result == 0 || pid == 0 {
+        if result == 0 || pid == 0 || expected_pid.is_some_and(|expected| expected != pid) {
             return Err(PeerError::PeerDenied);
         }
         // SAFETY: read-only process identity rights and non-inherited handle.
@@ -822,7 +944,10 @@ mod platform {
         }
         // Kept through the exchange to fence PID reuse. This is primary OS-account
         // identity, not proof of a last-message thread impersonation context.
-        Ok(process)
+        Ok(VerifiedProcess {
+            _handle: process,
+            pid,
+        })
     }
 
     fn serve(
@@ -834,7 +959,7 @@ mod platform {
         stop: &Arc<AtomicBool>,
         management: Option<&ManagementSender>,
     ) -> Result<(), PeerError> {
-        let _client_process = verify_process(pipe, user, false)?;
+        let _client_process = verify_process(pipe, user, false, None)?;
         let started = Instant::now();
         let mut magic = [0_u8; 8];
         read_exact(pipe, &mut magic, deadline, stop)?;
@@ -876,6 +1001,74 @@ mod platform {
         Connect,
         Read,
         Write,
+    }
+    #[derive(Debug, PartialEq, Eq)]
+    enum OperationFailure {
+        Error(PeerError),
+        // Only an immediate non-pending ConnectNamedPipe error or a proven
+        // terminal Connect completion may produce this tag. A cancellation
+        // reason or a Read/Write error with the same numeric code cannot do so.
+        ClosedBeforeProtocol,
+    }
+    impl From<PeerError> for OperationFailure {
+        fn from(error: PeerError) -> Self {
+            Self::Error(error)
+        }
+    }
+    impl OperationFailure {
+        fn into_peer_error(self) -> PeerError {
+            match self {
+                Self::Error(error) => error,
+                Self::ClosedBeforeProtocol => PeerError::Native(NO_DATA as i32),
+            }
+        }
+    }
+
+    fn terminal_operation_result(
+        kind: IoKind,
+        result: Result<u32, PeerError>,
+    ) -> Result<u32, OperationFailure> {
+        match (kind, result) {
+            (IoKind::Connect, Err(PeerError::Native(code))) if code == NO_DATA as i32 => {
+                Err(OperationFailure::ClosedBeforeProtocol)
+            }
+            (_, result) => result.map_err(OperationFailure::from),
+        }
+    }
+
+    fn accept_before_protocol(
+        deadline: Instant,
+        stop: &AtomicBool,
+        mut accept: impl FnMut() -> Result<(), OperationFailure>,
+        mut disconnect: impl FnMut() -> Result<(), PeerError>,
+    ) -> Result<(), PeerError> {
+        loop {
+            budget(deadline, stop)?;
+            match accept() {
+                Ok(()) => return budget(deadline, stop),
+                Err(OperationFailure::ClosedBeforeProtocol) => {
+                    // No protocol bytes were read or delivered. The previous
+                    // client is terminal; reset this exact instance before the
+                    // next accept, without creating a new absolute deadline.
+                    budget(deadline, stop)?;
+                    disconnect()?;
+                    budget(deadline, stop)?;
+                }
+                Err(OperationFailure::Error(error)) => return Err(error),
+            }
+        }
+    }
+
+    fn disconnect_after_terminal(pipe: &Arc<OwnedHandle>) -> Result<(), PeerError> {
+        // SAFETY: caller has proven terminal completion for this exact instance;
+        // no pending native I/O or borrowed protocol buffer remains.
+        if unsafe { DisconnectNamedPipe(raw(pipe)) } == 0 {
+            let code = unsafe { GetLastError() };
+            if !matches!(code, PIPE_NOT_CONNECTED | BROKEN_PIPE) {
+                return Err(PeerError::Native(code as i32));
+            }
+        }
+        Ok(())
     }
     struct IoState {
         pipe: Arc<OwnedHandle>,
@@ -930,10 +1123,22 @@ mod platform {
         stop: &AtomicBool,
         exchange: Option<&BootstrapBudget>,
     ) -> Result<Vec<u8>, PeerError> {
+        native_operation(pipe, kind, input, output_length, deadline, stop, exchange)
+            .map_err(OperationFailure::into_peer_error)
+    }
+    fn native_operation(
+        pipe: &Arc<OwnedHandle>,
+        kind: IoKind,
+        input: &[u8],
+        output_length: usize,
+        deadline: Instant,
+        stop: &AtomicBool,
+        exchange: Option<&BootstrapBudget>,
+    ) -> Result<Vec<u8>, OperationFailure> {
         budget(deadline, stop)?;
         management_budget(deadline, stop, exchange)?;
         if input.len() > MESSAGE_LIMIT || output_length > MESSAGE_LIMIT {
-            return Err(PeerError::Protocol);
+            return Err(PeerError::Protocol.into());
         }
         // SAFETY: unnamed manual-reset non-inherited event, initially unsignaled.
         let event = owned(unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) })?;
@@ -980,11 +1185,12 @@ mod platform {
                 return Ok(Vec::new());
             }
             if code != IO_PENDING {
-                return Err(PeerError::Native(code as i32));
+                return terminal_operation_result(kind, Err(PeerError::Native(code as i32)))
+                    .map(|_| Vec::new());
             }
             owner.pending = true;
         }
-        let transferred = wait_completion(&mut owner, deadline, stop, exchange)?;
+        let transferred = wait_completion(&mut owner, kind, deadline, stop, exchange)?;
         owner.pending = false;
         budget(deadline, stop)?;
         management_budget(deadline, stop, exchange)?;
@@ -999,7 +1205,7 @@ mod platform {
             IoKind::Connect => 0,
         };
         if transferred as usize > expected {
-            return Err(PeerError::Protocol);
+            return Err(PeerError::Protocol.into());
         }
         // This vector is public framing for writes/connects, secret response for
         // reads. The caller immediately wraps/clears its owned copy below.
@@ -1011,16 +1217,17 @@ mod platform {
 
     fn wait_completion(
         owner: &mut IoOwner,
+        kind: IoKind,
         deadline: Instant,
         stop: &AtomicBool,
         exchange: Option<&BootstrapBudget>,
-    ) -> Result<u32, PeerError> {
+    ) -> Result<u32, OperationFailure> {
         loop {
             let state = owner.state.as_ref().ok_or(PeerError::UncertainDrain)?;
             let query_error = match completion(state) {
                 Completion::Terminal(result) => {
                     owner.pending = false;
-                    return result;
+                    return terminal_operation_result(kind, result);
                 }
                 Completion::Unproven(error) => error,
             };
@@ -1029,13 +1236,13 @@ mod platform {
                 .or_else(|| budget(deadline, stop).err())
                 .or_else(|| management_budget(deadline, stop, exchange).err())
             {
-                return cancel_and_drain(owner, error);
+                return cancel_and_drain(owner, error).map_err(OperationFailure::from);
             }
             // SAFETY: private event is held by this pending owner's fixed box.
             let wait =
                 unsafe { WaitForSingleObject(raw(&state.event), POLL_SLICE.as_millis() as u32) };
             if !matches!(wait, WAIT_OBJECT | WAIT_TIMEOUT) {
-                return cancel_and_drain(owner, native_error());
+                return cancel_and_drain(owner, native_error()).map_err(OperationFailure::from);
             }
         }
     }
@@ -1178,6 +1385,185 @@ mod platform {
         pub(crate) const ISOLATED_TEST: &str =
             "tests::peer_tests::isolated_unconfirmed_drain_child";
 
+        // 기존 native fixture는 실제 prewrite close를 반복하지만 232의
+        // 관측 위치를 고정하지 않는다. 이 검사는 native 호출 없이 terminal
+        // Connect 결과와 취소/소비 오류의 분류 경계를 확인한다.
+        #[test]
+        fn only_terminal_connect_no_data_allows_prewrite_reset() {
+            assert_eq!(
+                terminal_operation_result(IoKind::Connect, Err(PeerError::Native(232))),
+                Err(OperationFailure::ClosedBeforeProtocol)
+            );
+            for kind in [IoKind::Read, IoKind::Write] {
+                assert_eq!(
+                    terminal_operation_result(kind, Err(PeerError::Native(232))),
+                    Err(OperationFailure::Error(PeerError::Native(232)))
+                );
+            }
+            for error in [
+                PeerError::Native(5),
+                PeerError::Native(995),
+                PeerError::Timeout,
+                PeerError::Stopped,
+                PeerError::UncertainDrain,
+                // A preserved cancellation/query reason is intentionally not
+                // transformed into a confirmed terminal Connect result.
+                PeerError::Native(232),
+            ] {
+                let mut accepts = 0;
+                let mut disconnects = 0;
+                let result = accept_before_protocol(
+                    Instant::now() + IO_BUDGET,
+                    &AtomicBool::new(false),
+                    || {
+                        accepts += 1;
+                        Err(OperationFailure::from(error))
+                    },
+                    || {
+                        disconnects += 1;
+                        Ok(())
+                    },
+                );
+                assert_eq!(result, Err(error));
+                assert_eq!(accepts, 1);
+                assert_eq!(disconnects, 0);
+            }
+        }
+
+        #[test]
+        fn prewrite_reset_preserves_deadline_stop_and_disconnect_failure() {
+            let stop = AtomicBool::new(false);
+            let deadline = Instant::now() + IO_BUDGET;
+            let mut accepts = 0;
+            let mut disconnects = 0;
+            let result = accept_before_protocol(
+                deadline,
+                &stop,
+                || {
+                    accepts += 1;
+                    if accepts < 3 {
+                        Err(OperationFailure::ClosedBeforeProtocol)
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    disconnects += 1;
+                    Ok(())
+                },
+            );
+            assert_eq!(result, Ok(()));
+            assert_eq!(accepts, 3);
+            assert_eq!(disconnects, 2);
+
+            let result = accept_before_protocol(
+                Instant::now(),
+                &stop,
+                || panic!("expired accept must not reopen"),
+                || panic!("expired accept must not disconnect"),
+            );
+            assert_eq!(result, Err(PeerError::Timeout));
+
+            let mut accepts = 0;
+            let result = accept_before_protocol(
+                deadline,
+                &stop,
+                || {
+                    accepts += 1;
+                    Err(OperationFailure::ClosedBeforeProtocol)
+                },
+                || {
+                    stop.store(true, Ordering::Release);
+                    Ok(())
+                },
+            );
+            assert_eq!(result, Err(PeerError::Stopped));
+            assert_eq!(accepts, 1);
+
+            let stop = AtomicBool::new(false);
+            let mut accepts = 0;
+            let result = accept_before_protocol(
+                deadline,
+                &stop,
+                || {
+                    accepts += 1;
+                    Err(OperationFailure::ClosedBeforeProtocol)
+                },
+                || Err(PeerError::Native(5)),
+            );
+            assert_eq!(result, Err(PeerError::Native(5)));
+            assert_eq!(accepts, 1);
+        }
+
+        // 현재 handshake 자료에는 첫 open의 일시적 부재와 오류 분류를
+        // 제어하는 사례가 없다. Native 호출 없이 open 단계만 주입하여
+        // permission/EOF/unknown 오류가 교환 재생으로 바뀌지 않는지 확인한다.
+        #[test]
+        fn first_contact_retries_only_missing_or_busy_and_returns_one_owner() {
+            let stop = AtomicBool::new(false);
+            let deadline = Instant::now() + IO_BUDGET;
+            let mut attempts = 0;
+            let opened = open_before_io(deadline, &stop, None, || {
+                attempts += 1;
+                match attempts {
+                    1 => Err(PeerError::Native(2)),
+                    2 => Err(PeerError::Native(231)),
+                    _ => Ok(17_u8),
+                }
+            });
+            assert_eq!(opened, Ok(17));
+            assert_eq!(attempts, 3);
+
+            for error in [
+                PeerError::Native(5),
+                PeerError::Native(109),
+                PeerError::Native(232),
+                PeerError::Native(233),
+                PeerError::Native(995),
+                PeerError::Native(997),
+                PeerError::PeerDenied,
+                PeerError::UncertainDrain,
+            ] {
+                let mut attempts = 0;
+                let result = open_before_io(deadline, &stop, None, || {
+                    attempts += 1;
+                    Err::<u8, _>(error)
+                });
+                assert_eq!(result, Err(error));
+                assert_eq!(attempts, 1);
+            }
+        }
+
+        #[test]
+        fn first_contact_never_refreshes_original_deadline_or_reopens_after_cancel() {
+            let stop = AtomicBool::new(false);
+            let mut attempts = 0;
+            let result = open_before_io(Instant::now(), &stop, None, || {
+                attempts += 1;
+                Ok(17_u8)
+            });
+            assert_eq!(result, Err(PeerError::Timeout));
+            assert_eq!(attempts, 0);
+
+            let exchange = BootstrapBudget::new();
+            exchange.cancel();
+            let result = open_before_io(exchange.deadline(), &stop, Some(&exchange), || {
+                attempts += 1;
+                Ok(17_u8)
+            });
+            assert_eq!(result, Err(PeerError::Stopped));
+            assert_eq!(attempts, 0);
+
+            let deadline = Instant::now() + IO_BUDGET;
+            let result = open_before_io(deadline, &stop, None, || {
+                attempts += 1;
+                stop.store(true, Ordering::Release);
+                Err::<u8, _>(PeerError::Native(2))
+            });
+            assert_eq!(result, Err(PeerError::Stopped));
+            assert_eq!(attempts, 1);
+        }
+
         pub(crate) fn cancel_calls() -> usize {
             TEST_CANCEL_CALLS.load(Ordering::Acquire)
         }
@@ -1195,7 +1581,7 @@ mod platform {
 
         pub(crate) struct UnacknowledgedConnection {
             pipe: Arc<OwnedHandle>,
-            _server_process: OwnedHandle,
+            _server_process: VerifiedProcess,
             opened: Instant,
         }
         impl UnacknowledgedConnection {
@@ -1236,33 +1622,8 @@ mod platform {
             let deadline = opened + IO_BUDGET;
             let stop = AtomicBool::new(false);
             let name = pipe_name(reference);
-            let pipe = loop {
-                budget(deadline, &stop)?;
-                // SAFETY: test-only local pipe open with the same native name,
-                // non-inheritance and identification-only SQOS as production.
-                let handle = unsafe {
-                    CreateFileW(
-                        name.as_ptr(),
-                        GENERIC_READ | GENERIC_WRITE,
-                        0,
-                        ptr::null(),
-                        OPEN_EXISTING,
-                        FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-                        ptr::null_mut(),
-                    )
-                };
-                if handle != INVALID_HANDLE_VALUE && !handle.is_null() {
-                    break Arc::new(owned(handle)?);
-                }
-                let code = unsafe { GetLastError() };
-                if code != 231 {
-                    return Err(PeerError::Native(code as i32));
-                }
-                // Only a pre-write PIPE_BUSY is retried in this fixture. It
-                // cannot replay a request, token delivery or application action.
-                thread::sleep(POLL_SLICE);
-            };
-            let server_process = verify_process(&pipe, &user, true)?;
+            let pipe = open_client_pipe(&name, deadline, &stop, None)?;
+            let server_process = verify_process(&pipe, &user, true, None)?;
             write_all(&pipe, &request(reference), deadline, &stop)?;
             let mut response = Zeroizing::new([0_u8; 32]);
             read_exact(&pipe, &mut *response, deadline, &stop)?;
@@ -1303,21 +1664,37 @@ mod platform {
     }
     pub(super) struct HostClient;
     impl HostClient {
-        pub(super) fn installed(self, _: PublicFrame) -> Result<PublicFrame, PeerError> {
+        pub(super) fn deadline(&self) -> Instant {
+            Instant::now()
+        }
+        pub(super) fn installed_staged(
+            self,
+            _: PublicFrame,
+        ) -> Result<(Self, PublicFrame), PeerError> {
             Err(PeerError::Unsupported)
         }
+        pub(super) fn complete_delivery(self) -> Result<(), PeerError> {
+            Err(PeerError::Unsupported)
+        }
+        pub(super) fn abort(self) {}
     }
     pub(super) fn offer_host(
         _: &Path,
         _: &CredentialRef,
         _: HostOffer,
+        _: BootstrapBudget,
     ) -> Result<(HostClient, PublicFrame), PeerError> {
         Err(PeerError::Unsupported)
     }
     pub(super) fn fatal_stop_requested() -> bool {
         false
     }
-    pub(super) fn connect(_: &Path, _: &CredentialRef) -> Result<SecretToken, PeerError> {
+    pub(super) fn connect(
+        _: &Path,
+        _: &CredentialRef,
+        _: Option<u32>,
+        _: Instant,
+    ) -> Result<AuthenticatedPeerToken, PeerError> {
         Err(PeerError::Unsupported)
     }
     pub(super) fn cleanup_stale(_: &Path, _: &CredentialRef) -> Result<(), PeerError> {
@@ -1337,7 +1714,30 @@ impl PeerBootstrap {
     }
 
     pub fn connect(runtime: &Path, reference: &CredentialRef) -> Result<SecretToken, PeerError> {
-        platform::connect(runtime, reference)
+        Self::connect_verified_with_deadline(runtime, reference, None, Instant::now() + IO_BUDGET)
+    }
+    /// Launcher가 소유한 child를 유지한 상태에서 actual kernel PID를 비교한다.
+    /// PID 불일치는 request/token 전송 전에 거부하며 같은 account만으로 우회하지 않는다.
+    pub fn connect_verified_with_deadline(
+        runtime: &Path,
+        reference: &CredentialRef,
+        expected_server_pid: Option<u32>,
+        deadline: Instant,
+    ) -> Result<SecretToken, PeerError> {
+        if expected_server_pid == Some(0) {
+            return Err(PeerError::PeerDenied);
+        }
+        let deadline = control_deadline(deadline)?;
+        platform::connect(runtime, reference, expected_server_pid, deadline)
+            .map(AuthenticatedPeerToken::into_token)
+    }
+    pub fn connect_authenticated_with_deadline(
+        runtime: &Path,
+        reference: &CredentialRef,
+        deadline: Instant,
+    ) -> Result<AuthenticatedPeerToken, PeerError> {
+        let deadline = control_deadline(deadline)?;
+        platform::connect(runtime, reference, None, deadline)
     }
     pub fn start_with_management(
         runtime: &RuntimeDirectory,
@@ -1371,6 +1771,17 @@ impl PeerBootstrap {
     pub fn fatal_stop_requested(&self) -> bool {
         platform::fatal_stop_requested()
     }
+}
+
+fn control_deadline(deadline: Instant) -> Result<Instant, PeerError> {
+    if fatal_stop_requested() {
+        return Err(PeerError::UncertainDrain);
+    }
+    let now = Instant::now();
+    if deadline <= now {
+        return Err(PeerError::Timeout);
+    }
+    Ok(deadline.min(now + IO_BUDGET))
 }
 
 fn request(reference: &CredentialRef) -> Vec<u8> {
@@ -1921,32 +2332,48 @@ mod platform {
         _directory: Directory,
     }
     impl HostClient {
-        pub(super) fn installed(self, public: PublicFrame) -> Result<PublicFrame, PeerError> {
-            self.inner.installed(public).map_err(PeerError::from)
+        pub(super) fn deadline(&self) -> Instant {
+            self.inner.deadline()
+        }
+        pub(super) fn installed_staged(
+            mut self,
+            public: PublicFrame,
+        ) -> Result<(Self, PublicFrame), PeerError> {
+            let complete = self
+                .inner
+                .installed_staged(public)
+                .map_err(PeerError::from)?;
+            Ok((self, complete))
+        }
+        pub(super) fn complete_delivery(mut self) -> Result<(), PeerError> {
+            self.inner.complete_delivery().map_err(PeerError::from)
+        }
+        pub(super) fn abort(self) {
+            self.inner.abort();
         }
     }
     pub(super) fn offer_host(
         runtime: &Path,
         reference: &CredentialRef,
         offer: HostOffer,
+        exchange: BootstrapBudget,
     ) -> Result<(HostClient, PublicFrame), PeerError> {
         let directory = Directory::open(runtime)?;
         let name = format!("pairing-{}.sock", channel_name(reference));
         let before = directory.socket(&name)?;
         let stop = Arc::new(AtomicBool::new(false));
-        let exchange = BootstrapBudget::new();
         let stream = connect_socket(
             &directory.path.join(&name),
             exchange
                 .native_io_deadline()
-                .map_err(PeerError::Management)?,
+                .map_err(|error| PeerError::from(ExchangeError::from(error)))?,
             &stop,
         )?;
         let after = directory.socket(&name)?;
         if before.st_dev != after.st_dev || before.st_ino != after.st_ino {
             return Err(PeerError::UnsafePath);
         }
-        verify_peer(&stream)?;
+        verify_peer(&stream, None)?;
         let io = SocketIo {
             stream,
             stop,
@@ -1966,24 +2393,29 @@ mod platform {
     pub(super) fn connect(
         runtime: &Path,
         reference: &CredentialRef,
-    ) -> Result<SecretToken, PeerError> {
+        expected_server_pid: Option<u32>,
+        deadline: Instant,
+    ) -> Result<AuthenticatedPeerToken, PeerError> {
         let directory = Directory::open(runtime)?;
         let name = format!("pairing-{}.sock", channel_name(reference));
         let before = directory.socket(&name)?;
-        let deadline = Instant::now() + IO_BUDGET;
         let stop = AtomicBool::new(false);
         let stream = connect_socket(&directory.path.join(&name), deadline, &stop)?;
         let after = directory.socket(&name)?;
         if before.st_dev != after.st_dev || before.st_ino != after.st_ino {
             return Err(PeerError::UnsafePath);
         }
-        verify_peer(&stream)?;
+        let server_pid = verify_peer(&stream, expected_server_pid)?;
         write_all(&stream, &request(reference), deadline, &stop)?;
         let mut response = Zeroizing::new([0_u8; 32]);
         read_exact(&stream, &mut *response, deadline, &stop)?;
         write_all(&stream, &[ACK], deadline, &stop)?;
         wait_eof(&stream, deadline, &stop)?;
-        response_token(&response)
+        check_budget(deadline, &stop)?;
+        Ok(AuthenticatedPeerToken {
+            token: response_token(&response)?,
+            server_pid,
+        })
     }
 
     pub(super) fn cleanup_stale(
@@ -2045,6 +2477,7 @@ mod platform {
         deadline: Instant,
         stop: &AtomicBool,
     ) -> Result<UnixStream, PeerError> {
+        check_budget(deadline, stop)?;
         validate_socket_path(path)?;
         // SAFETY: documented local stream socket type; ownership transfers below.
         let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
@@ -2146,7 +2579,7 @@ mod platform {
         Ok(())
     }
 
-    fn verify_peer(stream: &UnixStream) -> Result<(), PeerError> {
+    fn verify_peer(stream: &UnixStream, expected_pid: Option<u32>) -> Result<u32, PeerError> {
         let expected = current_uid()?;
         #[cfg(target_os = "linux")]
         {
@@ -2174,6 +2607,13 @@ mod platform {
             if credentials.uid != expected || credentials.pid <= 0 {
                 return Err(PeerError::PeerDenied);
             }
+            let pid = u32::try_from(credentials.pid).map_err(|_| PeerError::PeerDenied)?;
+            if expected_pid.is_some_and(|expected| expected != pid) {
+                return Err(PeerError::PeerDenied);
+            }
+            // SO_PEERCRED is the kernel connect/listen snapshot. The launcher
+            // must retain its owned child to bind this PID to that generation.
+            Ok(pid)
         }
         #[cfg(target_os = "macos")]
         {
@@ -2186,8 +2626,32 @@ mod platform {
             if uid != expected {
                 return Err(PeerError::PeerDenied);
             }
+            let mut pid: libc::pid_t = 0;
+            let mut length = mem::size_of::<libc::pid_t>() as libc::socklen_t;
+            // SAFETY: SOL_LOCAL=0 / LOCAL_PEERPID=2 are Apple's native local
+            // socket PID option. Exact live pid_t storage and length are provided.
+            if unsafe {
+                libc::getsockopt(
+                    stream.as_raw_fd(),
+                    0,
+                    2,
+                    (&mut pid as *mut libc::pid_t).cast(),
+                    &mut length,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if length as usize != mem::size_of::<libc::pid_t>() || pid <= 0 {
+                return Err(PeerError::PeerDenied);
+            }
+            let pid = u32::try_from(pid).map_err(|_| PeerError::PeerDenied)?;
+            if expected_pid.is_some_and(|expected| expected != pid) {
+                return Err(PeerError::PeerDenied);
+            }
+            // This socket's kernel PID is not a process generation/liveness pin.
+            Ok(pid)
         }
-        Ok(())
     }
 
     fn serve(
@@ -2198,7 +2662,7 @@ mod platform {
         stop: &Arc<AtomicBool>,
         management: Option<&ManagementSender>,
     ) -> Result<(), PeerError> {
-        verify_peer(stream)?;
+        verify_peer(stream, None)?;
         let started = Instant::now();
         let mut magic = [0_u8; 8];
         read_exact(stream, &mut magic, deadline, stop)?;

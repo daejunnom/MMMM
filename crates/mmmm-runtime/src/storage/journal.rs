@@ -313,7 +313,7 @@ impl DurableStore {
         step_id: &StepId,
         invocation: &Value,
     ) -> StorageResult<StepRecord> {
-        self.dispatch_intent_internal(operation, step_id, invocation, None)
+        self.dispatch_intent_internal(operation, step_id, invocation, None, None)
     }
 
     pub(crate) fn dispatch_intent_internal(
@@ -322,6 +322,7 @@ impl DurableStore {
         step_id: &StepId,
         invocation: &Value,
         resolution_witness: Option<&BlobRef>,
+        undo_authorization: Option<super::undo::UndoIntentAuthorization<'_>>,
     ) -> StorageResult<StepRecord> {
         self.validator
             .validate("Invocation", invocation)
@@ -331,9 +332,11 @@ impl DurableStore {
         let invocation_id: InvocationId =
             serde_json::from_value(invocation["invocationId"].clone())
                 .map_err(|e| StorageError::Contract(e.to_string()))?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // The unique mutable Store borrow and exclusive root lease protect
+        // this connection. The undo hook shares read-only durable verification
+        // on the same connection; all live provider reads precede this tx.
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let mut record = read_record(&transaction, operation)?;
         if record.cancellation_requested
             || record.reconciliation_required
@@ -363,6 +366,13 @@ impl DurableStore {
             || invocation["context"]["principalRef"] != record.principal.as_str()
         {
             return Err(StorageError::Conflict("Invocation identity"));
+        }
+        if undo_authorization.is_none() {
+            super::undo::reject_recovery_only_route(&transaction, invocation)?;
+        } else if resolution_witness.is_some() {
+            return Err(StorageError::Conflict(
+                "Provider undo cannot use result resolution authorization",
+            ));
         }
         // Context/action/implementation pins must match the frozen step; the
         // application separately validates expiry, grant and target preconditions.
@@ -453,6 +463,20 @@ impl DurableStore {
             .map_err(|e| StorageError::Contract(e.to_string()))?;
         if invocation["argumentsDigest"] != args_hash.as_str() {
             return Err(StorageError::Conflict("Invocation arguments digest"));
+        }
+        if let Some(authorization) = &undo_authorization {
+            super::undo::reserve_undo_in(
+                &transaction,
+                self,
+                super::undo::UndoClaimInput {
+                    operation: &record,
+                    plan: &plan,
+                    step,
+                    invocation,
+                    invocation_blob: &blob,
+                },
+                authorization,
+            )?;
         }
         if record.steps[index].write_effect {
             check_fences(
@@ -811,17 +835,95 @@ impl DurableStore {
         operation: &OperationId,
         step: &StepId,
     ) -> StorageResult<Value> {
-        let row:Option<(String,i64)>=self.connection.query_row(
-            "SELECT i.blob_digest,b.byte_length FROM invocations i JOIN blobs b ON b.digest=i.blob_digest WHERE operation_id=?1 AND step_id=?2",
-            params![operation.as_str(),step.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-        let (digest, length) = row.ok_or(StorageError::NotFound("Durable invocation"))?;
+        self.stored_invocation_checked(operation, step, 8 * 1024 * 1024, || Ok(()))
+    }
+
+    /// Original intent metadata only. A BlobRef is not a caller read grant;
+    /// transport code still verifies current operation/context authority.
+    pub fn stored_invocation_blob(
+        &self,
+        operation: &OperationId,
+        step: &StepId,
+    ) -> StorageResult<BlobRef> {
+        let record = read_record(&self.connection, operation)?;
+        let actual = record
+            .steps
+            .iter()
+            .find(|stored| &stored.step_id == step)
+            .ok_or(StorageError::NotFound("Original invocation step"))?;
+        let row: Option<(String, String, String, i64)> = self.connection.query_row(
+            "SELECT i.invocation_id,i.invocation_hash,i.blob_digest,b.byte_length FROM invocations i JOIN blobs b ON b.digest=i.blob_digest WHERE i.operation_id=?1 AND i.step_id=?2",
+            params![operation.as_str(),step.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        let (id, hash, digest, length) = row.ok_or(StorageError::NotFound("Durable invocation"))?;
         let blob = BlobRef {
             digest: Sha256Digest::new(digest).map_err(|e| StorageError::Corrupt(e.to_string()))?,
-            byte_length: length as u64,
+            byte_length: u64::try_from(length)
+                .map_err(|_| StorageError::Corrupt("Negative invocation blob length".into()))?,
         };
-        self.validator
-            .parse_and_validate("Invocation", &self.cas.read(&blob)?)
-            .map_err(|e| StorageError::Contract(e.to_string()))
+        if actual.dispatch == DispatchEvidence::NotSent
+            || actual.invocation_id.as_ref().map(InvocationId::as_str) != Some(id.as_str())
+            || actual.invocation_digest.as_ref() != Some(&blob.digest)
+            || hash != blob.digest.as_str()
+        {
+            return Err(StorageError::Conflict(
+                "Original invocation index and journal",
+            ));
+        }
+        let retained: i64 = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM blob_refs WHERE owner_kind='operation' AND owner_id=?1 AND digest=?2)",
+            params![operation.as_str(),blob.digest.as_str()],|r|r.get(0))?;
+        if retained != 1 {
+            return Err(StorageError::NotFound("Retained original invocation"));
+        }
+        Ok(blob)
+    }
+
+    /// Read the original bytes from one verified CAS handle with <=64KiB
+    /// chunks, a finite caller ceiling and cooperative cancellation/deadline.
+    pub fn stored_invocation_checked(
+        &self,
+        operation: &OperationId,
+        step: &StepId,
+        max_bytes: u64,
+        mut check: impl FnMut() -> StorageResult<()>,
+    ) -> StorageResult<Value> {
+        check()?;
+        let blob = self.stored_invocation_blob(operation, step)?;
+        let value = self
+            .validator
+            .parse_and_validate(
+                "Invocation",
+                &self.read_blob_checked(&blob, max_bytes, &mut check)?,
+            )
+            .map_err(|e| StorageError::Contract(e.to_string()))?;
+        let record = read_record(&self.connection, operation)?;
+        let actual = record
+            .steps
+            .iter()
+            .find(|stored| &stored.step_id == step)
+            .ok_or(StorageError::NotFound("Original invocation step"))?;
+        if value["operationId"] != operation.as_str()
+            || value["stepId"] != step.as_str()
+            || value["invocationId"].as_str()
+                != actual.invocation_id.as_ref().map(InvocationId::as_str)
+            || value["context"]["principalRef"] != record.principal.as_str()
+            || value["context"]["projectId"] != record.project_id.as_str()
+            || value["argumentsDigest"]
+                != mmmm_contracts::canonical_digest(&value["arguments"])
+                    .map_err(|e| StorageError::Contract(e.to_string()))?
+                    .as_str()
+            || value["contextDigest"]
+                != mmmm_contracts::verify_projected_digest("ExecutionContext", &value["context"])
+                    .map_err(|e| StorageError::Contract(e.to_string()))?
+                    .as_str()
+            || self.stored_invocation_blob(operation, step)? != blob
+        {
+            return Err(StorageError::Conflict(
+                "Original invocation identity/digest changed",
+            ));
+        }
+        check()?;
+        Ok(value)
     }
 }
 

@@ -128,10 +128,10 @@ impl NativePlanner<'_> {
             resource.resource_id.as_str().to_owned(),
             resource.sha256.clone(),
         );
-        if let Some(previous) = sources.resources.get(&resource_key) {
-            if !same_resource(previous, resource) {
-                return Err(conflict());
-            }
+        if let Some(previous) = sources.resources.get(&resource_key)
+            && !same_resource(previous, resource)
+        {
+            return Err(conflict());
         }
         let read =
             self.source
@@ -318,19 +318,19 @@ impl NativePlanner<'_> {
                 }
                 requested.insert(resource.resource_id.as_str().into(), resource.clone());
             }
-            if let Some(geometry) = &node.block_geometry {
-                if !requested.contains_key(geometry.resource_id.as_str()) {
-                    let resource = self.source.resource_pin(
-                        principal,
-                        project,
-                        geometry.resource_id.as_str(),
-                        Some(context),
-                    )?;
-                    if resource.resource_id != geometry.resource_id {
-                        return Err(conflict());
-                    }
-                    requested.insert(resource.resource_id.as_str().into(), resource);
+            if let Some(geometry) = &node.block_geometry
+                && !requested.contains_key(geometry.resource_id.as_str())
+            {
+                let resource = self.source.resource_pin(
+                    principal,
+                    project,
+                    geometry.resource_id.as_str(),
+                    Some(context),
+                )?;
+                if resource.resource_id != geometry.resource_id {
+                    return Err(conflict());
                 }
+                requested.insert(resource.resource_id.as_str().into(), resource);
             }
             let displays = node
                 .display

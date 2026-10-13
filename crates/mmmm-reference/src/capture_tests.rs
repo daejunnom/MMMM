@@ -465,8 +465,10 @@ fn actual_source_budget_resource_hash_and_final_authority_are_checked() {
     state.borrow_mut().rights_drift = true;
     let input = request(&state.borrow().grant);
     assert!(capture(&mut catalog, &mut source, &input, &Allow { deny: None }).is_err());
-    let mut limits = CatalogLimits::default();
-    limits.max_capture_evidence_bytes = native().len();
+    let limits = CatalogLimits {
+        max_capture_evidence_bytes: native().len(),
+        ..CatalogLimits::default()
+    };
     catalog = Catalog::new([7; 32], limits).unwrap();
     let (_, mut source, state) = setup();
     let input = request(&state.borrow().grant);

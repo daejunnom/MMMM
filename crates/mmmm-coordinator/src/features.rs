@@ -880,13 +880,13 @@ fn check_access(
         if !principal.permits_context(id) {
             return Err(forbidden());
         }
-        if let Some(requested) = input.get("contextId").and_then(Value::as_str) {
-            if requested != id {
-                return Err(ServiceError::new(
-                    "STALE_CONTEXT",
-                    "Resolved current context differs from the request locator",
-                ));
-            }
+        if let Some(requested) = input.get("contextId").and_then(Value::as_str)
+            && requested != id
+        {
+            return Err(ServiceError::new(
+                "STALE_CONTEXT",
+                "Resolved current context differs from the request locator",
+            ));
         }
         if access
             .project
@@ -903,10 +903,10 @@ fn check_access(
         ContractValidator::shared()
             .and_then(|v| v.validate("Project", project))
             .map_err(|_| invalid_source())?;
-        if let Some(requested) = input.get("projectId").and_then(Value::as_str) {
-            if project["projectId"].as_str() != Some(requested) {
-                return Err(forbidden());
-            }
+        if let Some(requested) = input.get("projectId").and_then(Value::as_str)
+            && project["projectId"].as_str() != Some(requested)
+        {
+            return Err(forbidden());
         }
     }
     budget.check()

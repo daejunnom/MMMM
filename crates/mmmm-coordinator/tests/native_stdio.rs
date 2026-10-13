@@ -2,7 +2,7 @@
 //! hidden worker without adding a product CLI probe or an unrelated driver.
 //! Small contract fixtures cannot prove blocked kernel pipe cancellation.
 use mmmm_coordinator::stdio_io::{
-    NativeStdioPort, StdioDrain, StdioError, StdioLimits, WORKER_COMMAND, worker_entry,
+    NativeStdioPort, StdioDrain, StdioError, StdioLimits, WORKER_COMMAND, worker_entry_exit,
 };
 use std::{
     fs::File,
@@ -15,12 +15,7 @@ use std::{
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|v| v == WORKER_COMMAND) {
-        let status = if worker_entry(&args[1..]).is_ok() {
-            0
-        } else {
-            3
-        };
-        std::process::exit(status);
+        worker_entry_exit(&args[1..]);
     }
     // Cargo forwards normal libtest options to harness-free targets too. This
     // fixture stays serial because only its own std handles are redirected.
@@ -41,9 +36,79 @@ fn main() {
     truncated_raw_capability_is_failure();
     held_raw_payload_deadline();
     blocked_raw_stdout_never_acknowledges();
+    #[cfg(target_os = "macos")]
+    descriptor_above_lowered_soft_limit_is_not_inherited();
     eprintln!(
         "native stdio acceptance: line and raw roundtrip, EOF, truncated raw capability, held input deadline/cancel, blocked output and verified drain passed"
     );
+}
+
+#[cfg(target_os = "macos")]
+fn descriptor_above_lowered_soft_limit_is_not_inherited() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    // The existing cases do not distinguish a descriptor inventory from a
+    // soft limit. This fixture opens an inheritable writer first, lowers only
+    // this test process's soft limit, and checks EOF while the worker is alive.
+    struct RestoreLimit(libc::rlimit);
+    impl Drop for RestoreLimit {
+        fn drop(&mut self) {
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.0) }, 0);
+        }
+    }
+    let mut original: libc::rlimit = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) },
+        0
+    );
+    // Require a finite, small fixture range rather than raising a native limit.
+    assert!(original.rlim_cur > 128 && original.rlim_max >= original.rlim_cur);
+    let mut fds = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let mut read = unsafe { File::from_raw_fd(fds[0]) };
+    let write = unsafe { File::from_raw_fd(fds[1]) };
+    for fd in fds {
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            -1
+        );
+    }
+    let high = unsafe { libc::fcntl(write.as_raw_fd(), libc::F_DUPFD, 128) };
+    assert!(high >= 128);
+    let high = unsafe { File::from_raw_fd(high) };
+    assert_ne!(
+        unsafe { libc::fcntl(high.as_raw_fd(), libc::F_SETFD, 0) },
+        -1
+    );
+    let flags = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFL) };
+    assert_ne!(flags, -1);
+    assert_ne!(
+        unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        -1
+    );
+    drop(write);
+    let restore = RestoreLimit(original);
+    let lowered = libc::rlimit {
+        rlim_cur: 64,
+        rlim_max: original.rlim_max,
+    };
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+    let scenario = Scenario::start();
+    // Restore the parent's limit immediately; the worker inherited 64 and the
+    // formerly-open descriptor number remains 128 or greater during its exec.
+    drop(restore);
+    drop(high);
+    let mut bytes = Vec::new();
+    output_eof(&mut read, &mut bytes);
+    assert!(bytes.is_empty());
+    let cancel = AtomicBool::new(false);
+    assert!(matches!(
+        scenario
+            .port
+            .poll_read_line(Instant::now() + Duration::from_secs(1), &cancel),
+        Ok(Poll::Pending)
+    ));
+    scenario.drain();
 }
 struct Scenario {
     port: NativeStdioPort,
@@ -207,8 +272,9 @@ fn held_stdin_cancel() {
 fn blocked_stdout_never_acknowledges() {
     let mut scenario = Scenario::start();
     let line = format!("{{\"padding\":\"{}\"}}", "x".repeat(1_048_576 - 32));
-    // Keep the read end open but unread. The helper fills the small actual
-    // stdout pipe and blocks; private TCP acceptance must not become Ready.
+    // Keep the read end open but unread. The helper completes a bounded native
+    // prefix write, fills the small stdout pipe and blocks on remaining chunks;
+    // private TCP acceptance must not become Ready before final flush.
     let started = Instant::now();
     let error = write(&scenario.port, line.as_bytes(), Duration::from_millis(700)).unwrap_err();
     assert_eq!(error.code, "deadline");

@@ -10,6 +10,8 @@ mod registered_action;
 mod report;
 mod result_binding;
 pub mod types;
+#[cfg(test)]
+mod undo;
 
 pub use ports::*;
 pub use types::*;

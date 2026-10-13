@@ -164,6 +164,10 @@ impl PlanningRequestSource for crate::service::RequestContextSlot {
 /// Explicit offline composition can implement this from a server-owned
 /// workspace-context registry. Returning the argument itself is not validation.
 pub trait PlanningContextPort {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Authenticated identity, live authority and host, exact Project/context, access and budget are independent validation inputs"
+    )]
     fn authorize(
         &mut self,
         principal: &AuthenticatedPrincipal,
@@ -536,6 +540,71 @@ pub trait PlanningBackendPort: PlanningEnvironmentPort {
         context: &Value,
         budget: &RequestBudget,
     ) -> AppResult<PackBuildInputs>;
+
+    /// Actual adapters receive the one call-scoped Store rather than retaining
+    /// a daemon handle. Borrow guards must end before independent live host I/O.
+    /// Defaults preserve the existing trusted fixture/backend port surface.
+    fn verify_live_target_with_store(
+        &mut self,
+        _store: &PlanningStore<'_>,
+        principal: &PrincipalId,
+        profile: &TargetProfileId,
+        context: &Value,
+        actual_hello: &Value,
+        budget: &RequestBudget,
+    ) -> AppResult<VerifiedPlanningTarget> {
+        self.verify_live_target(principal, profile, context, actual_hello, budget)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Call-scoped durable source authority remains separate from exact authored documents, resources and compiler context"
+    )]
+    fn lower_owned_pack_with_store(
+        &mut self,
+        _store: &PlanningStore<'_>,
+        principal: &PrincipalId,
+        project: &ProjectCatalog,
+        owned_values: &[Value],
+        resources: &[SceneResource],
+        context: &Value,
+        budget: &RequestBudget,
+    ) -> AppResult<PackBuildInputs> {
+        self.lower_owned_pack(principal, project, owned_values, resources, context, budget)
+    }
+
+    fn snapshot_native_targets_with_store(
+        &mut self,
+        _store: &PlanningStore<'_>,
+        principal: &PrincipalId,
+        project: &ProjectCatalog,
+        change: &PreparedNativeChange,
+        context: &Value,
+    ) -> AppResult<NativeTargetSnapshot> {
+        self.snapshot_native_targets(principal, project, change, context)
+    }
+
+    fn verify_projection_references_with_store(
+        &mut self,
+        _store: &PlanningStore<'_>,
+        principal: &PrincipalId,
+        project: &ProjectCatalog,
+        projection: &InstanceProjection,
+        context: &Value,
+    ) -> AppResult<Vec<Value>> {
+        self.verify_projection_references(principal, project, projection, context)
+    }
+
+    fn command_layout_support_with_store(
+        &mut self,
+        _store: &PlanningStore<'_>,
+        principal: &PrincipalId,
+        project: &ProjectCatalog,
+        module: &Value,
+        context: &Value,
+    ) -> AppResult<CommandLayoutSupport> {
+        self.command_layout_support(principal, project, module, context)
+    }
 }
 pub type SharedPlanningBackend = Rc<RefCell<Box<dyn PlanningBackendPort>>>;
 
@@ -1440,7 +1509,14 @@ impl<'a> ConcretePlanningEnvironment<'a> {
             .backend
             .try_borrow_mut()
             .map_err(|_| source_busy())?
-            .verify_live_target(principal, profile, context, &hello, self.access.budget())?;
+            .verify_live_target_with_store(
+                &self.store,
+                principal,
+                profile,
+                context,
+                &hello,
+                self.access.budget(),
+            )?;
         if target.compiler.profile_id() != profile
             || target.evidence_resource_pins.is_empty()
             || target.evidence_resource_pins.len() > 4096
@@ -1600,7 +1676,7 @@ impl PlanningEnvironmentPort for ConcretePlanningEnvironment<'_> {
             .backend
             .try_borrow_mut()
             .map_err(|_| source_busy())?
-            .snapshot_native_targets(principal, project, change, context);
+            .snapshot_native_targets_with_store(&self.store, principal, project, change, context);
         let snapshot = self.after(principal, context, result)?;
         if snapshot.context_digest.as_str() != text(context, "contextDigest")?
             || snapshot.scope.project_id != *project.project_id()
@@ -1661,7 +1737,7 @@ impl PlanningEnvironmentPort for ConcretePlanningEnvironment<'_> {
             .backend
             .try_borrow_mut()
             .map_err(|_| source_busy())?
-            .command_layout_support(principal, project, module, context);
+            .command_layout_support_with_store(&self.store, principal, project, module, context);
         self.after(principal, context, result)
     }
     fn command_layout_request(
@@ -1692,7 +1768,13 @@ impl PlanningEnvironmentPort for ConcretePlanningEnvironment<'_> {
             .backend
             .try_borrow_mut()
             .map_err(|_| source_busy())?
-            .verify_projection_references(principal, project, projection, context);
+            .verify_projection_references_with_store(
+                &self.store,
+                principal,
+                project,
+                projection,
+                context,
+            );
         let pins = self.after(principal, context, result)?;
         if pins.len() > 4096 {
             return Err(source_budget());
@@ -1757,7 +1839,8 @@ impl PlanningEnvironmentPort for ConcretePlanningEnvironment<'_> {
             .backend
             .try_borrow_mut()
             .map_err(|_| source_busy())?
-            .lower_owned_pack(
+            .lower_owned_pack_with_store(
+                &self.store,
                 principal,
                 project,
                 owned_values,

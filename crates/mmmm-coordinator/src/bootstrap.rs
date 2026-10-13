@@ -214,6 +214,23 @@ struct ActiveBootstrap {
     expires: Instant,
 }
 
+pub(crate) mod workspace_seal {
+    pub trait Sealed {}
+}
+/// Only this crate's captured kernel-owner witness implements the sealed port.
+/// Public setup values and PrincipalId strings cannot install a workspace.
+pub trait NativeWorkspacePermit: workspace_seal::Sealed {
+    fn check_project(
+        &self,
+        store: &DurableStore,
+        project: &ProjectId,
+    ) -> StorageResult<PrincipalId>;
+}
+struct OwnerWorkspace {
+    context: Value,
+    ownership: ActiveBootstrap,
+}
+
 /// Main-loop owned. Neither the native I/O worker nor public facade requests
 /// obtain this object, the mutable Store, or the authority installation methods.
 pub struct HostBootstrapProcessor {
@@ -222,6 +239,7 @@ pub struct HostBootstrapProcessor {
     authority: LocalAuthority,
     pending: BTreeMap<RequestId, PendingBootstrap>,
     active: BTreeMap<ContextId, ActiveBootstrap>,
+    workspace: BTreeMap<ContextId, OwnerWorkspace>,
 }
 impl HostBootstrapProcessor {
     pub fn new(hosts: HostBridge, authority: LocalAuthority) -> Result<Self, ManagementError> {
@@ -231,7 +249,68 @@ impl HostBootstrapProcessor {
             authority,
             pending: BTreeMap::new(),
             active: BTreeMap::new(),
+            workspace: BTreeMap::new(),
         })
+    }
+    /// Trusted composition has independently verified this Project's current
+    /// sources and installed a read-only grant before publishing any endpoint.
+    /// This method records only its exact already-granted immutable context.
+    pub fn install_workspace_context(
+        &mut self,
+        permit: &dyn NativeWorkspacePermit,
+        store: &DurableStore,
+        context: &Value,
+    ) -> Result<(), ManagementError> {
+        ContractValidator::shared()
+            .and_then(|v| v.validate("ExecutionContext", context))
+            .map_err(|_| ManagementError::InvalidFrame)?;
+        mmmm_contracts::verify_projected_digest("ExecutionContext", context)
+            .map_err(|_| ManagementError::InvalidFrame)?;
+        let project = ProjectId::new(text(context, "projectId")?)
+            .map_err(|_| ManagementError::InvalidFrame)?;
+        let owner = permit
+            .check_project(store, &project)
+            .map_err(|_| ManagementError::InvalidFrame)?;
+        let id = ContextId::new(text(context, "contextId")?)
+            .map_err(|_| ManagementError::InvalidFrame)?;
+        let policy = Sha256Digest::new(text(context, "policyRevision")?)
+            .map_err(|_| ManagementError::InvalidFrame)?;
+        if owner != self.owner
+            || context["principalRef"] != owner.as_str()
+            || context["environment"]["kind"] != "offline"
+            || context["scope"]["projectId"] != project.as_str()
+            || !context["scope"]["regions"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+            || !context["scope"]["externalTargetIds"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+            || self.workspace.len() >= 64
+            || self.workspace.contains_key(&id)
+        {
+            return Err(ManagementError::InvalidFrame);
+        }
+        self.authority
+            .authorize_retained_scope(&owner, &project, &id, &policy, &context["scope"])
+            .map_err(|_| ManagementError::InvalidFrame)?;
+        permit
+            .check_project(store, &project)
+            .map_err(|_| ManagementError::InvalidFrame)?;
+        self.workspace.insert(
+            id.clone(),
+            OwnerWorkspace {
+                context: context.clone(),
+                ownership: ActiveBootstrap {
+                    principal: owner,
+                    project,
+                    policy,
+                    context_id: id,
+                    route_owner: None,
+                    expires: Instant::now() + Duration::from_secs(1800),
+                },
+            },
+        );
+        Ok(())
     }
     /// The envelope's native budget must be passed unchanged by composition.
     /// Finished is consumed even when that budget has expired or been cancelled.
@@ -305,12 +384,41 @@ impl HostBootstrapProcessor {
         let mut contexts = BTreeSet::new();
         let mut lifetime = SESSION_LIFETIME;
         for active in current {
+            if self
+                .authority
+                .policy_revision(&active.principal, &active.project)
+                .ok()
+                .as_ref()
+                != Some(&active.policy)
+            {
+                continue;
+            }
             if principal.as_ref().is_some_and(|id| id != &active.principal) {
                 return Err(ManagementError::WrongReply);
             }
             principal = Some(active.principal.clone());
             contexts.insert(active.context_id.clone());
             lifetime = lifetime.min(active.expires.saturating_duration_since(now));
+        }
+        let selected = principal.clone().unwrap_or_else(|| self.owner.clone());
+        for workspace in self.workspace.values() {
+            let owned = &workspace.ownership;
+            if owned.principal == selected
+                && now < owned.expires
+                && self
+                    .authority
+                    .authorize_retained_scope(
+                        &owned.principal,
+                        &owned.project,
+                        &owned.context_id,
+                        &owned.policy,
+                        &workspace.context["scope"],
+                    )
+                    .is_ok()
+            {
+                contexts.insert(owned.context_id.clone());
+                lifetime = lifetime.min(owned.expires.saturating_duration_since(now));
+            }
         }
         let methods = ContractValidator::shared()
             .map_err(|_| ManagementError::InvalidFrame)?
@@ -319,7 +427,7 @@ impl HostBootstrapProcessor {
             .map(|function| function.name.clone())
             .collect();
         Ok(SessionPolicy {
-            principal: principal.unwrap_or_else(|| self.owner.clone()),
+            principal: selected,
             allowed_methods: methods,
             allowed_contexts: contexts,
             lifetime,
@@ -622,6 +730,32 @@ impl HostBootstrapProcessor {
                 return Err(ManagementError::TransportUncertain);
             }
         }
+        let expired_workspace = self
+            .workspace
+            .iter()
+            .filter(|(_, w)| {
+                Instant::now() >= w.ownership.expires
+                    || self
+                        .authority
+                        .authorize_retained_scope(
+                            &w.ownership.principal,
+                            &w.ownership.project,
+                            &w.ownership.context_id,
+                            &w.ownership.policy,
+                            &w.context["scope"],
+                        )
+                        .is_err()
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in expired_workspace {
+            if let Some(workspace) = self.workspace.remove(&id)
+                && self.retire_active(&workspace.ownership).is_err()
+            {
+                self.workspace.insert(id, workspace);
+                return Err(ManagementError::TransportUncertain);
+            }
+        }
         let expired = self
             .pending
             .iter()
@@ -659,6 +793,15 @@ impl HostBootstrapProcessor {
                 && self.retire_active(&active).is_err()
             {
                 self.active.insert(id, active);
+                failed = true;
+            }
+        }
+        let workspace_ids = self.workspace.keys().cloned().collect::<Vec<_>>();
+        for id in workspace_ids {
+            if let Some(workspace) = self.workspace.remove(&id)
+                && self.retire_active(&workspace.ownership).is_err()
+            {
+                self.workspace.insert(id, workspace);
                 failed = true;
             }
         }

@@ -349,9 +349,11 @@ impl Catalog {
         while start < tools.len() {
             let mut accepted = None;
             for end in start + 1..=(start + MAX_PAGE_TOOLS).min(tools.len()) {
-                let mut page = ListToolsResult::default();
-                page.result_type = None;
-                page.tools = tools[start..end].to_vec();
+                let mut page = ListToolsResult {
+                    result_type: None,
+                    tools: tools[start..end].to_vec(),
+                    ..ListToolsResult::default()
+                };
                 if end < tools.len() {
                     page.next_cursor = Some(format!("mmmm-tools-v1-{revision}-{end}"));
                 }
@@ -831,11 +833,10 @@ impl Transport<RoleServer> for BoundedTransport {
             self.admission
                 .lock()
                 .map_err(|_| FacadeError::Runtime)?
-                .accept(&value).map_err(|error| {
-                    if error == FacadeError::InputFrame && !is_notification {
+                .accept(&value).inspect_err(|error| {
+                    if *error == FacadeError::InputFrame && !is_notification {
                         rejection = Some(json!({"jsonrpc":"2.0","id":reply_id,"error":{"code":-32600,"message":"Invalid bounded JSON-RPC request"}}));
                     }
-                    error
                 })?;
             serde_json::from_value(value)
                 .map(Some)
@@ -1544,12 +1545,13 @@ mod tests {
         assert!(results.0.is_ok() && results.1.is_ok() && results.2.is_ok());
         assert_eq!(io.maximum_writes.load(Ordering::SeqCst), 1);
         assert_eq!(io.active_writes.load(Ordering::SeqCst), 0);
-        let written = io.written.lock().unwrap();
-        assert_eq!(written.len(), 3);
-        for frame in written.iter() {
-            parse_json_with_limits(frame, limits()).unwrap();
+        {
+            let written = io.written.lock().unwrap();
+            assert_eq!(written.len(), 3);
+            for frame in written.iter() {
+                parse_json_with_limits(frame, limits()).unwrap();
+            }
         }
-        drop(written);
         transport.close().await.unwrap();
     }
 }

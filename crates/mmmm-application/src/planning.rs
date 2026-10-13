@@ -295,11 +295,15 @@ impl Application<'_> {
                 .cloned()
                 .map(Ok)
                 .unwrap_or_else(|| decode(&precondition["expected"]))?;
-            let observed = self.provider.observe_precondition_with_store(
-                self.store,
-                precondition,
-                &context,
-            )?;
+            let observed = self
+                .provider
+                .observe_plan_precondition_retained_with_store(
+                    self.store,
+                    plan,
+                    step,
+                    precondition,
+                    &context,
+                )?;
             if observed != expected {
                 return Err(AppError::new(
                     "TARGET_DRIFT",
