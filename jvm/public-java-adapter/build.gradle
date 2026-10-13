@@ -1,0 +1,2 @@
+dependencies { api project(':provider-sdk') }
+dependencies { testImplementation project(':host-core') }
