@@ -62,6 +62,23 @@ def native_operation(operation):
     return decorate
 
 
+def script_frames(error):
+    """Only public-script function names and line numbers, never local values."""
+    frames, inspected = [], 0
+    traceback = error.__traceback__
+    while traceback is not None and inspected < 64:
+        inspected += 1
+        code = traceback.tb_frame.f_code
+        if (code.co_filename == __file__
+                and code.co_name not in ("native_call", "wrapped", "failure_details", "script_frames")):
+            name = "".join(character if character.isascii() and (character.isalnum() or character == "_")
+                           else "?" for character in code.co_name)[:64]
+            frames.append({"function": name, "line": traceback.tb_lineno})
+            frames = frames[-5:]
+        traceback = traceback.tb_next
+    return frames
+
+
 def failure_details(error):
     # OSError.__str__ can include filenames. These diagnostics contain only
     # static source labels and the OS's numeric error and standard message.
@@ -76,6 +93,9 @@ def failure_details(error):
         detail = type(error).__name__
     detail = "".join(character if 32 <= ord(character) < 127 else "?" for character in detail)[:384]
     details = {"phase": CURRENT_PHASE, "operation": operation, "error": detail}
+    frames = script_frames(error)
+    if frames:
+        details["script_frames"] = frames
     if hasattr(error, "mmmm_cleanup_errors"):
         details["cleanup_errors"] = error.mmmm_cleanup_errors
     return details
@@ -496,7 +516,7 @@ def cancellation(_signum, _frame):
 def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe, target_os,
               invocation=None, owned_tail_policy="reject"):
     """Reserve a session leader before exec; snapshot twice and close pipes before reap."""
-    snapshot = NativeSnapshot(target_os)
+    snapshot = native_call("load supervision process API", NativeSnapshot, target_os)
     if owned_tail_policy not in ("reject", "terminate-build"):
         raise RuntimeError("unsupported owned-tail policy")
     streams, descriptors = [], set()
@@ -508,7 +528,7 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
         return ends
 
     def close(descriptor):
-        os.close(descriptor)
+        native_call("close owned pipe", os.close, descriptor)
         descriptors.discard(descriptor)
 
     # Prepare every parent-side resource before creating any executable child.
@@ -520,10 +540,19 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
                 descriptor = native_call("create owned command log", os.open, path.name,
                                          os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                                          0o600, dir_fd=parent)
-            finally:
-                os.close(parent)
-            stream = os.fdopen(descriptor, "wb")
+                descriptors.add(descriptor)
+            except BaseException as log_error:
+                try:
+                    native_call("close failed owned log parent", os.close, parent)
+                except OSError as parent_error:
+                    details = failure_details(parent_error)
+                    log_error.mmmm_cleanup_errors = [details["operation"] + ": " + details["error"]]
+                raise
+            else:
+                native_call("close owned log parent", os.close, parent)
+            stream = native_call("open owned command log stream", os.fdopen, descriptor, "wb")
             streams.append(stream)
+            descriptors.discard(descriptor)
         out_read, out_write = pipe()
         err_read, err_write = pipe()
         report_read, report_write = pipe()
@@ -534,7 +563,7 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
             native_call("register owned pipe selector", selector.register, descriptor, selectors.EVENT_READ, key)
         leader = native_call("fork reserved session leader", os.fork)
     except BaseException as preparation_error:
-        cleanup_errors = []
+        cleanup_errors = list(getattr(preparation_error, "mmmm_cleanup_errors", []))
 
         def cleanup(operation, function, *args):
             try:
@@ -549,72 +578,75 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
             cleanup("close unstarted owned pipe", os.close, descriptor)
         cleanup("close unstarted output selector", selector.close)
         if cleanup_errors:
-            # At most two logs, ten pipe ends and one selector were prepared.
+            # At most two logs, ten pipe ends, one selector and a failed log
+            # parent close can contribute bounded cleanup facts.
             # Preserve the first failure while recording every cleanup attempt.
             preparation_error.mmmm_cleanup_errors = cleanup_errors
         raise
     if leader == 0:
         session_id = None
         try:
-            selector.close()
+            native_call("close child output selector", selector.close)
             for stream in streams:
-                stream.close()
+                native_call("close child command log stream", stream.close)
             for descriptor in (out_read, err_read, report_read, release_write, start_write):
-                os.close(descriptor)
+                native_call("close child unneeded pipe", os.close, descriptor)
             native_call("establish reserved session", os.setsid)
             session_id = os.getpid()
             # The still-live wrapper reserves SID/PGID until parent drain checks.
-            os.write(report_write, b"ready\n")
+            native_call("report session readiness", os.write, report_write, b"ready\n")
             # Parent must verify the native SID/PGID and start-time identity
             # before any build worker may execute.
-            if os.read(start_read, 1) != b"x":
+            if native_call("await verified session admission", os.read, start_read, 1) != b"x":
                 os._exit(126)
-            os.close(start_read)
+            native_call("close child admission pipe", os.close, start_read)
             native_call("set core dump limit", resource.setrlimit, resource.RLIMIT_CORE, (0, 0))
             native_call("set address space limit", resource.setrlimit, resource.RLIMIT_AS, (MEMORY_LIMIT, MEMORY_LIMIT))
             native_call("set descriptor limit", resource.setrlimit, resource.RLIMIT_NOFILE, (256, 256))
             worker = native_call("fork bounded build worker", os.fork)
             if worker == 0:
-                os.close(report_write)
-                os.close(release_read)
-                os.dup2(out_write, 1)
-                os.dup2(err_write, 2)
-                os.close(out_write)
-                os.close(err_write)
-                os.chdir(cwd)
-                os.execve(program, [invocation or program, *args], environment)
-            os.close(out_write)
-            os.close(err_write)
-            os.set_blocking(release_read, False)
+                native_call("close worker report pipe", os.close, report_write)
+                native_call("close worker release pipe", os.close, release_read)
+                native_call("redirect worker stdout", os.dup2, out_write, 1)
+                native_call("redirect worker stderr", os.dup2, err_write, 2)
+                native_call("close worker stdout pipe", os.close, out_write)
+                native_call("close worker stderr pipe", os.close, err_write)
+                native_call("set worker checkout directory", os.chdir, cwd)
+                native_call("execute bounded build worker", os.execve, program,
+                            [invocation or program, *args], environment)
+            native_call("close leader stdout pipe", os.close, out_write)
+            native_call("close leader stderr pipe", os.close, err_write)
+            native_call("set leader release pipe nonblocking", os.set_blocking, release_read, False)
             watchdog = time.monotonic() + timeout + 2
             while True:
-                exited, status = os.waitpid(worker, os.WNOHANG)
+                exited, status = native_call("observe build worker exit", os.waitpid, worker, os.WNOHANG)
                 if exited == worker:
                     break
                 try:
-                    release = os.read(release_read, 1)
+                    release = native_call("observe controlling launcher pipe", os.read, release_read, 1)
                 except BlockingIOError:
                     release = None
                 # EOF means the controlling launcher died. This watchdog is
                 # independent of the parent's resource observation loop.
                 if release is not None or time.monotonic() >= watchdog:
-                    os.killpg(os.getpid(), signal.SIGKILL)
+                    native_call("watchdog terminate owned session", os.killpg, os.getpid(), signal.SIGKILL)
                     os._exit(126)
                 time.sleep(0.05)
             code = os.waitstatus_to_exitcode(status)
             if code < 0:
                 code = 128 - code
-            os.write(report_write, ("exit:" + str(code) + "\n").encode("ascii"))
-            os.close(report_write)
+            native_call("report build worker exit", os.write, report_write,
+                        ("exit:" + str(code) + "\n").encode("ascii"))
+            native_call("close leader report pipe", os.close, report_write)
             while True:
                 try:
-                    release = os.read(release_read, 1)
+                    release = native_call("await verified session release", os.read, release_read, 1)
                 except BlockingIOError:
                     release = None
                 if release == b"x":
                     break
                 if release is not None or time.monotonic() >= watchdog:
-                    os.killpg(os.getpid(), signal.SIGKILL)
+                    native_call("watchdog terminate unreleased session", os.killpg, os.getpid(), signal.SIGKILL)
                     os._exit(126)
                 time.sleep(0.05)
             os._exit(0)
@@ -643,15 +675,15 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
     try:
         while True:
             now = time.monotonic()
-            for key, _ in selector.select(0.1):
+            for key, _ in native_call("observe owned output selector", selector.select, 0.1):
                 descriptor, channel = key.fd, key.data
                 for _batch in range(32):
                     try:
-                        chunk = os.read(descriptor, 8192)
+                        chunk = native_call("read owned output pipe", os.read, descriptor, 8192)
                     except BlockingIOError:
                         break
                     if not chunk:
-                        selector.unregister(descriptor)
+                        native_call("unregister closed owned output", selector.unregister, descriptor)
                         close(descriptor)
                         if channel == 2 and command_exit is None:
                             raise RuntimeError("native control ended without command result")
@@ -673,7 +705,7 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
                                 raise RuntimeError("native control report invalid")
                     else:
                         retain = min(len(chunk), max(0, LOG_LIMIT - total))
-                        streams[channel].write(chunk[:retain])
+                        native_call("capture owned command output", streams[channel].write, chunk[:retain])
                         total += retain
                         if retain != len(chunk) and "combined output limit exceeded" not in errors:
                             errors.append("combined output limit exceeded")
@@ -685,9 +717,9 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
                 observe()
                 observed = now
             if ready:
-                members = snapshot.observe(leader)
+                members = native_call("observe reserved session membership", snapshot.observe, leader)
                 if not approved and not errors:
-                    os.write(start_write, b"x")
+                    native_call("admit verified session build worker", os.write, start_write, b"x")
                     close(start_write)
                     approved = True
                 if members > PROCESS_LIMIT and "owned process limit exceeded" not in errors:
@@ -699,7 +731,7 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
                         if owned_tail_policy == "terminate-build" and not errors:
                             # This is explicit build-tool cleanup after the
                             # observed command exit, never a command retry.
-                            os.killpg(leader, signal.SIGKILL)
+                            native_call("terminate owned build tail", os.killpg, leader, signal.SIGKILL)
                             killed, kill_started = True, time.monotonic()
                             owned_tail_terminated = True
                         elif "command left running owned descendants" not in errors:
@@ -715,7 +747,7 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
             if errors and not killed:
                 if not ready:
                     raise RuntimeError("failure before native session identity was established")
-                os.killpg(leader, signal.SIGKILL)
+                native_call("terminate failed owned session", os.killpg, leader, signal.SIGKILL)
                 killed, kill_started = True, time.monotonic()
                 if command_exit is None:
                     command_exit = 124 if "command timeout" in errors else 125
@@ -724,10 +756,10 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
                 break
         if drained:
             if not killed:
-                os.write(release_write, b"x")
+                native_call("release drained session leader", os.write, release_write, b"x")
             deadline = time.monotonic() + 2
             while True:
-                finished, _ = os.waitpid(leader, os.WNOHANG)
+                finished, _ = native_call("reap drained session leader", os.waitpid, leader, os.WNOHANG)
                 if finished == leader:
                     reaped = True
                     break
@@ -742,22 +774,31 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
         errors.append("native supervision: " + details["operation"] + ": " + details["error"])
         if ready and not reaped:
             try:
-                os.killpg(leader, signal.SIGKILL)
+                native_call("terminate errored owned session", os.killpg, leader, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            except OSError as termination_error:
+                details = failure_details(termination_error)
+                errors.append("error-path termination: " + details["operation"] + ": " + details["error"])
             deadline, empty = time.monotonic() + 15, 0
             drained = False
             while time.monotonic() < deadline:
-                for key, _ in selector.select(0.1):
+                try:
+                    events = native_call("observe error drain output selector", selector.select, 0.1)
+                except OSError as drain_selector_error:
+                    details = failure_details(drain_selector_error)
+                    errors.append("error-path output observation: " + details["operation"] + ": " + details["error"])
+                    break
+                for key, _ in events:
                     descriptor, channel = key.fd, key.data
                     try:
-                        chunk = os.read(descriptor, 8192)
+                        chunk = native_call("read error drain output pipe", os.read, descriptor, 8192)
                         if not chunk:
-                            selector.unregister(descriptor)
+                            native_call("unregister closed error drain output", selector.unregister, descriptor)
                             close(descriptor)
                         elif channel != 2:
                             retain = min(len(chunk), max(0, LOG_LIMIT - total))
-                            streams[channel].write(chunk[:retain])
+                            native_call("capture error drain output", streams[channel].write, chunk[:retain])
                             total += retain
                     except BlockingIOError:
                         pass
@@ -766,12 +807,12 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
                         # Missing EOF cannot be converted to a successful drain.
                         break
                 try:
-                    members = snapshot.observe(leader)
+                    members = native_call("observe error drain session membership", snapshot.observe, leader)
                     pipes_closed = all(key.data == 2 for key in selector.get_map().values())
                     empty = empty + 1 if members == 0 and pipes_closed else 0
                     if empty >= 2:
                         drained = True
-                        finished, _ = os.waitpid(leader, os.WNOHANG)
+                        finished, _ = native_call("reap errored session leader", os.waitpid, leader, os.WNOHANG)
                         reaped = finished == leader
                         if not reaped:
                             drained = False
@@ -787,21 +828,25 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
     finally:
         for stream in streams:
             try:
-                stream.flush()
-                os.fsync(stream.fileno())
+                native_call("flush owned command log", stream.flush)
+                native_call("sync owned command log", os.fsync, stream.fileno())
             except OSError as flush_error:
                 errors.append("owned log flush: " + str(flush_error))
             finally:
                 try:
-                    stream.close()
+                    native_call("close completed command log", stream.close)
                 except OSError as close_error:
                     errors.append("owned log close: " + str(close_error))
         for descriptor in descriptors:
             try:
-                os.close(descriptor)
+                native_call("close completed owned pipe", os.close, descriptor)
             except OSError as close_error:
                 errors.append("owned descriptor close: " + str(close_error))
-        selector.close()
+        try:
+            native_call("close completed output selector", selector.close)
+        except OSError as selector_error:
+            details = failure_details(selector_error)
+            errors.append("owned selector close: " + details["operation"] + ": " + details["error"])
     reason = "completed_after_owned_tail_cleanup" if owned_tail_terminated and not errors else "completed"
     if errors:
         reason = ("timeout" if "command timeout" in errors else "cancelled" if "command cancelled" in errors
@@ -1045,4 +1090,7 @@ if __name__ == "__main__":
                       + ": " + export_details["error"], file=sys.stderr)
         print("mmmm-bootstrap: phase=" + details["phase"] + "; operation=" + details["operation"]
               + "; " + details["error"], file=sys.stderr)
+        if details.get("script_frames"):
+            print("mmmm-bootstrap: source frames=" + json.dumps(details["script_frames"], separators=(",", ":")),
+                  file=sys.stderr)
         sys.exit(1)
