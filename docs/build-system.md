@@ -280,6 +280,12 @@ wrapper도 memory 합계에 포함하며 worker는 32개까지 허용한다. 목
 짧은 구조체 응답, identity 교체와 SID/PGID 이탈을 0으로 대체하지 않는다.
 policy, API flavor, sample 수, peak와 최대 관측 간격을 증거에 남긴다.
 
+디렉터리 목록과 metadata 순회 및 유한한 출력 배치 사이에도 fallible native
+체크포인트를 수행한다. 실제 전체 소유 범위의 identity와 자원 관측에 성공한
+경우에만 마지막 표본 시각을 갱신한다. 저장 크기 검사 콜백이 native 오류를
+다른 문자열로 감싸거나 무시해도 최초 오류와 종료 원인을 보존한다. 단일 OS 호출이
+1초 이상 막히는 경우에는 관측 제한 초과를 그대로 반환한다.
+
 이는 kernel resident memory quota가 아니며 관측 사이의 초과와 fork/exec의
 일시적 사용을 완전히 막는 보장은 없다. Python bootstrap은 부모의 native 확인을
 마친 뒤 worker를 허용한다. Rust 감독기는 시작 전 native self preflight와

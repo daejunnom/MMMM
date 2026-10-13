@@ -71,6 +71,11 @@ Windows의 빌드 관리 도구 bootstrap은 실제로 통과했으며, 제품 �
 | Fabric 호스트 첫 실제 컴파일 | Minecraft 26.3 API 오류 4개로 실패 | 실제 의존성 JAR의 API를 검사해 ChunkPos 및 청크 이벤트 차이를 확인; 수정 후 재검사 대상 |
 | 다섯 번째 3개 OS 기반 CI | Windows와 Linux의 전체 기반 job 통과; 집계 실패 | macOS `set address space limit`의 native EINVAL을 확정; Darwin 전용 VM 및 관측 memory 정책을 구현 중 |
 | Darwin 자원 정책의 Windows 검사 | 관리 도구 64 통과, 1 ignored | 순수 Darwin 정책·API 분류 9개 포함; 실제 macOS native 동작은 미검증 |
+| 여섯 번째 3개 OS 기반 CI | Windows와 Linux의 전체 기반 job 통과; 집계 실패 | macOS VM 설정과 확인은 성공했으나 동기 파일 크기 검사 중 성공 표본 간격이 2817 ms로 늘어 1초 제한을 초과; 원본 실패를 보존 |
+| 파일 순회 중 자원 관측과 입력 파싱 제어 | Windows 관리 도구 69, 계약 28 검사 통과; 두 crate의 all-targets Clippy 통과 | fallible 순회 체크포인트와 최초 native 오류 보존, JSON 원래 취소 오류 보존; 실제 macOS 관측 간격은 후속 CI 대상 |
+| 교환·계획·실행·저장 집중 검사 | application 38, exchange 59, planner 37, runtime 63 검사 통과 | 실제 임시 SQLite/CAS와 순수 도메인 및 실패 경로; 이후 raw bytes 읽기와 호스트 연결 변경은 별도 재검사 |
+| JVM 호스트와 공개 Java 어댑터 | host-core 32, public-java-adapter 17 검사 통과; SDK 107개의 유효 성공을 재사용; Fabric compileJava 통과 | 실제 Gradle 및 XML 결과 확인; 이후 native 실행·승인 변경과 실제 서버·클라이언트 인수는 별도 |
+| Coordinator와 CLI의 확장 검사 | CLI 12 통과; Coordinator 73 통과, 11 실패, 1 ignored | 정책 이름 fixture 10개와 native 종료 증거 경로 fixture 1개를 수정 중; 실제 stdio 통합 검사 실행은 lib 성공 이후 별도 |
 
 실패한 실행의 원본 판정은 유지한다. native drain과 정확한 소유 기록을 확인하고
 로그를 별도로 내보내며 digest를 대조한 경우에만 해당 실행의 알려진 임시 파일을
@@ -109,6 +114,15 @@ SHA-256을 대조하고 한정된 supervision 기록을 확인했다. Cargo는 �
 Windows와 Linux는 전체 기반 검사를 통과했다. macOS의 보존 artifact bytes와
 digest를 대조해 `set address space limit`의 native `EINVAL`을 확인했다.
 Darwin 전용 자원 정책의 채택과 구현을 실제 CI 성공으로 표시하지 않는다.
+
+여섯 번째 원격 실행은 source `40510b7a8f5554084c40445b5b0a76fc477d2dc1`의
+[foundation run](https://github.com/daejunnom/MMMM/actions/runs/38447616775)이다.
+Windows와 Linux는 전체 기반 검사를 통과했다. macOS는 `RLIMIT_AS` 설정과
+readback을 완료하고 Cargo를 시작했으나, 동기 파일 크기 검사 중 완전한 native
+표본 간격이 2817 ms로 늘어 실패했다. 보존 artifact의 정확한 bytes와 digest를
+대조했으며 실패·drain·export와 보존한 lease를 기록했다. 파일 순회와 출력 배치
+사이에 실제 native 관측을 연결했고, 단일 호출이 1초 이상 막히면 계속 실패한다.
+자원 한도를 늘리거나 성공한 것처럼 heartbeat를 기록하지 않는다.
 
 ## 단계별 규약 적용
 

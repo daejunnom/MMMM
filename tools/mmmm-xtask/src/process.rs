@@ -18,7 +18,10 @@ use std::time::{Duration, Instant};
 
 const POLL: Duration = Duration::from_millis(50);
 const NATURAL_EXIT_GRACE: Duration = Duration::from_secs(2);
+#[cfg(not(target_os = "macos"))]
 const READ_BATCH_BYTES: usize = 256 * 1024;
+#[cfg(target_os = "macos")]
+const READ_BATCH_BYTES: usize = 8192;
 #[cfg(any(target_os = "macos", test))]
 #[path = "darwin_resources.rs"]
 mod darwin_resources;
@@ -137,8 +140,19 @@ pub fn supervise(
     cancellation: &AtomicBool,
     mut observe: impl FnMut() -> Result<(), String>,
 ) -> Result<ProcessOutcome, ProcessError> {
+    supervise_with_progress(spec, cancellation, |_| observe())
+}
+
+/// Managed observations may checkpoint between bounded filesystem operations.
+/// Each Darwin checkpoint samples actual owned identities and resources. It
+/// cannot extend the successful-sample deadline without a complete sample.
+pub fn supervise_with_progress(
+    spec: &ProcessSpec,
+    cancellation: &AtomicBool,
+    mut observe: impl FnMut(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String>,
+) -> Result<ProcessOutcome, ProcessError> {
     validate(spec)?;
-    observe().map_err(|e| ProcessError::new("observation", e))?;
+    run_observation(&mut observe, || Ok(()))?;
     let started = Instant::now();
     let mut stdout_log = create_log(&spec.stdout_log)?;
     let mut stderr_log = create_log(&spec.stderr_log)?;
@@ -192,28 +206,48 @@ pub fn supervise(
             outcome.darwin_resources = Some(process.resource_evidence());
         }
         if !capture_failed {
-            let capture = process.capture(
-                &mut stdout_log,
-                &mut stderr_log,
-                &mut outcome.stdout_bytes,
-                &mut outcome.stderr_bytes,
-                spec.max_log_bytes,
-            );
-            if let Err(error) = capture {
-                capture_failed = true;
-                outcome.output_complete = false;
-                let reason = if error.kind == "output_limit" {
-                    TerminationReason::OutputLimit
-                } else {
-                    TerminationReason::SupervisorFailure
-                };
-                request_stop(
-                    &mut process,
-                    &mut outcome,
-                    &mut stopping_at,
-                    reason,
-                    error.to_string(),
+            // Retain the same finite total capture budget on Darwin, but
+            // observe between bounded 8KiB pipe batches rather than after two
+            // 256KiB loops.
+            let capture_batches = if cfg!(target_os = "macos") { 32 } else { 1 };
+            for _ in 0..capture_batches {
+                let capture = process.capture(
+                    &mut stdout_log,
+                    &mut stderr_log,
+                    &mut outcome.stdout_bytes,
+                    &mut outcome.stderr_bytes,
+                    spec.max_log_bytes,
                 );
+                if let Err(error) = capture {
+                    capture_failed = true;
+                    outcome.output_complete = false;
+                    let reason = if error.kind == "output_limit" {
+                        TerminationReason::OutputLimit
+                    } else {
+                        TerminationReason::SupervisorFailure
+                    };
+                    request_stop(
+                        &mut process,
+                        &mut outcome,
+                        &mut stopping_at,
+                        reason,
+                        error.to_string(),
+                    );
+                    break;
+                }
+                #[cfg(target_os = "macos")]
+                if failure_checks_active(&outcome, stopping_at) {
+                    if let Err(error) = progress_sample(&mut process, spec, cancellation, started) {
+                        request_stop(
+                            &mut process,
+                            &mut outcome,
+                            &mut stopping_at,
+                            observation_reason(&error),
+                            error.to_string(),
+                        );
+                    }
+                    outcome.darwin_resources = Some(process.resource_evidence());
+                }
             }
         }
         // Optional build-tail cleanup remains subject to cancellation, time,
@@ -239,13 +273,22 @@ pub fn supervise(
         if failure_checks_active(&outcome, stopping_at)
             && last_observation.elapsed() >= spec.observation_interval
         {
+            let observation = run_observation(&mut observe, || {
+                #[cfg(target_os = "macos")]
+                progress_sample(&mut process, spec, cancellation, started)?;
+                Ok(())
+            });
             last_observation = Instant::now();
-            if let Err(error) = observe() {
+            #[cfg(target_os = "macos")]
+            {
+                outcome.darwin_resources = Some(process.resource_evidence());
+            }
+            if let Err(error) = observation {
                 request_stop(
                     &mut process,
                     &mut outcome,
                     &mut stopping_at,
-                    TerminationReason::ObservationFailure,
+                    observation_reason(&error),
                     format!("managed observation failed: {error}"),
                 );
             }
@@ -376,6 +419,69 @@ pub fn supervise(
     }
     outcome.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     Ok(outcome)
+}
+
+fn observation_reason(error: &ProcessError) -> TerminationReason {
+    if error.kind == "command_cancelled" {
+        return TerminationReason::Cancelled;
+    }
+    if error.kind == "command_timeout" {
+        return TerminationReason::Timeout;
+    }
+    #[cfg(target_os = "macos")]
+    if error.kind == "resource_budget" {
+        return TerminationReason::ResourceBudget;
+    }
+    TerminationReason::ObservationFailure
+}
+
+#[cfg(target_os = "macos")]
+fn progress_sample(
+    process: &mut native::Process,
+    spec: &ProcessSpec,
+    cancellation: &AtomicBool,
+    started: Instant,
+) -> Result<(), ProcessError> {
+    process.observe_resources()?;
+    if cancellation.load(Ordering::Acquire) {
+        return Err(ProcessError::new("command_cancelled", "command cancelled"));
+    }
+    if started.elapsed() >= spec.timeout {
+        return Err(ProcessError::new(
+            "command_timeout",
+            "command timeout exceeded",
+        ));
+    }
+    Ok(())
+}
+
+fn run_observation(
+    observe: &mut impl FnMut(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String>,
+    mut sample: impl FnMut() -> Result<(), ProcessError>,
+) -> Result<(), ProcessError> {
+    let mut first_failure: Option<ProcessError> = None;
+    let observation = {
+        let mut checkpoint = || {
+            if let Some(error) = &first_failure {
+                return Err(error.to_string());
+            }
+            match sample() {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let message = error.to_string();
+                    first_failure = Some(error);
+                    Err(message)
+                }
+            }
+        };
+        observe(&mut checkpoint)
+    };
+    // A callback must not hide a native failure by wrapping its text or
+    // ignoring it. Keep the original error kind for termination and evidence.
+    match first_failure {
+        Some(error) => Err(error),
+        None => observation.map_err(|error| ProcessError::new("observation", error)),
+    }
 }
 
 fn failure_checks_active(outcome: &ProcessOutcome, stopping_at: Option<Instant>) -> bool {
@@ -1343,6 +1449,8 @@ mod native {
                 return Ok(());
             }
             let mut processed = 0;
+            #[cfg(target_os = "macos")]
+            let mut interrupted = 0;
             loop {
                 let mut bytes = [0u8; 8192];
                 match self.file.read(&mut bytes) {
@@ -1358,7 +1466,18 @@ mod native {
                         }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                        #[cfg(target_os = "macos")]
+                        {
+                            interrupted += 1;
+                            if interrupted >= 32 {
+                                // Return to the actual resource observer even
+                                // under a bounded burst of interrupted reads.
+                                return Ok(());
+                            }
+                        }
+                        continue;
+                    }
                     Err(error) => return Err(ProcessError::io("read process output", error)),
                 }
             }
@@ -1794,6 +1913,53 @@ mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicU64};
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    #[test]
+    fn observation_progress_keeps_the_first_native_failure() {
+        let mut samples = 0;
+        let error = run_observation(
+            &mut |checkpoint| {
+                assert_eq!(
+                    checkpoint().unwrap_err(),
+                    "resource_observation: native resource sample unavailable"
+                );
+                // Even a caller ignoring/wrapping the failure cannot erase it
+                // or silently retry the native sample within this observation.
+                assert!(checkpoint().is_err());
+                Ok(())
+            },
+            || {
+                samples += 1;
+                Err(ProcessError::new(
+                    "resource_observation",
+                    "native resource sample unavailable",
+                ))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(samples, 1);
+        assert_eq!(error.kind, "resource_observation");
+        assert_eq!(error.message, "native resource sample unavailable");
+    }
+    #[test]
+    fn observation_progress_preserves_managed_failure_after_samples() {
+        let mut samples = 0;
+        let error = run_observation(
+            &mut |checkpoint| {
+                for _ in 0..4 {
+                    checkpoint()?;
+                }
+                Err("ownership changed".into())
+            },
+            || {
+                samples += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(samples, 4);
+        assert_eq!(error.kind, "observation");
+        assert_eq!(error.message, "ownership changed");
+    }
     struct TestRun {
         root: PathBuf,
         spec: ProcessSpec,

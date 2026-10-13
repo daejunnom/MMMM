@@ -477,6 +477,129 @@ fn explicit_managed_environment_override_must_match_owned_path() {
 }
 
 #[test]
+fn measurement_progress_failure_preserves_exact_cause_and_active_lease() {
+    let fixture = Fixture::new("progress-failure");
+    let build = fixture.acquire();
+    let lease = fs::read(build.paths().catalog.join("lease.json")).unwrap();
+    let expected = build.measure().unwrap();
+    let mut calls = 0;
+    let error = build
+        .measure_with_progress(&mut || {
+            calls += 1;
+            Err("native resource observation failed at owned pid".into())
+        })
+        .unwrap_err();
+    assert_eq!(calls, 1);
+    assert_eq!(error.kind, "observation_failed");
+    assert_eq!(
+        error.message,
+        "native resource observation failed at owned pid"
+    );
+    assert_eq!(
+        fs::read(build.paths().catalog.join("lease.json")).unwrap(),
+        lease
+    );
+    let mut successful_calls = 0;
+    let measured = build
+        .measure_with_progress(&mut || {
+            successful_calls += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert!(successful_calls > 0);
+    assert_eq!(measured.slot_bytes, expected.slot_bytes);
+    assert_eq!(measured.catalog_bytes, expected.catalog_bytes);
+    build.finish(outcome(0)).unwrap();
+}
+
+#[test]
+fn tree_measurement_checkpoints_enumeration_and_delayed_metadata() {
+    use std::cell::Cell;
+    let fixture = Fixture::new("progress-cadence");
+    let directory = fixture.root.join("authored-tree");
+    fs::create_dir(&directory).unwrap();
+    for index in 0..128 {
+        fs::write(directory.join(format!("entry-{index}")), b"data").unwrap();
+    }
+    let elapsed_ms = Cell::new(0u64);
+    let last_checkpoint_ms = Cell::new(0u64);
+    let maximum_gap_ms = Cell::new(0u64);
+    let checkpoint_count = Cell::new(0usize);
+    let metadata_count = Cell::new(0usize);
+    let bytes = tree_bytes_observed_with_progress(
+        &directory,
+        &directory,
+        &[],
+        |path| {
+            if path != directory && metadata_count.get() == 1 {
+                // The first child is visited after all entries are enumerated.
+                // Checkpoints during that enumeration cannot be supplied by
+                // metadata callbacks alone.
+                assert!(checkpoint_count.get() >= 2 * 128);
+            }
+            metadata_count.set(metadata_count.get() + 1);
+            // Model a bounded slow metadata operation without sleeping or
+            // asserting scheduling behavior on the machine running this test.
+            elapsed_ms.set(elapsed_ms.get() + 25);
+        },
+        &mut || {
+            maximum_gap_ms.set(
+                maximum_gap_ms
+                    .get()
+                    .max(elapsed_ms.get() - last_checkpoint_ms.get()),
+            );
+            last_checkpoint_ms.set(elapsed_ms.get());
+            checkpoint_count.set(checkpoint_count.get() + 1);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(bytes, 128 * 4);
+    assert_eq!(metadata_count.get(), 129);
+    assert_eq!(elapsed_ms.get(), 3225);
+    assert_eq!(maximum_gap_ms.get(), 25);
+}
+
+#[test]
+fn progress_error_during_enumeration_stops_before_pending_metadata() {
+    use std::cell::Cell;
+    let fixture = Fixture::new("progress-stop");
+    let directory = fixture.root.join("authored-tree");
+    fs::create_dir(&directory).unwrap();
+    for index in 0..16 {
+        fs::write(directory.join(format!("entry-{index}")), b"data").unwrap();
+    }
+    let metadata_count = Cell::new(0usize);
+    let checkpoints_after_root = Cell::new(0usize);
+    let error = tree_bytes_observed_with_progress(
+        &directory,
+        &directory,
+        &[],
+        |path| {
+            assert_eq!(path, directory);
+            metadata_count.set(metadata_count.get() + 1);
+        },
+        &mut || {
+            if metadata_count.get() != 0 {
+                let count = checkpoints_after_root.get() + 1;
+                checkpoints_after_root.set(count);
+                // Fail immediately after the first directory.next(), before
+                // its entry is pushed and before any child metadata is read.
+                if count == 5 {
+                    return Err("owned resource sample exceeded its deadline".into());
+                }
+            }
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert_eq!(metadata_count.get(), 1);
+    assert_eq!(checkpoints_after_root.get(), 5);
+    assert_eq!(error.kind, "observation_failed");
+    assert_eq!(error.message, "owned resource sample exceeded its deadline");
+}
+
+#[test]
 fn measurement_tolerates_only_owned_ephemeral_entries_deleted_by_concurrent_worker() {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -573,11 +696,22 @@ fn churn_allowance_does_not_apply_to_completed_slot_or_other_error_kinds() {
     let build = fixture.acquire();
     let ephemeral = build.paths().cargo_target.join("vanishing");
     fs::write(&ephemeral, b"temporary").unwrap();
-    let result = tree_bytes_observed(&build.paths().slot, &build.paths().slot, &[], |path| {
-        if path == ephemeral {
-            fs::remove_file(path).unwrap();
-        }
-    });
+    let mut progress_calls = 0;
+    let result = tree_bytes_observed_with_progress(
+        &build.paths().slot,
+        &build.paths().slot,
+        &[],
+        |path| {
+            if path == ephemeral {
+                fs::remove_file(path).unwrap();
+            }
+        },
+        &mut || {
+            progress_calls += 1;
+            Ok(())
+        },
+    );
+    assert!(progress_calls > 0);
     assert_eq!(error_kind(result), "io");
     let roots = build.observation_roots();
     let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);

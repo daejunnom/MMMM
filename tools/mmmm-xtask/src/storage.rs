@@ -571,22 +571,48 @@ impl ManagedBuild {
         self.measure_with(|_| {})
     }
 
+    pub fn measure_with_progress(
+        &self,
+        progress: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<Measurement, StorageError> {
+        self.measure_observed(|_| {}, progress)
+    }
+
     fn measure_with(
         &self,
-        mut before_metadata: impl FnMut(&Path),
+        before_metadata: impl FnMut(&Path),
     ) -> Result<Measurement, StorageError> {
+        self.measure_observed(before_metadata, &mut || Ok(()))
+    }
+
+    fn measure_observed(
+        &self,
+        mut before_metadata: impl FnMut(&Path),
+        progress: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<Measurement, StorageError> {
+        observation_checkpoint(progress)?;
         self.verify_ownership()?;
+        observation_checkpoint(progress)?;
         let observation_roots = self.observation_roots();
         self.verify_observation_roots(&observation_roots)?;
+        observation_checkpoint(progress)?;
         let mut slot_bytes = None;
         let mut catalog_bytes = 0u64;
-        let slots = load_slots(&self.paths.catalog, &self.catalog)?;
+        let slots = load_slots_with_progress(&self.paths.catalog, &self.catalog, progress)?;
         self.validate_active_slots(&slots)?;
+        observation_checkpoint(progress)?;
         for (path, record) in slots {
+            observation_checkpoint(progress)?;
             let size = if record.slot_id == self.slot.slot_id && record.state == SlotState::Active {
-                tree_bytes_observed(&path, &path, &observation_roots, &mut before_metadata)?
+                tree_bytes_observed_with_progress(
+                    &path,
+                    &path,
+                    &observation_roots,
+                    &mut before_metadata,
+                    progress,
+                )?
             } else {
-                tree_bytes(&path, &path)?
+                tree_bytes_observed_with_progress(&path, &path, &[], |_| {}, progress)?
             };
             if record.slot_id == self.slot.slot_id {
                 slot_bytes = Some(size);
@@ -595,8 +621,11 @@ impl ManagedBuild {
         }
         // Ephemeral entries may disappear during a finite observation. Fixed
         // roots and ownership records must still be intact when it completes.
+        observation_checkpoint(progress)?;
         self.verify_observation_roots(&observation_roots)?;
+        observation_checkpoint(progress)?;
         self.verify_ownership()?;
+        observation_checkpoint(progress)?;
         let slot_bytes = slot_bytes.ok_or_else(|| {
             StorageError::new("ownership", "owned slot disappeared during measurement")
         })?;
@@ -931,27 +960,46 @@ fn load_slots(
     catalog_path: &Path,
     catalog: &CatalogRecord,
 ) -> Result<Vec<(PathBuf, SlotRecord)>, StorageError> {
+    load_slots_with_progress(catalog_path, catalog, &mut || Ok(()))
+}
+
+fn load_slots_with_progress(
+    catalog_path: &Path,
+    catalog: &CatalogRecord,
+    progress: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<Vec<(PathBuf, SlotRecord)>, StorageError> {
+    observation_checkpoint(progress)?;
     validate_catalog_entries(catalog_path)?;
+    observation_checkpoint(progress)?;
     let slots_path = catalog_path.join("slots");
     if !slots_path.exists() {
         return Ok(Vec::new());
     }
     verify_directory(&slots_path)?;
+    observation_checkpoint(progress)?;
     let mut slots = Vec::new();
-    for entry in fs::read_dir(&slots_path).map_err(|e| StorageError::io("read slots", e))? {
+    let mut directory = fs::read_dir(&slots_path).map_err(|e| StorageError::io("read slots", e))?;
+    loop {
+        observation_checkpoint(progress)?;
+        let entry = directory.next();
+        observation_checkpoint(progress)?;
+        let Some(entry) = entry else { break };
         if slots.len() >= MAX_ENTRIES {
             return Err(StorageError::new("walk_limit", "too many managed slots"));
         }
         let entry = entry.map_err(|e| StorageError::io("read slot", e))?;
         let path = entry.path();
         verify_directory(&path)?;
+        observation_checkpoint(progress)?;
         let slot_id = entry
             .file_name()
             .into_string()
             .map_err(|_| StorageError::new("path", "slot name is not UTF-8"))?;
         let record: SlotRecord = read_record(&path.join("owner.json"))?;
+        observation_checkpoint(progress)?;
         validate_slot_record(&record, &slot_id, catalog)?;
         validate_slot_entries(&path)?;
+        observation_checkpoint(progress)?;
         let scratch = path.join("scratch");
         if record.state == SlotState::Complete
             && scratch.exists()
@@ -965,6 +1013,7 @@ fn load_slots(
                 "completed slot has unexplained residual scratch; preserved",
             ));
         }
+        observation_checkpoint(progress)?;
         slots.push((path, record));
     }
     Ok(slots)
@@ -1437,14 +1486,39 @@ fn tree_bytes_observed(
     path: &Path,
     boundary: &Path,
     ephemeral_roots: &[PathBuf],
-    mut before_metadata: impl FnMut(&Path),
+    before_metadata: impl FnMut(&Path),
 ) -> Result<u64, StorageError> {
+    tree_bytes_observed_with_progress(
+        path,
+        boundary,
+        ephemeral_roots,
+        before_metadata,
+        &mut || Ok(()),
+    )
+}
+
+fn observation_checkpoint(
+    progress: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), StorageError> {
+    progress().map_err(|cause| StorageError::new("observation_failed", cause))
+}
+
+fn tree_bytes_observed_with_progress(
+    path: &Path,
+    boundary: &Path,
+    ephemeral_roots: &[PathBuf],
+    mut before_metadata: impl FnMut(&Path),
+    progress: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<u64, StorageError> {
+    observation_checkpoint(progress)?;
     let boundary =
         fs::canonicalize(boundary).map_err(|e| StorageError::io("resolve tree boundary", e))?;
+    observation_checkpoint(progress)?;
     let mut pending = vec![(path.to_path_buf(), 0usize)];
     let mut entries = 0usize;
     let mut bytes = 0u64;
     while let Some((path, depth)) = pending.pop() {
+        observation_checkpoint(progress)?;
         entries += 1;
         if depth > MAX_DEPTH || entries > MAX_ENTRIES {
             return Err(StorageError::new(
@@ -1454,21 +1528,29 @@ fn tree_bytes_observed(
         }
         reject_secret_path(&path)?;
         before_metadata(&path);
+        observation_checkpoint(progress)?;
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if vanished_ephemeral_entry(&path, &error, ephemeral_roots)? => continue,
             Err(error) => return Err(StorageError::io("measure managed entry", error)),
         };
+        observation_checkpoint(progress)?;
         if is_link(&metadata) {
             validate_internal_link(&path, &boundary)?;
+            observation_checkpoint(progress)?;
             bytes = checked_sum(bytes, metadata.len())?;
         } else if metadata.is_dir() {
-            let directory = match fs::read_dir(&path) {
+            let mut directory = match fs::read_dir(&path) {
                 Ok(directory) => directory,
                 Err(error) if vanished_ephemeral_entry(&path, &error, ephemeral_roots)? => continue,
                 Err(error) => return Err(StorageError::io("measure directory", error)),
             };
-            for entry in directory {
+            observation_checkpoint(progress)?;
+            loop {
+                observation_checkpoint(progress)?;
+                let entry = directory.next();
+                observation_checkpoint(progress)?;
+                let Some(entry) = entry else { break };
                 if pending.len() + entries >= MAX_ENTRIES {
                     return Err(StorageError::new(
                         "walk_limit",
@@ -1494,6 +1576,7 @@ fn tree_bytes_observed(
             ));
         }
     }
+    observation_checkpoint(progress)?;
     Ok(bytes)
 }
 

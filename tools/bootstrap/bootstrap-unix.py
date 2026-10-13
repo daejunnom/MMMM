@@ -297,16 +297,22 @@ def entries(path, allowed):
 
 
 @native_operation("enumerate directory names")
-def names(path):
+def names(path, checkpoint=None):
+    if checkpoint is not None:
+        checkpoint()
     descriptor = open_directory(path)
     try:
         result = []
         with os.scandir(descriptor) as iterator:
             for entry in iterator:
+                if checkpoint is not None:
+                    checkpoint()
                 if len(result) >= MAX_ENTRIES:
                     raise RuntimeError("directory entry bound exceeded")
                 safe_name(entry.name)
                 result.append(entry.name)
+        if checkpoint is not None:
+            checkpoint()
         return result
     finally:
         os.close(descriptor)
@@ -367,10 +373,12 @@ def vanished_active_descendant(path, roots):
     return True
 
 
-def measure(path, transient_roots=()):
+def measure(path, transient_roots=(), checkpoint=None):
     pending = [(path, 0, False)]
     count, length = 0, 0
     while pending:
+        if checkpoint is not None:
+            checkpoint()
         current, depth, enumerated = pending.pop()
         count += 1
         safe_name(current.name)
@@ -382,14 +390,18 @@ def measure(path, transient_roots=()):
             if not enumerated or not vanished_active_descendant(current, transient_roots):
                 raise
             continue
+        if checkpoint is not None:
+            checkpoint()
         if stat.S_ISDIR(value.st_mode):
             try:
-                children = names(current)
+                children = names(current, checkpoint)
             except FileNotFoundError:
                 if not enumerated or not vanished_active_descendant(current, transient_roots):
                     raise
                 continue
             for name in children:
+                if checkpoint is not None:
+                    checkpoint()
                 if count + len(pending) >= MAX_ENTRIES:
                     raise RuntimeError("managed tree entry bound exceeded")
                 pending.append((current / name, depth + 1, True))
@@ -849,6 +861,24 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
     reaped = False
     tail_started = None
     owned_tail_terminated = False
+
+    def checkpoint():
+        # A cooperative checkpoint observes the complete native owned scope.
+        # Its throttle uses only the last successfully completed resource
+        # sample; a blocked syscall or late sample still fails the 1s limit.
+        if target_os != "macos" or not approved or killed:
+            return
+        if snapshot.last_sample is None or time.monotonic() - snapshot.last_sample >= DARWIN_SAMPLE_TARGET:
+            native_call("observe resources during bounded parent work", snapshot.observe, leader, True)
+        if cancelled:
+            if "command cancelled" not in errors:
+                errors.append("command cancelled")
+            raise RuntimeError("command cancelled during bounded parent work")
+        if time.monotonic() - started >= timeout:
+            if "command timeout" not in errors:
+                errors.append("command timeout")
+            raise RuntimeError("command timeout during bounded parent work")
+
     try:
         while True:
             now = time.monotonic()
@@ -890,13 +920,18 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
                         total += retain
                         if retain != len(chunk) and "combined output limit exceeded" not in errors:
                             errors.append("combined output limit exceeded")
+                    checkpoint()
+            now = time.monotonic()
             if now - started >= timeout and "command timeout" not in errors:
                 errors.append("command timeout")
             if cancelled and "command cancelled" not in errors:
                 errors.append("command cancelled")
             if now - observed >= 5:
-                observe()
-                observed = now
+                if target_os == "macos":
+                    observe(checkpoint)
+                else:
+                    observe()
+                observed = time.monotonic()
             if ready:
                 members = native_call("observe reserved session membership", snapshot.observe, leader, not killed)
                 if not approved and not errors and resource_proved:
@@ -1147,22 +1182,28 @@ def entry():
     observation_roots = tuple(cache / name for name in
                               ("cargo-target", "cargo-home", "gradle-build", "gradle-project-cache", "gradle-user-home")) + (scratch,)
 
-    def verify_active_observation():
+    def verify_active_observation(checkpoint=None):
         for path, expected in pins.items():
+            if checkpoint is not None:
+                checkpoint()
             if identity(path) != expected:
                 raise RuntimeError("pinned directory identity changed")
         for root in observation_roots:
+            if checkpoint is not None:
+                checkpoint()
             if identity(root) != DIRECTORY_PINS[root]:
                 raise RuntimeError("active observation fixed root changed")
         for path, expected in records.items():
+            if checkpoint is not None:
+                checkpoint()
             if read_regular(path, RECORD_LIMIT) != expected:
                 raise RuntimeError("active observation ownership record changed")
 
-    def observe():
-        verify_active_observation()
-        slot_bytes = measure(slot, observation_roots)
-        catalog_bytes = measure(catalog, observation_roots)
-        verify_active_observation()
+    def observe(checkpoint=None):
+        verify_active_observation(checkpoint)
+        slot_bytes = measure(slot, observation_roots, checkpoint)
+        catalog_bytes = measure(catalog, observation_roots, checkpoint)
+        verify_active_observation(checkpoint)
         if slot_bytes > SLOT_LIMIT or catalog_bytes > CATALOG_LIMIT:
             raise RuntimeError("managed bootstrap byte budget exceeded")
 
@@ -1233,10 +1274,12 @@ def entry():
     completion_args = ["bootstrap-complete", "--checkout", str(checkout), "--ownership", str(ownership_file),
                        "--proof", str(evidence / "bootstrap-process.json"), "--evidence-root", str(evidence),
                        "--purpose", "bootstrap", "--output-root", str(output)]
-    def observe_completion():
+    def observe_completion(checkpoint=None):
         # Rust adoption may remove scratch or evict the completed slot. Only
         # stable catalog/output/evidence roots remain pinned for this command.
         for path in (checkout, output, evidence, catalog, slots):
+            if checkpoint is not None:
+                checkpoint()
             if identity(path) != pins[path]:
                 raise RuntimeError("completion root identity changed")
         # The trusted Rust completion itself measures its catalog. Traversing

@@ -150,8 +150,10 @@ fn run_managed(
     spec.env.insert("CARGO_BUILD_JOBS".into(), "2".into());
     spec.timeout = Duration::from_secs(timeout);
     spec.tail_policy = tail_policy;
-    let result = process::supervise(&spec, &cancellation, || {
-        let measurement = build.measure().map_err(|error| error.to_string())?;
+    let result = process::supervise_with_progress(&spec, &cancellation, |checkpoint| {
+        let measurement = build
+            .measure_with_progress(checkpoint)
+            .map_err(|error| error.to_string())?;
         if !measurement.within_budget {
             return Err("managed disk budget exceeded".into());
         }
