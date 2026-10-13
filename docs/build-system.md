@@ -266,10 +266,28 @@ device와 inode를 소유 시점의 identity와 비교한다.
 
 처음 선택한 자원 한도는 Cargo worker 2개, 1200초, 합계 출력 128 MiB,
 slot 8 GiB, catalog 12 GiB이며 크기는 5초마다 관측한다. Windows bootstrap은
-Job Object의 2 GiB memory와 32개 process 한도를 사용한다. Unix bootstrap의
+Job Object의 2 GiB memory와 32개 process 한도를 사용한다. Linux bootstrap의
 `RLIMIT_AS`는 process마다 2 GiB의 주소 공간 상한을 물려주며, 실행 중인 group
 구성원은 wrapper를 제외하고 32개를 관측 한도로 검사한다. Unix의 이 한도는
 Job Object 전체 memory 상한이나 커널 process quota와 같은 보장이 아니다.
+
+Darwin의 2 GiB `RLIMIT_AS`는 실제 runner에서 기존 VM 예약보다 작아
+Cargo 시작 전 `EINVAL`을 반환했다. `managed-darwin-resources/1`은 512 GiB
+VM 한도의 설정과 readback, 각 소유 process의 관측 VM 한도를 적용하고,
+전체 live 소유 그룹의 RSS와 physical footprint 합계를 각각 2 GiB로 검사한다.
+wrapper도 memory 합계에 포함하며 worker는 32개까지 허용한다. 목표 관측 주기는
+100 ms이고 마지막 완전한 성공 관측으로부터 1초를 넘으면 실패한다. native 오류,
+짧은 구조체 응답, identity 교체와 SID/PGID 이탈을 0으로 대체하지 않는다.
+policy, API flavor, sample 수, peak와 최대 관측 간격을 증거에 남긴다.
+
+이는 kernel resident memory quota가 아니며 관측 사이의 초과와 fork/exec의
+일시적 사용을 완전히 막는 보장은 없다. Python bootstrap은 부모의 native 확인을
+마친 뒤 worker를 허용한다. Rust 감독기는 시작 전 native self preflight와
+async-signal-safe 설정을 하고 exec 직후 첫 소유 process 관측을 수행하므로,
+첫 관측 전에 명령이 실행될 수 있다. 첫 관측 실패도 해당 소유 범위 종료와 drain을
+거치며 lease를 보존한다. 이 정책의 실제 macOS 실행 검증은 아직 완료되지 않았다.
+Windows 및 Linux의 일반 Rust 관리 명령에 대한 동일 memory/process quota 연결도
+별도 G0 검증 대상이다. bootstrap 한도를 전체 명령의 완료 근거로 사용하지 않는다.
 크기와 process 수는 관측 사이 증가할 수 있다. 독립 session으로 의도적으로 이탈하는
 프로그램을 격리하는 보안 sandbox를 제공한다는 주장도 하지 않는다.
 

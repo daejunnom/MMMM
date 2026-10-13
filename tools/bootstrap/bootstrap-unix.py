@@ -32,6 +32,10 @@ CATALOG_LIMIT = 12 * 1024**3
 LOG_LIMIT = 128 * 1024**2
 MEMORY_LIMIT = 2 * 1024**3
 PROCESS_LIMIT = 32
+DARWIN_VM_LIMIT = 512 * 1024**3
+DARWIN_SAMPLE_TARGET = 0.1
+DARWIN_SAMPLE_GAP = 1.0
+U64_MAX = 2**64 - 1
 MAX_ENTRIES = 100000
 CATALOG_FIELDS = {"schema", "catalog_id"}
 LEASE_FIELDS = {"schema", "catalog_id", "slot_id", "token", "pid", "started_ms"}
@@ -407,6 +411,33 @@ class BsdInfo(ctypes.Structure):
                  ("start_usec", ctypes.c_uint64)]
 
 
+class TaskInfo(ctypes.Structure):
+    # Public PROC_PIDTASKINFO=4: adjusted virtual_size, not raw vm_map size.
+    _fields_ = [(name, ctypes.c_uint64) for name in
+                ("virtual_size", "resident_size", "total_user", "total_system",
+                 "threads_user", "threads_system")]
+    _fields_ += [("counters", ctypes.c_int32 * 12)]
+
+
+class RusageInfoV0(ctypes.Structure):
+    # Public RUSAGE_INFO_V0=0. UUID is never emitted into evidence.
+    _fields_ = [("uuid", ctypes.c_ubyte * 16)]
+    _fields_ += [(name, ctypes.c_uint64) for name in
+                ("user_time", "system_time", "pkg_idle_wkups", "interrupt_wkups",
+                 "pageins", "wired_size", "resident_size", "phys_footprint",
+                 "start_abstime", "exit_abstime")]
+
+
+def checked_resource_sum(total, value):
+    if not 0 <= value <= U64_MAX or not 0 <= total <= U64_MAX - value:
+        raise RuntimeError("Darwin native resource sum overflow")
+    return total + value
+
+
+class DarwinProcessExited(RuntimeError):
+    """An exit-class resource result still requires native identity proof."""
+
+
 class NativeSnapshot:
     def __init__(self, target_os):
         self.target_os = target_os
@@ -419,8 +450,32 @@ class NativeSnapshot:
             self.libproc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
                                                  ctypes.c_void_p, ctypes.c_int]
             self.libproc.proc_pidinfo.restype = ctypes.c_int
-            if ctypes.sizeof(BsdInfo) != 136:
-                raise RuntimeError("unexpected Darwin proc_bsdinfo ABI")
+            self.libproc.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+            self.libproc.proc_pid_rusage.restype = ctypes.c_int
+            if (ctypes.sizeof(BsdInfo) != 136 or ctypes.sizeof(TaskInfo) != 96
+                    or ctypes.sizeof(RusageInfoV0) != 96):
+                raise RuntimeError("unexpected Darwin native process/resource ABI")
+            self.last_sample = None
+            self.resources = {
+                "policy": "managed-darwin-resources/1", "configured_rlimit_as_bytes": DARWIN_VM_LIMIT,
+                "rlimit_as_readback_bytes": None, "adjusted_vm_per_pid_limit_bytes": DARWIN_VM_LIMIT,
+                "aggregate_rss_limit_bytes": MEMORY_LIMIT, "aggregate_footprint_limit_bytes": MEMORY_LIMIT,
+                "worker_limit": PROCESS_LIMIT, "wrapper_limit": 1, "wrapper_in_memory_sum": True,
+                "sample_target_ms": 100, "max_successful_sample_gap_ms": 1000,
+                "taskinfo_flavor": 4, "rusage_flavor": 0, "sample_count": 0,
+                "peak_observed_adjusted_vm_bytes": 0, "peak_observed_aggregate_rss_bytes": 0,
+                "peak_observed_aggregate_footprint_bytes": 0, "peak_observed_workers": 0,
+                "max_observed_sample_gap_ms": 0, "sampling_may_overshoot": True,
+                "kernel_resident_quota": False,
+            }
+            before = self.bsd_info(os.getpid())
+            values = self.memory_info(os.getpid())
+            after = self.bsd_info(os.getpid())
+            self.verify_memory_identity(before, after, os.getpid())
+            self.check_resources(*values, 0)
+            self.resources["preflight_self_adjusted_vm_bytes"] = values[0]
+            self.resources["preflight_self_rss_bytes"] = values[1]
+            self.resources["preflight_self_footprint_bytes"] = values[2]
 
     def bsd_info(self, pid, zombie=False):
         info = BsdInfo()
@@ -432,7 +487,64 @@ class NativeSnapshot:
             raise RuntimeError("Darwin native process identity unavailable")
         return info
 
-    def observe(self, leader):
+    def memory_info(self, pid):
+        task, usage = TaskInfo(), RusageInfoV0()
+        ctypes.set_errno(0)
+        size = native_call("observe Darwin task memory", self.libproc.proc_pidinfo,
+                           pid, 4, 0, ctypes.byref(task), ctypes.sizeof(task))
+        if size != ctypes.sizeof(task):
+            if size == 0 and ctypes.get_errno() == errno.ESRCH:
+                raise DarwinProcessExited("Darwin task resource process exit requires identity confirmation")
+            raise RuntimeError("Darwin task resource observation unavailable; bytes=" + str(size)
+                               + "; errno=" + str(ctypes.get_errno()))
+        ctypes.set_errno(0)
+        result = native_call("observe Darwin physical footprint", self.libproc.proc_pid_rusage,
+                             pid, 0, ctypes.byref(usage))
+        if result != 0:
+            if ctypes.get_errno() == errno.ESRCH:
+                raise DarwinProcessExited("Darwin footprint process exit requires identity confirmation")
+            raise RuntimeError("Darwin footprint observation unavailable; errno=" + str(ctypes.get_errno()))
+        if usage.start_abstime == 0:
+            raise RuntimeError("Darwin resource observation does not identify a live process")
+        if usage.exit_abstime != 0:
+            raise DarwinProcessExited("Darwin resource process exit requires identity confirmation")
+        return task.virtual_size, max(task.resident_size, usage.resident_size), usage.phys_footprint
+
+    def memory_or_confirmed_zombie(self, pid, before):
+        try:
+            return self.memory_info(pid)
+        except DarwinProcessExited:
+            after = self.bsd_info(pid, True)
+            self.verify_memory_identity(before, after, pid)
+            if after.status != 5:
+                raise RuntimeError("Darwin resource process exit not confirmed by native zombie identity")
+            # The reserved group ID plus unchanged start/PGID identifies a
+            # departed member. This omits an ended process, never a zero sample.
+            return None
+
+    @staticmethod
+    def verify_memory_identity(before, after, pid):
+        if (before is None or after is None or before.pid != pid or after.pid != pid
+                or before.uid != os.geteuid() or after.uid != os.geteuid()
+                or (before.start_sec, before.start_usec, before.pgid)
+                != (after.start_sec, after.start_usec, after.pgid)):
+            raise RuntimeError("Darwin resource process identity changed or unavailable")
+
+    @staticmethod
+    def check_resources(vm, rss, footprint, workers):
+        if vm > DARWIN_VM_LIMIT or rss > MEMORY_LIMIT or footprint > MEMORY_LIMIT or workers > PROCESS_LIMIT:
+            raise RuntimeError("Darwin resource budget exceeded; adjusted_vm=" + str(vm)
+                               + "; aggregate_rss=" + str(rss) + "; aggregate_footprint=" + str(footprint)
+                               + "; workers=" + str(workers))
+
+    def sample_gap(self, started, finished):
+        gap = finished - (self.last_sample if self.last_sample is not None else started)
+        self.resources["max_observed_sample_gap_ms"] = max(
+            self.resources["max_observed_sample_gap_ms"], int(gap * 1000))
+        if gap > DARWIN_SAMPLE_GAP:
+            raise RuntimeError("Darwin successful resource sample gap exceeded 1000ms")
+
+    def observe(self, leader, resources=True):
         if self.target_os == "linux":
             count, seen = 0, False
             with os.scandir("/proc") as iterator:
@@ -466,6 +578,11 @@ class NativeSnapshot:
             if not seen:
                 raise RuntimeError("reserved leader missing from native snapshot")
             return count
+        sample_started = time.monotonic()
+        sample_memory = resources and (self.last_sample is None or sample_started - self.last_sample >= DARWIN_SAMPLE_TARGET)
+        if resources and self.last_sample is not None:
+            self.sample_gap(sample_started, sample_started)
+        vm_peak, rss_sum, footprint_sum = 0, 0, 0
         capacity = 1024
         while True:
             pids = (ctypes.c_int * capacity)()
@@ -482,7 +599,11 @@ class NativeSnapshot:
             if pid <= 0:
                 continue
             if pid == leader:
-                before, after = self.bsd_info(pid, True), self.bsd_info(pid, True)
+                before = self.bsd_info(pid, True)
+                if before is not None and before.status != 5 and os.getsid(pid) != leader:
+                    raise RuntimeError("reserved Darwin leader changed session identity")
+                values = self.memory_or_confirmed_zombie(pid, before) if sample_memory and before is not None and before.status != 5 else None
+                after = self.bsd_info(pid, True)
                 if before is None or after is None or before.pid != leader or after.pid != leader:
                     raise RuntimeError("reserved Darwin leader disappeared")
                 start = before.start_sec, before.start_usec
@@ -491,6 +612,15 @@ class NativeSnapshot:
                         or self.leader_start is not None and self.leader_start != start):
                     raise RuntimeError("reserved Darwin leader changed identity")
                 self.leader_start, seen = start, True
+                if values is not None:
+                    self.verify_memory_identity(before, after, pid)
+                    if after.status == 5:
+                        raise RuntimeError("Darwin wrapper exited during resource observation")
+                    if os.getsid(pid) != leader:
+                        raise RuntimeError("reserved Darwin leader changed session during resource observation")
+                    vm_peak = max(vm_peak, values[0])
+                    rss_sum = checked_resource_sum(rss_sum, values[1])
+                    footprint_sum = checked_resource_sum(footprint_sum, values[2])
                 continue
             try:
                 session = os.getsid(pid)
@@ -501,6 +631,7 @@ class NativeSnapshot:
             before = self.bsd_info(pid)
             if before is None:
                 continue
+            values = self.memory_or_confirmed_zombie(pid, before) if sample_memory and before.status != 5 else None
             try:
                 session_after = os.getsid(pid)
             except ProcessLookupError:
@@ -516,8 +647,24 @@ class NativeSnapshot:
                 raise RuntimeError("owned Darwin session member changed process group")
             if after.pgid == leader and after.status != 5:
                 count += 1
+                if values is not None:
+                    self.verify_memory_identity(before, after, pid)
+                    vm_peak = max(vm_peak, values[0])
+                    rss_sum = checked_resource_sum(rss_sum, values[1])
+                    footprint_sum = checked_resource_sum(footprint_sum, values[2])
         if not seen:
             raise RuntimeError("reserved Darwin leader missing from snapshot")
+        if sample_memory:
+            finished = time.monotonic()
+            self.resources["sample_count"] += 1
+            for name, value in (("peak_observed_adjusted_vm_bytes", vm_peak),
+                                ("peak_observed_aggregate_rss_bytes", rss_sum),
+                                ("peak_observed_aggregate_footprint_bytes", footprint_sum),
+                                ("peak_observed_workers", count)):
+                self.resources[name] = max(self.resources[name], value)
+            self.sample_gap(sample_started, finished)
+            self.last_sample = finished
+            self.check_resources(vm_peak, rss_sum, footprint_sum, count)
         return count
 
 
@@ -606,16 +753,29 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
                 native_call("close child unneeded pipe", os.close, descriptor)
             native_call("establish reserved session", os.setsid)
             session_id = os.getpid()
-            # The still-live wrapper reserves SID/PGID until parent drain checks.
+            # Establish ownership before quota configuration can fail. The
+            # parent still withholds admission until the separate limit proof.
             native_call("report session readiness", os.write, report_write, b"ready\n")
+            vm_limit = DARWIN_VM_LIMIT if target_os == "macos" else MEMORY_LIMIT
+            if target_os == "macos":
+                native_call("set core dump limit", resource.setrlimit, resource.RLIMIT_CORE, (0, 0))
+                native_call("set address space limit", resource.setrlimit, resource.RLIMIT_AS, (vm_limit, vm_limit))
+                readback = native_call("read address space limit", resource.getrlimit, resource.RLIMIT_AS)
+                if readback != (vm_limit, vm_limit):
+                    raise RuntimeError("configured address space limit readback mismatch")
+                native_call("set descriptor limit", resource.setrlimit, resource.RLIMIT_NOFILE, (256, 256))
+                native_call("report verified address space limit", os.write, report_write,
+                            ("limit:" + str(vm_limit) + "\n").encode("ascii"))
+            # The still-live wrapper reserves SID/PGID until parent drain checks.
             # Parent must verify the native SID/PGID and start-time identity
             # before any build worker may execute.
             if native_call("await verified session admission", os.read, start_read, 1) != b"x":
                 os._exit(126)
             native_call("close child admission pipe", os.close, start_read)
-            native_call("set core dump limit", resource.setrlimit, resource.RLIMIT_CORE, (0, 0))
-            native_call("set address space limit", resource.setrlimit, resource.RLIMIT_AS, (MEMORY_LIMIT, MEMORY_LIMIT))
-            native_call("set descriptor limit", resource.setrlimit, resource.RLIMIT_NOFILE, (256, 256))
+            if target_os == "linux":
+                native_call("set core dump limit", resource.setrlimit, resource.RLIMIT_CORE, (0, 0))
+                native_call("set address space limit", resource.setrlimit, resource.RLIMIT_AS, (MEMORY_LIMIT, MEMORY_LIMIT))
+                native_call("set descriptor limit", resource.setrlimit, resource.RLIMIT_NOFILE, (256, 256))
             worker = native_call("fork bounded build worker", os.fork)
             if worker == 0:
                 native_call("close worker report pipe", os.close, report_write)
@@ -683,6 +843,7 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
         close(descriptor)
     errors, report, command_exit = [], bytearray(), None
     ready, approved, killed, drained, empty = False, False, False, False, 0
+    resource_proved = target_os != "macos"
     started, observed, kill_started = time.monotonic(), time.monotonic(), None
     total = 0
     reaped = False
@@ -713,6 +874,10 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
                             report = bytearray(rest)
                             if line == b"ready" and not ready:
                                 ready = True
+                            elif (target_os == "macos" and ready and not resource_proved
+                                  and line == ("limit:" + str(DARWIN_VM_LIMIT)).encode("ascii")):
+                                snapshot.resources["rlimit_as_readback_bytes"] = DARWIN_VM_LIMIT
+                                resource_proved = True
                             elif line.startswith(b"exit:") and ready and command_exit is None:
                                 command_exit = int(line[5:])
                             elif line.startswith(b"launcher-error:"):
@@ -733,13 +898,15 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
                 observe()
                 observed = now
             if ready:
-                members = native_call("observe reserved session membership", snapshot.observe, leader)
-                if not approved and not errors:
+                members = native_call("observe reserved session membership", snapshot.observe, leader, not killed)
+                if not approved and not errors and resource_proved:
                     native_call("admit verified session build worker", os.write, start_write, b"x")
                     close(start_write)
                     approved = True
                 if members > PROCESS_LIMIT and "owned process limit exceeded" not in errors:
                     errors.append("owned process limit exceeded")
+                if not resource_proved and now - started >= 5:
+                    raise RuntimeError("Darwin address space limit proof unavailable before admission")
                 if command_exit is not None and members and not killed:
                     if tail_started is None:
                         tail_started = now
@@ -823,7 +990,7 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
                         # Missing EOF cannot be converted to a successful drain.
                         break
                 try:
-                    members = native_call("observe error drain session membership", snapshot.observe, leader)
+                    members = native_call("observe error drain session membership", snapshot.observe, leader, False)
                     pipes_closed = all(key.data == 2 for key in selector.get_map().values())
                     empty = empty + 1 if members == 0 and pipes_closed else 0
                     if empty >= 2:
@@ -869,8 +1036,11 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
                   else "output_limit" if "combined output limit exceeded" in errors
                   else "remaining_children" if "command left running owned descendants" in errors
                   else "supervisor_failure")
-    return {"command_exit": command_exit, "drained": drained, "supervisor_errors": errors,
-            "owned_tail_terminated": owned_tail_terminated, "termination_reason": reason}
+    result = {"command_exit": command_exit, "drained": drained, "supervisor_errors": errors,
+              "owned_tail_terminated": owned_tail_terminated, "termination_reason": reason}
+    if target_os == "macos":
+        result["darwin_resources"] = snapshot.resources
+    return result
 
 
 def default_output(target_os):

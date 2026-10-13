@@ -65,6 +65,12 @@ Windows의 빌드 관리 도구 bootstrap은 실제로 통과했으며, 제품 �
 | JVM SDK 및 호스트 코어 검사 | SDK 92, host-core 4 검사 통과; 실패·오류·skip 없음 | Java 25와 실제 Gradle 실행 및 XML 결과 확인; Fabric 게임 호스트와 실제 게임 인수는 별도 |
 | 교환 모듈 첫 실제 검사 | 57 통과, 2 실패 | 좌표 숫자의 JSON 표현 비교와 수정·삭제 충돌 검사 순서를 수정; 수정 후 결과는 재검사 대상 |
 | 네 번째 3개 OS 기반 CI | Windows와 Linux의 전체 기반 job 통과; 집계 실패 | macOS reserved launcher의 ValueError가 먼저 발생; 종료 경로의 EPERM과 구분하며 원본 supervision proof와 빈 Cargo 로그를 보존 |
+| 컴파일러 집중 검사 | 70 검사 통과, 실패 및 ignored 없음 | 수학·scene·animation·pack의 순수 출력 및 거절 경로; strict Clippy 수정 후 재검증과 실제 native parser·game 인수는 별도 |
+| Reference capture 집중 검사 | 39 검사 통과, 실패 및 ignored 없음 | 기존 30개 및 실제 원문·CAS·rights·ordered identity 조합 9개; 실제 paired game source 및 자산 resolver 연결은 별도 |
+| JVM 새 읽기·schema·undo 경계 검사 | SDK 107, host-core 29 검사 통과 | 원본 계약에 맞게 fixture 수정 후 실제 검사; 다음 JVM 실행에서 해당 입력의 성공 재사용을 확인. 실제 게임 인수는 별도 |
+| Fabric 호스트 첫 실제 컴파일 | Minecraft 26.3 API 오류 4개로 실패 | 실제 의존성 JAR의 API를 검사해 ChunkPos 및 청크 이벤트 차이를 확인; 수정 후 재검사 대상 |
+| 다섯 번째 3개 OS 기반 CI | Windows와 Linux의 전체 기반 job 통과; 집계 실패 | macOS `set address space limit`의 native EINVAL을 확정; Darwin 전용 VM 및 관측 memory 정책을 구현 중 |
+| Darwin 자원 정책의 Windows 검사 | 관리 도구 64 통과, 1 ignored | 순수 Darwin 정책·API 분류 9개 포함; 실제 macOS native 동작은 미검증 |
 
 실패한 실행의 원본 판정은 유지한다. native drain과 정확한 소유 기록을 확인하고
 로그를 별도로 내보내며 digest를 대조한 경우에만 해당 실행의 알려진 임시 파일을
@@ -97,6 +103,12 @@ Windows와 Linux는 전체 기반 검사를 통과했다. macOS의 원본 artifa
 SHA-256을 대조하고 한정된 supervision 기록을 확인했다. Cargo는 실행되지
 않았고 launcher의 `ValueError`가 주된 실패이며, 종료 시 `EPERM`도 기록됐다.
 자원 한도와 process 관찰을 완화하지 않고 native 실패 지점을 확인한다.
+
+다섯 번째 원격 실행은 source `580bab7e418ebb8a7ab4a334277d88f22477a031`의
+[foundation run](https://github.com/daejunnom/MMMM/actions/runs/38440722051)이다.
+Windows와 Linux는 전체 기반 검사를 통과했다. macOS의 보존 artifact bytes와
+digest를 대조해 `set address space limit`의 native `EINVAL`을 확인했다.
+Darwin 전용 자원 정책의 채택과 구현을 실제 CI 성공으로 표시하지 않는다.
 
 ## 단계별 규약 적용
 
