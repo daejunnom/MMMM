@@ -1,0 +1,13 @@
+{
+  "contractVersion": "0.2.0",
+  "generatorVersion": "fixture-only",
+  "inputRevision": "965424740c8282615d26729302e700ea146763f2e2496c06f3d0d018227b0813",
+  "entries": [
+    {
+      "sourceObjectId": "prefab-shop",
+      "sourceNodeId": "shell",
+      "outputResourceId": "resource-wall-blocks",
+      "locator": "/cells"
+    }
+  ]
+}

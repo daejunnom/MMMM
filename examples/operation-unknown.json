@@ -1,0 +1,33 @@
+{
+  "contractVersion": "0.2.0",
+  "operationId": "operation-unknown-fixture",
+  "planId": "plan-fixture-01",
+  "state": "outcome_unknown",
+  "dispatchEvidence": "dispatched",
+  "completedStepIds": [],
+  "pendingStepIds": [],
+  "unverifiedStepIds": [
+    "echo-step"
+  ],
+  "result": {
+    "text": "MMMM"
+  },
+  "diagnostics": [],
+  "artifacts": [],
+  "recovery": {
+    "mode": "none",
+    "coverage": "none"
+  },
+  "verification": "not_run",
+  "nextAction": "reconcile",
+  "stepEvidence": [
+    {
+      "stepId": "echo-step",
+      "dispatch": "sent",
+      "effect": "unknown",
+      "providerReceipt": null,
+      "observationRefs": [],
+      "furtherEffectsPossible": true
+    }
+  ]
+}

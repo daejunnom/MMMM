@@ -1,0 +1,16 @@
+{
+  "contractVersion": "0.2.0",
+  "reuseInstalledTools": true,
+  "modUseEnabled": true,
+  "newInstallPolicy": "manual_only",
+  "providerDiscovery": true,
+  "compatibilityProfiles": true,
+  "profileTrustMode": "trusted_sources_and_pinned_digests",
+  "publicJavaMode": "registered_signatures_only",
+  "remoteTools": "registered_only",
+  "privateReflection": false,
+  "guiAutomation": false,
+  "runtimeMods": "forbid",
+  "disabledProviders": [],
+  "disabledActions": []
+}

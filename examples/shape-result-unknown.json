@@ -1,0 +1,17 @@
+{
+  "contractVersion": "0.2.0",
+  "queryDigest": "1ed510c79ba90abffb66a1d7b569d381e1662f7b7dd8470b58c6cc4b03be9a45",
+  "status": "requires_runtime",
+  "observedFromTick": "0",
+  "observedToTick": "0",
+  "worldRevision": null,
+  "coverage": {
+    "status": "unknown",
+    "includedKinds": [],
+    "exclusions": [
+      "runtime_not_connected"
+    ],
+    "consistency": "per_item_observed"
+  },
+  "reason": "게임 호스트 관찰 없이 collision이 빈 공간이라고 반환하지 않는다."
+}

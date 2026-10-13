@@ -1,0 +1,66 @@
+{
+  "algorithm": "RFC8785 subset used by provided examples; numeric syntax limited",
+  "ecmascriptSubsetCrosscheck": true,
+  "records": [
+    {
+      "file": "prefab.json",
+      "type": "Prefab",
+      "field": "revision",
+      "digest": "446bb9c083a05a281f29d5f0745c2e73d9596f98c096c9e54c71f450553c6f10"
+    },
+    {
+      "file": "instance.json",
+      "type": "Instance",
+      "field": "revision",
+      "digest": "965424740c8282615d26729302e700ea146763f2e2496c06f3d0d018227b0813"
+    },
+    {
+      "file": "command-module.json",
+      "type": "CommandModule",
+      "field": "revision",
+      "digest": "05b430a0ebcf25c9bad6555053a1615dff1626552c3f096b4d88c039363429c2"
+    },
+    {
+      "file": "animation-clip.json",
+      "type": "AnimationClip",
+      "field": "revision",
+      "digest": "aaf33918d1ea1b992d23c9cd397286d952c3a84db3c29785d2288cc2733aed19"
+    },
+    {
+      "file": "project.json",
+      "type": "Project",
+      "field": "revision",
+      "digest": "5d0766dac20949c88d9661f096ec107139a9f01c93c002bc96008d80ec6a5ab3"
+    },
+    {
+      "file": "execution-context.json",
+      "type": "ExecutionContext",
+      "field": "contextDigest",
+      "digest": "46ef6804a90205b704807bd7bec418633e702fb571554eae7153b2a302ec9ab8"
+    },
+    {
+      "file": "execution-plan.json",
+      "type": "ExecutionPlan",
+      "field": "planHash",
+      "digest": "481191351fc2a3c08479153ce0c44ef49c063d4ce45c700d58925fd5344dbbb8"
+    },
+    {
+      "file": "physics-definition.json",
+      "type": "PhysicsDefinition",
+      "field": "revision",
+      "digest": "5c0cb1ac868229a064b36d5ca807716d3e9faa19a3638332ceb6e69fefd0ad5f"
+    },
+    {
+      "file": "exchange-manifest.json",
+      "type": "SceneExchangeManifest",
+      "field": "bundleRevision",
+      "digest": "9b0a00680a960c6b602af8cbdaf1c28ac580c4eb2d9f4bfdfffd4833cc8d369f"
+    },
+    {
+      "file": "asset.json",
+      "type": "Asset",
+      "field": "revision",
+      "digest": "d7119cbfa1f92046ba92ea843b231a65c118e21d249186b211657d4b7f314a03"
+    }
+  ]
+}

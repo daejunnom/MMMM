@@ -1,0 +1,7 @@
+{
+  "contractVersion": "0.2.0",
+  "planId": "plan-fixture-01",
+  "planHash": "481191351fc2a3c08479153ce0c44ef49c063d4ce45c700d58925fd5344dbbb8",
+  "contextId": "context-fixture-01",
+  "idempotencyKey": "fixture-request-0001"
+}

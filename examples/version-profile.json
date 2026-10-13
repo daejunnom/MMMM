@@ -1,0 +1,28 @@
+{
+  "contractVersion": "0.2.0",
+  "profileId": "java-26.3",
+  "edition": "java",
+  "gameVersion": "26.3",
+  "javaMajor": null,
+  "dataPackVersion": {
+    "major": 121,
+    "minor": 0
+  },
+  "resourcePackVersion": {
+    "major": 97,
+    "minor": 1
+  },
+  "nativeFloatCompute": true,
+  "testedLoaders": [],
+  "validationStatus": "reference_only",
+  "provenanceUrls": [
+    "https://feedback.minecraft.net/hc/en-us/articles/48913133328013-Minecraft-Java-Edition-26-3",
+    "https://www.minecraft.net/en-us/article/minecraft-java-edition-26-1"
+  ],
+  "artifactSha256": null,
+  "requiredFeatures": [
+    "minecraft:native_compute"
+  ],
+  "writeSupport": "unverified",
+  "evidenceResourceIds": []
+}

@@ -1,0 +1,230 @@
+{
+  "contractVersion": "0.2.0",
+  "prefabId": "prefab-shop",
+  "revision": "446bb9c083a05a281f29d5f0745c2e73d9596f98c096c9e54c71f450553c6f10",
+  "name": "편의점 예제",
+  "nodes": [
+    {
+      "nodeId": "root",
+      "name": "Root",
+      "parentId": null,
+      "transform": {
+        "kind": "trs",
+        "translation": [
+          0,
+          0,
+          0
+        ],
+        "rotationXyzw": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      },
+      "colliders": [],
+      "extensions": {}
+    },
+    {
+      "nodeId": "shell",
+      "name": "건물 외피",
+      "parentId": "root",
+      "transform": {
+        "kind": "trs",
+        "translation": [
+          0,
+          0,
+          0
+        ],
+        "rotationXyzw": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      },
+      "blockGeometry": {
+        "resourceId": "resource-wall-blocks",
+        "bounds": {
+          "min": [
+            0,
+            0,
+            0
+          ],
+          "maxExclusive": [
+            8,
+            5,
+            6
+          ]
+        },
+        "rotationPolicy": "quarter_turn_y_only",
+        "cellOrigin": "minimum_corner"
+      },
+      "colliders": [],
+      "extensions": {}
+    },
+    {
+      "nodeId": "sign",
+      "name": "텍스트 간판",
+      "parentId": "root",
+      "transform": {
+        "kind": "trs",
+        "translation": [
+          4,
+          3,
+          0
+        ],
+        "rotationXyzw": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      },
+      "display": {
+        "kind": "text",
+        "payload": {
+          "text": "MMMM 편의점"
+        },
+        "textRole": "label",
+        "resourceRefs": []
+      },
+      "colliders": [],
+      "extensions": {}
+    },
+    {
+      "nodeId": "door",
+      "name": "문 파트",
+      "parentId": "root",
+      "transform": {
+        "kind": "trs",
+        "translation": [
+          3,
+          1,
+          0
+        ],
+        "rotationXyzw": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      },
+      "colliders": [],
+      "extensions": {},
+      "display": {
+        "kind": "block",
+        "payload": {
+          "blockState": {
+            "id": "minecraft:iron_block",
+            "properties": {}
+          }
+        },
+        "resourceRefs": []
+      }
+    }
+  ],
+  "ports": [
+    {
+      "portId": "entrance",
+      "kind": "entry",
+      "nodeId": "root",
+      "transform": {
+        "kind": "trs",
+        "translation": [
+          3.5,
+          1,
+          1.5
+        ],
+        "rotationXyzw": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "portId": "destination",
+      "kind": "teleport_destination",
+      "nodeId": "root",
+      "transform": {
+        "kind": "trs",
+        "translation": [
+          3.5,
+          1,
+          2.5
+        ],
+        "rotationXyzw": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      }
+    }
+  ],
+  "state": [
+    {
+      "stateId": "opened",
+      "scope": "instance",
+      "type": "boolean",
+      "unit": "unitless",
+      "storage": "scoreboard",
+      "initialValue": false,
+      "lifecycle": "spawn"
+    }
+  ],
+  "references": [
+    {
+      "symbolId": "open_fn",
+      "kind": "function",
+      "scope": "project",
+      "targetId": "fixture:open_shop"
+    }
+  ],
+  "commandModuleIds": [
+    "module-shop-button"
+  ],
+  "clipIds": [
+    "clip-door"
+  ],
+  "resources": [
+    {
+      "resourceId": "resource-wall-blocks",
+      "sha256": "e270cde385ca8c511b1649ff98467dc301b2cbddd7d03e070b308b2c3d3a6479",
+      "mediaType": "application/vnd.mmmm.blockset+json",
+      "sizeBytes": 16236
+    }
+  ]
+}

@@ -1,0 +1,92 @@
+{
+  "contractVersion": "0.2.0",
+  "profileId": "fixture:legacy_java_echo",
+  "profileVersion": "0.1.0",
+  "provenance": {
+    "author": "MMMM fixture authors",
+    "licenseExpression": "MIT"
+  },
+  "match": {
+    "loader": "fabric",
+    "modId": "fixture_legacy",
+    "supportedGameVersions": [
+      "26.3"
+    ],
+    "supportedModVersions": [
+      "0.1.0"
+    ],
+    "side": "server"
+  },
+  "action": {
+    "actionId": "fixture:legacy_java_echo",
+    "contractVersion": "0.2.0",
+    "title": "Echo text (fixture only)",
+    "summary": "Returns a string in a structured object. No game or filesystem changes.",
+    "semanticKind": "mmmm:diagnostic.echo",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "maxLength": 128
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "additionalProperties": false
+    },
+    "side": "server",
+    "requiredContext": [
+      "executor"
+    ],
+    "effect": "read",
+    "planning": "pure",
+    "completion": "synchronous",
+    "cancellation": "none",
+    "recovery": "none",
+    "idempotency": "read",
+    "guarantees": [
+      "returns_input_text"
+    ],
+    "limitations": [],
+    "requiredPermissions": [
+      "diagnostic.read"
+    ],
+    "verificationRequirement": "schema_only",
+    "implementationDigest": "f61ff8630fd33ce19fecd868f9af125c66edf0564fa64e96e0875accf26c24cb",
+    "versionEvidence": "declared"
+  },
+  "binding": {
+    "kind": "public_java",
+    "ownerClass": "org.mmmm.fixture.LegacyApi",
+    "methodName": "echo",
+    "parameterTypes": [
+      "java.lang.String"
+    ],
+    "returnType": "java.util.Map",
+    "receiver": "static",
+    "arguments": [
+      {
+        "kind": "argument",
+        "pointer": "/text",
+        "codec": "string"
+      }
+    ],
+    "resultCodec": "json_compatible",
+    "initialization": "invoke_only",
+    "access": "public_only"
+  }
+}

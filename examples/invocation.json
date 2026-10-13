@@ -1,0 +1,52 @@
+{
+  "contractVersion": "0.2.0",
+  "invocationId": "invocation-fixture-01",
+  "operationId": "operation-fixture-01",
+  "stepId": "echo-step",
+  "bindingId": "binding-fixture-01",
+  "actionId": "fixture:echo_text",
+  "actionContractVersion": "0.2.0",
+  "actionDigest": "07db749c581337adde03fd0c112bc33a9ae49f8c8ac0dfda0771bb225513ea3a",
+  "arguments": {
+    "text": "MMMM"
+  },
+  "context": {
+    "contractVersion": "0.2.0",
+    "contextId": "context-fixture-01",
+    "principalRef": "principal-fixture",
+    "projectId": "project-fixture",
+    "environment": {
+      "gameInstanceId": "game-fixture-01",
+      "sessionEpoch": "epoch-fixture-01",
+      "worldId": "world-fixture-01",
+      "side": "server",
+      "kind": "game"
+    },
+    "dimension": "minecraft:overworld",
+    "executorHandle": "handle-fixture-player",
+    "origin": [
+      0,
+      64,
+      0
+    ],
+    "rotationDegrees": [
+      0,
+      0
+    ],
+    "anchor": "feet",
+    "policyRevision": "f9e450da8826e70a7a6a825ff505012943cc9b1cf8ce783fc3ac6d784df39ce9",
+    "scope": {
+      "projectId": "project-fixture",
+      "resourceIds": [],
+      "objectIds": [],
+      "regions": [],
+      "externalTargetIds": []
+    },
+    "contextDigest": "46ef6804a90205b704807bd7bec418633e702fb571554eae7153b2a302ec9ab8"
+  },
+  "deadlineAt": "2026-10-13T11:59:30Z",
+  "idempotencyKey": "fixture-request-0001",
+  "implementationDigest": "f61ff8630fd33ce19fecd868f9af125c66edf0564fa64e96e0875accf26c24cb",
+  "argumentsDigest": "fc2a22eb08ec319739f5b5e5bac3be36ecfd209c72777606b1a6ad49d8a43c8d",
+  "contextDigest": "46ef6804a90205b704807bd7bec418633e702fb571554eae7153b2a302ec9ab8"
+}

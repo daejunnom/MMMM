@@ -1,0 +1,24 @@
+{
+  "contractVersion": "0.2.0",
+  "assetId": "asset-shop-blocks",
+  "revision": "d7119cbfa1f92046ba92ea843b231a65c118e21d249186b211657d4b7f314a03",
+  "kind": "block_set",
+  "resource": {
+    "resourceId": "resource-wall-blocks",
+    "sha256": "e270cde385ca8c511b1649ff98467dc301b2cbddd7d03e070b308b2c3d3a6479",
+    "mediaType": "application/json",
+    "sizeBytes": 16236
+  },
+  "sourceRefs": [
+    {
+      "sourceId": "source-synthetic",
+      "kind": "fixture",
+      "locator": "examples/blockset.json",
+      "sha256": null,
+      "rights": "owned",
+      "verifiedAt": "2026-10-13T00:00:00Z"
+    }
+  ],
+  "dependencies": [],
+  "redistribution": "allowed"
+}

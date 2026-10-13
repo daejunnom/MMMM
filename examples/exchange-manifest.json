@@ -1,0 +1,73 @@
+{
+  "contractVersion": "0.2.0",
+  "bundleId": "bundle-shop",
+  "bundleRevision": "9b0a00680a960c6b602af8cbdaf1c28ac580c4eb2d9f4bfdfffd4833cc8d369f",
+  "projectId": "project-fixture",
+  "projectRevision": "5d0766dac20949c88d9661f096ec107139a9f01c93c002bc96008d80ec6a5ab3",
+  "selectionId": "selection-shop",
+  "dataSnapshotId": "snapshot-fixture",
+  "coordinates": {
+    "basisToMinecraftRowMajor": [
+      1,
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      1
+    ],
+    "metersPerBlock": 1,
+    "distanceUnit": "blocks",
+    "massUnit": "kilograms",
+    "angleUnit": "radians",
+    "quaternionOrder": "xyzw",
+    "matrixLayout": "row_major_column_vectors",
+    "timeDomain": "game_seconds"
+  },
+  "payloads": [
+    {
+      "path": "objects/selection.json",
+      "kind": "selection",
+      "resource": {
+        "resourceId": "resource-selection",
+        "sha256": "2199bd846a91c5884a870cd5c8040be21824316fcbdcbff3c63443f7b0a78c00",
+        "mediaType": "application/json",
+        "sizeBytes": 6287
+      },
+      "redistribution": "allowed"
+    },
+    {
+      "path": "physics/definition.json",
+      "kind": "physics",
+      "resource": {
+        "resourceId": "resource-physics",
+        "sha256": "0dd699a845bd228ac9bdcd47f64aceaedc1c705c4dd5a2866fbc2320e60a7a2f",
+        "mediaType": "application/json",
+        "sizeBytes": 3109
+      },
+      "redistribution": "allowed"
+    }
+  ],
+  "preservedFeatures": [
+    "mmmm:stable_node_ids",
+    "mmmm:raw_affine"
+  ],
+  "losses": [],
+  "objectMap": [
+    {
+      "externalId": "door-object",
+      "instanceId": "instance-shop-a",
+      "nodeId": "door",
+      "confidence": "confirmed"
+    }
+  ]
+}

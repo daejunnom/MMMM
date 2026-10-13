@@ -1,0 +1,66 @@
+{
+  "contractVersion": "0.2.0",
+  "planId": "plan-fixture-01",
+  "planHash": "481191351fc2a3c08479153ce0c44ef49c063d4ce45c700d58925fd5344dbbb8",
+  "projectId": "project-fixture",
+  "contextId": "context-fixture-01",
+  "policyRevision": "f9e450da8826e70a7a6a825ff505012943cc9b1cf8ce783fc3ac6d784df39ce9",
+  "expiresAt": "2026-10-13T12:00:00Z",
+  "scope": {
+    "projectId": "project-fixture",
+    "resourceIds": [],
+    "objectIds": [],
+    "regions": [],
+    "externalTargetIds": []
+  },
+  "preconditions": [
+    {
+      "kind": "policy_revision",
+      "subject": "policy-local",
+      "expected": "f9e450da8826e70a7a6a825ff505012943cc9b1cf8ce783fc3ac6d784df39ce9",
+      "coverage": "full_target"
+    }
+  ],
+  "steps": [
+    {
+      "stepId": "echo-step",
+      "bindingId": "binding-fixture-01",
+      "actionId": "fixture:echo_text",
+      "actionContractVersion": "0.2.0",
+      "actionDigest": "07db749c581337adde03fd0c112bc33a9ae49f8c8ac0dfda0771bb225513ea3a",
+      "arguments": {
+        "text": "MMMM"
+      },
+      "dependsOn": [],
+      "effect": "read",
+      "completion": "synchronous",
+      "recovery": "none",
+      "resourcesRead": [],
+      "resourcesWritten": [],
+      "verificationRequirement": "schema_only",
+      "contextId": "context-fixture-01",
+      "implementationDigest": "f61ff8630fd33ce19fecd868f9af125c66edf0564fa64e96e0875accf26c24cb",
+      "resultBindings": []
+    }
+  ],
+  "atomicity": "none",
+  "losses": [],
+  "diagnostics": [],
+  "approvalRequirement": "within_existing_grant",
+  "contextPins": [
+    {
+      "contextId": "context-fixture-01",
+      "contextDigest": "46ef6804a90205b704807bd7bec418633e702fb571554eae7153b2a302ec9ab8",
+      "environment": {
+        "gameInstanceId": "game-fixture-01",
+        "sessionEpoch": "epoch-fixture-01",
+        "worldId": "world-fixture-01",
+        "side": "server",
+        "kind": "game"
+      }
+    }
+  ],
+  "dependencyPins": [],
+  "projectBaseRevision": "5d0766dac20949c88d9661f096ec107139a9f01c93c002bc96008d80ec6a5ab3",
+  "timeBudgetMs": 10000
+}

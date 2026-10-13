@@ -1,0 +1,10 @@
+{
+  "snapshotId": "snapshot-fixture",
+  "query": "돌",
+  "kinds": [
+    "minecraft:block"
+  ],
+  "locale": "ko_kr",
+  "cursor": null,
+  "limit": 20
+}

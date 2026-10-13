@@ -1,0 +1,49 @@
+{
+  "contractVersion": "0.2.0",
+  "projectId": "project-fixture",
+  "revision": "5d0766dac20949c88d9661f096ec107139a9f01c93c002bc96008d80ec6a5ab3",
+  "name": "MMMM example project",
+  "targetProfileId": "java-26.3",
+  "gameTicksPerSecond": {
+    "numerator": "20",
+    "denominator": "1"
+  },
+  "authoringSpace": "minecraft_xyz_blocks",
+  "prefabIds": [
+    "prefab-shop"
+  ],
+  "instanceIds": [
+    "instance-shop-a"
+  ],
+  "resourceIds": [
+    "resource-wall-blocks"
+  ],
+  "policyResourceId": "policy-local",
+  "ownedResources": [
+    {
+      "kind": "prefab",
+      "objectId": "prefab-shop",
+      "revision": "446bb9c083a05a281f29d5f0745c2e73d9596f98c096c9e54c71f450553c6f10"
+    },
+    {
+      "kind": "instance",
+      "objectId": "instance-shop-a",
+      "revision": "965424740c8282615d26729302e700ea146763f2e2496c06f3d0d018227b0813"
+    },
+    {
+      "kind": "clip",
+      "objectId": "clip-door",
+      "revision": "aaf33918d1ea1b992d23c9cd397286d952c3a84db3c29785d2288cc2733aed19"
+    },
+    {
+      "kind": "command_module",
+      "objectId": "module-shop-button",
+      "revision": "05b430a0ebcf25c9bad6555053a1615dff1626552c3f096b4d88c039363429c2"
+    },
+    {
+      "kind": "asset",
+      "objectId": "asset-shop-blocks",
+      "revision": "d7119cbfa1f92046ba92ea843b231a65c118e21d249186b211657d4b7f314a03"
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "contractVersion": "0.2.0",
+  "snapshotId": "snapshot-fixture",
+  "gameVersion": "26.3",
+  "environment": {
+    "kind": "offline",
+    "workspaceId": "workspace-fixture",
+    "side": "offline"
+  },
+  "environmentFingerprint": "74e95f3baea2ea237addd3089aeba1e783d1348f296df7e0c8803996dae8303a",
+  "artifactSha256": null,
+  "side": "offline",
+  "layers": [
+    "version_reference"
+  ],
+  "serverPackStack": [],
+  "clientPackStack": [],
+  "locale": "ko_kr",
+  "coverage": {
+    "status": "complete",
+    "includedKinds": [
+      "minecraft:block"
+    ],
+    "exclusions": [],
+    "consistency": "immutable"
+  },
+  "sources": [
+    {
+      "sourceId": "source-fixture",
+      "kind": "fixture",
+      "locator": "examples/data-snapshot.json",
+      "sha256": null,
+      "rights": "owned",
+      "verifiedAt": "2026-10-13T00:00:00Z"
+    }
+  ],
+  "createdAt": "2026-10-13T00:00:00Z"
+}

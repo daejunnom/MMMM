@@ -1,0 +1,75 @@
+{
+  "contractVersion": "0.2.0",
+  "providerId": "fixture:provider",
+  "bindingId": "binding-fixture-01",
+  "providerVersion": "0.1.0",
+  "environment": {
+    "gameInstanceId": "game-fixture-01",
+    "sessionEpoch": "epoch-fixture-01",
+    "worldId": "world-fixture-01",
+    "side": "server",
+    "kind": "game"
+  },
+  "registrationMode": "provider",
+  "origin": {
+    "kind": "loader_entrypoint",
+    "sourceId": "fixture_provider"
+  },
+  "hostProtocolVersion": "0.2.0",
+  "actions": [
+    {
+      "actionId": "fixture:echo_text",
+      "contractVersion": "0.2.0",
+      "title": "Echo text (fixture only)",
+      "summary": "Returns a string in a structured object. No game or filesystem changes.",
+      "semanticKind": "mmmm:diagnostic.echo",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 128
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "side": "server",
+      "requiredContext": [
+        "executor"
+      ],
+      "effect": "read",
+      "planning": "pure",
+      "completion": "synchronous",
+      "cancellation": "none",
+      "recovery": "none",
+      "idempotency": "read",
+      "guarantees": [
+        "returns_input_text"
+      ],
+      "limitations": [],
+      "requiredPermissions": [
+        "diagnostic.read"
+      ],
+      "verificationRequirement": "schema_only",
+      "implementationDigest": "f61ff8630fd33ce19fecd868f9af125c66edf0564fa64e96e0875accf26c24cb",
+      "versionEvidence": "declared"
+    }
+  ],
+  "compatibilityEvidence": "declared",
+  "availability": "available"
+}

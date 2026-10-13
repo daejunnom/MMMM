@@ -1,0 +1,61 @@
+# Secret paths. Ignore rules do not authorize content access.
+.env
+.env.*
+credentials
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*credential*.json
+*service-account*.json
+*service_account*.json
+
+# Regenerable builds and caches belong outside the checkout.
+target/
+build/
+.gradle/
+.cache/
+node_modules/
+dist/
+dist-server/
+coverage/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.class
+*.dmp
+*.hprof
+
+# Raw data and run outputs are not repository source.
+datasets/
+models/
+checkpoints/
+*.ckpt
+*.onnx
+*.pt
+*.pth
+*.safetensors
+reports/
+runs/
+tmp/
+*.log
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Local editor and OS metadata.
+.DS_Store
+Thumbs.db
+*.swp
+
+# Application lockfiles, small admitted fixtures and reviewed summaries remain source.

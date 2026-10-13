@@ -1,0 +1,33 @@
+{
+  "contractVersion": "0.2.0",
+  "operationId": "operation-fixture-01",
+  "planId": "plan-fixture-01",
+  "state": "succeeded",
+  "dispatchEvidence": "provider_acknowledged",
+  "completedStepIds": [
+    "echo-step"
+  ],
+  "pendingStepIds": [],
+  "unverifiedStepIds": [],
+  "result": {
+    "text": "MMMM"
+  },
+  "diagnostics": [],
+  "artifacts": [],
+  "recovery": {
+    "mode": "none",
+    "coverage": "none"
+  },
+  "verification": "provider_report_only",
+  "nextAction": "none",
+  "stepEvidence": [
+    {
+      "stepId": "echo-step",
+      "dispatch": "acknowledged",
+      "effect": "none_confirmed",
+      "providerReceipt": null,
+      "observationRefs": [],
+      "furtherEffectsPossible": false
+    }
+  ]
+}

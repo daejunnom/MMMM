@@ -1,0 +1,319 @@
+{
+  "schemaVersion": 1,
+  "source": "MMMM_RUST_IMPLEMENTATION_HANDOFF_2026-10-13.zip",
+  "archiveSha256": "8b4016f09dd5fac95c5b977701639af8cceb3d0894090fcd8c4f0f79f1ebc692",
+  "contractVersion": "0.2.0",
+  "verifiedPackageEntries": 70,
+  "importedFiles": [
+    {
+      "packagePath": "contracts/digest-projections.json",
+      "repositoryPath": "contracts/digest-projections.json",
+      "sha256": "cba488c7e9af310a04c7a56ed7d7e848ff43d024fff97953f4ffa7bbb279fdbd"
+    },
+    {
+      "packagePath": "contracts/function-index.json",
+      "repositoryPath": "contracts/function-index.json",
+      "sha256": "6fca86b50af2b8f3a7ec3f44e96f0d4565f19ca6b6678efea897697545e03ddd"
+    },
+    {
+      "packagePath": "contracts/mmmm.schema.json",
+      "repositoryPath": "contracts/mmmm.schema.json",
+      "sha256": "d731b41cb772ed14c6b341d0199b8714cc7364a2eafd10f0f830c050ea5a3476"
+    },
+    {
+      "packagePath": "docs/ADAPTERS.ko.md",
+      "repositoryPath": "docs/ADAPTERS.ko.md",
+      "sha256": "bf0f590f80b2bb1edd48f83a3a37c20d1b3ea6259db7de6dd2602df04496ca70"
+    },
+    {
+      "packagePath": "docs/FUNCTION_CONTRACTS.ko.md",
+      "repositoryPath": "docs/FUNCTION_CONTRACTS.ko.md",
+      "sha256": "89f18d9c32e731aebc336487a525e4c6ccd15f8bc8f88f9cf39ca262ce2f9ff7"
+    },
+    {
+      "packagePath": "docs/IMPLEMENTATION_PLAN.ko.md",
+      "repositoryPath": "docs/IMPLEMENTATION_PLAN.ko.md",
+      "sha256": "6add52f9d0e5fb59d2d39510a416a16970e39dcb78b3261da9bd912b6c6e0e05"
+    },
+    {
+      "packagePath": "docs/MIGRATION.ko.md",
+      "repositoryPath": "docs/MIGRATION.ko.md",
+      "sha256": "b8d818470d1769ffecc5127531a1f64bcfca85c204d554bece8ce57526e54046"
+    },
+    {
+      "packagePath": "docs/VENDOR_AND_V1.ko.md",
+      "repositoryPath": "docs/VENDOR_AND_V1.ko.md",
+      "sha256": "234d92331741f472e606a3219782b7b18877164c447eef20e3a1eb325b4e90bf"
+    },
+    {
+      "packagePath": "examples/animation-clip.json",
+      "repositoryPath": "examples/animation-clip.json",
+      "sha256": "9e6fd732ca52d6e1a026b9fef5fbb4b7ca9b73c61f74def33a8514317ce0081b"
+    },
+    {
+      "packagePath": "examples/apply-request.json",
+      "repositoryPath": "examples/apply-request.json",
+      "sha256": "36d2efbce9f6683f480f365b0db9025b684f03fc98b1a2f711c1daae235306b6"
+    },
+    {
+      "packagePath": "examples/asset.json",
+      "repositoryPath": "examples/asset.json",
+      "sha256": "528a8b70a235b724e409e07b4dc6fcd1cf7ef82b490e9ff42ec0debd01a46250"
+    },
+    {
+      "packagePath": "examples/bake-artifact.json",
+      "repositoryPath": "examples/bake-artifact.json",
+      "sha256": "b3c444f0405d74de44f99db0ad11f21de24086d40093b07a1de85d376973d0f2"
+    },
+    {
+      "packagePath": "examples/bake-request.json",
+      "repositoryPath": "examples/bake-request.json",
+      "sha256": "994cda3c584ec2132af2f78bea15f0d7c5d977c407fbdf5e9e20416e3c6f0926"
+    },
+    {
+      "packagePath": "examples/blockset.json",
+      "repositoryPath": "examples/blockset.json",
+      "sha256": "e270cde385ca8c511b1649ff98467dc301b2cbddd7d03e070b308b2c3d3a6479"
+    },
+    {
+      "packagePath": "examples/catalog-page.json",
+      "repositoryPath": "examples/catalog-page.json",
+      "sha256": "397057659ac9038bad0403a483ef79aab574f35c7c15473eaadce1cdb21aaaa2"
+    },
+    {
+      "packagePath": "examples/catalog-query.json",
+      "repositoryPath": "examples/catalog-query.json",
+      "sha256": "ddc3fcbf0a43315a64df45bcb51cb2943cbe4d3f9b418d9d6f46eb587b1ab5a2"
+    },
+    {
+      "packagePath": "examples/change-intent.json",
+      "repositoryPath": "examples/change-intent.json",
+      "sha256": "fc893237e0a217d8280c5c33b1742cc1d53dfd1fecd92efb8a4a64feded4b744"
+    },
+    {
+      "packagePath": "examples/change-set.json",
+      "repositoryPath": "examples/change-set.json",
+      "sha256": "aee7060e624e1014569b60481cf2da1238df118b1a4b33752435935510644f9d"
+    },
+    {
+      "packagePath": "examples/command-module.json",
+      "repositoryPath": "examples/command-module.json",
+      "sha256": "c6137cbba067c72cc64f85559fbc71057036f3693f4f04a936f18f24e8642951"
+    },
+    {
+      "packagePath": "examples/compat-command.json",
+      "repositoryPath": "examples/compat-command.json",
+      "sha256": "ef093c84ce1ef2c38a532fb70008400fef4dc8298ac3115832ccee37e49074dc"
+    },
+    {
+      "packagePath": "examples/compat-external-bake.json",
+      "repositoryPath": "examples/compat-external-bake.json",
+      "sha256": "21fb1d7fb3c6b91245dd0913574939cbe472317d928714e2b99882ba8fd9cf0b"
+    },
+    {
+      "packagePath": "examples/compat-public-java.json",
+      "repositoryPath": "examples/compat-public-java.json",
+      "sha256": "e02cf9123bee983aaeb1872bd8fa7a823e9603af0a8a2e2e6cd5a12486b94434"
+    },
+    {
+      "packagePath": "examples/data-record-known.json",
+      "repositoryPath": "examples/data-record-known.json",
+      "sha256": "c1f26be10e4635d6ea4b7ac14b7c515c0e855a84d9c5c821a94e15c4f3c29862"
+    },
+    {
+      "packagePath": "examples/data-record-unknown.json",
+      "repositoryPath": "examples/data-record-unknown.json",
+      "sha256": "2a50b0759f7dc262201ebb637e92dc1e916a3187ac355b6506196fc232eb5cee"
+    },
+    {
+      "packagePath": "examples/data-snapshot.json",
+      "repositoryPath": "examples/data-snapshot.json",
+      "sha256": "55c742a6c2d98376e17a6c4360d7bcdb31bf938800aac08c338ee81f3eedd653"
+    },
+    {
+      "packagePath": "examples/exchange-manifest.json",
+      "repositoryPath": "examples/exchange-manifest.json",
+      "sha256": "6300ff3a2f939bee4d27f9435e14c20d0cafa380cc3d1034fd4583d97ab079d9"
+    },
+    {
+      "packagePath": "examples/execution-context.json",
+      "repositoryPath": "examples/execution-context.json",
+      "sha256": "1c99accd4b2577298e2634451ae7f053e6d6cbdae568a696fb75c69897690634"
+    },
+    {
+      "packagePath": "examples/execution-plan.json",
+      "repositoryPath": "examples/execution-plan.json",
+      "sha256": "268d67c2d79fe59d917f92d44ed68c9dead7c5b14f87e9aea2ab8aa60a649e06"
+    },
+    {
+      "packagePath": "examples/host-hello.json",
+      "repositoryPath": "examples/host-hello.json",
+      "sha256": "a0798f1cf4c1d155f9582ca06acb80797ad2465e873412ef59d4710491d52e55"
+    },
+    {
+      "packagePath": "examples/instance.json",
+      "repositoryPath": "examples/instance.json",
+      "sha256": "acec3f62c012654c6beaa0b1d4015826bf3f1de3623c161bac034fadb2f0ef66"
+    },
+    {
+      "packagePath": "examples/intent-scene-import.json",
+      "repositoryPath": "examples/intent-scene-import.json",
+      "sha256": "8dc9150895fdac3169afee8399a887d587e26bda59572bc6fe3d2142480914d1"
+    },
+    {
+      "packagePath": "examples/invocation.json",
+      "repositoryPath": "examples/invocation.json",
+      "sha256": "7d6d297d0e31f0d5c579c981cfe60959482aff59ee771e4c071ca11469cd657f"
+    },
+    {
+      "packagePath": "examples/operation-report.json",
+      "repositoryPath": "examples/operation-report.json",
+      "sha256": "1af0eb85fbb51697f9e7e0b577faa0fd44f3d1485ec7a054acf42cd6d640cb76"
+    },
+    {
+      "packagePath": "examples/operation-unknown.json",
+      "repositoryPath": "examples/operation-unknown.json",
+      "sha256": "2a21ff1010a205dcf2820b476a39cb61e8e82b29e9b0f79fa11592f293653937"
+    },
+    {
+      "packagePath": "examples/override-state-default.json",
+      "repositoryPath": "examples/override-state-default.json",
+      "sha256": "585199ad0bf2117b65c9386941a96e9bcd34db66ac6ff2b595ecd14b3b5025a1"
+    },
+    {
+      "packagePath": "examples/physics-definition.json",
+      "repositoryPath": "examples/physics-definition.json",
+      "sha256": "0dd699a845bd228ac9bdcd47f64aceaedc1c705c4dd5a2866fbc2320e60a7a2f"
+    },
+    {
+      "packagePath": "examples/policy.json",
+      "repositoryPath": "examples/policy.json",
+      "sha256": "4ec478beacd6d4629bde598a7f05498e8e9f20779381e97799bd8544a1ef7968"
+    },
+    {
+      "packagePath": "examples/prefab.json",
+      "repositoryPath": "examples/prefab.json",
+      "sha256": "51428691832ce9014a5f6715a344905e06678c008eb202950d952f5a0fd7ba2d"
+    },
+    {
+      "packagePath": "examples/project.json",
+      "repositoryPath": "examples/project.json",
+      "sha256": "dc2b3cf3dad756f51041ebbf54b4ba1cdfb2851eafaac3734e54a7992af0331b"
+    },
+    {
+      "packagePath": "examples/provider-compatibility.json",
+      "repositoryPath": "examples/provider-compatibility.json",
+      "sha256": "d0d3ecdc9eb5ba11df530fd81c54b33433a457cb88763e463961ac69c1c33a8e"
+    },
+    {
+      "packagePath": "examples/provider-result.json",
+      "repositoryPath": "examples/provider-result.json",
+      "sha256": "4e3bb1542cf89f4428662d9c7feea34f99adc755d3627e80d87d143209ce40f1"
+    },
+    {
+      "packagePath": "examples/provider-supported.json",
+      "repositoryPath": "examples/provider-supported.json",
+      "sha256": "15cf78688e6a7c9446449ac54fa1598586759534f4470194224d10934dfefb93"
+    },
+    {
+      "packagePath": "examples/release-spec-only.json",
+      "repositoryPath": "examples/release-spec-only.json",
+      "sha256": "63d79e48a97645d036ef2034d8ce6123a9e90250fca5295c0a17b60802e52677"
+    },
+    {
+      "packagePath": "examples/runtime-binding.json",
+      "repositoryPath": "examples/runtime-binding.json",
+      "sha256": "130449c51798618cf01e07627fbe229b4afbf185372d176d74563ad93ae27213"
+    },
+    {
+      "packagePath": "examples/scene-patch.json",
+      "repositoryPath": "examples/scene-patch.json",
+      "sha256": "02ad1bbeb27581d4f6a885544ccb63c09913d0c25d23e5ee717f0f925956a27d"
+    },
+    {
+      "packagePath": "examples/scene-selection.json",
+      "repositoryPath": "examples/scene-selection.json",
+      "sha256": "2199bd846a91c5884a870cd5c8040be21824316fcbdcbff3c63443f7b0a78c00"
+    },
+    {
+      "packagePath": "examples/shape-query.json",
+      "repositoryPath": "examples/shape-query.json",
+      "sha256": "a6a235544381fbdfd3a0df7a9aa6c90f35e4a3f7dd947513499d61eb6edd6408"
+    },
+    {
+      "packagePath": "examples/shape-result-unknown.json",
+      "repositoryPath": "examples/shape-result-unknown.json",
+      "sha256": "4ff7043444833391b5a1b77802995a17388c9ea8e92dc1e10a02250ae8b34f4e"
+    },
+    {
+      "packagePath": "examples/source-map.json",
+      "repositoryPath": "examples/source-map.json",
+      "sha256": "d641e2056f35ef90281e04e97ad7ef85eb902e3a5e6f8d3c5a3e8fdb71e129ac"
+    },
+    {
+      "packagePath": "examples/vendor-registry.json",
+      "repositoryPath": "examples/vendor-registry.json",
+      "sha256": "11988132ca6819cfc1493a7b4d2697a3271de950a1a9b0461a96e9cb038884a9"
+    },
+    {
+      "packagePath": "examples/version-profile.json",
+      "repositoryPath": "examples/version-profile.json",
+      "sha256": "ca9b1a292377d201a09749de4959f53294e300ec369b2e41fe3e7e18def1fc0d"
+    },
+    {
+      "packagePath": "HANDOFF.ko.md",
+      "repositoryPath": "docs/HANDOFF.ko.md",
+      "sha256": "af5462ed1a5b7bfbed7466b164a3cb1cba365108227bf2b105e937fdf6c77592"
+    },
+    {
+      "packagePath": "policies/default-policy.json",
+      "repositoryPath": "policies/default-policy.json",
+      "sha256": "4ec478beacd6d4629bde598a7f05498e8e9f20779381e97799bd8544a1ef7968"
+    },
+    {
+      "packagePath": "policies/vendor-registry.json",
+      "repositoryPath": "policies/vendor-registry.json",
+      "sha256": "11988132ca6819cfc1493a7b4d2697a3271de950a1a9b0461a96e9cb038884a9"
+    },
+    {
+      "packagePath": "SOURCES.md",
+      "repositoryPath": "docs/SOURCES.md",
+      "sha256": "4aa4d3db311749de273d18eba434562225da41bb8daffe581d953048617dda83"
+    },
+    {
+      "packagePath": "tests/acceptance-index.json",
+      "repositoryPath": "tests/acceptance-index.json",
+      "sha256": "dd7318025778fd2c0bd64978b796084d1940632ae57dce959d98a67405270201"
+    },
+    {
+      "packagePath": "tests/ACCEPTANCE.ko.md",
+      "repositoryPath": "tests/ACCEPTANCE.ko.md",
+      "sha256": "d2611519865d96ea29ea21eb69a7cf24bfe4c60ff2be304f66783458d38d72ad"
+    },
+    {
+      "packagePath": "tests/digest-fixtures.json",
+      "repositoryPath": "tests/digest-fixtures.json",
+      "sha256": "3d213cbae43abe591a12b935d555367c9a715df8fedc047ebe1dafa77706ace2"
+    },
+    {
+      "packagePath": "tests/example-index.json",
+      "repositoryPath": "tests/example-index.json",
+      "sha256": "6080775db36a23c07492b8feea0556d3f79f8e33aca1a6d1051de74c43d1ef5c"
+    },
+    {
+      "packagePath": "tests/resource-index.json",
+      "repositoryPath": "tests/resource-index.json",
+      "sha256": "7d2eb58bd2b1051d48cc8b63ecb8e65ff98bdc1568e14a9869572a08fc8cab96"
+    },
+    {
+      "packagePath": "tests/STATIC_CHECKS.ko.md",
+      "repositoryPath": "tests/STATIC_CHECKS.ko.md",
+      "sha256": "1a003121eea4755f1042209d14c5ae8ebbf8604e305c46fb2d61ed94a9cebd59"
+    }
+  ],
+  "excluded": [
+    "Package AGENTS and README do not replace repository governance",
+    "Generated combined reading edition and validation reports are not product evidence",
+    "Python package checker is reference material; the product checker is Rust"
+  ]
+}

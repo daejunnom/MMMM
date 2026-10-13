@@ -1,0 +1,869 @@
+{
+  "version": "0.2.0",
+  "status": "implementation_contracts",
+  "functions": [
+    {
+      "id": "FN01",
+      "name": "project.inspect",
+      "input": "ProjectQuery",
+      "output": "ProjectView",
+      "effect": "read",
+      "preconditions": [
+        "project root 권한",
+        "요청 revision 또는 현재 revision 존재"
+      ],
+      "postconditions": [
+        "같은 revision의 요약과 불명 참조 반환",
+        "live 상태와 authoring revision 구분"
+      ],
+      "errors": [
+        "NOT_FOUND",
+        "REVISION_CONFLICT"
+      ],
+      "cancellation": "읽기 중단, 쓰기 없음",
+      "retry": "같은 snapshot 읽기만 재시도",
+      "firstGate": "G1",
+      "owner": "application"
+    },
+    {
+      "id": "FN02",
+      "name": "prefab.validate",
+      "input": "Prefab",
+      "output": "DiagnosticList",
+      "effect": "pure",
+      "preconditions": [
+        "bounded DTO 파싱 완료"
+      ],
+      "postconditions": [
+        "중복/parent 순환/참조/type 규칙의 진단",
+        "입력 미변경"
+      ],
+      "errors": [
+        "SCHEMA_INVALID"
+      ],
+      "cancellation": "효과 없이 중단 가능",
+      "retry": "결정적",
+      "firstGate": "G0",
+      "owner": "domain"
+    },
+    {
+      "id": "FN03",
+      "name": "instance.instantiate",
+      "input": "InstantiateRequest",
+      "output": "InstanceDraft",
+      "effect": "pure",
+      "preconditions": [
+        "definition 의미 유효",
+        "호출자가 미사용 instanceId 할당",
+        "지원되는 placement"
+      ],
+      "postconditions": [
+        "authoring 초안만 생성",
+        "runtime UUID/실제 world는 아직 없음"
+      ],
+      "errors": [
+        "ID_COLLISION",
+        "UNSUPPORTED_TRANSFORM"
+      ],
+      "cancellation": "효과 없이 중단",
+      "retry": "동일 ID/입력은 동일 의미 초안",
+      "firstGate": "G1",
+      "owner": "domain"
+    },
+    {
+      "id": "FN04",
+      "name": "instance.clone",
+      "input": "CloneRequest",
+      "output": "InstanceDraft",
+      "effect": "pure",
+      "preconditions": [
+        "source prefab revision 일치",
+        "독립 ID",
+        "explicit_snapshot 요청이면 참조 존재"
+      ],
+      "postconditions": [
+        "local refs 재연결",
+        "project/external refs와 공유 정책 보존",
+        "정책에 따른 state 초기화"
+      ],
+      "errors": [
+        "REVISION_CONFLICT",
+        "STATE_SNAPSHOT_REQUIRED",
+        "REFERENCE_UNRESOLVED"
+      ],
+      "cancellation": "효과 없이 중단",
+      "retry": "할당 ID를 입력에 고정",
+      "firstGate": "G1",
+      "owner": "domain"
+    },
+    {
+      "id": "FN05",
+      "name": "instance.relocate",
+      "input": "RelocateRequest",
+      "output": "InstanceDraft",
+      "effect": "pure",
+      "preconditions": [
+        "참조 의미를 알 수 있음",
+        "placement 변환 가능"
+      ],
+      "postconditions": [
+        "로컬 구조·포트·참조 이동 초안",
+        "외부 목적지 유지"
+      ],
+      "errors": [
+        "OPAQUE_RELOCATION",
+        "NONINVERTIBLE_TRANSFORM"
+      ],
+      "cancellation": "효과 없이 중단",
+      "retry": "결정적",
+      "firstGate": "G1",
+      "owner": "domain"
+    },
+    {
+      "id": "FN06",
+      "name": "command.layout",
+      "input": "CommandLayoutRequest",
+      "output": "CommandModule",
+      "effect": "pure",
+      "preconditions": [
+        "체인 관계와 조건 원본 확인",
+        "target state 변환 규칙"
+      ],
+      "postconditions": [
+        "rack/embedded 배치 계산",
+        "next와 conditionSource 관계 보존",
+        "초안은 비활성"
+      ],
+      "errors": [
+        "CHAIN_CYCLE",
+        "CONDITION_SOURCE_MISMATCH",
+        "UNSUPPORTED_TARGET_VERSION"
+      ],
+      "cancellation": "효과 없이 중단",
+      "retry": "결정적",
+      "firstGate": "G3",
+      "owner": "domain"
+    },
+    {
+      "id": "FN07",
+      "name": "math.compile",
+      "input": "MathCompileRequest",
+      "output": "CompileFragment",
+      "effect": "staging",
+      "preconditions": [
+        "타입/단위/연산 DAG 유효",
+        "profile에서 op 지원",
+        "symbolTable 읽기 허용"
+      ],
+      "postconditions": [
+        "소스/명령 조각과 defined/referenced 목록 반환",
+        "게임 미실행"
+      ],
+      "errors": [
+        "UNIT_MISMATCH",
+        "NUMERIC_RANGE",
+        "UNSUPPORTED_OPERATOR"
+      ],
+      "cancellation": "staging만 폐기 가능",
+      "retry": "input/target/compiler digest로 재사용",
+      "firstGate": "G3",
+      "owner": "compiler"
+    },
+    {
+      "id": "FN08",
+      "name": "clip.retime",
+      "input": "RetimeRequest",
+      "output": "AnimationClip",
+      "effect": "pure",
+      "preconditions": [
+        "duration>0",
+        "event 정책과 끝 범위 유효"
+      ],
+      "postconditions": [
+        "새 시간/동일 stable IDs",
+        "event 순서/hold/종료 보존"
+      ],
+      "errors": [
+        "INVALID_TIME",
+        "EVENT_OUT_OF_RANGE"
+      ],
+      "cancellation": "효과 없이 중단",
+      "retry": "결정적",
+      "firstGate": "G3",
+      "owner": "domain"
+    },
+    {
+      "id": "FN09",
+      "name": "plan.create",
+      "input": "CreatePlanRequest",
+      "output": "ExecutionPlan",
+      "effect": "private_cache",
+      "preconditions": [
+        "context/grant/target policy",
+        "expected project revision",
+        "변경 intent 유효"
+      ],
+      "postconditions": [
+        "고정 action/implementation/context/dependency pins",
+        "scope와 loss/승인 표시",
+        "사용자/월드 미변경"
+      ],
+      "errors": [
+        "STALE_CONTEXT",
+        "REVISION_CONFLICT",
+        "CAPABILITY_UNAVAILABLE",
+        "LOSS_APPROVAL_REQUIRED"
+      ],
+      "cancellation": "계획 폐기; live 효과 없음",
+      "retry": "새 ID 가능; 같은 intent 의미 유지",
+      "firstGate": "G1",
+      "owner": "application"
+    },
+    {
+      "id": "FN10",
+      "name": "plan.inspect",
+      "input": "PlanQuery",
+      "output": "ExecutionPlan",
+      "effect": "read",
+      "preconditions": [
+        "principal이 plan을 읽을 권한"
+      ],
+      "postconditions": [
+        "저장된 plan 반환",
+        "동적으로 provider 변경 안 함"
+      ],
+      "errors": [
+        "PLAN_NOT_FOUND",
+        "PERMISSION_REQUIRED"
+      ],
+      "cancellation": "읽기만",
+      "retry": "동일 plan",
+      "firstGate": "G1",
+      "owner": "application"
+    },
+    {
+      "id": "FN11",
+      "name": "plan.apply",
+      "input": "ApplyRequest",
+      "output": "OperationReport",
+      "effect": "write",
+      "preconditions": [
+        "hash/expiry/context/policy pins 일치",
+        "idempotency reserve",
+        "target precondition 재확인"
+      ],
+      "postconditions": [
+        "dispatch 이전 durable 기록",
+        "요구 검증 수준만 완료 표시",
+        "기존 key 재호출은 같은 operation"
+      ],
+      "errors": [
+        "STALE_PLAN",
+        "TARGET_DRIFT",
+        "IDEMPOTENCY_CONFLICT",
+        "OUTCOME_UNKNOWN"
+      ],
+      "cancellation": "취소 요청과 실제 중단 구분",
+      "retry": "dispatch 후 맹목 재시도 금지",
+      "firstGate": "G1",
+      "owner": "application"
+    },
+    {
+      "id": "FN12",
+      "name": "operation.get",
+      "input": "OperationQuery",
+      "output": "OperationReport",
+      "effect": "read",
+      "preconditions": [
+        "원장 접근 권한"
+      ],
+      "postconditions": [
+        "현재 증거와 불명 상태 반환",
+        "조회만으로 재실행 없음"
+      ],
+      "errors": [
+        "OPERATION_NOT_FOUND"
+      ],
+      "cancellation": "읽기만",
+      "retry": "같은 op 조회",
+      "firstGate": "G1",
+      "owner": "runtime"
+    },
+    {
+      "id": "FN13",
+      "name": "operation.cancel",
+      "input": "OperationQuery",
+      "output": "OperationReport",
+      "effect": "write",
+      "preconditions": [
+        "작업 소유권/관리 권한",
+        "제공 취소 능력 확인"
+      ],
+      "postconditions": [
+        "queued 취소 또는 cancel_requested",
+        "효과/미확인 유지"
+      ],
+      "errors": [
+        "CANCEL_UNSUPPORTED",
+        "PERMISSION_REQUIRED"
+      ],
+      "cancellation": "본 작업이 취소 요청",
+      "retry": "같은 요청 idempotent, 완료 보장 아님",
+      "firstGate": "G1",
+      "owner": "application"
+    },
+    {
+      "id": "FN14",
+      "name": "operation.reconcile",
+      "input": "OperationQuery",
+      "output": "OperationReport",
+      "effect": "read_and_journal",
+      "preconditions": [
+        "불명/진행 중 op",
+        "같은 binding/job/관찰 대상 식별"
+      ],
+      "postconditions": [
+        "실제 관찰로 증거 보완",
+        "다른 provider로 write 재발행 안 함"
+      ],
+      "errors": [
+        "STALE_CONTEXT",
+        "RECONCILIATION_INSUFFICIENT"
+      ],
+      "cancellation": "조회만 중지; 원 effect 잔존",
+      "retry": "조회 재시도 가능",
+      "firstGate": "G1",
+      "owner": "application"
+    },
+    {
+      "id": "FN15",
+      "name": "recovery.plan",
+      "input": "RecoveryRequest",
+      "output": "ExecutionPlan",
+      "effect": "private_cache",
+      "preconditions": [
+        "기록된 direct 변화/유효 undo token",
+        "현재 상태가 after와 일치"
+      ],
+      "postconditions": [
+        "새 복구 plan",
+        "간접 효과의 복구를 약속하지 않음"
+      ],
+      "errors": [
+        "RECOVERY_CONFLICT",
+        "RECOVERY_EXPIRED"
+      ],
+      "cancellation": "실행 전 중단 가능",
+      "retry": "새 관찰로 재계획",
+      "firstGate": "G1",
+      "owner": "application"
+    },
+    {
+      "id": "FN16",
+      "name": "providers.discover",
+      "input": "DiscoveryRequest",
+      "output": "ProviderInventory",
+      "effect": "private_cache",
+      "preconditions": [
+        "이미 연결된 environment",
+        "정책 허용",
+        "allowEffects=false"
+      ],
+      "postconditions": [
+        "feature별 availability",
+        "등록 출처/검증 수준 보존",
+        "자동 설치 없음"
+      ],
+      "errors": [
+        "STALE_CONTEXT",
+        "INCOMPATIBLE_CONTRACT"
+      ],
+      "cancellation": "조회 중지; mod unload 아님",
+      "retry": "inventory 갱신",
+      "firstGate": "G1",
+      "owner": "adapters"
+    },
+    {
+      "id": "FN17",
+      "name": "route.resolve",
+      "input": "RouteRequest",
+      "output": "RouteResolution",
+      "effect": "pure",
+      "preconditions": [
+        "고정 inventory",
+        "필요 guarantees와 side"
+      ],
+      "postconditions": [
+        "선택 binding과 digest 또는 unavailable",
+        "강제 preferred가 불충족이면 자동 대체 안 함"
+      ],
+      "errors": [
+        "INVENTORY_STALE",
+        "CAPABILITY_UNAVAILABLE"
+      ],
+      "cancellation": "효과 없음",
+      "retry": "같은 inventory 결정적",
+      "firstGate": "G1",
+      "owner": "runtime"
+    },
+    {
+      "id": "FN18",
+      "name": "provider.invoke",
+      "input": "Invocation",
+      "output": "ProviderResult",
+      "effect": "declared_by_action",
+      "preconditions": [
+        "Coordinator가 만든 invocation",
+        "actual principal 권한",
+        "binding/implementation digest"
+      ],
+      "postconditions": [
+        "자체 handler 보고만 반환",
+        "job_accepted는 jobHandle 필요"
+      ],
+      "errors": [
+        "OUTPUT_INVALID",
+        "PROVIDER_DISCONNECTED",
+        "DEADLINE_EXCEEDED"
+      ],
+      "cancellation": "선언한 취소 능력만",
+      "retry": "provider-keyed 범위만",
+      "firstGate": "G2",
+      "owner": "adapters"
+    },
+    {
+      "id": "FN19",
+      "name": "compatibility.bind",
+      "input": "CompatibilityBindRequest",
+      "output": "ProviderDescriptor",
+      "effect": "private_cache",
+      "preconditions": [
+        "profile 승인 digest",
+        "현재 interface match",
+        "정적 public signature 확인"
+      ],
+      "postconditions": [
+        "same ActionDescriptor",
+        "사용 불가 이유 명시",
+        "새 클래스 초기화/명령 실행 없음"
+      ],
+      "errors": [
+        "PROFILE_UNTRUSTED",
+        "UNSUPPORTED_BINDING",
+        "INTERFACE_MISMATCH"
+      ],
+      "cancellation": "효과 없이 중지",
+      "retry": "같은 profile/environment 고정",
+      "firstGate": "G1",
+      "owner": "adapters"
+    },
+    {
+      "id": "FN20",
+      "name": "catalog.search",
+      "input": "CatalogQuery",
+      "output": "CatalogPage",
+      "effect": "read",
+      "preconditions": [
+        "snapshot 존재",
+        "query 권한/limit/cursor 일치"
+      ],
+      "postconditions": [
+        "snapshot 고정 page",
+        "모름/누락을 값으로 바꾸지 않음"
+      ],
+      "errors": [
+        "STALE_CURSOR",
+        "SNAPSHOT_NOT_FOUND"
+      ],
+      "cancellation": "읽기만",
+      "retry": "동일 snapshot page",
+      "firstGate": "G1",
+      "owner": "reference"
+    },
+    {
+      "id": "FN21",
+      "name": "catalog.describe",
+      "input": "RecordQuery",
+      "output": "DataRecord",
+      "effect": "read",
+      "preconditions": [
+        "record scope 읽기 권한"
+      ],
+      "postconditions": [
+        "known/absent/unknown/unsupported/requires_runtime",
+        "출처/단위/coverage 포함"
+      ],
+      "errors": [
+        "SNAPSHOT_NOT_FOUND",
+        "PERMISSION_REQUIRED"
+      ],
+      "cancellation": "읽기만",
+      "retry": "동일 snapshot",
+      "firstGate": "G1",
+      "owner": "reference"
+    },
+    {
+      "id": "FN22",
+      "name": "catalog.capture",
+      "input": "SnapshotRequest",
+      "output": "DataSnapshot",
+      "effect": "private_cache",
+      "preconditions": [
+        "approved source roots/runtime connection",
+        "no implicit mutation"
+      ],
+      "postconditions": [
+        "새 immutable snapshot",
+        "source hashes/pack order/side",
+        "로드 안 된 영역은 unknown"
+      ],
+      "errors": [
+        "SOURCE_UNAVAILABLE",
+        "SCHEMA_UNSUPPORTED",
+        "PERMISSION_REQUIRED"
+      ],
+      "cancellation": "partial snapshot coverage 명시",
+      "retry": "새 snapshot 가능",
+      "firstGate": "G2",
+      "owner": "reference"
+    },
+    {
+      "id": "FN23",
+      "name": "world.shape_query",
+      "input": "ShapeQueryContext",
+      "output": "ShapeResult",
+      "effect": "read",
+      "preconditions": [
+        "게임 context/loaded region",
+        "position/state/neighbors/entity context 일치"
+      ],
+      "postconditions": [
+        "queryDigest/observation window",
+        "unsupported를 empty geometry로 반환 안 함"
+      ],
+      "errors": [
+        "STALE_CONTEXT",
+        "SIDE_MISMATCH",
+        "TARGET_DRIFT"
+      ],
+      "cancellation": "실제 조회만 중단",
+      "retry": "문맥 갱신하면 다른 결과 가능",
+      "firstGate": "G2",
+      "owner": "reference"
+    },
+    {
+      "id": "FN24",
+      "name": "exchange.prepare",
+      "input": "ExchangeBuildRequest",
+      "output": "SceneExchangeManifest",
+      "effect": "staging",
+      "preconditions": [
+        "선택/source refs 고정",
+        "단위와 자산 사용 범위",
+        "physics 있으면 관계 유효"
+      ],
+      "postconditions": [
+        "중립 manifest/payload만 작성",
+        "모델러 이름 무관",
+        "사용자 원본 미변경"
+      ],
+      "errors": [
+        "REFERENCE_UNRESOLVED",
+        "UNIT_MISMATCH",
+        "RESOURCE_FORBIDDEN"
+      ],
+      "cancellation": "staging 정리",
+      "retry": "내용 hash 재사용",
+      "firstGate": "G3",
+      "owner": "exchange"
+    },
+    {
+      "id": "FN25",
+      "name": "exchange.inspect",
+      "input": "ArtifactQuery",
+      "output": "BundleInspection",
+      "effect": "read",
+      "preconditions": [
+        "authorized resource",
+        "archive/size/path limits"
+      ],
+      "postconditions": [
+        "모든 payload digest/ID/권리/loss 확인",
+        "임의 tool 실행 안 함"
+      ],
+      "errors": [
+        "ARCHIVE_INVALID",
+        "RESOURCE_HASH_MISMATCH",
+        "UNSUPPORTED_FORMAT"
+      ],
+      "cancellation": "읽기 중지",
+      "retry": "같은 bytes 재시도",
+      "firstGate": "G3",
+      "owner": "exchange"
+    },
+    {
+      "id": "FN26",
+      "name": "bake.plan",
+      "input": "BakePlanRequest",
+      "output": "ExecutionPlan",
+      "effect": "private_cache",
+      "preconditions": [
+        "source/physics pins",
+        "external context 권한",
+        "필요 capability"
+      ],
+      "postconditions": [
+        "외부 작업 scope와 output budget 고정",
+        "game 설치는 별도 plan"
+      ],
+      "errors": [
+        "CAPABILITY_UNAVAILABLE",
+        "BUDGET_EXCEEDED",
+        "LOSS_APPROVAL_REQUIRED"
+      ],
+      "cancellation": "실행 전 중단",
+      "retry": "새 plan",
+      "firstGate": "G3",
+      "owner": "application"
+    },
+    {
+      "id": "FN27",
+      "name": "bake.ingest",
+      "input": "BakeIngestRequest",
+      "output": "BakeArtifact",
+      "effect": "staging",
+      "preconditions": [
+        "결과 bytes hash",
+        "request ID/input digest 일치",
+        "좌표/샘플/위상 검증"
+      ],
+      "postconditions": [
+        "검증된 부분과 미확인 구분",
+        "실시간 solver로 오표시 안 함"
+      ],
+      "errors": [
+        "INPUT_DIGEST_MISMATCH",
+        "TOPOLOGY_CHANGED",
+        "INCOMPLETE_OUTPUT"
+      ],
+      "cancellation": "staging 중지",
+      "retry": "동일 result 검사",
+      "firstGate": "G3",
+      "owner": "exchange"
+    },
+    {
+      "id": "FN28",
+      "name": "scene.diff",
+      "input": "SceneImportRequest",
+      "output": "ScenePatch",
+      "effect": "pure",
+      "preconditions": [
+        "stable ID 매핑",
+        "base revision",
+        "허용 loss"
+      ],
+      "postconditions": [
+        "명시적인 생성/수정/삭제",
+        "누락 필드는 유지",
+        "target world 미변경"
+      ],
+      "errors": [
+        "OBJECT_MAPPING_AMBIGUOUS",
+        "REVISION_CONFLICT"
+      ],
+      "cancellation": "효과 없음",
+      "retry": "결정적",
+      "firstGate": "G3",
+      "owner": "exchange"
+    },
+    {
+      "id": "FN29",
+      "name": "scene.plan",
+      "input": "ScenePlanRequest",
+      "output": "ExecutionPlan",
+      "effect": "private_cache",
+      "preconditions": [
+        "base snapshot/context",
+        "ScenePatch 의미 유효"
+      ],
+      "postconditions": [
+        "일반 plan invariants 사용",
+        "외부 결과로 권한 확대 안 함"
+      ],
+      "errors": [
+        "STALE_PLAN",
+        "LOSS_APPROVAL_REQUIRED"
+      ],
+      "cancellation": "실행 전",
+      "retry": "재계획",
+      "firstGate": "G3",
+      "owner": "application"
+    },
+    {
+      "id": "FN30",
+      "name": "pack.build",
+      "input": "BuildRequest",
+      "output": "ExportManifest",
+      "effect": "staging",
+      "preconditions": [
+        "현재 source revision/target version",
+        "target compiler 지원",
+        "dependency pins"
+      ],
+      "postconditions": [
+        "generated/reference/entry/symbol/source map 목록",
+        "pack install/reload는 미수행"
+      ],
+      "errors": [
+        "UNSUPPORTED_TARGET_VERSION",
+        "REFERENCE_UNRESOLVED",
+        "UNOWNED_REQUIRED_CAPABILITY"
+      ],
+      "cancellation": "staging cooperative stop",
+      "retry": "input/compiler digest 동일시 재사용",
+      "firstGate": "G3",
+      "owner": "compiler"
+    },
+    {
+      "id": "FN31",
+      "name": "artifact.read",
+      "input": "ArtifactReadRequest",
+      "output": "ArtifactSlice",
+      "effect": "read",
+      "preconditions": [
+        "resource ACL",
+        "offset/limit",
+        "digest 고정"
+      ],
+      "postconditions": [
+        "bounded slice",
+        "UTF8 경계 또는 base64 명시",
+        "secret 경로 미노출"
+      ],
+      "errors": [
+        "RESOURCE_FORBIDDEN",
+        "RANGE_INVALID"
+      ],
+      "cancellation": "읽기만",
+      "retry": "동일 bytes",
+      "firstGate": "G1",
+      "owner": "runtime"
+    },
+    {
+      "id": "FN32",
+      "name": "command.complete",
+      "input": "CompleteRequest",
+      "output": "CommandSuggestions",
+      "effect": "read",
+      "preconditions": [
+        "실제 executor/side/source 권한",
+        "cursor가 UTF16 코드포인트 경계"
+      ],
+      "postconditions": [
+        "기존 tree 제안",
+        "replacement span UTF16",
+        "실행/설정 변경 없음"
+      ],
+      "errors": [
+        "CURSOR_INVALID",
+        "CONTEXT_REQUIRED",
+        "SIDE_MISMATCH"
+      ],
+      "cancellation": "읽기 중지",
+      "retry": "tree/context 바뀌면 새 결과",
+      "firstGate": "G2",
+      "owner": "application"
+    },
+    {
+      "id": "FN33",
+      "name": "action.read",
+      "input": "RegisteredActionRequest",
+      "output": "ProviderResult",
+      "effect": "declared_read",
+      "preconditions": [
+        "등록 action effect=read",
+        "schema/context/policy",
+        "별도 승인된 read 범위"
+      ],
+      "postconditions": [
+        "실제 input/output schema 검증",
+        "응답은 provider 보고"
+      ],
+      "errors": [
+        "EFFECT_MISMATCH",
+        "OUTPUT_INVALID"
+      ],
+      "cancellation": "제공자 범위",
+      "retry": "정해진 read backoff만",
+      "firstGate": "G2",
+      "owner": "application"
+    },
+    {
+      "id": "FN34",
+      "name": "action.plan",
+      "input": "RegisteredActionRequest",
+      "output": "ExecutionPlan",
+      "effect": "private_cache",
+      "preconditions": [
+        "write/unknown effect 명시",
+        "scope/approval requirement"
+      ],
+      "postconditions": [
+        "opaque 또는 typed action을 pinned plan화",
+        "직접 실행하지 않음"
+      ],
+      "errors": [
+        "UNKNOWN_CAPABILITY",
+        "PERMISSION_REQUIRED"
+      ],
+      "cancellation": "실행 전",
+      "retry": "재계획",
+      "firstGate": "G2",
+      "owner": "application"
+    },
+    {
+      "id": "FN35",
+      "name": "dependency.admit",
+      "input": "AdmissionRequest",
+      "output": "AdmissionDecision",
+      "effect": "pure",
+      "preconditions": [
+        "실제 source/license/transitive 정보",
+        "채택할 contract/version 범위"
+      ],
+      "postconditions": [
+        "admit/rust_own/external_only/defer/reject",
+        "Rust 언어 이유의 예외 없음"
+      ],
+      "errors": [
+        "EVIDENCE_MISSING"
+      ],
+      "cancellation": "효과 없음",
+      "retry": "동일 evidence 결정적",
+      "firstGate": "G0",
+      "owner": "runtime"
+    },
+    {
+      "id": "FN36",
+      "name": "release.evaluate",
+      "input": "ReleaseEvidence",
+      "output": "GateReport",
+      "effect": "pure",
+      "preconditions": [
+        "실제 시험 증거 refs와 artifact inventory"
+      ],
+      "postconditions": [
+        "미실행과 실패 분리",
+        "v1 domain vendor 존재면 차단",
+        "specification_only는 release 승인 금지"
+      ],
+      "errors": [
+        "RELEASE_EVIDENCE_INVALID"
+      ],
+      "cancellation": "효과 없음",
+      "retry": "동일 evidence 결정적",
+      "firstGate": "G4",
+      "owner": "xtask"
+    }
+  ]
+}

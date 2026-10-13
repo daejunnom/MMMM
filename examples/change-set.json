@@ -1,0 +1,11 @@
+{
+  "contractVersion": "0.2.0",
+  "changeSetId": "changes-fixture-01",
+  "operationId": "operation-fixture-01",
+  "contextId": "context-fixture-01",
+  "directChanges": [],
+  "indirectEffects": "not_observed",
+  "notes": [
+    "Read-only fixture: no changes occurred."
+  ]
+}

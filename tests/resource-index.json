@@ -1,0 +1,8 @@
+{
+  "resource-wall-blocks": "blockset.json",
+  "resource-source-map": "source-map.json",
+  "resource-selection": "scene-selection.json",
+  "resource-physics": "physics-definition.json",
+  "resource-exchange": "exchange-manifest.json",
+  "resource-bake": "bake-artifact.json"
+}

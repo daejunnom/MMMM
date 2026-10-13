@@ -1,0 +1,34 @@
+{
+  "contractVersion": "0.2.0",
+  "contextId": "context-fixture-01",
+  "principalRef": "principal-fixture",
+  "projectId": "project-fixture",
+  "environment": {
+    "gameInstanceId": "game-fixture-01",
+    "sessionEpoch": "epoch-fixture-01",
+    "worldId": "world-fixture-01",
+    "side": "server",
+    "kind": "game"
+  },
+  "dimension": "minecraft:overworld",
+  "executorHandle": "handle-fixture-player",
+  "origin": [
+    0,
+    64,
+    0
+  ],
+  "rotationDegrees": [
+    0,
+    0
+  ],
+  "anchor": "feet",
+  "policyRevision": "f9e450da8826e70a7a6a825ff505012943cc9b1cf8ce783fc3ac6d784df39ce9",
+  "scope": {
+    "projectId": "project-fixture",
+    "resourceIds": [],
+    "objectIds": [],
+    "regions": [],
+    "externalTargetIds": []
+  },
+  "contextDigest": "46ef6804a90205b704807bd7bec418633e702fb571554eae7153b2a302ec9ab8"
+}

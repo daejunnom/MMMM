@@ -1,0 +1,26 @@
+{
+  "kind": "instance.clone",
+  "instanceId": "instance-shop-a",
+  "expectedRevision": "ab315c778d997072827e9c144840400299835d56eb3571ab20617fc568e9b178",
+  "placement": {
+    "kind": "trs",
+    "translation": [
+      160,
+      64,
+      128
+    ],
+    "rotationXyzw": [
+      0,
+      0,
+      0,
+      1
+    ],
+    "scale": [
+      1,
+      1,
+      1
+    ]
+  },
+  "statePolicy": "defaults",
+  "externalReferencePolicy": "preserve"
+}

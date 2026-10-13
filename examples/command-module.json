@@ -1,0 +1,41 @@
+{
+  "contractVersion": "0.2.0",
+  "moduleId": "module-shop-button",
+  "ownerPrefabId": "prefab-shop",
+  "layout": "embedded",
+  "localOriginNodeId": "root",
+  "commands": [
+    {
+      "commandId": "button_entry",
+      "source": "function fixture:open_shop",
+      "kind": "impulse",
+      "conditional": false,
+      "auto": false,
+      "localPosition": [
+        2,
+        1,
+        1
+      ],
+      "facing": "north",
+      "nextId": null,
+      "conditionSourceId": null,
+      "references": [
+        {
+          "symbolId": "open_fn",
+          "kind": "function",
+          "scope": "project",
+          "targetId": "fixture:open_shop"
+        }
+      ],
+      "parseStatus": "parsed"
+    }
+  ],
+  "inputSymbols": [],
+  "outputSymbols": [],
+  "sharedStateIds": [],
+  "physicalClearanceBlocks": 1,
+  "logicalIsolation": "instance_scoped",
+  "chunkPolicy": "near_player_verified",
+  "opaqueRelocation": "reject",
+  "revision": "05b430a0ebcf25c9bad6555053a1615dff1626552c3f096b4d88c039363429c2"
+}

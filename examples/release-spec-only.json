@@ -1,0 +1,26 @@
+{
+  "contractVersion": "0.2.0",
+  "productVersion": "0.0.0-spec",
+  "stage": "v0",
+  "targetProfiles": [
+    "java-26.3"
+  ],
+  "requiredTestIds": [
+    "G2-game",
+    "G4-mvp"
+  ],
+  "passedTestIds": [],
+  "failedTestIds": [],
+  "notRunTestIds": [
+    "G2-game",
+    "G4-mvp"
+  ],
+  "domainVendorsRemaining": [],
+  "nonRustDomainRuntimes": [],
+  "unresolvedOperations": [],
+  "approvedPlatformShims": [
+    "jvm-host"
+  ],
+  "bundleSha256": null,
+  "claim": "specification_only"
+}

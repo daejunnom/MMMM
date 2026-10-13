@@ -1,0 +1,58 @@
+{
+  "contractVersion": "0.2.0",
+  "requestId": "bake-door",
+  "projectId": "project-fixture",
+  "projectRevision": "5d0766dac20949c88d9661f096ec107139a9f01c93c002bc96008d80ec6a5ab3",
+  "sourceBundle": {
+    "resourceId": "resource-exchange",
+    "sha256": "6300ff3a2f939bee4d27f9435e14c20d0cafa380cc3d1034fd4583d97ab079d9",
+    "mediaType": "application/json",
+    "sizeBytes": 1737
+  },
+  "physicsId": "physics-door",
+  "physicsRevision": "5c0cb1ac868229a064b36d5ca807716d3e9faa19a3638332ceb6e69fefd0ad5f",
+  "sampling": {
+    "evaluation": "already_baked",
+    "sourceFps": {
+      "numerator": "20",
+      "denominator": "1"
+    },
+    "sourceFrameZero": "0",
+    "sampleTimes": [
+      {
+        "numerator": "0",
+        "denominator": "1"
+      },
+      {
+        "numerator": "1",
+        "denominator": "1"
+      },
+      {
+        "numerator": "2",
+        "denominator": "1"
+      }
+    ],
+    "tickRounding": "exact",
+    "maxTimeErrorSeconds": 0,
+    "initialFinalIncluded": true
+  },
+  "duration": {
+    "numerator": "2",
+    "denominator": "1"
+  },
+  "representation": "rigid_part_tracks",
+  "requiredCapabilities": [
+    "mmmm:physics.rigid_bake"
+  ],
+  "budget": {
+    "maxParts": 32,
+    "maxSamples": 121,
+    "maxArtifactBytes": "10485760",
+    "maxWallMilliseconds": 30000
+  },
+  "tolerances": {
+    "positionBlocks": 0.001,
+    "angleRadians": 0.001,
+    "timeSeconds": 0.001
+  }
+}

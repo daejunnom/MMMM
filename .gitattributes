@@ -1,0 +1,28 @@
+# Authored source and documentation use LF.
+* text=auto
+*.md text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.java text eol=lf
+*.gradle text eol=lf
+*.kts text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.ps1 text eol=lf
+*.sh text eol=lf
+Cargo.lock text eol=lf
+LICENSE text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# Canonical package inputs, supplied snapshots and digest-locked fixtures preserve bytes.
+contracts/** -text
+examples/** -text
+policies/default-policy.json -text
+policies/vendor-registry.json -text
+tests/*-index.json -text
+tests/digest-fixtures.json -text
+docs/reference/** -text
+tests/**/fixtures/** -text
+crates/**/tests/fixtures/** -text

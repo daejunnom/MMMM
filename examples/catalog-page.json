@@ -1,0 +1,50 @@
+{
+  "snapshotId": "snapshot-fixture",
+  "queryDigest": "7adc27363d7f9980bc2d84b137edea1bea3a2f7c7baff1f39deb646bd92d7322",
+  "records": [
+    {
+      "contractVersion": "0.2.0",
+      "recordId": "record-stone",
+      "snapshotId": "snapshot-fixture",
+      "kind": "minecraft:block",
+      "resourceId": "minecraft:stone",
+      "status": "known",
+      "value": {
+        "fixture": true,
+        "name": "돌",
+        "properties": {}
+      },
+      "valueType": "block_definition",
+      "unit": "unitless",
+      "sources": [
+        {
+          "sourceId": "source-fixture",
+          "kind": "fixture",
+          "locator": "examples/data-snapshot.json",
+          "sha256": null,
+          "rights": "owned",
+          "verifiedAt": "2026-10-13T00:00:00Z"
+        }
+      ],
+      "provenance": "documented",
+      "scopeDigest": "47c492ace7248ec7f1aaecd4c0c851e227be1ac3085c61148666eaadfb56fdeb",
+      "coverage": {
+        "status": "complete",
+        "includedKinds": [
+          "minecraft:block"
+        ],
+        "exclusions": [],
+        "consistency": "immutable"
+      }
+    }
+  ],
+  "nextCursor": null,
+  "coverage": {
+    "status": "complete",
+    "includedKinds": [
+      "minecraft:block"
+    ],
+    "exclusions": [],
+    "consistency": "immutable"
+  }
+}

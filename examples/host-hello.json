@@ -1,0 +1,22 @@
+{
+  "contractVersion": "0.2.0",
+  "hostProtocolVersion": "0.2.0",
+  "hostBuild": "fixture-only",
+  "environment": {
+    "gameInstanceId": "game-fixture-01",
+    "sessionEpoch": "epoch-fixture-01",
+    "worldId": "world-fixture-01",
+    "side": "server",
+    "kind": "game"
+  },
+  "loader": {
+    "id": "fixture",
+    "version": "0.1.0"
+  },
+  "gameVersion": "26.3",
+  "javaMajor": 25,
+  "capabilities": [
+    "diagnostic.echo"
+  ],
+  "registryDigest": "e84b2f4acae1c6560d15cbd9cb9833d9f165e72c3e894fcacb169ed1158ea13c"
+}

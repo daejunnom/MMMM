@@ -1,0 +1,42 @@
+{
+  "contractVersion": "0.2.0",
+  "algorithm": "RFC8785+SHA256",
+  "excludeTopLevelFields": {
+    "Project": [
+      "revision"
+    ],
+    "Prefab": [
+      "revision"
+    ],
+    "Instance": [
+      "revision"
+    ],
+    "CommandModule": [
+      "revision"
+    ],
+    "AnimationClip": [
+      "revision"
+    ],
+    "Asset": [
+      "revision"
+    ],
+    "PhysicsDefinition": [
+      "revision"
+    ],
+    "SceneExchangeManifest": [
+      "bundleRevision"
+    ],
+    "ExecutionContext": [
+      "contextDigest"
+    ],
+    "ExecutionPlan": [
+      "planHash"
+    ],
+    "ActionDescriptor": [],
+    "CompatibilityProfile": [],
+    "Policy": [],
+    "BakeRequest": []
+  },
+  "rawArtifacts": "sha256(original_bytes)",
+  "notes": "Do not recursively remove nested revisions. Fixture checker supports its finite numeric subset, not general JCS conformance."
+}

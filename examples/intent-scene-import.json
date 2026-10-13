@@ -1,0 +1,31 @@
+{
+  "kind": "scene.import_patch",
+  "patch": {
+    "contractVersion": "0.2.0",
+    "patchId": "patch-door",
+    "projectId": "project-fixture",
+    "baseRevision": "5d0766dac20949c88d9661f096ec107139a9f01c93c002bc96008d80ec6a5ab3",
+    "sourceArtifact": {
+      "resourceId": "resource-bake",
+      "sha256": "b3c444f0405d74de44f99db0ad11f21de24086d40093b07a1de85d376973d0f2",
+      "mediaType": "application/json",
+      "sizeBytes": 3947
+    },
+    "entries": [
+      {
+        "kind": "attach_clip",
+        "instanceId": "instance-shop-a",
+        "nodeId": "door",
+        "clipId": "clip-door"
+      }
+    ],
+    "sourceMap": {
+      "resourceId": "resource-source-map",
+      "sha256": "d641e2056f35ef90281e04e97ad7ef85eb902e3a5e6f8d3c5a3e8fdb71e129ac",
+      "mediaType": "application/json",
+      "sizeBytes": 336
+    },
+    "losses": [],
+    "absenceMeansDeletion": false
+  }
+}

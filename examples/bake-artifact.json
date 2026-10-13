@@ -1,0 +1,164 @@
+{
+  "contractVersion": "0.2.0",
+  "artifactId": "bake-artifact-example",
+  "requestId": "bake-door",
+  "inputDigest": "aa4c09540881679422636fee7595eda9c5c62969b3a4e1aea90424af9049d1ee",
+  "sourceProjectRevision": "5d0766dac20949c88d9661f096ec107139a9f01c93c002bc96008d80ec6a5ab3",
+  "representation": "rigid_part_tracks",
+  "tool": {
+    "providerId": "fixture:solver",
+    "version": "0.2.0",
+    "implementationDigest": "f61ff8630fd33ce19fecd868f9af125c66edf0564fa64e96e0875accf26c24cb"
+  },
+  "solverSettings": {
+    "resourceId": "resource-physics",
+    "sha256": "0dd699a845bd228ac9bdcd47f64aceaedc1c705c4dd5a2866fbc2320e60a7a2f",
+    "mediaType": "application/json",
+    "sizeBytes": 3109
+  },
+  "coordinates": {
+    "basisToMinecraftRowMajor": [
+      1,
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      1
+    ],
+    "metersPerBlock": 1,
+    "distanceUnit": "blocks",
+    "massUnit": "kilograms",
+    "angleUnit": "radians",
+    "quaternionOrder": "xyzw",
+    "matrixLayout": "row_major_column_vectors",
+    "timeDomain": "game_seconds"
+  },
+  "clips": [
+    {
+      "contractVersion": "0.2.0",
+      "clipId": "clip-door",
+      "ownerPrefabId": "prefab-shop",
+      "timeDomain": "game_seconds",
+      "duration": {
+        "numerator": "2",
+        "denominator": "1"
+      },
+      "loop": false,
+      "tracks": [
+        {
+          "nodeId": "door",
+          "interpolation": "linear_trs",
+          "keys": [
+            {
+              "at": {
+                "numerator": "0",
+                "denominator": "1"
+              },
+              "transform": {
+                "kind": "trs",
+                "translation": [
+                  3,
+                  1,
+                  0
+                ],
+                "rotationXyzw": [
+                  0,
+                  0,
+                  0,
+                  1
+                ],
+                "scale": [
+                  1,
+                  1,
+                  1
+                ]
+              }
+            },
+            {
+              "at": {
+                "numerator": "2",
+                "denominator": "1"
+              },
+              "transform": {
+                "kind": "trs",
+                "translation": [
+                  3,
+                  3,
+                  0
+                ],
+                "rotationXyzw": [
+                  0,
+                  0,
+                  0,
+                  1
+                ],
+                "scale": [
+                  1,
+                  1,
+                  1
+                ]
+              }
+            }
+          ],
+          "poseSpace": "absolute_parent_local"
+        }
+      ],
+      "events": [],
+      "poseWriter": "animation",
+      "requiresBake": false,
+      "revision": "aaf33918d1ea1b992d23c9cd397286d952c3a84db3c29785d2288cc2733aed19",
+      "sampling": {
+        "evaluation": "already_baked",
+        "sourceFps": {
+          "numerator": "20",
+          "denominator": "1"
+        },
+        "sourceFrameZero": "0",
+        "sampleTimes": [
+          {
+            "numerator": "0",
+            "denominator": "1"
+          },
+          {
+            "numerator": "1",
+            "denominator": "1"
+          },
+          {
+            "numerator": "2",
+            "denominator": "1"
+          }
+        ],
+        "tickRounding": "exact",
+        "maxTimeErrorSeconds": 0,
+        "initialFinalIncluded": true
+      },
+      "representation": "rigid_part_tracks",
+      "losses": []
+    }
+  ],
+  "surfaceSamples": [],
+  "topologyPolicy": "not_applicable",
+  "topologyDigest": null,
+  "initialFinalVerified": false,
+  "intermediatePoseVerified": false,
+  "losses": [],
+  "cost": {
+    "kind": "estimate",
+    "parts": 1,
+    "samples": 3,
+    "maxActiveEntities": 1,
+    "assumptions": [
+      "고정 계약 예제이며 solver 또는 게임 실행 결과가 아니다."
+    ]
+  }
+}

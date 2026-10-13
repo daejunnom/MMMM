@@ -1,0 +1,18 @@
+{
+  "snapshotId": "snapshot-fixture",
+  "contextId": "context-fixture-01",
+  "dimension": "minecraft:overworld",
+  "position": [
+    0,
+    64,
+    0
+  ],
+  "blockState": {
+    "blockId": "minecraft:stone",
+    "properties": {}
+  },
+  "neighborContextDigest": "27520c70d7dfbef9691f5bd7463b8d0bcc350b7eabb2b79cf3c74293012a55a9",
+  "entityContextHandle": null,
+  "shapeKind": "collision",
+  "loadPolicy": "loaded_only"
+}

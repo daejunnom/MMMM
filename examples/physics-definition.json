@@ -1,0 +1,167 @@
+{
+  "contractVersion": "0.2.0",
+  "physicsId": "physics-door",
+  "revision": "5c0cb1ac868229a064b36d5ca807716d3e9faa19a3638332ceb6e69fefd0ad5f",
+  "selectionId": "selection-shop",
+  "coordinates": {
+    "basisToMinecraftRowMajor": [
+      1,
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      1
+    ],
+    "metersPerBlock": 1,
+    "distanceUnit": "blocks",
+    "massUnit": "kilograms",
+    "angleUnit": "radians",
+    "quaternionOrder": "xyzw",
+    "matrixLayout": "row_major_column_vectors",
+    "timeDomain": "game_seconds"
+  },
+  "gravityMetersPerSecondSquared": [
+    0,
+    -9.81,
+    0
+  ],
+  "materials": [
+    {
+      "materialId": "material-steel-example",
+      "source": "user_declared",
+      "friction": 0.5,
+      "restitution": 0.1,
+      "linearDamping": 0.1,
+      "angularDamping": 0.1,
+      "semantics": "제작자 예제 값이며 Minecraft 원본 물성이 아니다."
+    }
+  ],
+  "bodies": [
+    {
+      "bodyId": "body-door",
+      "mode": "dynamic",
+      "transform": {
+        "kind": "trs",
+        "translation": [
+          0,
+          0,
+          0
+        ],
+        "rotationXyzw": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      },
+      "massKg": 10,
+      "centerOfMassLocal": [
+        0,
+        0,
+        0
+      ],
+      "inertiaPolicy": "derive_from_colliders",
+      "initialLinearVelocityMetersPerSecond": [
+        0,
+        0,
+        0
+      ],
+      "initialAngularVelocityRadiansPerSecond": [
+        0,
+        0,
+        0
+      ],
+      "colliderIds": [
+        "collider-door"
+      ],
+      "materialId": "material-steel-example",
+      "visualBindings": [
+        {
+          "node": {
+            "instanceId": "instance-shop-a",
+            "nodeId": "door"
+          },
+          "bodyToNode": {
+            "kind": "trs",
+            "translation": [
+              0,
+              0,
+              0
+            ],
+            "rotationXyzw": [
+              0,
+              0,
+              0,
+              1
+            ],
+            "scale": [
+              1,
+              1,
+              1
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "colliders": [
+    {
+      "colliderId": "collider-door",
+      "bodyId": "body-door",
+      "shape": {
+        "shape": {
+          "kind": "box",
+          "halfExtents": [
+            0.5,
+            1,
+            0.05
+          ]
+        },
+        "space": "body_local",
+        "exactness": "approximated",
+        "provenance": "user_declared"
+      },
+      "transform": {
+        "kind": "trs",
+        "translation": [
+          0,
+          0,
+          0
+        ],
+        "rotationXyzw": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      },
+      "isSensor": false,
+      "collisionGroup": 1
+    }
+  ],
+  "joints": [],
+  "runtimeIntent": "bake_only",
+  "requiredCapabilities": [
+    "mmmm:physics.rigid_bake"
+  ]
+}

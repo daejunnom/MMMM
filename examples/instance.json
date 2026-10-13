@@ -1,0 +1,31 @@
+{
+  "contractVersion": "0.2.0",
+  "instanceId": "instance-shop-a",
+  "revision": "965424740c8282615d26729302e700ea146763f2e2496c06f3d0d018227b0813",
+  "prefabId": "prefab-shop",
+  "prefabRevision": "446bb9c083a05a281f29d5f0745c2e73d9596f98c096c9e54c71f450553c6f10",
+  "worldId": "world-fixture-01",
+  "dimension": "minecraft:overworld",
+  "placement": {
+    "kind": "trs",
+    "translation": [
+      128,
+      64,
+      128
+    ],
+    "rotationXyzw": [
+      0,
+      0,
+      0,
+      1
+    ],
+    "scale": [
+      1,
+      1,
+      1
+    ]
+  },
+  "bindings": [],
+  "overrides": [],
+  "lifecycle": "planned"
+}

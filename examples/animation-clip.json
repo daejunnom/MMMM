@@ -1,0 +1,101 @@
+{
+  "contractVersion": "0.2.0",
+  "clipId": "clip-door",
+  "ownerPrefabId": "prefab-shop",
+  "timeDomain": "game_seconds",
+  "duration": {
+    "numerator": "2",
+    "denominator": "1"
+  },
+  "loop": false,
+  "tracks": [
+    {
+      "nodeId": "door",
+      "interpolation": "linear_trs",
+      "keys": [
+        {
+          "at": {
+            "numerator": "0",
+            "denominator": "1"
+          },
+          "transform": {
+            "kind": "trs",
+            "translation": [
+              3,
+              1,
+              0
+            ],
+            "rotationXyzw": [
+              0,
+              0,
+              0,
+              1
+            ],
+            "scale": [
+              1,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "at": {
+            "numerator": "2",
+            "denominator": "1"
+          },
+          "transform": {
+            "kind": "trs",
+            "translation": [
+              3,
+              3,
+              0
+            ],
+            "rotationXyzw": [
+              0,
+              0,
+              0,
+              1
+            ],
+            "scale": [
+              1,
+              1,
+              1
+            ]
+          }
+        }
+      ],
+      "poseSpace": "absolute_parent_local"
+    }
+  ],
+  "events": [],
+  "poseWriter": "animation",
+  "requiresBake": false,
+  "revision": "aaf33918d1ea1b992d23c9cd397286d952c3a84db3c29785d2288cc2733aed19",
+  "sampling": {
+    "evaluation": "already_baked",
+    "sourceFps": {
+      "numerator": "20",
+      "denominator": "1"
+    },
+    "sourceFrameZero": "0",
+    "sampleTimes": [
+      {
+        "numerator": "0",
+        "denominator": "1"
+      },
+      {
+        "numerator": "1",
+        "denominator": "1"
+      },
+      {
+        "numerator": "2",
+        "denominator": "1"
+      }
+    ],
+    "tickRounding": "exact",
+    "maxTimeErrorSeconds": 0,
+    "initialFinalIncluded": true
+  },
+  "representation": "rigid_part_tracks",
+  "losses": []
+}

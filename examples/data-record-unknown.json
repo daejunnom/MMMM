@@ -1,0 +1,31 @@
+{
+  "contractVersion": "0.2.0",
+  "recordId": "record-density",
+  "snapshotId": "snapshot-fixture",
+  "kind": "mmmm:mass_density",
+  "resourceId": "minecraft:stone",
+  "status": "unknown",
+  "valueType": "float64",
+  "unit": "kg_per_cubic_meter",
+  "sources": [
+    {
+      "sourceId": "source-fixture",
+      "kind": "fixture",
+      "locator": "examples/data-snapshot.json",
+      "sha256": null,
+      "rights": "owned",
+      "verifiedAt": "2026-10-13T00:00:00Z"
+    }
+  ],
+  "provenance": "documented",
+  "scopeDigest": "47c492ace7248ec7f1aaecd4c0c851e227be1ac3085c61148666eaadfb56fdeb",
+  "coverage": {
+    "status": "complete",
+    "includedKinds": [
+      "minecraft:block"
+    ],
+    "exclusions": [],
+    "consistency": "immutable"
+  },
+  "reason": "이 예제는 Minecraft 경도에서 밀도를 추정하지 않는다."
+}

@@ -1,0 +1,76 @@
+{
+  "contractVersion": "0.2.0",
+  "profileId": "fixture:external_bake",
+  "profileVersion": "0.1.0",
+  "provenance": {
+    "author": "MMMM fixture authors",
+    "licenseExpression": "MIT"
+  },
+  "match": {
+    "loader": "external",
+    "supportedGameVersions": [
+      "26.3"
+    ],
+    "supportedModVersions": [
+      "0.2.0"
+    ],
+    "side": "external"
+  },
+  "action": {
+    "actionId": "fixture:external_bake",
+    "contractVersion": "0.2.0",
+    "title": "Echo text (fixture only)",
+    "summary": "Returns a string in a structured object. No game or filesystem changes.",
+    "semanticKind": "mmmm:physics.rigid_bake",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "request": {
+          "$ref": "urn:mmmm:contracts:0.2.0#/$defs/BakeRequest"
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "$ref": "urn:mmmm:contracts:0.2.0#/$defs/ProviderResult"
+    },
+    "side": "external",
+    "requiredContext": [
+      "project"
+    ],
+    "effect": "write",
+    "planning": "pure",
+    "completion": "job",
+    "cancellation": "cooperative",
+    "recovery": "none",
+    "idempotency": "provider_keyed",
+    "guarantees": [
+      "artifact_manifest"
+    ],
+    "limitations": [
+      "픽스처만 대상으로 한 명세이며 특정 편집기의 공식 지원이 아니다."
+    ],
+    "requiredPermissions": [
+      "external.workspace.write"
+    ],
+    "verificationRequirement": "independent_readback",
+    "implementationDigest": "f61ff8630fd33ce19fecd868f9af125c66edf0564fa64e96e0875accf26c24cb",
+    "versionEvidence": "declared"
+  },
+  "binding": {
+    "kind": "registered_rpc",
+    "targetId": "fixture-solver-target",
+    "method": "bake.prepare",
+    "arguments": {
+      "request": {
+        "kind": "argument",
+        "pointer": "/request",
+        "codec": "json_value"
+      }
+    },
+    "resultCodec": "mmmm_provider_result_v02"
+  }
+}

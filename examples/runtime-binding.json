@@ -1,0 +1,24 @@
+{
+  "contractVersion": "0.2.0",
+  "instanceId": "instance-shop-a",
+  "environment": {
+    "gameInstanceId": "game-fixture-01",
+    "sessionEpoch": "epoch-fixture-01",
+    "worldId": "world-fixture-01",
+    "side": "server",
+    "kind": "game"
+  },
+  "nodeBindings": [
+    {
+      "nodeId": "sign",
+      "handles": [
+        "handle-fixture-sign"
+      ],
+      "entityUuids": [
+        "00000000-0000-4000-8000-000000000001"
+      ],
+      "locations": []
+    }
+  ],
+  "sourceRevision": "ab315c778d997072827e9c144840400299835d56eb3571ab20617fc568e9b178"
+}
