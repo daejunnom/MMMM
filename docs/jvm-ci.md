@@ -9,6 +9,13 @@ Windows는 Rust bootstrap 생성물 관측에서, macOS는 JVM helper의 읽기 
 자동 변수 대입에서, Linux는 제한된 PowerShell의 helper 시작 전 ICU 초기화에서 멈췄다.
 이 문서와 workflow 소스는 3개 OS 인수 성공을 의미하지 않는다.
 
+후보 `43fc99447942b83c3ad9b76d8a748cf7ee528d93`의
+[다섯 번째 실제 JVM 실행](https://github.com/daejunnom/MMMM/actions/runs/38472862594)은
+Windows 검증이 성공하고 macOS와 Linux가 실패했다. 두 Unix 실행의 원본 관리 증거에서는
+`native_kind=unix_fifo`, `generated_relative=scratch/clr-debug-pipe-<pid>-<start>-in`을
+관측했다. 해당 특수 파일 때문에 측정과 evidence export가 실패했으며 소유 슬롯과 lease를
+보존했다. 이 관측을 근거로 채택한 D025의 새 설정은 아래와 같고 아직 실제 실행하지 않았다.
+
 PR은 merge commit 대신 `pull_request.head.sha`를 checkout한다. event SHA,
 PR head/base SHA, repository, workflow, run, attempt 및 실제 runner image를
 외부 `ci-context.json`에 기록한다. 빌드 전후 Git HEAD 및 관련 추적 소스의 bytes를
@@ -122,6 +129,27 @@ HResult, ErrorRecord category와 안전한 error ID, 고정 작업 단계, helpe
 경로, target object와 stack trace는 요약에 넣지 않는다. 테스트 report export 실패도
 같은 방식으로 원인을 남기며 성공으로 바꾸지 않는다.
 
+[MMMM-D025](DECISIONS.md)에 따라 Rust의 소유 `purpose=jvm` route는 PowerShell helper를
+spawn하기 전에 `ProcessSpec.env`에 `DOTNET_EnableDiagnostics=0`을 고정으로 넣는다.
+native 환경 구성은 이 explicit override를 child에 전달하며 부모의 원래 설정을 기록하지
+않는다. `jvm-ci.ps1`에서 시작 후 환경을 대입하는 방법으로 대체하지 않는다. 이 설정은
+해당 helper의 .NET debugging, profiling과 diagnostic port를 끄며 다른 진단 설정으로
+다시 활성화하지 못한다.
+[Microsoft의 공식 환경 변수 정의](https://learn.microsoft.com/en-us/dotnet/core/tools/dotnet-environment-variables#dotnet_enablediagnostics)
+CoreCLR의 공식 문서는 이 설정이 Linux·macOS debugging pipe와 semaphore의 생성을
+예방한다고 명시한다.
+[CoreCLR managed debugging 비활성화](https://github.com/dotnet/runtime/blob/main/docs/workflow/debugging/coreclr/debugging-runtime.md#disabling-managed-attachdebugging)
+
+helper는 `jvm-runtime-inside.json`에 `managed_helper_diagnostics_disabled` boolean만
+추가한다. 이 값은 현재 process의 고정 설정 readback이며 원래 환경 문자열을 export하지
+않는다. 값이 false이면 `MANAGED_JVM_DIAGNOSTICS_POLICY_REQUIRED`로 실패한다.
+boolean이 true인 것만으로 FIFO 부재나 전체 native 실행 성공을 증명하지는 않는다.
+정책 적용 후 실제 3개 OS의 helper 시작, FIFO 생성 예방, 원래 로그 export, Gradle·XML
+검증과 종료·lease 해제를 별도로 확인해야 한다. stdout·stderr, 기존 native 감독 및
+runtime probe는 유지하며 특수 파일 무시·이름 기반 삭제와 중단 lease 자동 채택은 추가하지
+않는다. bootstrap, 일반 Rust 관리 검사, 전역 PowerShell, .NET 설치·이미지와 제품 게임
+프로세스의 환경은 변경하지 않는다. JVM/JVMTI 게임 정의 관측의 권한이나 설정도 바꾸지 않는다.
+
 `jvm-runtime-probe.ps1`은 관리 제한 밖의 기존 CI PowerShell과 같은 executable로 실행한
 helper 안에서 각각 `jvm-runtime-outside.json`, `jvm-runtime-inside.json`을 만든다.
 record는 최대 16 KiB이며 PowerShell 및 .NET 버전, 실제 `en-US` 정렬 연산과 GC의
@@ -151,6 +179,6 @@ source 및 toolchain 식별, 개별 task·XML 요약과 관리 종료 기록을 
 URL과 환경 변수 전체도 기록하지 않는다. 원시 native 로그는 외부 CI artifact에 두며
 개인 개발 경로가 포함된 로그를 저장소 문서로 복사하지 않는다.
 
-현재 실패 원인 수정과 공유 probe는 소스 작성 및 정적 검토 범위다. 실제 3개 OS CI 성공,
+새 D025 정책은 소스 작성 및 정적 검토 범위다. 정책 적용 후 실제 3개 OS CI 성공,
 Minecraft 서버·수동 클라이언트·멀티플레이·vanilla 생성물 검증과 공개 `v0.1.0`
 배포는 미완료이며 이 workflow의 SDK 테스트나 Fabric 컴파일로 대체하지 않는다.

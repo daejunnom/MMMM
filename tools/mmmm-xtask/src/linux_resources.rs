@@ -109,6 +109,65 @@ fn metadata(message: &'static str) -> ProcessError {
     ProcessError::new("resource_observation", message)
 }
 
+#[derive(Clone, Copy)]
+enum NumericField {
+    StatPid,
+    DirectoryPid,
+    ProcessGroup,
+    Session,
+    ThreadCount,
+    StartTicks,
+    VirtualBytes,
+    RssKib,
+}
+
+impl NumericField {
+    fn role(self) -> &'static str {
+        match self {
+            Self::StatPid => "stat_pid",
+            Self::DirectoryPid => "directory_pid",
+            Self::ProcessGroup => "process_group",
+            Self::Session => "session",
+            Self::ThreadCount => "thread_count",
+            Self::StartTicks => "start_ticks",
+            Self::VirtualBytes => "virtual_bytes",
+            Self::RssKib => "rss_kib",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NumericFailure {
+    Empty,
+    InvalidDecimal,
+    Overflow,
+    NonPositive,
+}
+
+impl NumericFailure {
+    fn category(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::InvalidDecimal => "invalid_decimal",
+            Self::Overflow => "overflow",
+            Self::NonPositive => "non_positive",
+        }
+    }
+}
+
+fn numeric_error(field: NumericField, failure: NumericFailure) -> ProcessError {
+    // Both labels come from closed enums. Never include the original token,
+    // comm, pathname, or other native process data in this diagnostic.
+    ProcessError::new(
+        "resource_observation",
+        format!(
+            "native process numeric field rejected; field={}; category={}",
+            field.role(),
+            failure.category(),
+        ),
+    )
+}
+
 fn parse_stat(bytes: &[u8], expected_pid: i32) -> Result<Stat, ProcessError> {
     if bytes.len() > STAT_BYTES || expected_pid <= 0 {
         return Err(metadata("native process stat exceeds its bound"));
@@ -122,7 +181,7 @@ fn parse_stat(bytes: &[u8], expected_pid: i32) -> Result<Stat, ProcessError> {
         .rposition(|byte| *byte == b')')
         .filter(|end| *end > begin)
         .ok_or_else(|| metadata("native process stat has no comm terminator"))?;
-    let pid = signed(trim(&bytes[..begin]))?;
+    let pid = positive_pid(trim(&bytes[..begin]), NumericField::StatPid)?;
     if pid != expected_pid {
         return Err(ProcessError::new(
             "process_identity",
@@ -143,13 +202,13 @@ fn parse_stat(bytes: &[u8], expected_pid: i32) -> Result<Stat, ProcessError> {
     let stat = Stat {
         identity: Identity {
             pid,
-            group: signed(fields[2])?,
-            session: signed(fields[3])?,
-            start_ticks: unsigned(fields[19])?,
+            group: signed(fields[2], NumericField::ProcessGroup)?,
+            session: signed(fields[3], NumericField::Session)?,
+            start_ticks: unsigned(fields[19], NumericField::StartTicks)?,
         },
         state: fields[0][0],
-        threads: unsigned(fields[17])?,
-        virtual_bytes: unsigned(fields[20])?,
+        threads: unsigned(fields[17], NumericField::ThreadCount)?,
+        virtual_bytes: unsigned(fields[20], NumericField::VirtualBytes)?,
     };
     if !stat.definitely_exited() && stat.threads == 0 {
         return Err(metadata("live native process has no thread count"));
@@ -175,7 +234,7 @@ fn parse_rollup(bytes: &[u8]) -> Result<u64, ProcessError> {
                 return Err(metadata("native RSS rollup has an invalid unit or value"));
             }
             rss = Some(
-                unsigned(fields[0])?
+                unsigned(fields[0], NumericField::RssKib)?
                     .checked_mul(1024)
                     .ok_or_else(|| metadata("native RSS byte conversion overflow"))?,
             );
@@ -194,19 +253,68 @@ fn trim(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
-fn unsigned(bytes: &[u8]) -> Result<u64, ProcessError> {
-    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
-        return Err(metadata("native process numeric field is invalid"));
+fn unsigned(bytes: &[u8], field: NumericField) -> Result<u64, ProcessError> {
+    if bytes.is_empty() {
+        return Err(numeric_error(field, NumericFailure::Empty));
+    }
+    if !bytes.iter().all(u8::is_ascii_digit) {
+        return Err(numeric_error(field, NumericFailure::InvalidDecimal));
     }
     std::str::from_utf8(bytes)
         .ok()
         .and_then(|text| text.parse().ok())
-        .ok_or_else(|| metadata("native process numeric field overflows"))
+        .ok_or_else(|| numeric_error(field, NumericFailure::Overflow))
 }
 
-fn signed(bytes: &[u8]) -> Result<i32, ProcessError> {
-    let value = unsigned(bytes)?;
-    i32::try_from(value).map_err(|_| metadata("native process identity field overflows"))
+fn signed(bytes: &[u8], field: NumericField) -> Result<i32, ProcessError> {
+    // Linux stat fields 5 and 6 use signed decimal output. In particular,
+    // fs/proc/array.c initializes pgid/sid to -1 before task signal locking.
+    // seq_put_decimal_ll emits digits with an optional minus, never a plus.
+    let digits = bytes.strip_prefix(b"-").unwrap_or(bytes);
+    if bytes.is_empty() {
+        return Err(numeric_error(field, NumericFailure::Empty));
+    }
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return Err(numeric_error(field, NumericFailure::InvalidDecimal));
+    }
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .ok_or_else(|| numeric_error(field, NumericFailure::Overflow))
+}
+
+fn positive_pid(bytes: &[u8], field: NumericField) -> Result<i32, ProcessError> {
+    let value = unsigned(bytes, field)?;
+    let value = i32::try_from(value).map_err(|_| numeric_error(field, NumericFailure::Overflow))?;
+    if value <= 0 {
+        return Err(numeric_error(field, NumericFailure::NonPositive));
+    }
+    Ok(value)
+}
+
+fn belongs_to_owned_group(stat: Stat, group: i32) -> Result<bool, ProcessError> {
+    if group <= 0 {
+        return Err(ProcessError::new(
+            "process_identity",
+            "reserved Linux process group is not positive",
+        ));
+    }
+    if stat.identity.session == group && stat.identity.group != group && !stat.definitely_exited() {
+        return Err(ProcessError::new(
+            "scope_escape",
+            "owned Linux session member changed process group",
+        ));
+    }
+    if stat.identity.group != group {
+        return Ok(false);
+    }
+    if stat.identity.session != group {
+        return Err(ProcessError::new(
+            "process_identity",
+            "owned Linux process group has inconsistent session identity",
+        ));
+    }
+    Ok(true)
 }
 
 fn verify_identity(before: Stat, after: Stat) -> Result<(), ProcessError> {
@@ -325,7 +433,7 @@ mod native {
                 if name.is_empty() || !name.iter().all(u8::is_ascii_digit) {
                     continue;
                 }
-                let pid = signed(&name)?;
+                let pid = positive_pid(&name, NumericField::DirectoryPid)?;
                 if pid == group {
                     continue;
                 }
@@ -335,23 +443,8 @@ mod native {
                     continue;
                 };
                 let stat = member.initial;
-                if stat.identity.session == group
-                    && stat.identity.group != group
-                    && !stat.definitely_exited()
-                {
-                    return Err(ProcessError::new(
-                        "scope_escape",
-                        "owned Linux session member changed process group",
-                    ));
-                }
-                if stat.identity.group != group {
+                if !belongs_to_owned_group(stat, group)? {
                     continue;
-                }
-                if stat.identity.session != group {
-                    return Err(ProcessError::new(
-                        "process_identity",
-                        "owned Linux process group has inconsistent session identity",
-                    ));
                 }
                 let read_rss = include_rss && sample.live_processes < LIVE_LIMIT;
                 if let Some(member) = observe_member(&mut member, read_rss, false)? {
@@ -605,7 +698,7 @@ pub(super) use native::OwnedGroup;
 mod tests {
     use super::*;
 
-    fn stat(state: char, threads: u64) -> Vec<u8> {
+    fn stat_fields(state: char, threads: u64) -> Vec<String> {
         let mut fields = vec!["0".to_owned(); 21];
         fields[0] = state.to_string();
         fields[2] = "123".to_owned();
@@ -613,7 +706,15 @@ mod tests {
         fields[17] = threads.to_string();
         fields[19] = "456".to_owned();
         fields[20] = "987654".to_owned();
-        format!("123 (native ) comm) {}\n", fields.join(" ")).into_bytes()
+        fields
+    }
+
+    fn render_stat(pid: &str, fields: &[String]) -> Vec<u8> {
+        format!("{pid} (native ) comm) {}\n", fields.join(" ")).into_bytes()
+    }
+
+    fn stat(state: char, threads: u64) -> Vec<u8> {
+        render_stat("123", &stat_fields(state, threads))
     }
 
     #[test]
@@ -659,10 +760,122 @@ mod tests {
         ] {
             assert!(parse_stat(&bytes, 123).is_err());
         }
-        assert!(signed(b"2147483648").is_err());
-        assert!(unsigned(b"18446744073709551616").is_err());
-        assert!(unsigned(b"-1").is_err());
-        assert!(unsigned(b"+1").is_err());
+        assert!(signed(b"2147483648", NumericField::ProcessGroup).is_err());
+        assert!(unsigned(b"18446744073709551616", NumericField::StartTicks).is_err());
+        assert!(unsigned(b"-1", NumericField::StartTicks).is_err());
+        assert!(unsigned(b"+1", NumericField::StartTicks).is_err());
+    }
+
+    #[test]
+    fn signed_identity_fields_accept_minus_without_loosening_unsigned_or_positive_pid_bounds() {
+        for (token, expected) in [
+            (b"-2147483648".as_slice(), i32::MIN),
+            (b"-1".as_slice(), -1),
+            (b"0".as_slice(), 0),
+            (b"2147483647".as_slice(), i32::MAX),
+        ] {
+            assert_eq!(signed(token, NumericField::ProcessGroup).unwrap(), expected);
+        }
+        for token in [
+            b"".as_slice(),
+            b"-".as_slice(),
+            b"+1".as_slice(),
+            b"--1".as_slice(),
+            b"1-1".as_slice(),
+            b" 1".as_slice(),
+            b"1\n".as_slice(),
+            b"\xff".as_slice(),
+            b"2147483648".as_slice(),
+            b"-2147483649".as_slice(),
+        ] {
+            assert!(signed(token, NumericField::Session).is_err());
+        }
+        for field in [NumericField::StatPid, NumericField::DirectoryPid] {
+            assert_eq!(positive_pid(b"1", field).unwrap(), 1);
+            assert_eq!(positive_pid(b"2147483647", field).unwrap(), i32::MAX);
+            for token in [b"0".as_slice(), b"-1".as_slice(), b"2147483648".as_slice()] {
+                assert!(positive_pid(token, field).is_err());
+            }
+        }
+        for pid in ["0", "-1", "2147483648"] {
+            assert!(parse_stat(&render_stat(pid, &stat_fields('S', 1)), 123).is_err());
+        }
+        assert!(parse_stat(&stat('S', 1), 0).is_err());
+    }
+
+    #[test]
+    fn unrelated_signed_group_and_session_never_enter_the_owned_group() {
+        for (group, session) in [("-1", "-1"), ("-2147483648", "-1"), ("0", "0")] {
+            let mut fields = stat_fields('S', 1);
+            fields[2] = group.to_owned();
+            fields[3] = session.to_owned();
+            let actual = parse_stat(&render_stat("124", &fields), 124).unwrap();
+            assert!(!belongs_to_owned_group(actual, 123).unwrap());
+            assert!(belongs_to_owned_group(actual, -1).is_err());
+        }
+        let actual = parse_stat(&stat('S', 1), 123).unwrap();
+        assert!(belongs_to_owned_group(actual, 123).unwrap());
+        for (group, session, expected_kind) in [
+            ("-1", "123", "scope_escape"),
+            ("124", "123", "scope_escape"),
+            ("123", "-1", "process_identity"),
+            ("123", "124", "process_identity"),
+        ] {
+            let mut fields = stat_fields('S', 1);
+            fields[2] = group.to_owned();
+            fields[3] = session.to_owned();
+            let actual = parse_stat(&render_stat("125", &fields), 125).unwrap();
+            assert_eq!(
+                belongs_to_owned_group(actual, 123).unwrap_err().kind,
+                expected_kind
+            );
+        }
+        let mut fields = stat_fields('Z', 1);
+        fields[2] = "-1".to_owned();
+        let actual = parse_stat(&render_stat("124", &fields), 124).unwrap();
+        assert!(!belongs_to_owned_group(actual, 123).unwrap());
+    }
+
+    #[test]
+    fn numeric_diagnostics_report_only_closed_roles_and_failure_categories() {
+        for (index, role) in [
+            (2, "process_group"),
+            (3, "session"),
+            (17, "thread_count"),
+            (19, "start_ticks"),
+            (20, "virtual_bytes"),
+        ] {
+            let mut fields = stat_fields('S', 1);
+            fields[index] = "private-token".to_owned();
+            let error = parse_stat(&render_stat("123", &fields), 123).unwrap_err();
+            assert_eq!(error.kind, "resource_observation");
+            assert_eq!(
+                error.message,
+                format!(
+                    "native process numeric field rejected; field={role}; category=invalid_decimal"
+                )
+            );
+        }
+        for (token, category) in [
+            (b"".as_slice(), "empty"),
+            (b"private-token".as_slice(), "invalid_decimal"),
+            (b"18446744073709551616".as_slice(), "overflow"),
+            (b"2147483648".as_slice(), "overflow"),
+            (b"0".as_slice(), "non_positive"),
+        ] {
+            let error = positive_pid(token, NumericField::DirectoryPid).unwrap_err();
+            assert_eq!(
+                error.message,
+                format!(
+                    "native process numeric field rejected; field=directory_pid; category={category}"
+                )
+            );
+        }
+        let error = parse_rollup(b"Rss: private-token kB\n").unwrap_err();
+        assert_eq!(
+            error.message,
+            "native process numeric field rejected; field=rss_kib; category=invalid_decimal"
+        );
     }
 
     #[test]

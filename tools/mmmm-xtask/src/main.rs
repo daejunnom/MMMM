@@ -96,6 +96,7 @@ fn run_managed(
     let purpose = flags
         .remove("--purpose")
         .ok_or("required flag: --purpose")?;
+    let managed_jvm_helper = purpose == "jvm";
     let resource_policy = process::ResourcePolicy::for_managed_purpose(&purpose);
     let timeout = flags
         .remove("--timeout-seconds")
@@ -148,6 +149,13 @@ fn run_managed(
         .into_iter()
         .map(|(key, value)| (key.into(), value.into()))
         .collect();
+    if managed_jvm_helper {
+        // This owned build helper does not use managed attach/profiling.
+        // Override before CoreCLR starts, without reading inherited values.
+        // Unknown special entries still fail closed in managed storage.
+        spec.env
+            .insert("DOTNET_EnableDiagnostics".into(), "0".into());
+    }
     spec.env.insert("CARGO_BUILD_JOBS".into(), "2".into());
     spec.timeout = Duration::from_secs(timeout);
     spec.tail_policy = tail_policy;

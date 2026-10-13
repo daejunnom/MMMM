@@ -121,6 +121,25 @@ Gradle build와 project cache, Gradle user home, Java 임시 파일과 테스트
 잡지 않도록 구성한다. 재사용 가능한 daemon을 도입하려면 소유자, 종료 조건과
 파일 수명을 먼저 정의한다. 다른 프로젝트 또는 사용자 전역 cache와 daemon을 정리하지 않는다.
 
+[MMMM-D025](DECISIONS.md)의 소유 JVM helper에는 Rust 관리 route가 native spawn 전에
+`DOTNET_EnableDiagnostics=0`을 고정 child environment override로 넣는다. 부모의
+설정을 조회해 선택하거나 전역 환경을 변경하지 않는다. helper 안에서 시작 후 이 값을
+대입하는 방법은 CLR의 시작 시점 debugger FIFO 생성을 예방하지 못하므로 사용하지 않는다.
+helper의 runtime probe에는 해당 process 설정이 `0`인지 나타내는 boolean만 기록하고,
+불일치는 정적 오류로 실패한다. 원래 환경 값이나 환경 전체는 기록하지 않는다.
+
+이 정책은 해당 관리 helper의 .NET debugging, profiling과 diagnostic port 사용을 끈다.
+[Microsoft의 .NET 환경 변수 정의](https://learn.microsoft.com/en-us/dotnet/core/tools/dotnet-environment-variables#dotnet_enablediagnostics)
+CoreCLR의 공식 설명도 이 설정이 Linux·macOS의 debugging pipe와 semaphore 생성을
+예방한다고 명시한다.
+[CoreCLR managed debugging 비활성화](https://github.com/dotnet/runtime/blob/main/docs/workflow/debugging/coreclr/debugging-runtime.md#disabling-managed-attachdebugging)
+stdout·stderr, native 자원 관측과 종료·export 증거는 계속 수집한다. JVM/JVMTI의 게임
+정의 관측 설정이나 .NET 설치·이미지를 바꾸는 정책은 아니다. `purpose=jvm` 밖의
+bootstrap, 일반 Rust 검사, 전역 PowerShell과 제품 게임 프로세스에는 이 override를
+적용하지 않는다. 이미 발견한 FIFO·socket을 이름으로 무시하거나 삭제하지 않고,
+알 수 없거나 중단된 소유 lease를 그대로 보존한다. 새 정책의 실제 3개 OS 실행은
+미검증이며 이전 실패 관측과 소스 변경을 구분한다.
+
 일반 읽기 전용 Git metadata, 문서 검토와 짧은 formatting 검사는 관리 프로세스
 접점을 요구하지 않는다. 빌드 도구 자체의 최초 컴파일에도 저장소 밖의 고정 bootstrap
 슬롯과 확인 가능한 소유 실행을 사용한다. 실제 bootstrap 및 관리 명령은 구현 후 등록한다.

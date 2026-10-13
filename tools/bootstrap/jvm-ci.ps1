@@ -200,8 +200,15 @@ try {
     $operation = 'runtime_preflight'
     . (Join-Path $checkoutRoot 'tools/bootstrap/jvm-runtime-probe.ps1')
     $runtimeProbe = Get-MmmmJvmRuntimeProbe -SourceSha $ExpectedSourceSha -Target $Target -Scope inside
+    # The managed Rust route must supply this fixed override before pwsh starts.
+    # Setting it here cannot prevent the CLR startup debugger FIFO. Export only
+    # the observed policy boolean, never inherited environment values.
+    $runtimeProbe['managed_helper_diagnostics_disabled'] =
+        ([System.Environment]::GetEnvironmentVariable('DOTNET_EnableDiagnostics', [System.EnvironmentVariableTarget]::Process) -ceq '0')
     Write-NewJson (Join-Path $evidence 'jvm-runtime-inside.json') $runtimeProbe 16384
     $record.runtime_probe_sha256 = Get-RegularHash (Join-Path $evidence 'jvm-runtime-inside.json') 16384
+    $operation = 'managed_diagnostics_policy'
+    if (-not $runtimeProbe['managed_helper_diagnostics_disabled']) { throw 'MANAGED_JVM_DIAGNOSTICS_POLICY_REQUIRED' }
     $operation = 'managed_gradle_user_home'
     $managedGradleHome = Assert-PhysicalPath $env:GRADLE_USER_HOME $true
     $scratch = Assert-PhysicalPath $env:TMP $true
