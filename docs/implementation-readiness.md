@@ -91,6 +91,9 @@ Windows의 빌드 관리 도구 bootstrap은 실제로 통과했으며, 제품 �
 | 확장된 Rust 소스의 엄격 검사 | 등록된 workspace 전체 all-targets Clippy `-D warnings` 통과 | compiler calibration, runtime undo·bootstrap, Coordinator source·context·target profile과 CLI 포함. 아직 등록하지 않은 production composition, observer agent와 실제 게임 경로의 검증으로 확대하지 않음 |
 | 실제 peer와 target profile의 집중 검사 | CLI 12 통과; Coordinator 140 통과, 1 실패, 1 ignored 후 target profile 12개 재검사 통과 | 실제 Windows native peer의 잘못된 PID 거절과 정상 연결 세 번 반복 통과. reference-only profile의 nullable artifact를 suite fixture로 잘못 역직렬화한 테스트만 수정했으며, 전체 최초 실패와 집중 재검사 성공을 구분. 실제 게임 calibration 또는 profile 승인 결과가 아님 |
 | 첫 JVM 3개 OS CI | 세 OS와 집계 실패, 각 artifact의 bytes·SHA-256 확인 | source `1498ea14f253b03bf97a72323feddad934118b03`; macOS의 읽기 전용 PowerShell 변수 대입, Windows bootstrap의 활성 cache 경합과 Linux helper 시작 전 signal 6을 보존. Linux ICU 메시지를 패키지 부재로 단정하지 않으며 수정 후 성공은 별도 검증 |
+| bootstrap 활성 항목 관측 회귀 | Windows 실제 harness 17개 사례 통과, 명령 종료 0 | 원래 열거된 authored leaf를 삭제한 뒤 실제 누락 예외를 보존하고 활성 descendant만 허용. PowerShell child tuple의 깊이 증가 괄호를 수정하여 실제 깊이 5/5/1 및 root 선택을 확인. 완료 cache·owner record·링크·알 수 없는 wrapper 거절, fixture와 외부 sentinel 보존. 첫 두 harness 실패 및 원격 Windows bootstrap 재검증은 별도 |
+| JVM 공유 runtime probe | Windows 관리 한도 안의 실제 PowerShell 7.6.5·.NET 10.0.11에서 `en-US` 정렬 통과 | 정해진 GC 숫자와 유한 record만 확인. helper와 workflow의 정적 파싱은 통과했으나 Linux·macOS probe 및 수정 후 3개 OS JVM CI 성공은 미검증 |
+| 열한 번째 Rust 3개 OS CI | Windows 전체 기반 job 통과; Linux·macOS 및 집계 실패 | source `ef9d9281e1dd16aa467a9a880ead2851c0a4df2c`; 세 artifact의 bytes·SHA-256을 대조. macOS stdio의 `posix_spawnattr_setflags` 인자형 컴파일 오류와 Linux의 platform 조건부 린트 두 건을 확인해 수정. 원래 실패를 유지하며 수정 후 해당 OS 성공은 별도 검증 |
 
 실패한 실행의 원본 판정은 유지한다. native drain과 정확한 소유 기록을 확인하고
 로그를 별도로 내보내며 digest를 대조한 경우에만 해당 실행의 알려진 임시 파일을

@@ -3,13 +3,17 @@
 `.github/workflows/jvm.yml`은 Windows x64 (`windows-2025`), Linux x64
 (`ubuntu-24.04`), macOS ARM64 (`macos-15`)에서 같은 후보 source SHA를 확인하고
 Java SDK, 호스트 core 및 public Java adapter 테스트와 Fabric 호스트 컴파일·테스트를
-실행하도록 작성한 기반이다. 현재 이 신규 workflow의 실제 실행 결과는 미관측이다.
+실행하도록 작성한 기반이다. 후보 `1498ea14f253b03bf97a72323feddad934118b03`의
+[실제 첫 실행](https://github.com/daejunnom/MMMM/actions/runs/38462192682)은 세 runner 모두 실패했다.
+Windows는 Rust bootstrap 생성물 관측에서, macOS는 JVM helper의 읽기 전용 PowerShell
+자동 변수 대입에서, Linux는 제한된 PowerShell의 helper 시작 전 ICU 초기화에서 멈췄다.
 이 문서와 workflow 소스는 3개 OS 인수 성공을 의미하지 않는다.
 
 PR은 merge commit 대신 `pull_request.head.sha`를 checkout한다. event SHA,
 PR head/base SHA, repository, workflow, run, attempt 및 실제 runner image를
 외부 `ci-context.json`에 기록한다. 빌드 전후 Git HEAD 및 관련 추적 소스의 bytes를
-확인하며, JVM 소스·Gradle 설정·계약·예제·검증 helper의 SHA를 별도 manifest에 둔다.
+확인하며, JVM 소스·Gradle 설정·계약·예제·검증 helper와 공유 runtime probe의 SHA를
+별도 manifest에 둔다.
 원격 cache 또는 이전 성공 증거를 가져오는 기능은 없다.
 
 ## 도구와 입력
@@ -85,6 +89,33 @@ Linux의 일반 관리 명령 resource quota 연결, Darwin 감독 정책의 실
 [빌드 수명](build-system.md)과 [구현 착수 조건](implementation-readiness.md)을 따른다.
 실패 또는 초과 뒤 상한을 바꾸거나 자동 재시도하지 않는다.
 
+JVM helper는 관리 경로를 `managedGradleHome`에 보관한다. PowerShell의 `$HOME`과
+겹치는 변수 이름을 사용하지 않는다. 실패 record에는 원래 exception chain의 타입과
+HResult, ErrorRecord category와 안전한 error ID, 고정 작업 단계, helper의 저장소 상대
+경로와 줄을 보존한다. chain은 최대 8개, 타입은 192자, error ID는 256자로 제한한다.
+예외 메시지는 최대 128자의 정적 대문자 오류 코드일 때만 기록한다. 실제 메시지의 개인
+경로, target object와 stack trace는 요약에 넣지 않는다. 테스트 report export 실패도
+같은 방식으로 원인을 남기며 성공으로 바꾸지 않는다.
+
+`jvm-runtime-probe.ps1`은 관리 제한 밖의 기존 CI PowerShell과 같은 executable로 실행한
+helper 안에서 각각 `jvm-runtime-outside.json`, `jvm-runtime-inside.json`을 만든다.
+record는 최대 16 KiB이며 PowerShell 및 .NET 버전, 실제 `en-US` 정렬 연산과 GC의
+정해진 숫자 설정만 보존한다. Linux에서는 자기 프로세스의 `VmSize`, `VmRSS`, address
+space soft/hard limit과 이미 로드된 ICU 라이브러리의 파일명만 기록한다. 고정된
+`/proc/self/status`, `limits`는 각각 64 KiB, `maps`는 1 MiB까지 읽고 ICU 파일명은 최대
+16개로 제한한다. 메모리 주소, 전체 maps, 절대 경로와 환경 변수 전체는 내보내지 않는다.
+helper가 시작 전에 종료하면 내부 record는 없으며 감독기의 실제 종료 signal과 구분한다.
+이 probe는 새 프로세스나 설치를 만들지 않고 globalization 설정 및 상한을 변경하지 않는다.
+
+첫 Linux 실행의 실제 `RLIMIT_AS` soft/hard readback은 각각 2 GiB였고 자식은 signal 6으로
+종료했다. ICU 오류 메시지만으로 패키지 부재를 확정하지 않는다. Linux의 `RLIMIT_AS`는
+가상 주소 공간을 제한하고 `mmap` 등이 상한에 닿으면 `ENOMEM`으로 실패할 수 있다.
+[Linux getrlimit 문서](https://man7.org/linux/man-pages/man2/getrlimit.2.html)
+.NET은 GC 시작 시 commit과 별도로 가상 주소 구간을 예약하며 기본 region range는
+큰 값일 수 있다. [공식 GC 설정 문서](https://learn.microsoft.com/en-us/dotnet/core/runtime-config/garbage-collector)
+새 probe 결과와 목적별 메모리 정책 검토가 필요하다. 이 수정은 Linux 상한을 변경하지
+않으며 ICU 설치, invariant globalization 또는 상한 확대 재시도를 추가하지 않는다.
+
 세 runner job 모두 성공해야 `jvm-result` 집계가 성공한다. workflow는 path filter로
 필수 상태를 생략하지 않는다. `always()` 기록과 artifact export에 실제 step outcome,
 source 및 toolchain 식별, 개별 task·XML 요약과 관리 종료 기록을 남기고 14일 보존한다.
@@ -92,6 +123,6 @@ source 및 toolchain 식별, 개별 task·XML 요약과 관리 종료 기록을 
 URL과 환경 변수 전체도 기록하지 않는다. 원시 native 로그는 외부 CI artifact에 두며
 개인 개발 경로가 포함된 로그를 저장소 문서로 복사하지 않는다.
 
-현재 문서는 소스 작성 및 정적 검토 범위를 기록한다. 실제 3개 OS CI 성공,
+현재 실패 원인 수정과 공유 probe는 소스 작성 및 정적 검토 범위다. 실제 3개 OS CI 성공,
 Minecraft 서버·수동 클라이언트·멀티플레이·vanilla 생성물 검증과 공개 `v0.1.0`
 배포는 미완료이며 이 workflow의 SDK 테스트나 Fabric 컴파일로 대체하지 않는다.

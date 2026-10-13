@@ -181,16 +181,16 @@ impl MacExec {
                 ))
             }
         }
+        // libc exposes these Darwin constants as c_int, while the native API
+        // accepts c_short. Validate in the parent, before the forked exec path.
+        let flags =
+            libc::c_short::try_from(libc::POSIX_SPAWN_SETEXEC | libc::POSIX_SPAWN_CLOEXEC_DEFAULT)
+                .map_err(|_| StdioError::new("native_descriptors"))?;
         check(unsafe { libc::posix_spawnattr_init(&mut plan.attr) })?;
         plan.attr_ready = true;
         check(unsafe { libc::posix_spawn_file_actions_init(&mut plan.actions) })?;
         plan.actions_ready = true;
-        check(unsafe {
-            libc::posix_spawnattr_setflags(
-                &mut plan.attr,
-                libc::POSIX_SPAWN_SETEXEC | libc::POSIX_SPAWN_CLOEXEC_DEFAULT,
-            )
-        })?;
+        check(unsafe { libc::posix_spawnattr_setflags(&mut plan.attr, flags) })?;
         for fd in [
             libc::STDIN_FILENO,
             libc::STDOUT_FILENO,

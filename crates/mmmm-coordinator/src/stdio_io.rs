@@ -918,9 +918,9 @@ fn worker_exit_error(status: i32) -> StdioError {
     };
     #[cfg(unix)]
     let encoded = if (65..=64 + WORKER_STAGES.len() as i32).contains(&status) {
-        Some(((status - 64) as u32, 65_535))
+        Some(((status - 64) as u32, 65_535u32))
     } else if (129..=128 + WORKER_STAGES.len() as i32).contains(&status) {
-        Some(((status - 128) as u32, 65_534))
+        Some(((status - 128) as u32, 65_534u32))
     } else {
         None
     };

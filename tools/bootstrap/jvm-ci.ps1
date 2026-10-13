@@ -13,11 +13,12 @@ Set-StrictMode -Version Latest
 $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
 $pathComparison = if ($IsWindows) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
 $phase = 'preflight'
+$operation = 'managed_paths'
 $tasks = @(':provider-sdk:test', ':host-core:test', ':public-java-adapter:test', ':fabric-host:compileJava', ':fabric-host:test')
 $nativeExit = $null
 $record = [ordered]@{ schema='mmmm-jvm-ci-result/1'; source_sha=$ExpectedSourceSha; target=$Target;
     status='not_run'; phase=$phase; gradle_exit=$null; required_tasks=$tasks; tasks=@(); tests=@();
-    game_verification='not_run'; release_verification='not_run'; evidence_errors=@();
+    game_verification='not_run'; release_verification='not_run'; evidence_errors=@(); failure_details=@();
     profile=[ordered]@{ gradle='9.6.0'; jdk_archive_release='25.0.4.1+1'; gradle_workers=2;
         junit_forks=1; launcher_heap_bytes=268435456; daemon_heap_bytes=1073741824; test_heap_bytes=536870912;
         managed_output_bytes=67108864; timeout_seconds=1200; slot_bytes=8589934592; catalog_bytes=12884901888;
@@ -68,6 +69,30 @@ function Write-NewJson([string]$Path, $Value, [int]$Limit = 65536) {
     if ($bytes.Length -gt $Limit) { throw 'EVIDENCE_RECORD_BUDGET_EXCEEDED' }
     $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
     try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+}
+
+function Get-SafeFailureRecord([System.Management.Automation.ErrorRecord]$Failure, [string]$Operation) {
+    # Exception messages, targets and stack traces can include private paths or
+    # request values. Preserve the original typed chain and bounded safe fields.
+    $chain = [System.Collections.Generic.List[object]]::new()
+    $exception = $Failure.Exception
+    for ($index = 0; $null -ne $exception -and $index -lt 8; $index++) {
+        $type = $exception.GetType().FullName
+        if ($type.Length -gt 192 -or $type -cnotmatch '^[A-Za-z0-9_.+`]+$') { $type = 'withheld' }
+        $code = if ($exception.Message.Length -le 128 -and $exception.Message -cmatch '^[A-Z][A-Z0-9_]+$') { $exception.Message } else { $null }
+        $chain.Add([ordered]@{ type=$type; hresult=$exception.HResult; static_code=$code })
+        $exception = $exception.InnerException
+    }
+    $errorId = $Failure.FullyQualifiedErrorId
+    if ($errorId.Length -gt 256 -or $errorId -cnotmatch '^[A-Za-z0-9_.,+-]+$') { $errorId = 'withheld' }
+    $sourceLine = 0
+    $source = 'unavailable'
+    if ($null -ne $Failure.InvocationInfo -and ([string]$Failure.InvocationInfo.ScriptName).Equals($PSCommandPath, $pathComparison)) {
+        $source = 'tools/bootstrap/jvm-ci.ps1'
+        $sourceLine = $Failure.InvocationInfo.ScriptLineNumber
+    }
+    return [ordered]@{ phase=$phase; operation=$Operation; category=$Failure.CategoryInfo.Category.ToString();
+        error_id=$errorId; source=$source; source_line=$sourceLine; exceptions=$chain.ToArray(); chain_truncated=($null -ne $exception) }
 }
 
 function Get-RegularHash([string]$Path, [long]$Limit) {
@@ -168,10 +193,16 @@ try {
     if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'POWERSHELL_7_REQUIRED' }
     $checkoutRoot = Assert-PhysicalPath $Checkout $true
     $evidence = Assert-PhysicalPath $EvidenceRoot $true
-    $home = Assert-PhysicalPath $env:GRADLE_USER_HOME $true
+    $operation = 'runtime_preflight'
+    . (Join-Path $checkoutRoot 'tools/bootstrap/jvm-runtime-probe.ps1')
+    $runtimeProbe = Get-MmmmJvmRuntimeProbe -SourceSha $ExpectedSourceSha -Target $Target -Scope inside
+    Write-NewJson (Join-Path $evidence 'jvm-runtime-inside.json') $runtimeProbe 16384
+    $record.runtime_probe_sha256 = Get-RegularHash (Join-Path $evidence 'jvm-runtime-inside.json') 16384
+    $operation = 'managed_gradle_user_home'
+    $managedGradleHome = Assert-PhysicalPath $env:GRADLE_USER_HOME $true
     $scratch = Assert-PhysicalPath $env:TMP $true
-    $cache = Assert-PhysicalPath ([System.IO.Path]::GetDirectoryName($home)) $true
-    if ([System.IO.Path]::GetFileName($home) -cne 'gradle-user-home' -or [System.IO.Path]::GetFileName($cache) -cne 'cache') { throw 'MANAGED_JVM_CACHE_REQUIRED' }
+    $cache = Assert-PhysicalPath ([System.IO.Path]::GetDirectoryName($managedGradleHome)) $true
+    if ([System.IO.Path]::GetFileName($managedGradleHome) -cne 'gradle-user-home' -or [System.IO.Path]::GetFileName($cache) -cne 'cache') { throw 'MANAGED_JVM_CACHE_REQUIRED' }
     $slot = Assert-PhysicalPath ([System.IO.Path]::GetDirectoryName($cache)) $true
     if ([System.IO.Path]::GetFileName($slot) -cnotmatch '^(windows|linux|macos)-(x86_64|aarch64)-[0-9a-f]{24}-jvm$' -or
         -not (Is-Inside $scratch $slot) -or (Is-Inside $cache $checkoutRoot) -or (Is-Inside $evidence $checkoutRoot) -or (Is-Inside $evidence $slot)) { throw 'MANAGED_JVM_PATH_BOUNDARY_INVALID' }
@@ -182,10 +213,11 @@ try {
         elseif ($IsMacOS -and [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq 'Arm64') { 'macos-arm64' }
         else { throw 'UNSUPPORTED_JVM_TARGET' }
     if ($actualTarget -cne $Target) { throw 'JVM_TARGET_MISMATCH' }
+    $operation = 'native_path_identity'
     if ($IsWindows) { Add-Type -Path (Join-Path $checkoutRoot 'tools/bootstrap/WindowsBootstrap.cs') }
     $checkoutRoot = Get-NativePath $checkoutRoot $true
     $evidence = Get-NativePath $evidence $true
-    $home = Get-NativePath $home $true
+    $managedGradleHome = Get-NativePath $managedGradleHome $true
     $scratch = Get-NativePath $scratch $true
     $projectCache = Get-NativePath $projectCache $true
     $gradleBuild = Get-NativePath $gradleBuild $true
@@ -193,11 +225,12 @@ try {
     foreach ($optionName in @('JAVA_TOOL_OPTIONS','JDK_JAVA_OPTIONS','GRADLE_OPTS')) {
         if ($null -ne [System.Environment]::GetEnvironmentVariable($optionName)) { throw 'UNREGISTERED_JVM_OPTION_OVERRIDE' }
     }
+    $operation = 'source_input_identity'
     $sourceSha = @(& git -C $checkoutRoot rev-parse HEAD)
     if ($LASTEXITCODE -ne 0 -or $sourceSha.Count -ne 1 -or $sourceSha[0] -cne $ExpectedSourceSha) { throw 'SOURCE_SHA_MISMATCH' }
-    & git -C $checkoutRoot diff --quiet HEAD -- jvm contracts examples tools/bootstrap/jvm-ci.ps1 tools/bootstrap/jvm-archive.py .github/workflows/jvm.yml tools/bootstrap/WindowsBootstrap.cs
+    & git -C $checkoutRoot diff --quiet HEAD -- jvm contracts examples tools/bootstrap/jvm-ci.ps1 tools/bootstrap/jvm-runtime-probe.ps1 tools/bootstrap/jvm-archive.py .github/workflows/jvm.yml tools/bootstrap/WindowsBootstrap.cs
     if ($LASTEXITCODE -ne 0) { throw 'DIRTY_JVM_SOURCE_INPUTS' }
-    $inputs = @(& git -C $checkoutRoot ls-files -- jvm contracts examples tools/bootstrap/jvm-ci.ps1 tools/bootstrap/jvm-archive.py .github/workflows/jvm.yml tools/bootstrap/WindowsBootstrap.cs)
+    $inputs = @(& git -C $checkoutRoot ls-files -- jvm contracts examples tools/bootstrap/jvm-ci.ps1 tools/bootstrap/jvm-runtime-probe.ps1 tools/bootstrap/jvm-archive.py .github/workflows/jvm.yml tools/bootstrap/WindowsBootstrap.cs)
     if ($LASTEXITCODE -ne 0 -or $inputs.Count -lt 8 -or $inputs.Count -gt 10000) { throw 'SOURCE_INPUT_INVENTORY_INVALID' }
     $inputRecords = [System.Collections.Generic.List[object]]::new(); $inputBytes = 0L
     foreach ($relative in ($inputs | Sort-Object -CaseSensitive)) {
@@ -213,6 +246,7 @@ try {
     Write-NewJson (Join-Path $evidence 'jvm-source-inputs.json') ([ordered]@{ schema='mmmm-jvm-source-inputs/1'; source_sha=$ExpectedSourceSha; inputs=$inputRecords.ToArray() }) 1MB
     $record.source_inputs_sha256 = Get-RegularHash (Join-Path $evidence 'jvm-source-inputs.json') 1MB
     $phase = 'pinned_toolchains'
+    $operation = 'pinned_archive_download_and_extraction'
     $jdkProfiles = @{
         'windows-x64' = @{ file='OpenJDK25U-jdk_x64_windows_hotspot_25.0.4.1_1.zip'; sha='00c847d804f4a78e9f04f2683faf14fed898535b177b7fc704486cb0284e9283'; java='jdk-25.0.4.1+1/bin/java.exe' }
         'linux-x64' = @{ file='OpenJDK25U-jdk_x64_linux_hotspot_25.0.4.1_1.tar.gz'; sha='dbb698396d478e7fa2b1e50f4103324b2a99b90569ee27c33f2261f9215cf41e'; java='jdk-25.0.4.1+1/bin/java' }
@@ -248,9 +282,10 @@ try {
     $record.jdk_release_sha256 = Get-RegularHash $releaseFile 64KB
     $gradleMain = Get-NativePath (Join-Path $toolchains 'gradle/gradle-9.6.0/lib/gradle-gradle-cli-main-9.6.0.jar') $false
     $env:JAVA_HOME = $javaHome
-    $env:GRADLE_USER_HOME = $home
+    $env:GRADLE_USER_HOME = $managedGradleHome
     $env:TMP = $scratch; $env:TEMP = $scratch; $env:TMPDIR = $scratch
     $phase = 'gradle_tasks'
+    $operation = 'required_gradle_tasks'
     $taskEvidence = Join-Path $evidence 'jvm-task-events.ndjson'
     $classpathEvidence = Join-Path $evidence 'jvm-classpath-inputs.ndjson'
     foreach ($newEvidence in @($taskEvidence, $classpathEvidence)) {
@@ -317,9 +352,10 @@ gradle.taskGraph.afterTask { task, state ->
     $nativeExit = $LASTEXITCODE
     $record.gradle_exit = $nativeExit
     $phase = 'evidence_export'
+    $operation = 'source_and_test_evidence'
     $finalSourceSha = @(& git -C $checkoutRoot rev-parse HEAD)
     if ($LASTEXITCODE -ne 0 -or $finalSourceSha.Count -ne 1 -or $finalSourceSha[0] -cne $ExpectedSourceSha) { throw 'SOURCE_SHA_CHANGED_DURING_BUILD' }
-    & git -C $checkoutRoot diff --quiet HEAD -- jvm contracts examples tools/bootstrap/jvm-ci.ps1 tools/bootstrap/jvm-archive.py .github/workflows/jvm.yml tools/bootstrap/WindowsBootstrap.cs
+    & git -C $checkoutRoot diff --quiet HEAD -- jvm contracts examples tools/bootstrap/jvm-ci.ps1 tools/bootstrap/jvm-runtime-probe.ps1 tools/bootstrap/jvm-archive.py .github/workflows/jvm.yml tools/bootstrap/WindowsBootstrap.cs
     if ($LASTEXITCODE -ne 0) { throw 'SOURCE_CHANGED_DURING_BUILD' }
     foreach ($inputRecord in $inputRecords) {
         $finalFile = Assert-PhysicalPath (Join-Path $checkoutRoot $inputRecord.path) $false
@@ -337,24 +373,32 @@ gradle.taskGraph.afterTask { task, state ->
         $event = @($events | Where-Object task -CEQ ":${module}:test")
         if ($event.Count -eq 1 -and $event[0].status -cin @('executed','failed')) {
             try { $testSummaries.Add((Export-TestSummary $module (Join-Path $gradleBuild "$module/test-results/test"))) }
-            catch { $record.evidence_errors += "$module/TEST_REPORT_EXPORT_FAILED" }
+            catch {
+                $record.evidence_errors += "$module/TEST_REPORT_EXPORT_FAILED"
+                $record.failure_details += Get-SafeFailureRecord $_ "$module/test_report_export"
+            }
         }
     }
     $record.tests = $testSummaries.ToArray()
     $record.classpath_inputs_sha256 = Get-RegularHash $classpathEvidence 1MB
     $allExecuted = $events.Count -eq $tasks.Count -and @($events | Where-Object status -CNE 'executed').Count -eq 0
-    $allTests = $testSummaries.Count -eq 3 -and @($testSummaries | Where-Object passed -NE $true).Count -eq 0
+    $allTests = $testSummaries.Count -eq 4 -and @($testSummaries | Where-Object passed -NE $true).Count -eq 0
     $record.status = if ($nativeExit -eq 0 -and $allExecuted -and $allTests -and $record.evidence_errors.Count -eq 0) { 'passed' } else { 'failed' }
     $record.phase = $phase
     Write-NewJson (Join-Path $evidence 'jvm-result.json') $record 1MB
     if ($record.status -cne 'passed') { exit 1 }
     exit 0
 } catch {
+    $jvmFailure = $_
     $record.status = 'failed'; $record.phase = $phase; $record.gradle_exit = $nativeExit
-    $record.evidence_errors += 'JVM_INFRASTRUCTURE_FAILED/' + $_.Exception.GetType().Name
+    $record.evidence_errors += 'JVM_INFRASTRUCTURE_FAILED/' + $jvmFailure.Exception.GetType().Name
+    $failureDetail = Get-SafeFailureRecord $jvmFailure $operation
+    $record.failure_details += $failureDetail
     if (Get-Variable -Name evidence -ErrorAction SilentlyContinue) {
         try { Write-NewJson (Join-Path $evidence 'jvm-result.json') $record 1MB } catch { }
     }
     [System.Console]::Error.WriteLine("JVM_CI_FAILED/$phase")
+    $failureJson = ConvertTo-Json -InputObject $failureDetail -Depth 8 -Compress
+    if ($utf8.GetByteCount($failureJson) -le 4096) { [System.Console]::Error.WriteLine($failureJson) }
     exit 1
 }

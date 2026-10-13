@@ -2318,10 +2318,7 @@ mod platform {
                     Ok(()) => (),
                     Err(PeerError::Poll(flags))
                         if flags & libc::POLLHUP != 0
-                            && flags & (libc::POLLERR | libc::POLLNVAL) == 0 =>
-                    {
-                        ()
-                    }
+                            && flags & (libc::POLLERR | libc::POLLNVAL) == 0 => {}
                     Err(error) => return Err(error),
                 }
             }

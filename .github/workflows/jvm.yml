@@ -174,6 +174,12 @@ jobs:
           if (-not [System.IO.Path]::IsPathFullyQualified($pwsh) -or -not (Test-Path -LiteralPath $pwsh -PathType Leaf)) { throw 'A resolved absolute PowerShell application is required.' }
           $evidence = Join-Path $env:MMMM_EVIDENCE_ROOT 'verification'
           [System.IO.Directory]::CreateDirectory($evidence) | Out-Null
+          . (Join-Path $env:GITHUB_WORKSPACE 'tools/bootstrap/jvm-runtime-probe.ps1')
+          $outsideProbe = Get-MmmmJvmRuntimeProbe -SourceSha $env:EXPECTED_SOURCE_SHA -Target $env:MATRIX_TARGET -Scope outside
+          $probeBytes = [System.Text.UTF8Encoding]::new($false, $true).GetBytes((ConvertTo-Json -InputObject $outsideProbe -Depth 8 -Compress))
+          if ($probeBytes.Length -gt 16384) { throw 'Runtime probe evidence exceeded its fixed budget.' }
+          $probeStream = [System.IO.File]::Open((Join-Path $evidence 'jvm-runtime-outside.json'), [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+          try { $probeStream.Write($probeBytes, 0, $probeBytes.Length); $probeStream.Flush($true) } finally { $probeStream.Dispose() }
           & $env:MMMM_XTASK run --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root (Join-Path $env:MMMM_EVIDENCE_ROOT 'managed') --purpose jvm --timeout-seconds 1200 --owned-tail-policy terminate-build -- $pwsh -NoProfile -File (Join-Path $env:GITHUB_WORKSPACE 'tools/bootstrap/jvm-ci.ps1') -Checkout $env:GITHUB_WORKSPACE -EvidenceRoot $evidence -ExpectedSourceSha $env:EXPECTED_SOURCE_SHA -Target $env:MATRIX_TARGET -Python $python
           $managedExit = $LASTEXITCODE
           if ($managedExit -ne 0) { throw 'Managed JVM verification failed. Exported individual outcomes remain separate.' }

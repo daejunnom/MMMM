@@ -187,6 +187,25 @@ function Assert-EntryNames([string]$Path, [string[]]$Names) {
         }
     }
 }
+function Test-TransientMissingException([System.Exception]$Exception) {
+    # Method, property and lazy-enumerator failures can cross more than one
+    # PowerShell invocation wrapper. Typed catches only inspect selected wrapper
+    # levels. Accept the two actual absence types through this bounded whitelist;
+    # never infer absence from diagnostic text, HResult or a foreign inner cause.
+    for ($wrapperDepth = 0; $wrapperDepth -le 8; $wrapperDepth++) {
+        if ($null -eq $Exception) { return $false }
+        if ($Exception -is [System.IO.FileNotFoundException] -or
+            $Exception -is [System.IO.DirectoryNotFoundException]) { return $true }
+        if ($wrapperDepth -eq 8 -or $Exception.GetType().FullName -cnotin @(
+            'System.Management.Automation.RuntimeException',
+            'System.Management.Automation.MethodInvocationException',
+            'System.Management.Automation.GetValueInvocationException',
+            'System.Management.Automation.CmdletInvocationException',
+            'System.Reflection.TargetInvocationException')) { return $false }
+        $Exception = $Exception.InnerException
+    }
+    return $false
+}
 function Assert-TransientMissingBoundary([string]$Path, [string]$Root) {
     Assert-Within $Path $Root
     Assert-Directory $Root $false | Out-Null
@@ -199,7 +218,8 @@ function Assert-TransientMissingBoundary([string]$Path, [string]$Root) {
         Assert-SafeName $parts[$index]
         $current = [System.IO.Path]::Combine($current,$parts[$index])
         try { $attributes = [System.IO.File]::GetAttributes($current) }
-        catch [System.IO.FileNotFoundException],[System.IO.DirectoryNotFoundException] {
+        catch {
+            if (-not (Test-TransientMissingException $_.Exception)) { throw }
             # Only an absent suffix is permitted. Every surviving component
             # from the exact fixed root has already passed the boundary check.
             break
@@ -236,8 +256,8 @@ function Measure-Tree([string]$Path, [string[]]$TransientRoots = @()) {
         # Only current active cache/scratch descendants get this narrow allowance;
         # roots, ownership records, completed slots and cleanup keep strict errors.
         try { $attributes = [System.IO.File]::GetAttributes($entry) }
-        catch [System.IO.FileNotFoundException],[System.IO.DirectoryNotFoundException] {
-            if ($null -eq $transientRoot) { throw }
+        catch {
+            if ($null -eq $transientRoot -or -not (Test-TransientMissingException $_.Exception)) { throw }
             Assert-TransientMissingBoundary $entry $transientRoot
             continue
         }
@@ -247,17 +267,17 @@ function Measure-Tree([string]$Path, [string[]]$TransientRoots = @()) {
                 foreach ($child in [System.IO.Directory]::EnumerateFileSystemEntries($entry)) {
                     Assert-Within $child $entry
                     if ($pending.Count + $count -ge 100000) { throw 'Managed tree entry limit exceeded.' }
-                    $pending.Push(@($child, $depth + 1))
+                    $pending.Push(@($child, ($depth + 1)))
                 }
-            } catch [System.IO.FileNotFoundException],[System.IO.DirectoryNotFoundException] {
-                if ($null -eq $transientRoot) { throw }
+            } catch {
+                if ($null -eq $transientRoot -or -not (Test-TransientMissingException $_.Exception)) { throw }
                 Assert-TransientMissingBoundary $entry $transientRoot
             }
         } else {
             Assert-SafeFile $entry
             try { $length = [uint64]([System.IO.FileInfo]::new($entry).Length) }
-            catch [System.IO.FileNotFoundException],[System.IO.DirectoryNotFoundException] {
-                if ($null -eq $transientRoot) { throw }
+            catch {
+                if ($null -eq $transientRoot -or -not (Test-TransientMissingException $_.Exception)) { throw }
                 Assert-TransientMissingBoundary $entry $transientRoot
                 continue
             }
