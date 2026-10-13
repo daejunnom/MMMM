@@ -47,9 +47,18 @@ def native_call(operation, function, *args, **kwargs):
     """Tag only static operation names; retain native exception subclasses."""
     try:
         return function(*args, **kwargs)
-    except OSError as error:
+    except (OSError, ValueError) as error:
         if not hasattr(error, "mmmm_operation"):
             error.mmmm_operation = operation
+        if isinstance(error, ValueError) and function is resource.setrlimit:
+            # CPython maps these native failures to ValueError without errno.
+            # Only its fixed resource messages are classified; arbitrary error
+            # messages and arguments are never copied into build evidence.
+            error.mmmm_classification = {
+                "current limit exceeds maximum limit": "resource native EINVAL",
+                "not allowed to raise maximum limit": "resource native EPERM",
+                "invalid resource specified": "resource index invalid",
+            }.get(str(error), "resource ValueError unclassified")
         raise
 
 
@@ -89,6 +98,10 @@ def failure_details(error):
         detail = "errno=" + str(number) + " " + message
     elif isinstance(error, RuntimeError):
         detail = str(error)
+    elif isinstance(error, ValueError):
+        detail = "ValueError"
+        if hasattr(error, "mmmm_classification"):
+            detail += ": " + error.mmmm_classification
     else:
         detail = type(error).__name__
     detail = "".join(character if 32 <= ord(character) < 127 else "?" for character in detail)[:384]
@@ -654,6 +667,9 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
             try:
                 details = failure_details(child_error)
                 diagnostic = details["operation"] + ": " + details["error"]
+                if details.get("script_frames"):
+                    frame = details["script_frames"][-1]
+                    diagnostic += " [" + frame["function"] + ":" + str(frame["line"]) + "]"
                 os.write(report_write, ("launcher-error:" + diagnostic[:192] + "\n").encode("ascii"))
             except OSError:
                 pass

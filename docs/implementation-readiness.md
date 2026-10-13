@@ -61,6 +61,10 @@ Windows의 빌드 관리 도구 bootstrap은 실제로 통과했으며, 제품 �
 | 정본 소유 문서 저장 집중 검사 | runtime 35 검사 통과, 실패 및 warning 없음 | historical Project membership, exact revision/CAS, ACL·취소·재시작·source pin 손상; authored compound commit은 다음 통합 대상 |
 | JVM SDK 실제 제품 컴파일 | Java 25, Gradle 9.6.0 및 Loom 1.17.21 구성, SDK compileJava/resources/jar 통과 | deprecated API 수정 후 제품 소스 컴파일; 테스트 소스 반환형 오류 수정 및 host-core/Fabric 검증은 별도 |
 | 세 번째 3개 OS 기반 CI | Windows와 Linux의 전체 기반 job 통과; 집계 실패 | macOS prepare/supervise 단계 EPERM 유지; 공개 소스 함수와 줄 번호를 한정해 다음 실행에서 원인 확인 |
+| 변경 전 상태 보존과 Coordinator 집중 검사 | application 23 검사 통과; Coordinator 22 통과, 8 실패, 1 ignored | 원래 상태의 독립 capture 및 원장 연결은 통과; Windows endpoint publish의 실제 native 오류와 시작 실패 진단을 수정 중 |
+| JVM SDK 및 호스트 코어 검사 | SDK 92, host-core 4 검사 통과; 실패·오류·skip 없음 | Java 25와 실제 Gradle 실행 및 XML 결과 확인; Fabric 게임 호스트와 실제 게임 인수는 별도 |
+| 교환 모듈 첫 실제 검사 | 57 통과, 2 실패 | 좌표 숫자의 JSON 표현 비교와 수정·삭제 충돌 검사 순서를 수정; 수정 후 결과는 재검사 대상 |
+| 네 번째 3개 OS 기반 CI | Windows와 Linux의 전체 기반 job 통과; 집계 실패 | macOS reserved launcher의 ValueError가 먼저 발생; 종료 경로의 EPERM과 구분하며 원본 supervision proof와 빈 Cargo 로그를 보존 |
 
 실패한 실행의 원본 판정은 유지한다. native drain과 정확한 소유 기록을 확인하고
 로그를 별도로 내보내며 digest를 대조한 경우에만 해당 실행의 알려진 임시 파일을
@@ -86,6 +90,13 @@ process 관찰·자원 한도를 완화하지 않는다.
 Windows와 Linux는 구조·formatting·tests·Clippy까지 통과했다. macOS는
 `prepare and supervise Cargo build` 단계에서 실패했고 원인을 확인하는 진단을
 추가했다. 전체 집계의 실패는 유지하며 세 OS 통과로 표시하지 않는다.
+
+네 번째 원격 실행은 source `7a77858d9e32831941404d824d7dd3a97716bdca`의
+[foundation run](https://github.com/daejunnom/MMMM/actions/runs/38438925123)이다.
+Windows와 Linux는 전체 기반 검사를 통과했다. macOS의 원본 artifact bytes와
+SHA-256을 대조하고 한정된 supervision 기록을 확인했다. Cargo는 실행되지
+않았고 launcher의 `ValueError`가 주된 실패이며, 종료 시 `EPERM`도 기록됐다.
+자원 한도와 process 관찰을 완화하지 않고 native 실패 지점을 확인한다.
 
 ## 단계별 규약 적용
 
