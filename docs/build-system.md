@@ -275,10 +275,12 @@ Darwin의 2 GiB `RLIMIT_AS`는 실제 runner에서 기존 VM 예약보다 작아
 Cargo 시작 전 `EINVAL`을 반환했다. `managed-darwin-resources/1`은 512 GiB
 VM 한도의 설정과 readback, 각 소유 process의 관측 VM 한도를 적용하고,
 전체 live 소유 그룹의 RSS와 physical footprint 합계를 각각 2 GiB로 검사한다.
-wrapper도 memory 합계에 포함하며 worker는 32개까지 허용한다. 목표 관측 주기는
+Python bootstrap의 wrapper도 memory 합계에 포함하며 worker는 32개까지 허용한다. 목표 관측 주기는
 100 ms이고 마지막 완전한 성공 관측으로부터 1초를 넘으면 실패한다. native 오류,
 짧은 구조체 응답, identity 교체와 SID/PGID 이탈을 0으로 대체하지 않는다.
 policy, API flavor, sample 수, peak와 최대 관측 간격을 증거에 남긴다.
+Python bootstrap은 wrapper를 memory 합계에 포함한다. Rust 관리 명령은
+해당 명령의 소유 그룹을 관측하며 supervisor wrapper는 합계에서 제외한다.
 
 디렉터리 목록과 metadata 순회 및 유한한 출력 배치 사이에도 fallible native
 체크포인트를 수행한다. 실제 전체 소유 범위의 identity와 자원 관측에 성공한
@@ -291,9 +293,25 @@ policy, API flavor, sample 수, peak와 최대 관측 간격을 증거에 남긴
 마친 뒤 worker를 허용한다. Rust 감독기는 시작 전 native self preflight와
 async-signal-safe 설정을 하고 exec 직후 첫 소유 process 관측을 수행하므로,
 첫 관측 전에 명령이 실행될 수 있다. 첫 관측 실패도 해당 소유 범위 종료와 drain을
-거치며 lease를 보존한다. 이 정책의 실제 macOS 실행 검증은 아직 완료되지 않았다.
-Windows 및 Linux의 일반 Rust 관리 명령에 대한 동일 memory/process quota 연결도
-별도 G0 검증 대상이다. bootstrap 한도를 전체 명령의 완료 근거로 사용하지 않는다.
+거치며 lease를 보존한다. 실제 macOS 기반 CI에서 이 정책의 실행과 전체 기반 검사
+성공을 확인했으며, 새 제품 입력의 성공과 JVM 적합성은 별도로 검증한다.
+
+일반 Rust 관리 명령의 `ResourcePolicy`는 현재 OS와 일치해야 한다. Windows는
+자식 시작 전에 Job의 kill-on-close, commit 2 GiB와 process 32개 설정을 readback으로
+대조한다. 실행 중 같은 Job의 실제 peak commit과 process 수를 관측한다. Linux는
+자식의 async-signal-safe 시작 경로에서 `RLIMIT_AS` soft 및 hard 각각 2 GiB를
+설정·대조하며, 실행 중 원래 SID와 PGID의 소유 그룹을 32개까지 관측한다. 그룹
+리더는 포함하고 supervisor wrapper는 제외한다. Linux의 설정은 process별 VM
+상한이며 그룹 전체 memory, kernel resident memory나 kernel process quota가 아니다.
+두 정책은 100 ms 목표로 관측하고 설정·readback·표본 수·peak·최대 표본 간격을
+`resource_limits`에 보존한다. Linux에 별도의 1초 표본 간격 실패 조건을 추가하지
+않는다. 실제 Windows 자식의 설정 및 readback 검사는 통과했으며, 다른 OS의 새
+일반 정책과 JVM의 주소 공간 요구는 실제 후속 실행으로 확인한다. 이전 bootstrap
+또는 이전 감독 도구의 성공을 새 일반 명령 정책의 완료 근거로 사용하지 않는다.
+
+저장 크기 관측의 native 실패에는 단계, 소유 생성물 루트 기준 경로, 시도 횟수와
+OS 오류를 유한하게 남긴다. 개인 절대 경로와 보호된 이름은 진단에 넣지 않는다.
+접근 거부를 무시하거나 이전 크기로 대체하지 않는다.
 크기와 process 수는 관측 사이 증가할 수 있다. 독립 session으로 의도적으로 이탈하는
 프로그램을 격리하는 보안 sandbox를 제공한다는 주장도 하지 않는다.
 

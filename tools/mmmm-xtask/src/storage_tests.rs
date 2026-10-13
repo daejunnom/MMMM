@@ -712,7 +712,67 @@ fn churn_allowance_does_not_apply_to_completed_slot_or_other_error_kinds() {
         },
     );
     assert!(progress_calls > 0);
-    assert_eq!(error_kind(result), "io");
+    let error = result.unwrap_err();
+    assert_eq!(error.kind, "io");
+    assert!(error.message.contains("managed entry metadata"));
+    assert!(error.message.contains("raw_os_error=Some("));
+    assert!(error.message.contains("generated_relative=cache"));
+    assert!(error.message.contains("vanishing"));
+    assert!(
+        !error
+            .message
+            .contains(fixture.root.to_string_lossy().as_ref())
+    );
+    // Reuse this failure-boundary fixture to prove native denial remains
+    // fatal, diagnostics stay bounded and escaped, and private roots or
+    // policy-protected path names cannot enter the shared context.
+    let native_denial = std::io::Error::from_raw_os_error(5);
+    let native_cause = native_denial.to_string();
+    let diagnostic = measurement_io_error(
+        "managed entry metadata",
+        &build
+            .paths()
+            .scratch
+            .join(format!("compiler\n{}", "한".repeat(1024))),
+        &build.paths().slot,
+        native_denial,
+    );
+    assert_eq!(diagnostic.kind, "io");
+    assert!(diagnostic.message.contains("raw_os_error=Some(5)"));
+    assert!(diagnostic.message.contains("compiler\\n"));
+    assert!(!diagnostic.message.contains('\n'));
+    assert!(diagnostic.message.ends_with(&native_cause));
+    let context = diagnostic
+        .message
+        .strip_suffix(&format!(": {native_cause}"))
+        .unwrap();
+    assert!(context.len() <= 512 && context.ends_with("..."));
+    assert!(
+        !diagnostic
+            .message
+            .contains(fixture.root.to_string_lossy().as_ref())
+    );
+    let protected = measurement_io_error(
+        "directory open",
+        &build.paths().scratch.join(".env"),
+        &build.paths().slot,
+        std::io::Error::from_raw_os_error(5),
+    );
+    assert!(protected.message.contains("<withheld by path policy>"));
+    assert!(!protected.message.contains(".env"));
+    let outside = measurement_io_error(
+        "directory enumeration",
+        &fixture.checkout.join("private-original"),
+        &build.paths().slot,
+        std::io::Error::from_raw_os_error(5),
+    );
+    assert!(outside.message.contains("<outside generated boundary>"));
+    assert!(!outside.message.contains("private-original"));
+    assert!(
+        !outside
+            .message
+            .contains(fixture.root.to_string_lossy().as_ref())
+    );
     let roots = build.observation_roots();
     let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
     let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);

@@ -77,6 +77,10 @@ Windows의 빌드 관리 도구 bootstrap은 실제로 통과했으며, 제품 �
 | JVM 호스트와 공개 Java 어댑터 | host-core 32, public-java-adapter 17 검사 통과; SDK 107개의 유효 성공을 재사용; Fabric compileJava 통과 | 실제 Gradle 및 XML 결과 확인; 이후 native 실행·승인 변경과 실제 서버·클라이언트 인수는 별도 |
 | Coordinator와 CLI의 확장 검사 | CLI 12 통과; Coordinator 73 통과, 11 실패, 1 ignored | 정책 이름 fixture 10개와 native 종료 증거 경로 fixture 1개를 수정 중; 실제 stdio 통합 검사 실행은 lib 성공 이후 별도 |
 | Coordinator 인증·범위 재검사 | CLI 12, Coordinator 86 통과; 1 실패, 1 ignored | 잘못된 정책 이름 fixture 10개 및 per-Project scope 검사는 통과; native 종료 증거의 `child_parent_identity` 경계는 미해결. 이후 retained authentication hook은 미실행 |
+| 일곱 번째 3개 OS 기반 CI | Linux와 macOS 전체 기반 job 통과; Windows와 집계 실패 | source `3f022c91e32324ae0a16fe7abbfe00fd4ce98ce4`; Windows 저장 크기 관측의 native 접근 거부를 그대로 보존. 실제 Darwin 성공과 새 제품 인수를 구분 |
+| 일반 자원 정책과 저장 관측 진단 | Windows 관리 도구 81 통과, 1 ignored | 실제 소유 자식의 Job 설정·readback과 bounded 진단 검사 포함. 이 실행의 부모는 이전 감독 도구이며 새 정책을 모든 제품 실행에 적용했다고 표시하지 않음 |
+| 여덟 번째 3개 OS 기반 CI | 3개 OS bootstrap·구조·formatting 통과; 제품 검사와 집계 실패 | source `8d2ac7f49132eea55ba527f53232958f966abdc1`; Windows·Linux의 테스트 취소 호출 컴파일 오류와 Darwin의 variadic `mode_t` 승격 오류를 보존·수정. 제품 테스트 성공으로 표시하지 않음 |
+| 격리 stdio worker 실제 검사 | Windows worker 시작 실패, native `10106`, drain 확인 | bootstrap과 실행 파일 확인 이후 `worker_connect`에서 실패. OS에서 도출한 최소 환경 수정은 재검사 대상이며 메모리 또는 process 상한을 변경하지 않음 |
 
 실패한 실행의 원본 판정은 유지한다. native drain과 정확한 소유 기록을 확인하고
 로그를 별도로 내보내며 digest를 대조한 경우에만 해당 실행의 알려진 임시 파일을
@@ -124,6 +128,20 @@ readback을 완료하고 Cargo를 시작했으나, 동기 파일 크기 검사 �
 대조했으며 실패·drain·export와 보존한 lease를 기록했다. 파일 순회와 출력 배치
 사이에 실제 native 관측을 연결했고, 단일 호출이 1초 이상 막히면 계속 실패한다.
 자원 한도를 늘리거나 성공한 것처럼 heartbeat를 기록하지 않는다.
+
+일곱 번째 원격 실행은 source `3f022c91e32324ae0a16fe7abbfe00fd4ce98ce4`의
+[foundation run](https://github.com/daejunnom/MMMM/actions/runs/38452370274)이다.
+Linux와 macOS는 전체 기반 job을 통과했다. Windows는 실제 제품 검사를 진행하다
+저장 크기 관측에서 `Access is denied`로 실패했으며 정확한 artifact bytes와 digest,
+실제 종료·drain·export 및 lease 해제를 확인했다. 실패 위치 진단을 추가하되 native
+오류나 관측 정책을 완화하지 않는다.
+
+여덟 번째 원격 실행은 source `8d2ac7f49132eea55ba527f53232958f966abdc1`의
+[foundation run](https://github.com/daejunnom/MMMM/actions/runs/38453149507)이다.
+모든 OS에서 bootstrap·구조·formatting을 통과했으나 제품 컴파일에서 실패했다.
+보존한 세 OS artifact의 bytes와 digest를 대조했고, Windows·Linux의 존재하지 않는
+테스트 취소 호출과 Darwin의 variadic 정수 승격 오류를 확인했다. Darwin 제품
+컴파일 실행의 실제 자원 관측은 611개 표본과 최대 230 ms 간격을 기록했다.
 
 ## 단계별 규약 적용
 

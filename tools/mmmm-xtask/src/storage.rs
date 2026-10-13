@@ -1532,7 +1532,14 @@ fn tree_bytes_observed_with_progress(
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if vanished_ephemeral_entry(&path, &error, ephemeral_roots)? => continue,
-            Err(error) => return Err(StorageError::io("measure managed entry", error)),
+            Err(error) => {
+                return Err(measurement_io_error(
+                    "managed entry metadata",
+                    &path,
+                    &boundary,
+                    error,
+                ));
+            }
         };
         observation_checkpoint(progress)?;
         if is_link(&metadata) {
@@ -1543,7 +1550,14 @@ fn tree_bytes_observed_with_progress(
             let mut directory = match fs::read_dir(&path) {
                 Ok(directory) => directory,
                 Err(error) if vanished_ephemeral_entry(&path, &error, ephemeral_roots)? => continue,
-                Err(error) => return Err(StorageError::io("measure directory", error)),
+                Err(error) => {
+                    return Err(measurement_io_error(
+                        "directory open",
+                        &path,
+                        &boundary,
+                        error,
+                    ));
+                }
             };
             observation_checkpoint(progress)?;
             loop {
@@ -1562,7 +1576,14 @@ fn tree_bytes_observed_with_progress(
                     Err(error) if vanished_ephemeral_entry(&path, &error, ephemeral_roots)? => {
                         break;
                     }
-                    Err(error) => return Err(StorageError::io("measure entry", error)),
+                    Err(error) => {
+                        return Err(measurement_io_error(
+                            "directory enumeration",
+                            &path,
+                            &boundary,
+                            error,
+                        ));
+                    }
                 };
                 pending.push((entry.path(), depth + 1));
             }
@@ -1578,6 +1599,42 @@ fn tree_bytes_observed_with_progress(
     }
     observation_checkpoint(progress)?;
     Ok(bytes)
+}
+
+fn measurement_io_error(
+    stage: &'static str,
+    path: &Path,
+    boundary: &Path,
+    error: std::io::Error,
+) -> StorageError {
+    // A failed metadata open cannot establish whether Windows access denial
+    // came from deletion, sharing or access control. Keep the error fatal and
+    // preserve its native cause, while identifying only the generated leaf.
+    const CONTEXT_LIMIT: usize = 512;
+    let mut context = format!(
+        "measure {stage}; attempts=1; kind={:?}; raw_os_error={:?}; generated_relative=",
+        error.kind(),
+        error.raw_os_error()
+    );
+    // Apply the path policy before even formatting a relative label. No file
+    // contents or metadata are read to produce this diagnostic.
+    let relative = if reject_secret_leaf_file(path).is_err() {
+        std::borrow::Cow::Borrowed("<withheld by path policy>")
+    } else {
+        match path.strip_prefix(boundary) {
+            Ok(relative) if relative.as_os_str().is_empty() => std::borrow::Cow::Borrowed("."),
+            Ok(relative) => relative.to_string_lossy(),
+            Err(_) => std::borrow::Cow::Borrowed("<outside generated boundary>"),
+        }
+    };
+    for character in relative.chars().flat_map(char::escape_debug) {
+        if context.len() + character.len_utf8() > CONTEXT_LIMIT - 3 {
+            context.push_str("...");
+            break;
+        }
+        context.push(character);
+    }
+    StorageError::io(&context, error)
 }
 
 fn vanished_ephemeral_entry(

@@ -25,6 +25,9 @@ const READ_BATCH_BYTES: usize = 8192;
 #[cfg(any(target_os = "macos", test))]
 #[path = "darwin_resources.rs"]
 mod darwin_resources;
+#[path = "resource_policy.rs"]
+mod resource_policy;
+pub use resource_policy::ResourcePolicy;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,6 +54,8 @@ pub struct ProcessSpec {
     /// Combined retained stdout and stderr bytes. Excess output fails the run.
     pub max_log_bytes: u64,
     pub tail_policy: TailPolicy,
+    /// Fixed native policy for the current platform; foreign modes are rejected.
+    pub resource_policy: ResourcePolicy,
 }
 
 impl ProcessSpec {
@@ -67,6 +72,7 @@ impl ProcessSpec {
             drain_timeout: Duration::from_secs(15),
             max_log_bytes: 64 * 1024 * 1024,
             tail_policy: TailPolicy::Reject,
+            resource_policy: ResourcePolicy::current(),
         }
     }
 }
@@ -80,7 +86,6 @@ pub enum TerminationReason {
     Timeout,
     OutputLimit,
     ObservationFailure,
-    #[cfg(target_os = "macos")]
     ResourceBudget,
     RemainingChildren,
     SupervisorFailure,
@@ -103,6 +108,9 @@ pub struct ProcessOutcome {
     /// accepted. Drain and capture remain independent completion requirements.
     pub owned_tail_terminated: bool,
     pub native_scope: &'static str,
+    pub resource_policy: ResourcePolicy,
+    #[cfg(any(windows, target_os = "linux"))]
+    pub resource_limits: Option<resource_policy::Evidence>,
     #[cfg(target_os = "macos")]
     pub darwin_resources: Option<darwin_resources::Evidence>,
 }
@@ -144,8 +152,8 @@ pub fn supervise(
 }
 
 /// Managed observations may checkpoint between bounded filesystem operations.
-/// Each Darwin checkpoint samples actual owned identities and resources. It
-/// cannot extend the successful-sample deadline without a complete sample.
+/// Each checkpoint samples actual native resources according to the fixed
+/// platform policy. Darwin deadlines require a complete successful sample.
 pub fn supervise_with_progress(
     spec: &ProcessSpec,
     cancellation: &AtomicBool,
@@ -168,6 +176,9 @@ pub fn supervise_with_progress(
         output_complete: true,
         owned_tail_terminated: false,
         native_scope: native::SCOPE,
+        resource_policy: spec.resource_policy,
+        #[cfg(any(windows, target_os = "linux"))]
+        resource_limits: None,
         #[cfg(target_os = "macos")]
         darwin_resources: None,
     };
@@ -187,23 +198,18 @@ pub fn supervise_with_progress(
     let mut capture_failed = false;
     let mut empty_observations = 0u8;
     loop {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
         if failure_checks_active(&outcome, stopping_at) {
             if let Err(error) = process.observe_resources() {
-                let reason = if error.kind == "resource_budget" {
-                    TerminationReason::ResourceBudget
-                } else {
-                    TerminationReason::ObservationFailure
-                };
                 request_stop(
                     &mut process,
                     &mut outcome,
                     &mut stopping_at,
-                    reason,
+                    observation_reason(&error),
                     error.to_string(),
                 );
             }
-            outcome.darwin_resources = Some(process.resource_evidence());
+            record_resource_evidence(&process, &mut outcome);
         }
         if !capture_failed {
             // Retain the same finite total capture budget on Darwin, but
@@ -246,7 +252,7 @@ pub fn supervise_with_progress(
                             error.to_string(),
                         );
                     }
-                    outcome.darwin_resources = Some(process.resource_evidence());
+                    record_resource_evidence(&process, &mut outcome);
                 }
             }
         }
@@ -274,15 +280,12 @@ pub fn supervise_with_progress(
             && last_observation.elapsed() >= spec.observation_interval
         {
             let observation = run_observation(&mut observe, || {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
                 progress_sample(&mut process, spec, cancellation, started)?;
                 Ok(())
             });
             last_observation = Instant::now();
-            #[cfg(target_os = "macos")]
-            {
-                outcome.darwin_resources = Some(process.resource_evidence());
-            }
+            record_resource_evidence(&process, &mut outcome);
             if let Err(error) = observation {
                 request_stop(
                     &mut process,
@@ -428,14 +431,26 @@ fn observation_reason(error: &ProcessError) -> TerminationReason {
     if error.kind == "command_timeout" {
         return TerminationReason::Timeout;
     }
-    #[cfg(target_os = "macos")]
     if error.kind == "resource_budget" {
         return TerminationReason::ResourceBudget;
     }
     TerminationReason::ObservationFailure
 }
 
-#[cfg(target_os = "macos")]
+fn record_resource_evidence(process: &native::Process, outcome: &mut ProcessOutcome) {
+    #[cfg(target_os = "macos")]
+    {
+        outcome.darwin_resources = Some(process.resource_evidence());
+    }
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        outcome.resource_limits = Some(process.resource_evidence());
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    let _ = (process, outcome);
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn progress_sample(
     process: &mut native::Process,
     spec: &ProcessSpec,
@@ -508,6 +523,7 @@ fn request_stop(
 }
 
 fn validate(spec: &ProcessSpec) -> Result<(), ProcessError> {
+    spec.resource_policy.validate_current()?;
     if spec.timeout < Duration::from_secs(1)
         || spec.timeout > Duration::from_secs(3600)
         || spec.observation_interval.is_zero()
@@ -669,6 +685,7 @@ mod native {
     };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
         JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
@@ -701,6 +718,7 @@ mod native {
         leader: Handle,
         stdout: Pipe,
         stderr: Pipe,
+        resources: resource_policy::Tracker,
     }
     struct Attributes {
         storage: Vec<usize>,
@@ -744,7 +762,11 @@ mod native {
                     return Err(last("create owned job"));
                 }
                 let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
-                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                    | JOB_OBJECT_LIMIT_JOB_MEMORY
+                    | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+                limits.BasicLimitInformation.ActiveProcessLimit = resource_policy::PROCESS_LIMIT;
+                limits.JobMemoryLimit = resource_policy::MEMORY_LIMIT as usize;
                 if SetInformationJobObject(
                     job.0,
                     JobObjectExtendedLimitInformation,
@@ -752,8 +774,10 @@ mod native {
                     size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
                 ) == 0
                 {
-                    return Err(last("set kill-on-close job boundary"));
+                    return Err(last("set finite owned job resource limits"));
                 }
+                let (readback, _) = job_resource_limits(job.0)?;
+                let resources = resource_policy::Tracker::windows(readback)?;
                 let (stdout, stdout_write) = pipe()?;
                 let (stderr, stderr_write) = pipe()?;
                 let attributes = SECURITY_ATTRIBUTES {
@@ -848,6 +872,7 @@ mod native {
                     leader,
                     stdout,
                     stderr,
+                    resources,
                 };
                 let suspend_count = ResumeThread(thread.0);
                 if suspend_count != 1 {
@@ -899,6 +924,37 @@ mod native {
             }
             Ok(accounting.ActiveProcesses == 0)
         }
+        pub(super) fn observe_resources(&mut self) -> Result<(), ProcessError> {
+            if !self.resources.due() {
+                return Ok(());
+            }
+            let (readback, peak_committed) = job_resource_limits(self.job.0)?;
+            let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { zeroed() };
+            let mut returned = 0;
+            if unsafe {
+                QueryInformationJobObject(
+                    self.job.0,
+                    JobObjectBasicAccountingInformation,
+                    (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                    size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                    &mut returned,
+                )
+            } == 0
+            {
+                return Err(last("observe owned job resource accounting"));
+            }
+            if returned != size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32 {
+                return Err(ProcessError::new(
+                    "resource_observation",
+                    "owned job accounting response has an unexpected byte count",
+                ));
+            }
+            self.resources
+                .record_windows(readback, accounting.ActiveProcesses, peak_committed)
+        }
+        pub(super) fn resource_evidence(&self) -> resource_policy::Evidence {
+            self.resources.evidence()
+        }
         pub(super) fn terminate(&mut self) -> Result<(), ProcessError> {
             if unsafe { TerminateJobObject(self.job.0, 124) } == 0 {
                 Err(last("terminate owned job"))
@@ -929,6 +985,35 @@ mod native {
         pub(super) fn outputs_closed(&self) -> bool {
             self.stdout.eof && self.stderr.eof
         }
+    }
+    fn job_resource_limits(
+        job: HANDLE,
+    ) -> Result<(resource_policy::JobReadback, u64), ProcessError> {
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+        let mut returned = 0;
+        let expected = size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+        if unsafe {
+            QueryInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                expected,
+                &mut returned,
+            )
+        } == 0
+        {
+            return Err(last("read owned job resource limits"));
+        }
+        Ok((
+            resource_policy::JobReadback {
+                flags: limits.BasicLimitInformation.LimitFlags,
+                committed_bytes: limits.JobMemoryLimit as u64,
+                active_limit: limits.BasicLimitInformation.ActiveProcessLimit,
+                returned_bytes: returned,
+                expected_bytes: expected,
+            },
+            limits.PeakJobMemoryUsed as u64,
+        ))
     }
     impl Pipe {
         fn capture(
@@ -1194,6 +1279,8 @@ mod native {
         mac_leader_identity: Option<(u64, u64)>,
         #[cfg(target_os = "macos")]
         resources: darwin_resources::Tracker,
+        #[cfg(target_os = "linux")]
+        resources: resource_policy::Tracker,
     }
     impl Process {
         pub(super) fn spawn(spec: &ProcessSpec) -> Result<Self, ProcessError> {
@@ -1220,6 +1307,28 @@ mod native {
                     if libc::setsid() == -1 {
                         return Err(std::io::Error::last_os_error());
                     }
+                    #[cfg(target_os = "linux")]
+                    {
+                        let limits = libc::rlimit {
+                            rlim_cur: resource_policy::MEMORY_LIMIT as libc::rlim_t,
+                            rlim_max: resource_policy::MEMORY_LIMIT as libc::rlim_t,
+                        };
+                        if libc::setrlimit(libc::RLIMIT_AS, &limits) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        let mut readback = libc::rlimit {
+                            rlim_cur: 0,
+                            rlim_max: 0,
+                        };
+                        if libc::getrlimit(libc::RLIMIT_AS, &mut readback) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if readback.rlim_cur != limits.rlim_cur
+                            || readback.rlim_max != limits.rlim_max
+                        {
+                            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                        }
+                    }
                     #[cfg(target_os = "macos")]
                     {
                         let pid = libc::getpid();
@@ -1237,6 +1346,8 @@ mod native {
             let pid = child.id() as libc::pid_t;
             #[cfg(target_os = "macos")]
             resources.configured();
+            #[cfg(target_os = "linux")]
+            let resources = resource_policy::Tracker::linux();
             let stdout = child
                 .stdout
                 .take()
@@ -1263,6 +1374,8 @@ mod native {
                 #[cfg(target_os = "macos")]
                 mac_leader_identity: None,
                 #[cfg(target_os = "macos")]
+                resources,
+                #[cfg(target_os = "linux")]
                 resources,
             };
             for fd in [
@@ -1385,6 +1498,18 @@ mod native {
         #[cfg(target_os = "macos")]
         pub(super) fn resource_evidence(&self) -> darwin_resources::Evidence {
             self.resources.evidence.clone()
+        }
+        #[cfg(target_os = "linux")]
+        pub(super) fn observe_resources(&mut self) -> Result<(), ProcessError> {
+            if self.resources.due() {
+                let members = live_group_members(self.pid)?;
+                self.resources.record_linux(members)?;
+            }
+            Ok(())
+        }
+        #[cfg(target_os = "linux")]
+        pub(super) fn resource_evidence(&self) -> resource_policy::Evidence {
+            self.resources.evidence()
         }
         pub(super) fn terminate(&mut self) -> Result<(), ProcessError> {
             if self.reaped || !self.reservation_valid {
@@ -1960,6 +2085,21 @@ mod tests {
         assert_eq!(error.kind, "observation");
         assert_eq!(error.message, "ownership changed");
     }
+    #[test]
+    fn foreign_resource_policy_is_rejected_before_filesystem_or_process_access() {
+        let mut spec = ProcessSpec::new(
+            PathBuf::from("unresolved-program"),
+            PathBuf::from("unresolved-directory"),
+            PathBuf::from("unresolved-stdout"),
+            PathBuf::from("unresolved-stderr"),
+        );
+        spec.resource_policy = if ResourcePolicy::current() == ResourcePolicy::WindowsJob {
+            ResourcePolicy::LinuxAddressSpace
+        } else {
+            ResourcePolicy::WindowsJob
+        };
+        assert_eq!(validate(&spec).unwrap_err().kind, "resource_configuration");
+    }
     struct TestRun {
         root: PathBuf,
         spec: ProcessSpec,
@@ -2025,6 +2165,53 @@ mod tests {
             "failure" => std::process::exit(23),
             "hold" => std::thread::sleep(Duration::from_secs(30)),
             "brief_hold" => std::thread::sleep(Duration::from_millis(500)),
+            "resource_probe" => {
+                #[cfg(target_os = "linux")]
+                {
+                    let mut limit = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    // SAFETY: this child reads only its own fixed rlimit into
+                    // a live writable value; no parent or global quota changes.
+                    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) }, 0);
+                    assert_eq!(
+                        limit.rlim_cur,
+                        resource_policy::MEMORY_LIMIT as libc::rlim_t
+                    );
+                    assert_eq!(
+                        limit.rlim_max,
+                        resource_policy::MEMORY_LIMIT as libc::rlim_t
+                    );
+                    println!("owned Linux address-space readback verified");
+                }
+                #[cfg(windows)]
+                println!("owned Windows resource probe executed");
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            #[cfg(target_os = "linux")]
+            "many_owned" => {
+                // This ignored isolated fixture has a finite count and delay.
+                // Its enclosing supervisor owns termination and reap evidence.
+                #[allow(clippy::zombie_processes)]
+                let children: Vec<_> = (0..33)
+                    .map(|_| {
+                        std::process::Command::new(std::env::current_exe().unwrap())
+                            .args([
+                                "--exact",
+                                "process::tests::process_fixture_child",
+                                "--ignored",
+                                "--nocapture",
+                            ])
+                            .env("MMMM_PROCESS_FIXTURE", "hold")
+                            .spawn()
+                            .unwrap()
+                    })
+                    .collect();
+                println!("owned process fixture started {} children", children.len());
+                std::thread::sleep(Duration::from_secs(30));
+                drop(children);
+            }
             "remaining" | "remaining_brief" | "remaining_failure" => {
                 // The fixture leader must exit before this child. The enclosing
                 // native scope owns and drains it; waiting here would remove the
@@ -2195,6 +2382,68 @@ mod tests {
             TerminationReason::ObservationFailure
         );
         assert!(result.drained);
+        run.cleanup(result.drained);
+    }
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn resource_limits_are_configured_before_the_owned_command_executes() {
+        let run = TestRun::new("resource_probe");
+        let result = supervise(&run.spec, &AtomicBool::new(false), || Ok(())).unwrap();
+        assert_eq!(result.resource_policy, ResourcePolicy::current());
+        assert_eq!(result.termination_reason, TerminationReason::Completed);
+        assert!(result.drained && result.output_complete && result.supervisor_errors.is_empty());
+        let evidence = serde_json::to_value(result.resource_limits.as_ref().unwrap()).unwrap();
+        assert_eq!(evidence["kernel_resident_quota"], false);
+        assert!(evidence["sample_count"].as_u64().unwrap() > 0);
+        assert!(evidence["peak_observed_processes"].as_u64().unwrap() > 0);
+        #[cfg(windows)]
+        {
+            assert_eq!(evidence["policy"], "managed-windows-job-resources/1");
+            assert_eq!(
+                evidence["readback_job_committed_limit_bytes"],
+                resource_policy::MEMORY_LIMIT
+            );
+            assert_eq!(
+                evidence["readback_active_process_limit"],
+                resource_policy::PROCESS_LIMIT
+            );
+            assert!(
+                evidence["peak_observed_job_committed_bytes"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(evidence["policy"], "managed-linux-process-resources/1");
+            assert_eq!(
+                evidence["rlimit_as_readback_soft_bytes"],
+                resource_policy::MEMORY_LIMIT
+            );
+            assert_eq!(
+                evidence["rlimit_as_readback_hard_bytes"],
+                resource_policy::MEMORY_LIMIT
+            );
+            assert_eq!(evidence["aggregate_memory_quota"], false);
+            assert_eq!(evidence["kernel_process_quota"], false);
+        }
+        run.cleanup(result.drained);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "isolated finite native process-count quota proof; root runs separately"]
+    fn linux_more_than_32_owned_live_processes_fail_and_drain() {
+        let run = TestRun::new("many_owned");
+        let result = supervise(&run.spec, &AtomicBool::new(false), || Ok(())).unwrap();
+        assert_eq!(result.termination_reason, TerminationReason::ResourceBudget);
+        assert!(result.drained);
+        assert!(
+            result
+                .supervisor_errors
+                .iter()
+                .any(|error| error.contains("resource_budget"))
+        );
         run.cleanup(result.drained);
     }
     #[cfg(windows)]

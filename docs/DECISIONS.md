@@ -32,6 +32,7 @@
 | MMMM-D020 | 빌드 자식의 종료 기본 정책은 엄격한 거절이며, Cargo와 CI 빌드에는 명시적인 소유 자식 정리를 선택할 수 있다. | 리더 종료 후 2초의 자연 종료 유예를 거쳐 해당 실행의 전체 native scope만 종료한다. 실제 명령 code, 정리 여부, 완전한 출력 수집과 drain을 보존하며 제품 쓰기에 적용하지 않는다. |
 | MMMM-D021 | `CommandContext.rotationDegrees`의 두 값은 `[pitchDegrees, yawDegrees]` 순서로 해석한다. | 원본의 명시되지 않은 순서를 Minecraft native Vec2 의미와 맞춘 구현 결정이다. Rust와 Java 경계에서 같은 순서와 유한 값 검사를 적용한다. |
 | MMMM-D022 | Darwin 빌드는 `managed-darwin-resources/1`의 플랫폼별 자원 정책을 적용한다. | 512 GiB의 VM 설정·관측 한도와 소유 그룹 합계 RSS 및 physical footprint 각각 2 GiB를 구분한다. 100 ms 목표 관측, 완전한 성공 관측 사이 1초 상한과 worker 32개를 적용한다. kernel resident quota로 표현하지 않으며 실제 macOS CI로 검증한다. |
+| MMMM-D023 | 일반 Rust 관리 명령도 플랫폼별 자원 정책을 명시하고 native 설정과 관측 결과를 보존한다. | Windows는 시작 전 Job의 commit 2 GiB 및 process 32개 상한을 확인한다. Linux는 process마다 주소 공간 2 GiB를 설정·확인하고 소유 그룹 32개를 관측한다. 두 정책의 100 ms 목표 표본 및 최대 간격을 기록하며 Linux에 kernel resident quota나 Darwin의 1초 표본 간격 보장을 주장하지 않는다. Windows의 실제 자식 설정 검사는 통과했으며 다른 OS와 JVM 적합성은 별도 검증한다. |
 
 ## 구현 전에 확인할 항목
 
