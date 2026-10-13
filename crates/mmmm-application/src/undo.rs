@@ -395,9 +395,11 @@ impl Application<'_> {
             }
             self.observer
                 .validate_capture_target(&invocation, &record.scope, &target.target)?;
-            let bytes =
-                self.observer
-                    .read_target_with_store(self.store, &invocation, &target.target)?;
+            let bytes = self.observer.read_target_retained_with_store(
+                self.store,
+                &invocation,
+                &target.target,
+            )?;
             total = total
                 .checked_add(bytes.len())
                 .filter(|size| *size <= AFTER_BYTES)
@@ -627,7 +629,7 @@ impl Application<'_> {
                 ));
             }
             let bytes = authority
-                .read_current_target(
+                .read_current_target_retained(
                     self.store,
                     &record,
                     invocation,
@@ -730,7 +732,13 @@ impl Application<'_> {
             .map_err(|error| AppError::storage("RECOVERY_EXPIRED", error))?;
         let mut total = 0usize;
         let mut restored = true;
+        let mut unchanged = true;
         let mut changes = Vec::new();
+        let mut fresh_states = Vec::new();
+        let confirmed_changes = matches!(
+            observed.effect,
+            EffectEvidence::SomeConfirmed | EffectEvidence::CompleteConfirmed
+        );
         for state in &record.after_states {
             authority
                 .observer
@@ -741,10 +749,11 @@ impl Application<'_> {
                     "Undo source lacks an independent expected restoration state",
                 )
             })?;
-            let bytes =
-                authority
-                    .observer
-                    .read_target_with_store(self.store, &original, &state.target)?;
+            let bytes = authority.observer.read_target_retained_with_store(
+                self.store,
+                &original,
+                &state.target,
+            )?;
             total = total
                 .checked_add(bytes.len())
                 .filter(|size| *size <= AFTER_BYTES)
@@ -754,28 +763,49 @@ impl Application<'_> {
                         "Undo target verification exceeds its finite budget",
                     )
                 })?;
-            restored &=
-                raw_digest(&bytes) == expected.digest && bytes.len() as u64 == expected.byte_length;
-            let before = self
+            let fresh = self
                 .store
-                .read_blob(&state.after)
+                .put_blob(&bytes)
                 .map_err(|error| AppError::storage("RECOVERY_EXPIRED", error))?;
-            total = total
-                .checked_add(before.len())
-                .filter(|size| *size <= AFTER_BYTES)
-                .ok_or_else(|| {
-                    AppError::new(
-                        "BUDGET_EXCEEDED",
-                        "Undo observation images exceed their finite budget",
-                    )
-                })?;
-            changes.push(DirectChange {
-                target: state.target.clone(),
-                before,
-                after: bytes,
-            });
+            self.store
+                .pin_operation_artifact(&operation, &fresh)
+                .map_err(|error| AppError::storage("RECOVERY_EXPIRED", error))?;
+            let matches_before = &fresh == expected;
+            let matches_after = fresh == state.after;
+            restored &= matches_before;
+            unchanged &= matches_after;
+            fresh_states.push(json!({"target":state.target,"after":fresh,
+                "matchesSourceBefore":matches_before,"matchesSourceAfter":matches_after}));
+            if confirmed_changes {
+                let before = self
+                    .store
+                    .read_blob(&state.after)
+                    .map_err(|error| AppError::storage("RECOVERY_EXPIRED", error))?;
+                total = total
+                    .checked_add(before.len())
+                    .filter(|size| *size <= AFTER_BYTES)
+                    .ok_or_else(|| {
+                        AppError::new(
+                            "BUDGET_EXCEEDED",
+                            "Undo observation images exceed their finite budget",
+                        )
+                    })?;
+                changes.push(DirectChange {
+                    target: state.target.clone(),
+                    before,
+                    after: bytes,
+                });
+            }
         }
-        if restored
+        if observed.effect == EffectEvidence::Unknown
+            || (observed.effect == EffectEvidence::NoneConfirmed && !unchanged)
+        {
+            // A target drift cannot identify which actor changed it. Preserve
+            // the real job evidence and fresh bytes without creating recovery
+            // snapshots or inferring the undo's effects from provider output.
+            observed.effect = EffectEvidence::Unknown;
+            observed.settled = false;
+        } else if restored
             && observed.settled
             && matches!(
                 observed.effect,
@@ -787,7 +817,8 @@ impl Application<'_> {
             observed.effect = EffectEvidence::SomeConfirmed;
         }
         observed.evidence = json!({"independentJobEvidence":observed.evidence,"sourceOperationId":record.source_operation_id,
-            "sourceInvocationId":record.source_invocation_id,"undoRecordId":record.record_id,"restored":restored});
+            "sourceInvocationId":record.source_invocation_id,"undoRecordId":record.record_id,
+            "restored":restored,"unchangedFromSourceAfter":unchanged,"freshStates":fresh_states});
         observed.direct_changes = changes;
         check_rpc(rpc, principal)?;
         let current = rpc
@@ -910,7 +941,7 @@ impl Application<'_> {
             } else {
                 fresh = self
                     .observer
-                    .read_target_with_store(self.store, invocation, &target)?;
+                    .read_target_retained_with_store(self.store, invocation, &target)?;
                 fresh.as_slice()
             };
             total = total
@@ -1221,6 +1252,42 @@ impl UndoAuthority for AppUndoAuthority<'_> {
                 "Undo current target read budget exceeded".into(),
             ));
         }
+        Ok(bytes)
+    }
+    fn read_current_target_retained(
+        &mut self,
+        store: &mut DurableStore,
+        record: &ProviderUndoRecord,
+        invocation: &Value,
+        target: &str,
+        max_bytes: u64,
+    ) -> StorageResult<Vec<u8>> {
+        // Runtime invokes this retained observation only before opening its
+        // claim transaction. The original Invocation supplies the locator;
+        // fresh Recovery and exact new-plan Apply still supply authority.
+        self.authorize_recovery(store, record, invocation)?;
+        let original =
+            store.stored_invocation(&record.source_operation_id, &record.source_step_id)?;
+        self.observer
+            .validate_capture_target(&original, &record.scope, target)
+            .map_err(|error| self.failures.capture(error))?;
+        if !record
+            .after_states
+            .iter()
+            .any(|state| state.target == target)
+        {
+            return Err(StorageError::Conflict("Undo original target footprint"));
+        }
+        let bytes = self
+            .observer
+            .read_target_retained_with_store(store, &original, target)
+            .map_err(|error| self.failures.capture(error))?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(StorageError::InvalidTransition(
+                "Undo current target read budget exceeded".into(),
+            ));
+        }
+        self.authorize_recovery(store, record, invocation)?;
         Ok(bytes)
     }
 }

@@ -13,6 +13,9 @@ use mmmm_runtime::storage::{
     OperationRecord, OperationState, StepObservation, StorageError, StorageResult,
 };
 
+#[path = "undo_bundle_tests.rs"]
+mod undo_bundle_tests;
+
 fn undo_source_fixture(capture: bool, failed: bool) -> Fixture {
     let mut fixture = Fixture::new(1);
     fixture.provider.descriptor["recovery"] = json!("provider_undo");
@@ -298,6 +301,7 @@ struct TestUndoRpc {
     cancelled: Rc<Cell<bool>>,
     checks: Cell<usize>,
     deadline: std::time::Instant,
+    approved_plan: RefCell<Option<(PlanId, Sha256Digest)>>,
 }
 impl TestUndoRpc {
     fn from_authenticated_fixture(fixture: &Fixture) -> Self {
@@ -307,7 +311,23 @@ impl TestUndoRpc {
             cancelled: Rc::new(Cell::new(false)),
             checks: Cell::new(0),
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+            approved_plan: RefCell::new(None),
         }
+    }
+    fn approve_stored_plan(&self, store: &DurableStore, plan: &Value) {
+        self.check().unwrap();
+        validate("ExecutionPlan", plan).unwrap();
+        let id: PlanId = decode(&plan["planId"]).unwrap();
+        let hash: Sha256Digest = decode(&plan["planHash"]).unwrap();
+        assert_eq!(store.plan(&id, &hash).unwrap(), *plan);
+        assert_eq!(plan["approvalRequirement"], "explicit_approval");
+        let current = self.context.borrow();
+        assert_eq!(current["principalRef"], self.principal.as_str());
+        assert_eq!(plan["projectId"], current["projectId"]);
+        assert_eq!(plan["contextId"], current["contextId"]);
+        // Only the trusted fixture request composition records this approval.
+        // A new reservation, source receipt or caller ID never grants it.
+        *self.approved_plan.borrow_mut() = Some((id, hash));
     }
 }
 impl UndoRpcContext for TestUndoRpc {
@@ -328,6 +348,16 @@ impl UndoRpcContext for TestUndoRpc {
     fn current_context(&self) -> StorageResult<Value> {
         self.check()?;
         Ok(self.context.borrow().clone())
+    }
+    fn check_dispatch_plan(&self, plan: &PlanId, hash: &Sha256Digest) -> StorageResult<()> {
+        self.check()?;
+        if self.approved_plan.borrow().as_ref() == Some(&(plan.clone(), hash.clone())) {
+            Ok(())
+        } else {
+            Err(StorageError::Conflict(
+                "Exact owned fixture Apply plan seal",
+            ))
+        }
     }
 }
 
@@ -924,6 +954,7 @@ fn app_undo_intent_atomically_reserves_original_material_and_invocation_once_acr
     let pending = capture_pending(&mut fixture, &rpc, &mut host, &source_report).unwrap();
     retain_actual_settlement(&mut fixture, &source_plan, &source_report, true);
     let plan = undo_plan(&mut fixture, &rpc, &source_report).unwrap();
+    rpc.approve_stored_plan(&fixture.store, &plan);
     let (operation, step, invocation) =
         reserve_undo_candidate(&mut fixture, &rpc, &plan, "undo-first-claim");
     let principal = fixture.principal.clone();
@@ -1051,7 +1082,7 @@ fn app_undo_intent_atomically_reserves_original_material_and_invocation_once_acr
 }
 
 #[test]
-fn app_undo_claim_rejects_live_drift_epoch_cancelled_rpc_revoked_apply_and_forged_receipt_arguments()
+fn app_undo_claim_rejects_drift_epoch_cancelled_revoked_apply_forged_arguments_and_unbound_or_wrong_plan()
  {
     for case in [
         "drift",
@@ -1059,6 +1090,8 @@ fn app_undo_claim_rejects_live_drift_epoch_cancelled_rpc_revoked_apply_and_forge
         "cancelled",
         "apply_revoked",
         "forged_arguments",
+        "unbound_plan",
+        "wrong_plan",
     ] {
         let mut fixture = undo_source_fixture(true, false);
         fixture.target.borrow_mut().observer_available = false;
@@ -1078,6 +1111,15 @@ fn app_undo_claim_rejects_live_drift_epoch_cancelled_rpc_revoked_apply_and_forge
             plan["planHash"] = json!(projected_digest("ExecutionPlan", &plan).unwrap());
             fixture.store.save_plan(&plan).unwrap();
         }
+        match case {
+            "unbound_plan" => (),
+            "wrong_plan" => {
+                let other_actual_plan = undo_plan(&mut fixture, &rpc, &report).unwrap();
+                assert_ne!(other_actual_plan["planId"], plan["planId"]);
+                rpc.approve_stored_plan(&fixture.store, &other_actual_plan);
+            }
+            _ => rpc.approve_stored_plan(&fixture.store, &plan),
+        }
         let (operation, step, invocation) =
             reserve_undo_candidate(&mut fixture, &rpc, &plan, "undo-negative-claim");
         match case {
@@ -1096,7 +1138,7 @@ fn app_undo_claim_rejects_live_drift_epoch_cancelled_rpc_revoked_apply_and_forge
             }
             "cancelled" => rpc.cancelled.set(true),
             "apply_revoked" => fixture.target.borrow_mut().apply_grant = false,
-            "forged_arguments" => (),
+            "forged_arguments" | "unbound_plan" | "wrong_plan" => (),
             _ => unreachable!(),
         }
         let principal = fixture.principal.clone();
@@ -1400,6 +1442,7 @@ fn app_undo_independent_verification_uses_claimed_original_before_and_preserves_
         let source_id: OperationId = decode(&source_report["operationId"]).unwrap();
         let immutable_source = fixture.store.operation(&source_id).unwrap();
         let plan = undo_plan(&mut fixture, &rpc, &source_report).unwrap();
+        rpc.approve_stored_plan(&fixture.store, &plan);
         let (operation, step, invocation) =
             reserve_undo_candidate(&mut fixture, &rpc, &plan, "undo-verify-claim");
         let principal = fixture.principal.clone();

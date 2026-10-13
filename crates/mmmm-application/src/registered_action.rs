@@ -7,6 +7,15 @@ use serde_json::{Value, json};
 
 impl Application<'_> {
     pub fn action_plan(&mut self, principal: &PrincipalId, input: &Value) -> AppResult<Value> {
+        self.action_plan_with_undo(principal, input, None)
+    }
+
+    pub fn action_plan_with_undo(
+        &mut self,
+        principal: &PrincipalId,
+        input: &Value,
+        undo: Option<&mut UndoExecutionContext<'_>>,
+    ) -> AppResult<Value> {
         validate("RegisteredActionRequest", input)?;
         let (context, project) = self.registered_action_context(principal, input, Access::Plan)?;
         let descriptor = self.provider.action_descriptor(input, &context)?;
@@ -21,7 +30,7 @@ impl Application<'_> {
             "contextId":context["contextId"],"intent":{"kind":"external.action","request":input}});
         // The existing planner assembles opaque or typed frozen steps without
         // invoking any provider preview or granting permission to apply them.
-        self.plan_create(principal, &request)
+        self.plan_create_with_undo(principal, &request, undo)
     }
 
     pub fn action_read(&mut self, principal: &PrincipalId, input: &Value) -> AppResult<Value> {

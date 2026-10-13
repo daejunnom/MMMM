@@ -3,6 +3,7 @@
 
 pub mod animation;
 pub mod calibration;
+pub mod calibration_dispatch;
 pub mod math;
 mod pack_owned;
 pub mod packs;
@@ -55,6 +56,7 @@ pub fn compiler_digest() -> mmmm_contracts::Sha256Digest {
         include_bytes!("symbols.rs").as_slice(),
         include_bytes!("math.rs").as_slice(),
         include_bytes!("calibration.rs").as_slice(),
+        include_bytes!("calibration_dispatch.rs").as_slice(),
         include_bytes!("packs.rs").as_slice(),
         include_bytes!("pack_owned.rs").as_slice(),
         include_bytes!("scene.rs").as_slice(),

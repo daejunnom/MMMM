@@ -9,6 +9,15 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 impl Application<'_> {
     pub fn plan_create(&mut self, principal: &PrincipalId, input: &Value) -> AppResult<Value> {
+        self.plan_create_with_undo(principal, input, None)
+    }
+
+    pub fn plan_create_with_undo(
+        &mut self,
+        principal: &PrincipalId,
+        input: &Value,
+        undo: Option<&mut UndoExecutionContext<'_>>,
+    ) -> AppResult<Value> {
         validate("CreatePlanRequest", input)?;
         let project_id: ProjectId = decode(&input["projectId"])?;
         self.authority
@@ -31,7 +40,67 @@ impl Application<'_> {
         let prepared = self
             .planner
             .prepare_with_store(self.store, principal, input, &project, &context)?;
-        self.freeze_plan(principal, &project, &context, prepared)
+        self.freeze_ordinary_plan(principal, &project, &context, prepared, undo)
+    }
+
+    /// Ordinary preparation, including trusted setup, shares one role admission
+    /// boundary. Only the private validated FN15 undo path may freeze a plan for
+    /// a registered recovery-only action.
+    pub(crate) fn freeze_ordinary_plan(
+        &mut self,
+        principal: &PrincipalId,
+        project: &Value,
+        root_context: &Value,
+        prepared: PreparedPlan,
+        mut undo: Option<&mut UndoExecutionContext<'_>>,
+    ) -> AppResult<Value> {
+        check_prepared_limits(&prepared)?;
+        let project_id: ProjectId = decode(&project["projectId"])?;
+        let root_id: ContextId = decode(&root_context["contextId"])?;
+        check_context(principal, &project_id, &root_id, root_context)?;
+        if prepared.scope.project_id != project_id {
+            return Err(AppError::new(
+                "PERMISSION_REQUIRED",
+                "Prepared scope belongs to a different project",
+            ));
+        }
+        for step in &prepared.steps {
+            let context = prepared
+                .contexts
+                .iter()
+                .find(|context| context["contextId"] == step["contextId"])
+                .ok_or_else(|| {
+                    AppError::new("STALE_CONTEXT", "Prepared step has no actual context")
+                })?;
+            check_context(
+                principal,
+                &project_id,
+                &decode(&step["contextId"])?,
+                context,
+            )?;
+            self.authority
+                .authorize(principal, &project_id, Access::Plan, Some(context), None)?;
+            let recovery_only = if let Some(bundle) = undo.as_deref_mut() {
+                let descriptor = self.provider.action_descriptor(step, context)?;
+                crate::undo_provider::install_selected_role(
+                    bundle.material,
+                    self.store,
+                    principal,
+                    step,
+                    context,
+                    &descriptor,
+                )? == UndoActionRole::RecoveryOnly
+            } else {
+                crate::undo_provider::is_recovery_only_step(self.store, step)?
+            };
+            if recovery_only {
+                return Err(AppError::new(
+                    "RECOVERY_REQUIRED",
+                    "A registered undo action requires its retained source and a separately approved recovery plan",
+                ));
+            }
+        }
+        self.freeze_plan(principal, project, root_context, prepared)
     }
 
     pub fn plan_inspect(&mut self, principal: &PrincipalId, input: &Value) -> AppResult<Value> {
@@ -64,18 +133,7 @@ impl Application<'_> {
         let project_id: ProjectId = decode(&project["projectId"])?;
         let root_id: ContextId = decode(&root_context["contextId"])?;
         let mut contexts = BTreeMap::new();
-        if prepared.contexts.len() > 128
-            || prepared.steps.len() > 4096
-            || prepared.preconditions.len() > 4096
-            || prepared.dependency_pins.len() > 1024
-            || prepared.time_budget_ms == 0
-            || prepared.time_budget_ms > 3_600_000
-        {
-            return Err(AppError::new(
-                "BUDGET_EXCEEDED",
-                "Prepared plan exceeds finite application budgets",
-            ));
-        }
+        check_prepared_limits(&prepared)?;
         for context in &prepared.contexts {
             let id: ContextId = decode(&context["contextId"])?;
             check_context(principal, &project_id, &id, context)?;
@@ -246,13 +304,14 @@ impl Application<'_> {
         Ok(context)
     }
 
-    pub(crate) fn preflight(
+    pub(crate) fn preflight_with_undo(
         &mut self,
         principal: &PrincipalId,
         plan: &Value,
         step: &Value,
         operation: &mmmm_contracts::OperationId,
-    ) -> AppResult<(Value, Value)> {
+        undo: Option<&mut UndoExecutionContext<'_>>,
+    ) -> AppResult<(Value, Value, bool)> {
         ensure_unexpired(self.clock, plan)?;
         let project_id: ProjectId = decode(&plan["projectId"])?;
         let project = self
@@ -282,9 +341,46 @@ impl Application<'_> {
                 .ok_or_else(|| AppError::new("STALE_PLAN", "Dependency pins are absent"))?,
             &context,
         )?;
+        let recovery_only = if let Some(bundle) = undo {
+            crate::undo_provider::install_selected_role(
+                bundle.material,
+                self.store,
+                principal,
+                step,
+                &context,
+                &descriptor,
+            )? == UndoActionRole::RecoveryOnly
+        } else {
+            crate::undo_provider::is_recovery_only_step(self.store, step)?
+        };
         let preconditions = plan["preconditions"]
             .as_array()
             .ok_or_else(|| AppError::new("STALE_PLAN", "Preconditions are absent"))?;
+        if recovery_only {
+            let written: BTreeSet<String> = decode::<Vec<String>>(&step["resourcesWritten"])?
+                .into_iter()
+                .collect();
+            let mut targets = BTreeSet::new();
+            if written.is_empty()
+                || !preconditions.iter().all(|condition| {
+                    condition["kind"] == "resource_hash"
+                        && condition["coverage"] == "full_target"
+                        && condition["subject"].as_str().is_some_and(|target| {
+                            written.contains(target) && targets.insert(target.to_owned())
+                        })
+                })
+                || targets != written
+            {
+                return Err(AppError::new(
+                    "RECOVERY_CONFLICT",
+                    "Registered undo requires exactly its frozen full-target source-after preconditions",
+                ));
+            }
+            // Live target reads are performed through the immutable original
+            // source locator before capture and again before atomic claim. The
+            // closed undo arguments cannot select the generic provider target.
+            return Ok((context, descriptor, true));
+        }
         let phase_expected = self.phase_expected_digests(plan, step, operation)?;
         for precondition in preconditions {
             let expected: Sha256Digest = phase_expected
@@ -311,7 +407,7 @@ impl Application<'_> {
                 ));
             }
         }
-        Ok((context, descriptor))
+        Ok((context, descriptor, false))
     }
     pub(crate) fn phase_expected_digests(
         &self,
@@ -458,6 +554,22 @@ pub(crate) fn invocation_deadline(
         })?
         .format(&Rfc3339)
         .map_err(|_| AppError::new("BUDGET_EXCEEDED", "Invocation deadline cannot be encoded"))
+}
+
+fn check_prepared_limits(prepared: &PreparedPlan) -> AppResult<()> {
+    if prepared.contexts.len() > 128
+        || prepared.steps.len() > 4096
+        || prepared.preconditions.len() > 4096
+        || prepared.dependency_pins.len() > 1024
+        || prepared.time_budget_ms == 0
+        || prepared.time_budget_ms > 3_600_000
+    {
+        return Err(AppError::new(
+            "BUDGET_EXCEEDED",
+            "Prepared plan exceeds finite application budgets",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn check_context(

@@ -9,12 +9,20 @@ mod recovery;
 mod registered_action;
 mod report;
 mod result_binding;
+mod setup;
 pub mod types;
-#[cfg(test)]
 mod undo;
+pub mod undo_context;
+pub mod undo_provider;
 
 pub use ports::*;
+pub use setup::{SetupPlanningPort, SetupSelection};
 pub use types::*;
+pub use undo::{
+    HostUndoReceipt, HostUndoRegistration, InspectedHostUndoMaterial, UndoMaterialPort,
+};
+pub use undo_context::{UndoContextPort, UndoExecutionContext};
+pub use undo_provider::{InspectedUndoRoles, UndoActionRole, UndoExecutionPort};
 
 use mmmm_contracts::{ContractValidator, PrincipalId, ProjectId};
 use mmmm_runtime::storage::DurableStore;

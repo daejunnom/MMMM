@@ -20,13 +20,27 @@ impl Application<'_> {
         if step["effect"] == "read" {
             return Ok(());
         }
-        let required = matches!(
-            step["recovery"].as_str(),
-            Some("explicit_patch" | "file_snapshot")
-        );
         let capture = self
             .observer
             .capture_before_retained_with_store(self.store, invocation, scope)?;
+        self.retain_checked_before_capture(plan, step, operation, invocation, scope, capture)
+    }
+
+    /// Both ordinary and registered undo capture enter the same frozen target,
+    /// current phase digest, full scope and durable CAS retention checks.
+    pub(crate) fn retain_checked_before_capture(
+        &mut self,
+        plan: &Value,
+        step: &Value,
+        operation: &OperationId,
+        invocation: &Value,
+        scope: &WriteScope,
+        capture: Option<BeforeCapture>,
+    ) -> AppResult<()> {
+        let required = matches!(
+            step["recovery"].as_str(),
+            Some("explicit_patch" | "file_snapshot")
+        ) || crate::undo_provider::is_recovery_only_step(self.store, step)?;
         let Some(capture) = capture else {
             return if required {
                 Err(AppError::new(

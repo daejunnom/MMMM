@@ -9,8 +9,8 @@ use super::{
     journal::{decode, encode, pin_blob},
 };
 use mmmm_contracts::{
-    BindingId, InvocationId, ObjectId, OperationId, PrincipalId, ProjectId, Sha256Digest, StepId,
-    canonical_digest, encode_json, parse_json, verify_projected_digest,
+    BindingId, InvocationId, ObjectId, OperationId, PlanId, PrincipalId, ProjectId, Sha256Digest,
+    StepId, canonical_digest, encode_json, parse_json, verify_projected_digest,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -115,6 +115,19 @@ pub trait UndoRpcContext {
     fn check(&self) -> StorageResult<()>;
     fn authenticated_principal(&self) -> StorageResult<PrincipalId>;
     fn current_context(&self) -> StorageResult<Value>;
+    /// New claims require this call to be bound to the actual durable plan.
+    /// Inspect only retained authenticated approval, current grants, paired
+    /// context witness and local Apply expiry/budget; never perform host or
+    /// storage I/O. Observe-only receipt contexts deliberately deny claims.
+    fn check_dispatch_plan(
+        &self,
+        _plan_id: &PlanId,
+        _plan_hash: &Sha256Digest,
+    ) -> StorageResult<()> {
+        Err(StorageError::InvalidTransition(
+            "Provider undo claim requires the actual approved plan binding".into(),
+        ))
+    }
 }
 // The original receipt is already observed truth. A revoked caller budget must
 // not discard it after acquisition; this separate bounded local retention phase
@@ -180,6 +193,23 @@ pub trait UndoAuthority {
         target: &str,
         max_bytes: u64,
     ) -> StorageResult<Vec<u8>>;
+    /// Called only before the intent transaction. An actual observer may use
+    /// this same mutable Store to retain acquired target truth before checking
+    /// whether the caller may receive it. The observer must address the stored
+    /// original Invocation/target, while `new_invocation` supplies fresh
+    /// Recovery and Apply approval; closed undo arguments are never locators.
+    /// After retention commits, any authorization/expiry failure remains an
+    /// honest error and must not erase already acquired evidence.
+    fn read_current_target_retained(
+        &mut self,
+        store: &mut DurableStore,
+        record: &ProviderUndoRecord,
+        new_invocation: &Value,
+        target: &str,
+        max_bytes: u64,
+    ) -> StorageResult<Vec<u8>> {
+        self.read_current_target(store, record, new_invocation, target, max_bytes)
+    }
 }
 pub struct UndoDispatchRequest<'a> {
     pub operation_id: &'a OperationId,
@@ -1529,6 +1559,8 @@ pub(crate) struct UndoIntentAuthorization<'a> {
     record_digest: Sha256Digest,
     invocation_digest: Sha256Digest,
     current_context: Value,
+    plan_id: PlanId,
+    plan_hash: Sha256Digest,
 }
 pub(crate) struct UndoClaimInput<'a> {
     pub operation: &'a OperationRecord,
@@ -1543,6 +1575,16 @@ fn validate_claim(
     rpc: &dyn UndoRpcContext,
     record_id: &ObjectId,
 ) -> StorageResult<(ProviderUndoRecord, OriginalSource, BlobRef, Value)> {
+    // This is the new operation's plan, never the original source plan. Both
+    // the precheck and the same writer transaction use this durable identity.
+    rpc.check_dispatch_plan(&input.operation.plan_id, &input.operation.plan_hash)?;
+    if input.invocation["operationId"] != input.operation.operation_id.as_str()
+        || input.invocation["stepId"] != input.step["stepId"]
+        || input.invocation["context"]["projectId"] != input.operation.project_id.as_str()
+        || input.invocation["context"]["principalRef"] != input.operation.principal.as_str()
+    {
+        return Err(StorageError::Conflict("Undo new invocation identity"));
+    }
     let record = read_record_inner(store, record_id)?;
     if record.state != UndoRecordState::Available {
         return Err(StorageError::Conflict(
@@ -1631,7 +1673,7 @@ fn validate_claim(
     Ok((record, source, observation, current))
 }
 fn prepare_undo_authorization<'a>(
-    store: &DurableStore,
+    store: &mut DurableStore,
     rpc: &'a dyn UndoRpcContext,
     authority: &mut dyn UndoAuthority,
     request: &UndoDispatchRequest<'a>,
@@ -1671,7 +1713,7 @@ fn prepare_undo_authorization<'a>(
         let remaining = STATE_BYTES
             .checked_sub(total)
             .ok_or_else(|| invalid("Undo current state byte budget exceeded"))?;
-        let bytes = authority.read_current_target(
+        let bytes = authority.read_current_target_retained(
             store,
             &record,
             request.invocation,
@@ -1701,12 +1743,15 @@ fn prepare_undo_authorization<'a>(
             "Undo authority changed during precheck",
         ));
     }
+    rpc.check_dispatch_plan(&operation.plan_id, &operation.plan_hash)?;
     Ok(UndoIntentAuthorization {
         record_id: request.undo_record_id,
         rpc,
         record_digest: mmmm_contracts::raw_digest(encode_record(&record)?.as_bytes()),
         invocation_digest: invocation_blob.digest,
         current_context: current,
+        plan_id: operation.plan_id,
+        plan_hash: operation.plan_hash,
     })
 }
 /// The precheck seal contains no public constructor or transport port. Inside
@@ -1724,6 +1769,8 @@ pub(crate) fn reserve_undo_in(
     if mmmm_contracts::raw_digest(encode_record(&record)?.as_bytes()) != authorization.record_digest
         || input.invocation_blob.digest != authorization.invocation_digest
         || current != authorization.current_context
+        || input.operation.plan_id != authorization.plan_id
+        || input.operation.plan_hash != authorization.plan_hash
     {
         return Err(StorageError::Conflict(
             "Undo precheck seal differs from durable/current claim",
@@ -1768,6 +1815,9 @@ pub(crate) fn reserve_undo_in(
         pin_blob(transaction, "undo_claim", invocation_id.as_str(), reference)?;
     }
     authorization.rpc.check()?;
+    authorization
+        .rpc
+        .check_dispatch_plan(&input.operation.plan_id, &input.operation.plan_hash)?;
     Ok(())
 }
 

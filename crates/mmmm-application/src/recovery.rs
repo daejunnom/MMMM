@@ -6,6 +6,15 @@ use std::collections::BTreeMap;
 
 impl Application<'_> {
     pub fn recovery_plan(&mut self, principal: &PrincipalId, input: &Value) -> AppResult<Value> {
+        self.recovery_plan_with_undo(principal, input, None)
+    }
+
+    pub fn recovery_plan_with_undo(
+        &mut self,
+        principal: &PrincipalId,
+        input: &Value,
+        undo: Option<&mut UndoExecutionContext<'_>>,
+    ) -> AppResult<Value> {
         validate("RecoveryRequest", input)?;
         let operation: OperationId = decode(&input["operationId"])?;
         let context_id: ContextId = decode(&input["contextId"])?;
@@ -14,13 +23,15 @@ impl Application<'_> {
             &json!({"operationId":operation,"contextId":context_id}),
             Access::Recovery,
         )?;
-        if input["mode"] != "recorded_direct" {
-            // No token registry exists yet. A descriptor claiming undo support
-            // cannot supply a valid session-bound durable token by itself.
-            return Err(AppError::new(
-                "RECOVERY_EXPIRED",
-                "No retained provider undo token is available for this operation",
-            ));
+        if input["mode"] == "provider_undo" {
+            let bundle = undo.ok_or_else(|| {
+                AppError::new(
+                    "RECOVERY_EXPIRED",
+                    "No actual provider undo composition is available for this operation",
+                )
+            })?;
+            let rpc = bundle.open_for_recovery(self.store, principal, &context_id)?;
+            return self.provider_undo_plan(principal, input, rpc.as_ref());
         }
         let project = self
             .store
@@ -116,9 +127,11 @@ impl Application<'_> {
                     "Recovery belongs to an earlier binding, world or session epoch",
                 ));
             }
-            let current =
-                self.observer
-                    .read_target_with_store(self.store, &invocation, &snapshot.target)?;
+            let current = self.observer.read_target_retained_with_store(
+                self.store,
+                &invocation,
+                &snapshot.target,
+            )?;
             let current_ref = self
                 .store
                 .put_blob(&current)
@@ -171,6 +184,6 @@ impl Application<'_> {
                 ));
             }
         }
-        self.freeze_plan(principal, &project, &context, prepared)
+        self.freeze_ordinary_plan(principal, &project, &context, prepared, undo)
     }
 }

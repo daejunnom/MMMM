@@ -136,6 +136,17 @@ pub trait ProviderPort {
     /// A successful return acknowledges a request, not stopped effects. Apply
     /// revocation does not revoke a separately authorized current Cancel grant.
     fn request_cancel(&mut self, invocation: &Value, receipt: Option<&str>) -> AppResult<()>;
+    /// The common cancel path supplies the same durable store that owns this
+    /// original invocation. A provider may validate its retained host route
+    /// through that ownership before issuing the cooperative request.
+    fn request_cancel_with_store(
+        &mut self,
+        _store: &mut DurableStore,
+        invocation: &Value,
+        receipt: Option<&str>,
+    ) -> AppResult<()> {
+        self.request_cancel(invocation, receipt)
+    }
     /// A dedicated registered read boundary enforces mutation prohibition. It
     /// uses the current authenticated context, not a fabricated write operation.
     fn registered_read_with_store(
@@ -282,6 +293,17 @@ pub trait IndependentObserverPort {
         target: &str,
     ) -> AppResult<Vec<u8>> {
         self.read_target(stored_invocation, target)
+    }
+    /// Acquire and retain fresh private observation evidence before a recovery
+    /// claim or while observing its original target. Only CAS/pins may change;
+    /// this hook grants no mutation or authored-project commit authority.
+    fn read_target_retained_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        stored_invocation: &Value,
+        target: &str,
+    ) -> AppResult<Vec<u8>> {
+        self.read_target_with_store(store, stored_invocation, target)
     }
 }
 

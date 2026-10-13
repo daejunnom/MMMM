@@ -112,6 +112,8 @@ Java가 action schema를 compile했다는 사실은 Rust의 full schema meta-val
 | inspect `runtime_sources` | 실제 game/mod archive의 입력 컨테이너 SHA, 현재 ordered server pack view와 generation을 관측한다. 동적·불명확한 pack과 client pack은 unknown/null이다. |
 | inspect `native_targets` | 닫힌 block-state·block-entity·entity·storage·score·objective selector와 실제 native codec으로 bounded raw before/readback을 반환한다. 대상마다 membership·presence·coverage를 보존하며 tick window나 같은 호스트 결과를 독립 완료로 승격하지 않는다. |
 | inspect `undo_registration` | 선등록된 source→undo 관계와 실제 descriptor/source digest를 반환한다. 원래 operation report의 undoTokenRecord는 host가 동결한 영수증이며 비공개 provider token을 포함하지 않는다. |
+| inspect `undo_role` | 정확한 binding/action의 전체 descriptor와 `ordinary`·`source`·`recovery_only` 역할, 실제 등록 관계 및 세대 digest를 반환한다. 성공한 전체 조회는 등록 세대를 닫으며 불완전한 등록을 ordinary로 처리하지 않는다. |
+| inspect `undo_job` | 원래 복구 호출의 실제 SDK 실행 사실과 소비한 원래 source 호출·공개 영수증 연결을 조회한다. 다섯 영수증 참조 인수를 block/entity selector로 해석하지 않는다. |
 
 `rotationDegrees`의 array 순서는 원본 자료에 명시되지 않았다. MMMM 구현 결정은
 `[pitchDegrees, yawDegrees]`이며 native Vec2도 같은 순서를 사용한다. 0이 아닌 두
@@ -179,6 +181,36 @@ dispatch에서 발급한 불변 CalibrationRun 영수증을 조회하는 typed p
 mutation 직전에 다시 확인한다. 원래 receipt의 source policy와 context는 그대로
 보존하며, 새 복구 context에서 바뀔 수 있는 authority 필드는 policyRevision과 그에
 따른 contextDigest뿐이다.
+
+`undo_role`의 요청은 닫힌 `{kind, bindingId, actionId}`이며 실제 등록된 binding과
+action을 함께 선택한다. source의 `provider_undo` 선언에는 선등록된 source→undo 관계가,
+실제 Recover callback에는 역관계가 있어야 한다. 전체 등록 세대에서 이 검사를 마친
+첫 성공 조회는 추가 provider/action/undo 등록을 거절한다. 실패한 조회는 세대를
+성공으로 닫지 않으며 기존 setup 오류를 자동으로 새 세대로 대체하지 않는다.
+선택한 action에 직접 연결된 관계만 최대 64개, 최종 응답은 256 KiB로 제한한다.
+한도를 넘으면 `INPUT_LIMIT`이며 생략한 관계를 완전한 조회로 반환하지 않는다.
+등록 세대 digest는 실제 원본 ProviderInventory의 inventoryRevision과 정렬된 전체
+undo 관계의 binding/action 및 정본 descriptor SHA를 포함한 JCS 객체의 SHA다.
+Fabric 응답에는 이 역할 조회와 현재 context/environment, 실제 runtime source facts
+digest, host artifact SHA, registry generation 및 관측 tick/시각을 결합한다.
+이 관측은 Apply 권한이나 runtime profile 검증을 발급하지 않는다.
+
+`undo_job`은 닫힌 `{kind, invocationId}` 요청으로 원래 복구 HostSession과 전체
+설치 문맥을 확인한다. claim 때 원자적으로 얻은 source Invocation과 공개 영수증은
+원래 source의 실제 session route에 묶이며, 같은 scalar ID의 최신 session으로
+이동하지 않는다. 비공개 제공자 토큰은 조회에 포함하지 않는다. 실제 callback 진입,
+변이 경계, 취소, polling, 원래 future의 완료/실패, context 폐기 및 대기 중인
+게임 스레드 callback 수를 각각 기록한다. timeout으로 만든 ProviderResult나 늦게
+완료된 future는 이미 닫힌 보고를 성공으로 바꾸지 않는다.
+`synchronous_quiescent`는 실제 synchronous 등록 callback이 끝나고 SDK context가
+닫혔으며 추적된 게임 스레드 작업과 접수된 비동기 job이 없다는 SDK 실행 사실이다.
+비동기 job의 실제 종료 producer가 없으면 접수 이력을 계속 outstanding으로 보존한다.
+이는 원래 세계 대상의 복원, 간접 효과의 종료나 rollback 완료 증명이 아니다.
+Rust는 단일 원장에 보존한 실제 source 대상과 before/after 관측을 새 권한으로 다시
+읽어 효과를 `None`·`Some`·`Complete`·`Unknown`으로 판정한다. 미관측 target codec,
+간접 효과 또는 비동기 종료는 unknown으로 남기며 token 재사용이나 claim 해제를
+허용하는 근거로 바꾸지 않는다. 새 역할/job 회귀 소스는 별도 실제 검사 전까지
+이 문서의 이전 Java 성공 근거에 포함하지 않는다.
 
 현재 native batch·승인 회전·관측기·readonly accessor는 작성한 후속 source이며 실제
 컴파일과 게임 인수를 계속해야 한다. 전형적인 prefab/display/entity/module/scene 전체

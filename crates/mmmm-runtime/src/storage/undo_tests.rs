@@ -10,7 +10,7 @@ use crate::storage::{
         ResultFootprint, ResultResolutionWitness, ResultStepBinding,
     },
 };
-use mmmm_contracts::{ContextId, projected_digest, raw_digest};
+use mmmm_contracts::{ContextId, PlanId, projected_digest, raw_digest};
 use std::{
     cell::Cell,
     fs,
@@ -89,6 +89,9 @@ struct Rpc {
     cancel_at: Option<usize>,
     cancelled: Rc<Cell<bool>>,
     context_changed: Rc<Cell<bool>>,
+    bound_plan: Option<(PlanId, Sha256Digest)>,
+    binding_expired: Rc<Cell<bool>>,
+    dispatch_plan_checks: Cell<usize>,
 }
 impl UndoRpcContext for Rpc {
     fn check(&self) -> StorageResult<()> {
@@ -113,6 +116,43 @@ impl UndoRpcContext for Rpc {
         }
         Ok(current)
     }
+    fn check_dispatch_plan(&self, plan_id: &PlanId, plan_hash: &Sha256Digest) -> StorageResult<()> {
+        self.check()?;
+        self.dispatch_plan_checks
+            .set(self.dispatch_plan_checks.get() + 1);
+        if self.binding_expired.get()
+            || !self
+                .bound_plan
+                .as_ref()
+                .is_some_and(|(id, hash)| id == plan_id && hash == plan_hash)
+        {
+            return Err(StorageError::Conflict(
+                "Fixture Apply approval is not bound to this plan",
+            ));
+        }
+        Ok(())
+    }
+}
+// This Observe context intentionally inherits the trait's deny-by-default
+// dispatch method; receipt acquisition alone cannot grant Apply authority.
+struct ObserveOnly<'a>(&'a Rpc);
+impl UndoRpcContext for ObserveOnly<'_> {
+    fn check(&self) -> StorageResult<()> {
+        self.0.check()
+    }
+    fn authenticated_principal(&self) -> StorageResult<PrincipalId> {
+        self.0.authenticated_principal()
+    }
+    fn current_context(&self) -> StorageResult<Value> {
+        self.0.current_context()
+    }
+}
+#[derive(Clone)]
+struct CurrentReadEvidence {
+    target: String,
+    raw: BlobRef,
+    envelope: BlobRef,
+    summary: BlobRef,
 }
 struct Authority {
     denied: bool,
@@ -123,6 +163,11 @@ struct Authority {
     change_context_at: Option<usize>,
     context_changed: Rc<Cell<bool>>,
     current: BTreeMap<String, Vec<u8>>,
+    target_reads: usize,
+    retain_current_reads: bool,
+    retained_current_reads: Vec<CurrentReadEvidence>,
+    expire_binding_after_read: Option<usize>,
+    binding_expired: Rc<Cell<bool>>,
 }
 impl UndoAuthority for Authority {
     fn authorize_capture(
@@ -197,6 +242,7 @@ impl UndoAuthority for Authority {
             store.connection.is_autocommit(),
             "native target reads must not hold a SQLite write transaction"
         );
+        self.target_reads += 1;
         let bytes = self
             .current
             .get(target)
@@ -205,6 +251,79 @@ impl UndoAuthority for Authority {
             return Err(invalid("Fixture target budget exceeded"));
         }
         Ok(bytes.clone())
+    }
+    fn read_current_target_retained(
+        &mut self,
+        store: &mut DurableStore,
+        record: &ProviderUndoRecord,
+        new_invocation: &Value,
+        target: &str,
+        max_bytes: u64,
+    ) -> StorageResult<Vec<u8>> {
+        assert!(store.connection.is_autocommit());
+        let bytes = self.read_current_target(store, record, new_invocation, target, max_bytes)?;
+        if self.retain_current_reads {
+            // The original durable Invocation owns the target locator. Closed
+            // new undo arguments provide neither a locator nor source authority.
+            let source = store.stored_invocation_checked(
+                &record.source_operation_id,
+                &record.source_step_id,
+                8 * 1024 * 1024,
+                || Ok(()),
+            )?;
+            assert_eq!(source["invocationId"], record.source_invocation_id.as_str());
+            assert_eq!(source["context"], record.source_context);
+            let original = store
+                .stored_invocation_blob(&record.source_operation_id, &record.source_step_id)?;
+            let operation = record.source_operation_id.clone();
+            let raw = store.put_blob(&bytes)?;
+            // The unique envelope has no prior source pin, so its survival
+            // proves fresh original-source truth retention before any claim.
+            let envelope = store.put_blob(&encode_json(&json!({
+                "kind":"authored_recovery_target_observation",
+                    "operationId":operation,"stepId":record.source_step_id,"invocationId":record.source_invocation_id,
+                    "callOperationId":new_invocation["operationId"],"callInvocationId":new_invocation["invocationId"],
+                "sourceOperationId":record.source_operation_id,"sourceInvocation":original,
+                "target":target,"targetBlob":raw,
+            })).map_err(contract)?)?;
+            let summary = store.put_blob(
+                &encode_json(&json!({
+                    "kind":"authored_recovery_target_summary","operationId":operation,
+                    "stepId":record.source_step_id,"invocationId":record.source_invocation_id,
+                    "callOperationId":new_invocation["operationId"],"callInvocationId":new_invocation["invocationId"],
+                    "target":target,"readbackBlob":envelope,
+                }))
+                .map_err(contract)?,
+            )?;
+            let already_pinned: i64 = store.connection.query_row(
+                "SELECT count(*) FROM blob_refs WHERE owner_id=?1 AND digest=?2",
+                params![operation.as_str(), envelope.digest.as_str()],
+                |row| row.get(0),
+            )?;
+            assert_eq!(
+                already_pinned, 0,
+                "fresh source truth cannot rely on an existing after pin"
+            );
+            store.append_operation_summary(
+                &operation,
+                &summary,
+                &[envelope.clone(), raw.clone(), original],
+            )?;
+            assert!(store.connection.is_autocommit());
+            self.retained_current_reads.push(CurrentReadEvidence {
+                target: target.into(),
+                raw,
+                envelope,
+                summary,
+            });
+        }
+        if self
+            .expire_binding_after_read
+            .is_some_and(|n| self.target_reads >= n)
+        {
+            self.binding_expired.set(true);
+        }
+        Ok(bytes)
     }
 }
 struct SourceSession {
@@ -408,6 +527,7 @@ impl Fixture {
         );
         let context_changed = Rc::new(Cell::new(false));
         let cancelled = Rc::new(Cell::new(false));
+        let binding_expired = Rc::new(Cell::new(false));
         Self {
             store,
             root,
@@ -418,6 +538,9 @@ impl Fixture {
                 cancel_at: None,
                 cancelled: cancelled.clone(),
                 context_changed: context_changed.clone(),
+                bound_plan: None,
+                binding_expired: binding_expired.clone(),
+                dispatch_plan_checks: Cell::new(0),
             },
             authority: Authority {
                 denied: false,
@@ -431,6 +554,11 @@ impl Fixture {
                     (TARGET_A.into(), b"after-a".to_vec()),
                     (TARGET_B.into(), b"after-b".to_vec()),
                 ]),
+                target_reads: 0,
+                retain_current_reads: false,
+                retained_current_reads: vec![],
+                expire_binding_after_read: None,
+                binding_expired,
             },
             session: SourceSession {
                 receipt,
@@ -627,6 +755,10 @@ impl Fixture {
         pin_context(&mut plan, &self.rpc.context);
         let operation = OperationId::new(name).unwrap();
         reserve(&mut self.store, &plan, &operation);
+        self.rpc.bound_plan = Some((
+            serde_json::from_value(plan["planId"].clone()).unwrap(),
+            serde_json::from_value(plan["planHash"].clone()).unwrap(),
+        ));
         let invocation = invocation_for(
             &plan,
             0,
@@ -1563,6 +1695,288 @@ fn ordinary_and_valid_result_resolved_plans_cannot_dispatch_registered_undo_rout
             .state,
         UndoRecordState::Available
     );
+}
+
+#[test]
+fn actual_plan_binding_and_retained_target_truth_are_checked_before_and_inside_claim() {
+    for case in [
+        "other-plan-id",
+        "other-plan-hash",
+        "unbound-observe",
+        "default-deny-observe",
+        "wrong-invocation-operation",
+        "retained-expiry",
+        "writer-expiry",
+        "retained-valid",
+    ] {
+        let mut fixture = Fixture::new(false);
+        if matches!(case, "unbound-observe" | "default-deny-observe") {
+            fixture.rpc.binding_expired.set(true);
+        }
+        assert!(fixture.rpc.bound_plan.is_none());
+        let pending = if case == "default-deny-observe" {
+            register_undo_record(
+                &mut fixture.store,
+                &ObserveOnly(&fixture.rpc),
+                &mut fixture.authority,
+                &mut fixture.session,
+                &fixture.request,
+            )
+            .unwrap()
+        } else {
+            fixture.pending().unwrap()
+        };
+        assert_eq!(pending.state, UndoRecordState::Pending);
+        fixture.settle(EffectEvidence::CompleteConfirmed, "valid");
+        let available = fixture.promote(&pending.record_id).unwrap();
+        assert_eq!(available.state, UndoRecordState::Available);
+        assert_eq!(
+            fixture.rpc.dispatch_plan_checks.get(),
+            0,
+            "Observe capture and durable promotion do not grant Apply authority"
+        );
+        fixture.rpc.binding_expired.set(false);
+        let original = fixture
+            .store
+            .operation(&fixture.request.source_operation_id)
+            .unwrap();
+
+        let (operation_a, invocation_a) = fixture.new_intent(&available, "undo-approved-a", |_| {});
+        let approved_a = fixture.rpc.bound_plan.clone().unwrap();
+        let actual_a = fixture.store.operation(&operation_a).unwrap();
+        let (operation_b, mut invocation_b) =
+            fixture.new_intent(&available, "undo-actual-b", |_| {});
+        let actual_b = fixture.store.operation(&operation_b).unwrap();
+        let plan_a = fixture
+            .store
+            .plan(&actual_a.plan_id, &actual_a.plan_hash)
+            .unwrap();
+        let plan_b = fixture
+            .store
+            .plan(&actual_b.plan_id, &actual_b.plan_hash)
+            .unwrap();
+        assert_ne!(actual_a.plan_id, actual_b.plan_id);
+        assert_ne!(actual_a.plan_hash, actual_b.plan_hash);
+        assert_eq!(plan_a["steps"], plan_b["steps"]);
+        assert_eq!(plan_a["scope"], plan_b["scope"]);
+        assert_eq!(plan_a["contextPins"], plan_b["contextPins"]);
+        assert_eq!(invocation_a["arguments"], invocation_b["arguments"]);
+        assert_eq!(invocation_a["context"], invocation_b["context"]);
+        match case {
+            "other-plan-id" => fixture.rpc.bound_plan = Some(approved_a),
+            "other-plan-hash" => {
+                fixture.rpc.bound_plan =
+                    Some((actual_b.plan_id.clone(), actual_a.plan_hash.clone()))
+            }
+            "unbound-observe" => {
+                fixture.rpc.bound_plan = None;
+                fixture.rpc.binding_expired.set(true);
+            }
+            "wrong-invocation-operation" => invocation_b["operationId"] = json!(operation_a),
+            "retained-expiry" => {
+                fixture.authority.retain_current_reads = true;
+                fixture.authority.expire_binding_after_read = Some(1);
+            }
+            "writer-expiry" | "retained-valid" => fixture.authority.retain_current_reads = true,
+            _ => (),
+        }
+
+        let result = if case == "default-deny-observe" {
+            dispatch_undo_intent(
+                &mut fixture.store,
+                &ObserveOnly(&fixture.rpc),
+                &mut fixture.authority,
+                &UndoDispatchRequest {
+                    operation_id: &operation_b,
+                    step_id: &StepId::new("undo-step").unwrap(),
+                    invocation: &invocation_b,
+                    undo_record_id: &available.record_id,
+                },
+            )
+        } else if case == "writer-expiry" {
+            // Use the real precheck and SQLite writer, then expire only the
+            // local Apply binding. Native observations may not run in writer.
+            let step = StepId::new("undo-step").unwrap();
+            let request = UndoDispatchRequest {
+                operation_id: &operation_b,
+                step_id: &step,
+                invocation: &invocation_b,
+                undo_record_id: &available.record_id,
+            };
+            let seal = prepare_undo_authorization(
+                &mut fixture.store,
+                &fixture.rpc,
+                &mut fixture.authority,
+                &request,
+            )
+            .unwrap();
+            let reads = fixture.authority.target_reads;
+            let checks = fixture.rpc.dispatch_plan_checks.get();
+            fixture.rpc.binding_expired.set(true);
+            let result = fixture.store.dispatch_intent_internal(
+                &operation_b,
+                &step,
+                &invocation_b,
+                None,
+                Some(seal),
+            );
+            assert_eq!(fixture.authority.target_reads, reads);
+            assert!(fixture.rpc.dispatch_plan_checks.get() > checks);
+            result
+        } else {
+            fixture.dispatch(&available, &operation_b, &invocation_b)
+        };
+
+        if case == "retained-valid" {
+            assert_eq!(result.unwrap().dispatch, DispatchEvidence::IntentDurable);
+            assert!(
+                matches!(read_record_inner(&fixture.store, &available.record_id).unwrap().state,
+                UndoRecordState::Reserved { ref operation_id, .. } if operation_id == &operation_b)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .stored_invocation(&operation_b, &StepId::new("undo-step").unwrap())
+                    .unwrap(),
+                invocation_b
+            );
+        } else {
+            match case {
+                "default-deny-observe" => assert!(
+                    matches!(result, Err(StorageError::InvalidTransition(message))
+                    if message.contains("actual approved plan binding"))
+                ),
+                "wrong-invocation-operation" => assert!(matches!(
+                    result,
+                    Err(StorageError::Conflict("Undo new invocation identity"))
+                )),
+                _ => assert!(
+                    matches!(
+                        result,
+                        Err(StorageError::Conflict(
+                            "Fixture Apply approval is not bound to this plan"
+                        ))
+                    ),
+                    "case={case}"
+                ),
+            }
+            fixture.assert_no_intent(&operation_b);
+            assert_eq!(
+                read_record_inner(&fixture.store, &available.record_id)
+                    .unwrap()
+                    .state,
+                UndoRecordState::Available,
+                "case={case}"
+            );
+            let claim_rows: i64 = fixture.store.connection.query_row(
+                "SELECT count(*) FROM events WHERE operation_id=?1 AND kind IN ('provider_undo_claim','dispatch_intent')",
+                [operation_b.as_str()], |row| row.get(0),
+            ).unwrap();
+            let claim_pins: i64 = fixture
+                .store
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM blob_refs WHERE owner_kind='undo_claim' AND owner_id=?1",
+                    [invocation_b["invocationId"].as_str().unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let fences: i64 = fixture
+                .store
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM write_fences WHERE operation_id=?1",
+                    [operation_b.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!((claim_rows, claim_pins, fences), (0, 0, 0), "case={case}");
+        }
+        assert_eq!(
+            fixture
+                .store
+                .operation(&fixture.request.source_operation_id)
+                .unwrap(),
+            original
+        );
+        fixture.assert_no_intent(&operation_a);
+        assert_eq!(fixture.session.calls, 1);
+
+        if matches!(case, "retained-expiry" | "writer-expiry" | "retained-valid") {
+            assert_eq!(fixture.authority.target_reads, 2);
+            assert_eq!(fixture.authority.retained_current_reads.len(), 2);
+            let retained = fixture.authority.retained_current_reads.clone();
+            let exact: Vec<_> = retained
+                .iter()
+                .map(|evidence| {
+                    (
+                        fixture.store.read_blob(&evidence.raw).unwrap(),
+                        fixture.store.read_blob(&evidence.envelope).unwrap(),
+                        fixture.store.read_blob(&evidence.summary).unwrap(),
+                    )
+                })
+                .collect();
+            fixture.store.collect_orphan_blobs(1000).unwrap();
+            let fixture = fixture.reopen();
+            let associations =
+                associations(&fixture.store, &fixture.rpc, &available.source_operation_id).unwrap();
+            for (evidence, (raw, envelope, summary)) in retained.iter().zip(exact) {
+                assert_eq!(fixture.store.read_blob(&evidence.raw).unwrap(), raw);
+                assert_eq!(
+                    fixture.store.read_blob(&evidence.envelope).unwrap(),
+                    envelope
+                );
+                assert_eq!(fixture.store.read_blob(&evidence.summary).unwrap(), summary);
+                let observed = parse_json(&envelope).unwrap();
+                assert_eq!(
+                    observed["sourceOperationId"],
+                    available.source_operation_id.as_str()
+                );
+                assert_eq!(observed["target"], evidence.target);
+                let association = associations
+                    .iter()
+                    .find(|item| item.summary == evidence.summary)
+                    .unwrap();
+                assert!(association.source_blobs.contains(&evidence.raw));
+                assert!(association.source_blobs.contains(&evidence.envelope));
+                let source_pin: i64 = fixture
+                    .store
+                    .connection
+                    .query_row(
+                        "SELECT count(*) FROM blob_refs WHERE owner_kind='application_evidence' AND owner_id=?1 AND digest=?2",
+                        params![
+                            available.source_operation_id.as_str(),
+                            evidence.envelope.digest.as_str()
+                        ],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(source_pin, 1, "new truth retains the original source owner");
+            }
+            assert_eq!(
+                read_record_inner(&fixture.store, &available.record_id)
+                    .unwrap()
+                    .state,
+                if case == "retained-valid" {
+                    UndoRecordState::Reserved {
+                        operation_id: operation_b.clone(),
+                        step_id: StepId::new("undo-step").unwrap(),
+                        invocation_id: serde_json::from_value(invocation_b["invocationId"].clone())
+                            .unwrap(),
+                        invocation_digest: raw_digest(&encode_json(&invocation_b).unwrap()),
+                    }
+                } else {
+                    UndoRecordState::Available
+                }
+            );
+            if case != "retained-valid" {
+                fixture.assert_no_intent(&operation_b);
+            }
+        } else {
+            assert_eq!(fixture.authority.target_reads, 0, "case={case}");
+            assert_eq!(fixture.authority.recovery_checks, 0, "case={case}");
+        }
+    }
 }
 
 #[test]

@@ -102,6 +102,11 @@ final class ScopedUndoTokens {
      * 없으며, 같은 호출의 중복 처리는 HostRuntime의 호출 기록이 담당한다.
      */
     synchronized ObjectNode claim(HostSession current, Invocation recovery) {
+        return claimWithSource(current, recovery).privateToken();
+    }
+
+    /** Private token and public provenance are obtained from the same atomic consumed entry. */
+    synchronized ClaimedUndo claimWithSource(HostSession current, Invocation recovery) {
         Owner owner = owner(current, recovery);
         ObjectNode arguments = recovery.arguments();
         if (arguments.size() != CLAIM_FIELDS.size()) throw invalidClaim();
@@ -128,7 +133,16 @@ final class ScopedUndoTokens {
         if (!claimed.add(id)) {
             throw failure("RECOVERY_EXPIRED", "Undo material is unavailable or already claimed");
         }
-        return entry.privateToken().deepCopy();
+        return new ClaimedUndo(entry.privateToken(), entry.source(), entry.receipt());
+    }
+
+    record ClaimedUndo(ObjectNode privateToken, ObjectNode sourceInvocation, ObjectNode sourceReceipt) {
+        ClaimedUndo {
+            privateToken = privateToken.deepCopy(); sourceInvocation = sourceInvocation.deepCopy(); sourceReceipt = sourceReceipt.deepCopy();
+        }
+        @Override public ObjectNode privateToken() { return privateToken.deepCopy(); }
+        @Override public ObjectNode sourceInvocation() { return sourceInvocation.deepCopy(); }
+        @Override public ObjectNode sourceReceipt() { return sourceReceipt.deepCopy(); }
     }
 
     /** 호스트 generation 전체의 종료 때 호출한다. 개별 승인 세션 종료 때 지우지 않는다. */

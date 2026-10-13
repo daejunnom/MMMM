@@ -514,7 +514,7 @@ public final class MmmmFabricHost implements ModInitializer {
             try {
                 if (result.isDone()) return;
                 Set<String> required = "command_complete".equals(kind) ? Set.of("mmmm:command_complete")
-                        : Set.of("undo_registration", "undo_material").contains(kind) ? Set.of("mmmm:provider_inventory") : Set.of("mmmm:world_read");
+                        : Set.of("undo_registration", "undo_material", "undo_role", "undo_job").contains(kind) ? Set.of("mmmm:provider_inventory") : Set.of("mmmm:world_read");
                 new PlatformAuthority(null).check(paired, context, required, false);
                 if ("undo_registration".equals(kind)) {
                     HostDispatcher.exactFields(payload, Set.of("kind", "bindingId", "sourceActionId"));
@@ -522,6 +522,17 @@ public final class MmmmFabricHost implements ModInitializer {
                 } else if ("undo_material".equals(kind)) {
                     HostDispatcher.exactFields(payload, Set.of("kind", "sourceInvocationId"));
                     result.complete(runtime.undoMaterial(paired, context, HostDispatcher.string(payload, "sourceInvocationId")));
+                } else if ("undo_role".equals(kind)) {
+                    HostDispatcher.exactFields(payload, Set.of("kind", "bindingId", "actionId"));
+                    long fromTick = Integer.toUnsignedLong(server.getTickCount());
+                    ObjectNode actualFacts = NativeSourceFacts.observe(server, Long.toString(registryGeneration), environment());
+                    String hostArtifact = artifactDigest(container("mmmm_host"));
+                    result.complete(runtime.undoRole(HostDispatcher.string(payload, "bindingId"), HostDispatcher.string(payload, "actionId"),
+                            registration -> NativeUndoInspection.role(registration, context, actualFacts, hostArtifact,
+                                    Long.toString(registryGeneration), fromTick, Integer.toUnsignedLong(server.getTickCount()), java.time.Instant.now())));
+                } else if ("undo_job".equals(kind)) {
+                    HostDispatcher.exactFields(payload, Set.of("kind", "invocationId"));
+                    result.complete(runtime.undoJob(paired, context, HostDispatcher.string(payload, "invocationId")));
                 } else if ("command_complete".equals(kind)) {
                     HostDispatcher.exactFields(payload, Set.of("kind", "request"));
                     JsonNode request = payload.get("request"); contracts.validate("CompleteRequest", request);

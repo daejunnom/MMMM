@@ -28,6 +28,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
+import java.util.function.UnaryOperator;
 
 /** Bounded transient host dispatch. Durable intents, planning and recovery remain in Rust. */
 public final class HostRuntime implements AutoCloseable {
@@ -40,6 +41,7 @@ public final class HostRuntime implements AutoCloseable {
     private record Action(ObjectNode descriptor, String digest, ActionHandler handler,
                           OptionalCallbacks callbacks, JsonSchema input, JsonSchema output) { }
     private record Key(HostSession session, String invocationId) { }
+    private record UndoAssociation(Key sourceRoute, Invocation sourceInvocation, ObjectNode sourceReceipt) { }
     /** Approval rotation does not create a new identity for an already accepted invocation. */
     private record OwnerInvocationKey(String principalRef, String epoch, String gameInstanceId,
                                       String side, UUID playerId, String bindingId, String invocationId) {
@@ -56,6 +58,12 @@ public final class HostRuntime implements AutoCloseable {
         private final List<ObjectNode> effects = new ArrayList<>();
         private volatile boolean entered;
         private volatile boolean mutationStarted;
+        private volatile boolean callbackInvoked;
+        private volatile boolean rawCallbackSettled;
+        private volatile boolean rawCallbackFailed;
+        private volatile boolean providerJobEverAccepted;
+        private final AtomicInteger pendingGameThreadTasks = new AtomicInteger();
+        private UndoAssociation undoAssociation;
         private volatile ProviderResult latest;
         private volatile boolean providerFinal;
         private final AtomicBoolean polling = new AtomicBoolean();
@@ -87,6 +95,8 @@ public final class HostRuntime implements AutoCloseable {
     private long sequence;
     private int retainedBytes;
     private int registrationBytes;
+    private String registrationGeneration;
+    private boolean registrationInspection;
     private volatile boolean closed;
     private final AtomicInteger activeReads = new AtomicInteger();
 
@@ -101,7 +111,7 @@ public final class HostRuntime implements AutoCloseable {
 
     public synchronized void register(String bindingId, JsonNode descriptor,
                                       ActionHandler handler, OptionalCallbacks callbacks) {
-        if (closed || !invocations.isEmpty()) throw new ContractException("REGISTRATION_CLOSED", "Registration generation is frozen");
+        if (closed || registrationInspection || registrationGeneration != null || !invocations.isEmpty()) throw new ContractException("REGISTRATION_CLOSED", "Registration generation is frozen");
         contracts.validate("ActionDescriptor", descriptor);
         if (!providers.containsKey(bindingId)) throw new ContractException("PROVIDER_UNREGISTERED", "Provider provenance must be registered before its actions");
         ObjectNode value = ContractJson.object(descriptor).deepCopy();
@@ -133,7 +143,7 @@ public final class HostRuntime implements AutoCloseable {
     }
 
     public synchronized void registerUndo(String bindingId, String sourceActionId, String undoActionId) {
-        if (closed || !invocations.isEmpty()) throw new ContractException("REGISTRATION_CLOSED", "Undo registration must precede invocation dispatch");
+        if (closed || registrationInspection || registrationGeneration != null || !invocations.isEmpty()) throw new ContractException("REGISTRATION_CLOSED", "Undo registration must precede invocation dispatch");
         Action source = action(bindingId, sourceActionId); Action undo = action(bindingId, undoActionId);
         if (sourceActionId.equals(undoActionId) || !"provider_undo".equals(source.descriptor.path("recovery").asText())
                 || undo.callbacks.recover() == null || "read".equals(undo.descriptor.path("effect").asText())
@@ -154,8 +164,69 @@ public final class HostRuntime implements AutoCloseable {
         return result;
     }
 
+    /**
+     * Positive role proof from the complete actual Registrar generation. Successful inspection
+     * seals registrations; unsupported/incomplete inspection cannot turn absence into ordinary.
+     * The caller must authenticate the inspection and bind native source facts separately.
+     */
+    public synchronized ObjectNode undoRole(String bindingId, String actionId) {
+        return undoRole(bindingId, actionId, value -> value);
+    }
+
+    /** Platform attestation is completed and byte-bounded before the generation is sealed. */
+    public synchronized ObjectNode undoRole(String bindingId, String actionId, UnaryOperator<ObjectNode> trustedAttestation) {
+        if (registrationInspection) throw new ContractException("REGISTRATION_CLOSED", "Registrar inspection cannot reenter its generation attestation");
+        Action selected = action(bindingId, actionId);
+        for (var binding : bindings.entrySet()) for (var entry : binding.getValue().entrySet()) {
+            Action registered = entry.getValue();
+            boolean source = undoActions.containsKey(binding.getKey() + "\u0000" + entry.getKey());
+            boolean inverse = undoActions.entrySet().stream().anyMatch(route ->
+                    route.getKey().startsWith(binding.getKey() + "\u0000") && route.getValue().equals(entry.getKey()));
+            if ("provider_undo".equals(registered.descriptor.path("recovery").asText()) && !source
+                    || registered.callbacks.recover() != null && !inverse) {
+                throw new ContractException("RECOVERY_UNSUPPORTED", "Undo role inspection requires a complete registered source and recovery callback generation");
+            }
+        }
+        ObjectNode result = ContractJson.newObject().put("bindingId", bindingId).put("actionId", actionId);
+        result.set("selectedAction", selected.descriptor.deepCopy()); result.put("selectedActionDigest", selected.digest);
+        result.set("providerOrigin", providers.get(bindingId).path("origin").deepCopy());
+        var routes = result.putArray("routes");
+        ObjectNode generation = ContractJson.newObject().put("inventoryRevision", inventory().path("inventoryRevision").asText());
+        var generationRoutes = generation.putArray("undoRoutes");
+        boolean sourceRole = false; boolean inverseRole = false;
+        for (var registered : undoActions.entrySet().stream().sorted(Map.Entry.comparingByKey()).toList()) {
+            int separator = registered.getKey().indexOf('\u0000');
+            String routeBinding = registered.getKey().substring(0, separator);
+            String sourceId = registered.getKey().substring(separator + 1);
+            Action source = action(routeBinding, sourceId); Action undo = action(routeBinding, registered.getValue());
+            generationRoutes.add(ContractJson.newObject().put("bindingId", routeBinding).put("sourceActionId", sourceId)
+                    .put("sourceActionDigest", source.digest).put("undoActionId", registered.getValue()).put("undoActionDigest", undo.digest));
+            if (!routeBinding.equals(bindingId) || !sourceId.equals(actionId) && !registered.getValue().equals(actionId)) continue;
+            sourceRole |= sourceId.equals(actionId); inverseRole |= registered.getValue().equals(actionId);
+            if (routes.size() >= 64) throw new ContractException("INPUT_LIMIT", "Selected undo role exceeds the finite route limit");
+            ObjectNode route = ContractJson.newObject().put("sourceBindingId", routeBinding).put("undoBindingId", routeBinding);
+            route.set("sourceAction", source.descriptor.deepCopy()); route.set("undoAction", undo.descriptor.deepCopy());
+            route.set("providerOrigin", providers.get(routeBinding).path("origin").deepCopy()); routes.add(route);
+        }
+        if (sourceRole && inverseRole) throw new ContractException("RECOVERY_UNSUPPORTED", "An action cannot be both a source and recovery-only action");
+        result.put("role", inverseRole ? "recovery_only" : sourceRole ? "source" : "ordinary");
+        String actualGeneration = ContractJson.digest(generation);
+        if (registrationGeneration != null && !registrationGeneration.equals(actualGeneration)) {
+            throw new ContractException("REGISTRATION_CHANGED", "Sealed Registrar generation changed");
+        }
+        result.put("registrationGeneration", actualGeneration);
+        if (ContractJson.bytes(result).length > MAX_RESULT_BYTES) throw new ContractException("INPUT_LIMIT", "Selected undo role exceeds its transport byte limit");
+        registrationInspection = true;
+        try {
+            ObjectNode attested = trustedAttestation.apply(result.deepCopy());
+            if (attested == null || ContractJson.bytes(attested).length > MAX_RESULT_BYTES) throw new ContractException("INPUT_LIMIT", "Attested undo role exceeds its transport byte limit");
+            registrationGeneration = actualGeneration;
+            return attested.deepCopy();
+        } finally { registrationInspection = false; }
+    }
+
     public synchronized void registerProvider(JsonNode descriptor) {
-        if (closed || !invocations.isEmpty()) throw new ContractException("REGISTRATION_CLOSED", "Registration generation is frozen");
+        if (closed || registrationInspection || registrationGeneration != null || !invocations.isEmpty()) throw new ContractException("REGISTRATION_CLOSED", "Registration generation is frozen");
         contracts.validate("ProviderDescriptor", descriptor);
         ObjectNode value = ContractJson.object(descriptor).deepCopy();
         int descriptorBytes = boundedDescriptor(value);
@@ -222,11 +293,28 @@ public final class HostRuntime implements AutoCloseable {
                                 throw new ContractException("RECOVERY_UNSUPPORTED", "The recovery action has no approved source relationship");
                             }
                         }
-                        ObjectNode privateToken = undoTokens.claim(session, invocation);
-                        stage = action.callbacks.recover().recover(invocation, privateToken, local);
-                    } else stage = action.handler.execute(invocation, local);
+                        ScopedUndoTokens.ClaimedUndo claim = undoTokens.claimWithSource(session, invocation);
+                        Invocation sourceInvocation = new Invocation(contracts, claim.sourceInvocation());
+                        synchronized (HostRuntime.this) {
+                            Key sourceRoute = invocationOwners.get(OwnerInvocationKey.of(session, sourceInvocation));
+                            Running source = sourceRoute == null ? null : invocations.get(sourceRoute);
+                            if (source == null || !source.invocation.wire().equals(sourceInvocation.wire())) {
+                                throw new ContractException("RECOVERY_EXPIRED", "Consumed undo material has no exact retained original invocation route");
+                            }
+                            running.undoAssociation = new UndoAssociation(sourceRoute, sourceInvocation, claim.sourceReceipt());
+                        }
+                        running.callbackInvoked = true;
+                        stage = action.callbacks.recover().recover(invocation, claim.privateToken(), local);
+                    } else {
+                        running.callbackInvoked = true;
+                        stage = action.handler.execute(invocation, local);
+                    }
                     if (stage == null) throw new ContractException("OUTPUT_INVALID", "Provider returned no completion stage");
-                    bounded(stage, invocation.deadlineAt()).whenComplete((result, failure) -> finish(session, running, action, local, result, failure));
+                    CompletionStage<ProviderResult> observedStage = stage.whenComplete((reported, failure) -> {
+                        if (reported != null && "job_accepted".equals(reported.status())) running.providerJobEverAccepted = true;
+                        running.rawCallbackFailed = failure != null; running.rawCallbackSettled = true;
+                    });
+                    bounded(observedStage, invocation.deadlineAt()).whenComplete((result, failure) -> finish(session, running, action, local, result, failure));
                 } catch (RuntimeException exception) { finish(session, running, action, local, null, exception); }
             });
         } catch (RuntimeException exception) { finish(session, running, action, local, null, exception); }
@@ -326,6 +414,40 @@ public final class HostRuntime implements AutoCloseable {
         ObjectNode receipt = undoTokens.receipt(session, running.invocation);
         if (receipt == null) material.putNull("receipt"); else material.set("receipt", receipt);
         return material;
+    }
+
+    /** Actual SDK executor facts; this does not assert restored targets or termination of indirect native effects. */
+    public synchronized ObjectNode undoJob(HostSession session, ObjectNode installedContext, String invocationId) {
+        Running running = running(session, invocationId);
+        if (!running.invocation.context().equals(installedContext)) throw new ContractException("STALE_CONTEXT", "Undo job inspection requires its original installed context");
+        Action selected = action(running.invocation.bindingId(), running.invocation.actionId());
+        if (selected.callbacks.recover() == null) throw new ContractException("RECOVERY_UNSUPPORTED", "Invocation is not an actually registered undo callback");
+        boolean contextClosed = running.dispatchContext instanceof GuardedContext local && local.complete.get();
+        int pendingTasks = running.pendingGameThreadTasks.get();
+        String executorState = !running.entered ? "not_entered" : "running";
+        if (contextClosed) {
+            executorState = running.callbackInvoked && running.rawCallbackSettled && pendingTasks == 0
+                    && !running.polling.get() && !running.providerJobEverAccepted
+                    && "synchronous".equals(selected.descriptor.path("completion").asText()) ? "synchronous_quiescent" : "unknown";
+        }
+        ObjectNode result = ContractJson.newObject().put("format", "mmmm.host.undo-job/1");
+        result.set("invocation", running.invocation.wire()); result.put("invocationDigest", running.requestDigest);
+        UndoAssociation association = running.undoAssociation;
+        if (association == null) { result.putNull("sourceInvocation"); result.putNull("sourceReceipt"); }
+        else {
+            Running source = invocations.get(association.sourceRoute());
+            if (source == null || !source.invocation.wire().equals(association.sourceInvocation().wire())) {
+                throw new ContractException("RECOVERY_EXPIRED", "Undo source route is no longer retained");
+            }
+            result.set("sourceInvocation", association.sourceInvocation().wire()); result.set("sourceReceipt", association.sourceReceipt().deepCopy());
+        }
+        result.put("callbackEntered", running.callbackInvoked).put("mutationStarted", running.mutationStarted)
+                .put("cancellationRequested", running.cancelled.get()).put("polling", running.polling.get())
+                .put("rawCallbackSettled", running.rawCallbackSettled).put("rawCallbackFailed", running.rawCallbackFailed)
+                .put("contextClosed", contextClosed).put("pendingGameThreadTasks", pendingTasks)
+                .put("providerJobOutstanding", running.providerJobEverAccepted).put("executorState", executorState);
+        if (ContractJson.bytes(result).length > MAX_RESULT_BYTES) throw new ContractException("INPUT_LIMIT", "Undo job inspection exceeds its bounded transport size");
+        return result;
     }
 
     public CompletionStage<ObjectNode> cancel(HostSession session, String invocationId) {
@@ -485,6 +607,7 @@ public final class HostRuntime implements AutoCloseable {
                 if ("complete".equals(reported.status())) ContractJson.validateSchema(action.output, reported.data());
                 if (ContractJson.bytes(reported.wire()).length > MAX_RESULT_BYTES) throw new ContractException("OUTPUT_LIMIT", "Provider result exceeds the host limit");
                 if ("job_accepted".equals(reported.status())) {
+                    running.providerJobEverAccepted = true;
                     if (action.callbacks.poll() == null) throw new ContractException("OUTPUT_INVALID", "Provider accepted a job without a poll callback");
                     handles.resolve(session, running.invocation.bindingId(), session.context(running.invocation.contextId()), reported.jobHandle(), "job", String.class);
                 }
@@ -577,10 +700,15 @@ public final class HostRuntime implements AutoCloseable {
         }
         @Override public <T> CompletionStage<T> onGameThread(Supplier<T> callback) {
             CompletableFuture<T> result = new CompletableFuture<>();
+            if (running.pendingGameThreadTasks.incrementAndGet() > 32) {
+                running.pendingGameThreadTasks.decrementAndGet();
+                throw new ContractException("HOST_QUEUE_LIMIT", "Invocation game-thread callback capacity is exhausted");
+            }
             try { thread.execute(() -> {
                 try { liveAuthorityCheck(false); result.complete(callback.get()); }
                 catch (RuntimeException exception) { result.completeExceptionally(exception); }
-            }); } catch (RuntimeException exception) { result.completeExceptionally(exception); }
+                finally { running.pendingGameThreadTasks.decrementAndGet(); }
+            }); } catch (RuntimeException exception) { running.pendingGameThreadTasks.decrementAndGet(); result.completeExceptionally(exception); }
             return bounded(result, controlQuery ? clock.instant().plusSeconds(10) : invocation.deadlineAt());
         }
         @Override public <T> String createHandle(String type, T value, Class<T> javaType) {

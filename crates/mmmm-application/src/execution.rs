@@ -13,6 +13,15 @@ use std::time::{Duration, Instant};
 
 impl Application<'_> {
     pub fn plan_apply(&mut self, principal: &PrincipalId, input: &Value) -> AppResult<Value> {
+        self.plan_apply_with_undo(principal, input, None)
+    }
+
+    pub fn plan_apply_with_undo(
+        &mut self,
+        principal: &PrincipalId,
+        input: &Value,
+        undo: Option<&mut UndoExecutionContext<'_>>,
+    ) -> AppResult<Value> {
         validate("ApplyRequest", input)?;
         let id: PlanId = decode(&input["planId"])?;
         let hash: Sha256Digest = decode(&input["planHash"])?;
@@ -63,7 +72,7 @@ impl Application<'_> {
             }
             Reservation::Created(record) => record,
         };
-        self.execute_reserved(principal, &plan, &record.operation_id)?;
+        self.execute_reserved(principal, &plan, &record.operation_id, undo)?;
         let record = self
             .store
             .operation(&record.operation_id)
@@ -90,6 +99,7 @@ impl Application<'_> {
         principal: &PrincipalId,
         plan: &Value,
         operation: &OperationId,
+        mut undo: Option<&mut UndoExecutionContext<'_>>,
     ) -> AppResult<()> {
         let steps = plan["steps"]
             .as_array()
@@ -116,7 +126,13 @@ impl Application<'_> {
                 self.note(operation, "BUDGET_EXCEEDED", "Execution stopped before another dispatch because its finite time budget elapsed")?;
                 break;
             }
-            let (context, descriptor) = match self.preflight(principal, plan, step, operation) {
+            let (context, descriptor, recovery_only) = match self.preflight_with_undo(
+                principal,
+                plan,
+                step,
+                operation,
+                undo.as_deref_mut(),
+            ) {
                 Ok(v) => v,
                 Err(e) => {
                     self.note(operation, e.code, e.message)?;
@@ -185,16 +201,55 @@ impl Application<'_> {
                     }
                 }
             };
-            if let Err(e) =
-                self.retain_before_capture(plan, step, operation, &invocation, &record.scope)
-            {
+            let undo_rpc = if recovery_only {
+                let opened = undo
+                    .as_deref_mut()
+                    .ok_or_else(|| {
+                        AppError::new(
+                            "RECOVERY_EXPIRED",
+                            "Registered undo requires an actual approved request context",
+                        )
+                    })
+                    .and_then(|bundle| {
+                        bundle.open_for_plan(self.store, principal, plan, step, &context)
+                    });
+                match opened {
+                    Ok(rpc) => Some(rpc),
+                    Err(error) => {
+                        self.note(operation, error.code, error.message)?;
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
+            let capture = match undo_rpc.as_ref() {
+                Some(rpc) => self
+                    .capture_registered_undo_before(principal, rpc.as_ref(), &invocation)
+                    .and_then(|capture| {
+                        self.retain_checked_before_capture(
+                            plan,
+                            step,
+                            operation,
+                            &invocation,
+                            &record.scope,
+                            Some(capture),
+                        )
+                    }),
+                None => {
+                    self.retain_before_capture(plan, step, operation, &invocation, &record.scope)
+                }
+            };
+            if let Err(e) = capture {
                 self.note(operation, e.code, e.message)?;
                 break;
             }
             // Capture must match the durable phase digest itself, and a fresh
             // preflight after capture checks policy, expiry and target drift.
             // The native mutation still performs its atomic expected-state check.
-            if let Err(e) = self.preflight(principal, plan, step, operation) {
+            if let Err(e) =
+                self.preflight_with_undo(principal, plan, step, operation, undo.as_deref_mut())
+            {
                 self.note(operation, e.code, e.message)?;
                 break;
             }
@@ -214,12 +269,40 @@ impl Application<'_> {
             }
             // This commits Invocation bytes, the fence, and intent before any
             // provider call. An error afterwards is never a retry permission.
-            let intent = match resolution_witness.as_ref() {
-                Some(witness) => {
-                    self.store
-                        .dispatch_resolved_intent(operation, &step_id, &invocation, witness)
+            let intent = if let Some(rpc) = undo_rpc.as_ref() {
+                if resolution_witness.is_some() {
+                    Err(AppError::new(
+                        "RECOVERY_CONFLICT",
+                        "A registered undo cannot resolve new result bindings",
+                    ))
+                } else {
+                    self.dispatch_registered_undo_intent(
+                        principal,
+                        rpc.as_ref(),
+                        operation,
+                        &step_id,
+                        &invocation,
+                    )
+                    .and_then(|record| {
+                        record.ok_or_else(|| {
+                            AppError::new(
+                                "RECOVERY_EXPIRED",
+                                "Registered undo role is absent from its atomic claim",
+                            )
+                        })
+                    })
                 }
-                None => self.store.dispatch_intent(operation, &step_id, &invocation),
+            } else {
+                match resolution_witness.as_ref() {
+                    Some(witness) => self
+                        .store
+                        .dispatch_resolved_intent(operation, &step_id, &invocation, witness)
+                        .map_err(|error| AppError::storage("DISPATCH_REJECTED", error)),
+                    None => self
+                        .store
+                        .dispatch_intent(operation, &step_id, &invocation)
+                        .map_err(|error| AppError::storage("DISPATCH_REJECTED", error)),
+                }
             };
             if let Err(e) = intent {
                 self.note(
@@ -227,7 +310,7 @@ impl Application<'_> {
                     "DISPATCH_REJECTED",
                     "Durable runtime rejected a new dispatch intent",
                 )?;
-                return Err(AppError::storage("DISPATCH_REJECTED", e));
+                return Err(e);
             }
             match self.provider.dispatch_with_store(self.store, &invocation) {
                 Ok(response) => {
@@ -245,6 +328,14 @@ impl Application<'_> {
                     self.ambiguous(operation, &step_id, e.code, e.message)?;
                 }
             }
+            self.retain_source_undo_material(
+                principal,
+                operation,
+                &step_id,
+                &invocation,
+                &descriptor,
+                undo.as_deref_mut(),
+            )?;
             // Writes always need actual effect evidence. Provider completion is
             // retained separately and cannot stand in for the target observer.
             let current = self
@@ -261,7 +352,13 @@ impl Application<'_> {
                     || stored.verification_requirement
                         == VerificationRequirement::IndependentReadback)
             {
-                match self.observe(operation, &step_id, &invocation) {
+                match self.observe(
+                    principal,
+                    operation,
+                    &step_id,
+                    &invocation,
+                    undo.as_deref_mut(),
+                ) {
                     Ok(()) => (),
                     Err(e) => self.ambiguous(operation, &step_id, e.code, e.message)?,
                 }
@@ -342,9 +439,9 @@ impl Application<'_> {
             .request_cancel(&record.operation_id)
             .map_err(|e| AppError::storage("CANCEL_UNSUPPORTED", e))?;
         for (invocation, receipt) in dispatched {
-            if let Err(e) = self
-                .provider
-                .request_cancel(&invocation, receipt.as_deref())
+            if let Err(e) =
+                self.provider
+                    .request_cancel_with_store(self.store, &invocation, receipt.as_deref())
             {
                 self.note(&record.operation_id, e.code, e.message)?;
             }
@@ -358,6 +455,15 @@ impl Application<'_> {
         &mut self,
         principal: &PrincipalId,
         input: &Value,
+    ) -> AppResult<Value> {
+        self.operation_reconcile_with_undo(principal, input, None)
+    }
+
+    pub fn operation_reconcile_with_undo(
+        &mut self,
+        principal: &PrincipalId,
+        input: &Value,
+        mut undo: Option<&mut UndoExecutionContext<'_>>,
     ) -> AppResult<Value> {
         let record = self.authorized_operation(principal, input, Access::ObserveOperation)?;
         if record.state.terminal() {
@@ -409,6 +515,14 @@ impl Application<'_> {
                 Ok(None) => (),
                 Err(e) => self.note(&record.operation_id, e.code, e.message)?,
             }
+            self.retain_source_undo_material(
+                principal,
+                &record.operation_id,
+                &stored.step_id,
+                &invocation,
+                &descriptor,
+                undo.as_deref_mut(),
+            )?;
             let current = self
                 .store
                 .operation(&record.operation_id)
@@ -422,7 +536,13 @@ impl Application<'_> {
                 && (step.write_effect
                     || step.verification_requirement
                         == VerificationRequirement::IndependentReadback)
-                && let Err(e) = self.observe(&record.operation_id, &stored.step_id, &invocation)
+                && let Err(e) = self.observe(
+                    principal,
+                    &record.operation_id,
+                    &stored.step_id,
+                    &invocation,
+                    undo.as_deref_mut(),
+                )
             {
                 self.note(&record.operation_id, e.code, e.message)?;
             }
@@ -570,19 +690,83 @@ impl Application<'_> {
         Ok(())
     }
 
-    fn observe(
+    /// Receipt acquisition uses a separate current Observe context, never a
+    /// possibly expired/revoked source Apply seal. The runtime commits acquired
+    /// truthful Pending material before a late release denial. Failure here
+    /// does not prevent the existing independent effect observation.
+    fn retain_source_undo_material(
         &mut self,
+        principal: &PrincipalId,
         operation: &OperationId,
         step: &StepId,
         invocation: &Value,
+        descriptor: &Value,
+        undo: Option<&mut UndoExecutionContext<'_>>,
+    ) -> AppResult<()> {
+        if descriptor["recovery"] != "provider_undo" || descriptor["effect"] == "read" {
+            return Ok(());
+        }
+        let Some(bundle) = undo else {
+            return Ok(());
+        };
+        let acquired = bundle
+            .open_for_observation(self.store, principal, operation, step, invocation)
+            .and_then(|rpc| {
+                self.capture_provider_undo_record(
+                    principal,
+                    rpc.as_ref(),
+                    bundle.material,
+                    operation,
+                    step,
+                )
+            });
+        if let Err(error) = acquired {
+            self.note(operation, error.code, error.message)?;
+        }
+        Ok(())
+    }
+
+    fn observe(
+        &mut self,
+        principal: &PrincipalId,
+        operation: &OperationId,
+        step: &StepId,
+        invocation: &Value,
+        undo: Option<&mut UndoExecutionContext<'_>>,
     ) -> AppResult<()> {
         let record = self
             .store
             .operation(operation)
             .map_err(|e| AppError::storage("OPERATION_NOT_FOUND", e))?;
-        let observed = self
-            .observer
-            .readback_with_store(self.store, invocation, &record.scope)?;
+        self.authority
+            .authorize_operation(principal, &record, Access::ObserveOperation)?;
+        let observed = if crate::undo_provider::is_recovery_only_step(self.store, invocation)? {
+            let bundle = undo.ok_or_else(|| {
+                AppError::new(
+                    "RECOVERY_EXPIRED",
+                    "Registered undo observation requires its actual request composition",
+                )
+            })?;
+            let rpc =
+                bundle.open_for_observation(self.store, principal, operation, step, invocation)?;
+            let claimed = mmmm_runtime::storage::undo::claimed_undo_record(
+                self.store,
+                operation,
+                step,
+                &decode(&invocation["invocationId"])?,
+            )
+            .map_err(|error| AppError::storage("RECOVERY_EXPIRED", error))?;
+            let job = bundle.material.observe_registered_undo_job_with_store(
+                self.store,
+                invocation,
+                &claimed,
+                &record.scope,
+            )?;
+            self.verify_provider_undo_readback(principal, rpc.as_ref(), invocation, job)?
+        } else {
+            self.observer
+                .readback_with_store(self.store, invocation, &record.scope)?
+        };
         if observed.invocation_id.as_str() != invocation["invocationId"].as_str().unwrap_or("")
             || observed.binding_id.as_str() != invocation["bindingId"].as_str().unwrap_or("")
             || observed.context_digest.as_str()
@@ -623,6 +807,45 @@ impl Application<'_> {
         let provider_failed = output_evidence
             .iter()
             .any(|v| v["stepId"] == step.as_str() && crate::report::known_provider_failure(v));
+        let source_after = if invocation["actionId"].is_string()
+            && observed.settled
+            && matches!(
+                observed.effect,
+                EffectEvidence::SomeConfirmed | EffectEvidence::CompleteConfirmed
+            ) {
+            let plan = self
+                .store
+                .plan(&record.plan_id, &record.plan_hash)
+                .map_err(|error| AppError::storage("STALE_PLAN", error))?;
+            let selected = plan["steps"]
+                .as_array()
+                .and_then(|steps| {
+                    steps
+                        .iter()
+                        .find(|selected| selected["stepId"] == step.as_str())
+                })
+                .ok_or_else(|| {
+                    AppError::new(
+                        "STALE_PLAN",
+                        "Observed source step is absent from its actual plan",
+                    )
+                })?;
+            if selected["recovery"] == "provider_undo" {
+                match self.retain_undo_after_targets(operation, selected, invocation, &observed) {
+                    Ok(states) => states,
+                    Err(error) => {
+                        // Missing optional undo proof must not erase known
+                        // physical target truth or infer a restoration image.
+                        self.note(operation, error.code, error.message)?;
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
         if observed.direct_changes.len() > 4096
             || observed
                 .direct_changes
@@ -717,7 +940,7 @@ impl Application<'_> {
                 }
                 let bytes = self
                     .observer
-                    .read_target_with_store(self.store, invocation, target)?;
+                    .read_target_retained_with_store(self.store, invocation, target)?;
                 after_bytes = after_bytes
                     .checked_add(bytes.len())
                     .filter(|size| *size <= 128 * 1024 * 1024)
@@ -775,9 +998,11 @@ impl Application<'_> {
                     }
                     continue;
                 }
-                let current =
-                    self.observer
-                        .read_target_with_store(self.store, invocation, &prior.target)?;
+                let current = self.observer.read_target_retained_with_store(
+                    self.store,
+                    invocation,
+                    &prior.target,
+                )?;
                 if mmmm_contracts::raw_digest(&current) != prior.after.digest
                     || current.len() as u64 != prior.after.byte_length
                 {
@@ -801,7 +1026,8 @@ impl Application<'_> {
         let envelope = json!({"kind":"independent_readback", "stepId":step, "invocationId":observed.invocation_id,
             "bindingId":observed.binding_id,"contextDigest":observed.context_digest,
             "implementationDigest":observed.implementation_digest,"argumentsDigest":observed.arguments_digest,
-            "effect":observed.effect,"settled":observed.settled,"sourceRefs":[evidence_blob],"directChanges":snapshots});
+            "effect":observed.effect,"settled":observed.settled,"sourceRefs":[evidence_blob],"directChanges":snapshots,
+            "afterStates":source_after});
         let blob = self
             .store
             .put_blob(&encode_json(&envelope).map_err(|_| {
@@ -811,8 +1037,13 @@ impl Application<'_> {
                 )
             })?)
             .map_err(|e| AppError::storage("RECONCILIATION_INSUFFICIENT", e))?;
-        let summary = crate::report::compact_evidence(&envelope, &blob)?;
-        self.retain_summary(operation, &summary, &[blob.clone(), evidence_blob])?;
+        let mut sources = vec![blob.clone(), evidence_blob];
+        sources.extend(source_after.iter().map(|state| state.after.clone()));
+        sources.sort_by(|left, right| left.digest.cmp(&right.digest));
+        sources.dedup();
+        let mut summary = crate::report::compact_evidence(&envelope, &blob)?;
+        summary["sourceRefs"] = json!(sources);
+        self.retain_summary(operation, &summary, &sources)?;
         self.store
             .record_observation(
                 operation,
