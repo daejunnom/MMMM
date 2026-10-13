@@ -4,8 +4,9 @@
 이 문서는 빌드 및 테스트 생성물의 보관과 회수를 소유한다. 제품의 영속 데이터와
 사용자 자료는 별도의 소유 및 보존 수명을 갖는다.
 
-아래 절차는 채택한 구현 요구다. 관리 도구는 G0에서 `tools`의 Rust 개발 도구로
-구현하고 실제 명령을 등록한다. 현재 자동 정리나 자원 감독 도구가 설치된 상태를 의미하지 않는다.
+아래 절차는 채택한 구현 요구다. `tools/mmmm-xtask`와 플랫폼 bootstrap에
+관리 실행과 회수 구현이 있으며 Windows에서 실제 검증을 진행했다. 다른 OS,
+CI와 제품의 검증 완료 여부는 [구현 착수 조건](implementation-readiness.md)에 기록한다.
 
 ## 생성물 분류
 
@@ -82,6 +83,10 @@ commit SHA, PID, GUID 또는 시각마다 새 대형 빌드 트리를 만들지 
 
 크기는 제한된 깊이와 entry 수 안에서 관측한 파일 길이 합계로 검사한다.
 관측 사이 증가가 가능하므로 커널 disk quota나 실제 물리 할당량의 보장을 주장하지 않는다.
+활성 슬롯의 고정 cache와 scratch 아래에서 이미 열거한 임시 항목이 삭제된 경우에는
+남아 있는 상위 경로와 고정 루트의 소유 및 물리 경계를 확인한 뒤 누락을 허용한다.
+고정 루트, 소유 기록, 완료 슬롯과 정리 단계의 누락은 허용하지 않는다. 관측 전후에
+소유 기록과 고정 루트를 검증하며, 이 순회는 원자적인 파일시스템 snapshot이 아니다.
 보존 기록과 제품 영속 자료는 이 cache 예산으로 삭제하지 않는다.
 
 ## 관리 실행 절차
@@ -119,6 +124,34 @@ Gradle build와 project cache, Gradle user home, Java 임시 파일과 테스트
 일반 읽기 전용 Git metadata, 문서 검토와 짧은 formatting 검사는 관리 프로세스
 접점을 요구하지 않는다. 빌드 도구 자체의 최초 컴파일에도 저장소 밖의 고정 bootstrap
 슬롯과 확인 가능한 소유 실행을 사용한다. 실제 bootstrap 및 관리 명령은 구현 후 등록한다.
+
+### 빌드 명령 종료 뒤 소유 자식 정리
+
+기본 `owned-tail-policy`는 `reject`다. 명령 leader가 종료한 뒤 2초의 유한한
+종료 여유를 주고도 소유 자식이 남으면 supervisor 오류로 기록한다.
+이번 Windows 최초 컴파일 검사에서는 Cargo 종료 뒤 소유 Job에 MSVC의
+`VCTIP`가 남는 경로를 관측했다. MSVC가 만들 수 있는 잔여 telemetry 자식이라는
+설명은 [Microsoft의 MSVC 도구 정의](https://github.com/microsoft/BuildXL/blob/main/Public/Sdk/Experimental/Msvc/VisualCpp/visualCpp.dsc)에서도 확인할 수 있다.
+
+Cargo 최초 컴파일과 CI의 Cargo test 및 Clippy에는 명시적 `terminate-build`
+정책을 선택한다. leader의 실제 종료 code를 확보한 뒤 2초가 지나도 자식이
+남으면, Windows는 해당 실행의 Job만, Unix는 예약한 해당 실행의 process
+group만 종료한다. 이름을 기준으로 프로세스를 무시하거나 소유 범위 밖으로
+이탈시키지 않고, 전역 Visual Studio 설정이나 다른 사용자의 프로세스를 바꾸지 않는다.
+
+이 경로는 원래 Cargo 종료 code를 보존하며 `owned_tail_terminated: true`와
+`CompletedAfterOwnedTailCleanup`을 별도로 기록한다. 전체 native 종료와 출력
+pipe의 끝, 완전한 capture 및 export를 확인해야 정리를 완료로 기록할 수 있다.
+원래 code가 실패이면 전체 명령도 실패다. timeout, 취소, 출력 한도와 관측 실패는
+성공으로 바꾸지 않는다. 최초 컴파일의 strict adoption proof에는
+`owned_tail_terminated`를 명시하고, Unix의 종료 이유를 포함한 감독 결과는
+`bootstrap-supervision.json`에도 기록한다.
+
+이 선택은 재생성 빌드 도구의 수명을 위한 것이다. 제품의 쓰기 operation,
+게임 적용, 결과 불명 상태와 복구에는 적용하지 않는다. 명령을 다시 실행하거나
+불확실한 효과를 retry 가능으로 바꾸는 정책도 아니다. 정책 및 formatting 검사와
+Rust 최초 인계 control 명령은 기본 strict 정책을 사용한다. 실제 OS별 fixture와
+native 실행 결과를 확인하기 전에는 이 소스 선택을 3개 OS 검증 성공으로 표시하지 않는다.
 
 ## 정리 경계와 복구
 
@@ -179,3 +212,68 @@ cache miss, 오래된 완료 슬롯 회수와 보존 위치 내보내기 실패�
 symlink, Windows junction, 경로 충돌과 알 수 없는 파일의 정리를 확인한다.
 사용자 원본, 영속 DB, CAS, 복구 자료, 다른 checkout 및 릴리스 증거가 정리 대상에
 포함되지 않음을 검증한다. macOS의 자식 종료 확인은 별도 필수 항목이다.
+
+## Rust 기반 CI 소스와 최초 컴파일
+
+`.github/workflows/foundation.yml`은 Rust 기반 검사 workflow의 소스다.
+Windows x64, Linux x64와 macOS ARM64를 각각 독립 job에서 실행하도록 구성한다.
+현재 파일의 존재는 workflow 실행 또는 성공 근거가 아니다. 실제 run, attempt,
+checkout SHA와 OS 및 architecture를 확인한 뒤 관측 결과를 기록한다.
+3개 job을 모두 실행하고 집계하는 `foundation-result`는 실패, 취소와 미실행을
+성공으로 처리하지 않는다. 실제 성공을 확인하기 전에는 필수 상태 검사로 등록하지 않는다.
+
+runner는 `windows-2025`, `ubuntu-24.04`, `macos-15`로 명시하며 시작 시 실제 OS와
+process architecture를 검사한다. macOS runner 이름과 architecture 대응은
+[GitHub runner 문서](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)를
+기준으로 선택했고, 이미지 버전은 매 run의 `ci-context.json`에 별도로 기록한다.
+Rust `1.96.0`과 rustfmt 및 Clippy를 CI 임시 출력 루트의 `toolchain`에 설치한다.
+설치 단계는 5분으로 제한하며 관리 build cache와 수명을 구분한다.
+cache를 원격 복원하거나 다른 run의 성공 근거를 재사용하는 기능은 현재 workflow에 없다.
+CI는 source의 `Cargo.lock`을 요구하고 routine 최초 컴파일에도 locked resolution을
+사용한다. 승인한 의존성 변경을 반영하는 개발 최초 컴파일에는 Windows의
+`-UpdateLock` 또는 Unix의 `--update-lock`을 명시적으로 선택할 수 있다.
+이 선택은 lock 갱신을 허용하며, CI가 자동으로 재시도하거나 선택하지 않는다.
+
+최초 Cargo 실행은 Windows의 `tools/bootstrap/bootstrap.ps1` 또는 Unix의
+`tools/bootstrap/bootstrap-unix.py`가 맡는다. Unix launcher의 Python 코드는
+첫 Rust 도구를 만들기 위한 build infrastructure에만 사용한다. 제품 계약 처리,
+Coordinator와 변환 구현은 Rust 책임을 유지한다. Unix에는 Python 3.10 이상,
+Linux procfs 또는 macOS libproc의 native process 관찰이 필요하다.
+관찰 API, 출력 루트나 소유 기록이 유효하지 않으면 빌드를 시작하지 않거나 실패를 반환한다.
+
+Unix launcher는 별도 session의 leader를 먼저 만들고, 부모가 native identity를
+확인한 뒤 보내는 시작 신호가 있어야 Cargo를 실행한다. leader는 자식 종료 이후에도
+살아 있거나 unreaped 상태로 남아 SID와 process group identity를 예약한다.
+native group에 실행 중인 자식이 없다는 두 관측과 출력 pipe EOF를 확인한 뒤 leader를 회수한다.
+부모가 종료되어 제어 pipe에 EOF가 오면 wrapper는 자신의 group을 종료한다.
+wrapper 자체에도 유한한 watchdog 기한을 둔다. Linux와 macOS의 관찰 코드는 각각 다르다.
+record와 log는 no-follow directory descriptor를 따라 열고, 연 부모 directory의
+device와 inode를 소유 시점의 identity와 비교한다.
+
+처음 선택한 자원 한도는 Cargo worker 2개, 1200초, 합계 출력 128 MiB,
+slot 8 GiB, catalog 12 GiB이며 크기는 5초마다 관측한다. Windows bootstrap은
+Job Object의 2 GiB memory와 32개 process 한도를 사용한다. Unix bootstrap의
+`RLIMIT_AS`는 process마다 2 GiB의 주소 공간 상한을 물려주며, 실행 중인 group
+구성원은 wrapper를 제외하고 32개를 관측 한도로 검사한다. Unix의 이 한도는
+Job Object 전체 memory 상한이나 커널 process quota와 같은 보장이 아니다.
+크기와 process 수는 관측 사이 증가할 수 있다. 독립 session으로 의도적으로 이탈하는
+프로그램을 격리하는 보안 sandbox를 제공한다는 주장도 하지 않는다.
+
+빌드가 성공하면 export한 `bootstrap-process.json`의 종료와 보존 근거를 새 Rust
+도구의 `bootstrap-complete`가 검사하고, 동일한 소유 slot 및 lease만 인계한다.
+Unix 최초 컴파일이 실패하면 현재 구현은 소유 lease와 cache를 보존한다.
+과거 실패 또는 중단 lease를 자동 채택하거나 삭제하는 옵션은 제공하지 않는다.
+Rust 인계 이후에는 `mmmm-xtask run`을 통해 index 정책, formatting, workspace
+tests와 Clippy를 실행한다. 일반 명령 출력 한도는 Rust runner의 64 MiB를 사용한다.
+같은 `ci-checks` slot을 재사용하여 각 명령마다 대형 Cargo 트리를 만들지 않는다.
+
+각 OS job은 최대 75분, matrix는 최대 3개 job을 병렬 실행한다. artifact에는
+source 및 runner 식별, bootstrap proof, 관리 실행 영수증과 원시 로그만 포함하고
+build cache와 제품 data를 넣지 않는다. artifact 보존 기간은 14일이다.
+입력 checkout은 credential을 지속 저장하지 않고 workflow 권한은 `contents: read`다.
+공식 checkout과 artifact action은 확인한 commit SHA로 고정한다.
+
+이 구성은 Rust 기반 구현 검증을 위한 것이다. 실제 3개 OS bootstrap의 정상,
+실패, timeout, 취소, 남은 자식, 부모 강제 종료와 path 및 lease 경합 검증은
+각 OS에서 수행한 결과로 연결해야 한다. 이 workflow 소스만으로 G0 인수,
+게임 서버 및 클라이언트 인수 또는 `v0.1.0` 배포를 완료로 표시하지 않는다.

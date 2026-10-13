@@ -11,7 +11,8 @@
     "README.md",
     "Cargo.toml",
     "Cargo.lock",
-    "rust-toolchain.toml"
+    "rust-toolchain.toml",
+    "rustfmt.toml"
   ],
   "allowedRootDirectories": [
     ".github",

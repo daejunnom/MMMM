@@ -2,15 +2,19 @@
 //! a runtime UUID, loads a resource, or performs I/O. Wire values cross the
 //! canonical validator before they become typed immutable domain inputs.
 
+pub mod commands;
 pub mod graph;
 pub mod instance;
 pub mod prefab;
 pub mod state;
+pub mod time;
 pub mod transform;
 pub mod types;
 
+pub use commands::{command_layout, command_layout_with_support};
 pub use instance::{clone_instance, instantiate, relocate};
 pub use prefab::prefab_validate;
+pub use time::clip_retime;
 pub use types::{Diagnostic, DomainError, Instance, InstanceDraft, Prefab};
 
 use mmmm_contracts::ContractValidator;
@@ -26,8 +30,12 @@ fn validator() -> Result<&'static ContractValidator, DomainError> {
         .map_err(|message| DomainError::new("SCHEMA_INVALID", message.clone()))
 }
 
-pub(crate) fn decode<T: DeserializeOwned>(definition: &str, value: &Value) -> Result<T, DomainError> {
-    validator()?.validate(definition, value)
+pub(crate) fn decode<T: DeserializeOwned>(
+    definition: &str,
+    value: &Value,
+) -> Result<T, DomainError> {
+    validator()?
+        .validate(definition, value)
         .map_err(|error| DomainError::new("SCHEMA_INVALID", error.to_string()))?;
     serde_json::from_value(value.clone())
         .map_err(|error| DomainError::new("SCHEMA_INVALID", error.to_string()))
@@ -36,7 +44,8 @@ pub(crate) fn decode<T: DeserializeOwned>(definition: &str, value: &Value) -> Re
 pub(crate) fn encode<T: Serialize>(definition: &str, value: &T) -> Result<Value, DomainError> {
     let value = serde_json::to_value(value)
         .map_err(|error| DomainError::new("SCHEMA_INVALID", error.to_string()))?;
-    validator()?.validate(definition, &value)
+    validator()?
+        .validate(definition, &value)
         .map_err(|error| DomainError::new("SCHEMA_INVALID", error.to_string()))?;
     Ok(value)
 }

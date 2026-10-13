@@ -268,17 +268,16 @@ impl ManagedBuild {
         }
         let slot_path = slots_path.join(&slot_id);
         let previous = slots.iter().find(|(_, record)| record.slot_id == slot_id);
-        if let Some((_, record)) = previous {
-            if record.checkout_digest != checkout_digest
+        if let Some((_, record)) = previous
+            && (record.checkout_digest != checkout_digest
                 || record.purpose != config.purpose
                 || record.os != std::env::consts::OS
-                || record.arch != std::env::consts::ARCH
-            {
-                return Err(StorageError::new(
-                    "ownership",
-                    "fixed slot identity differs from the physical checkout",
-                ));
-            }
+                || record.arch != std::env::consts::ARCH)
+        {
+            return Err(StorageError::new(
+                "ownership",
+                "fixed slot identity differs from the physical checkout",
+            ));
         }
         if slot_path.exists() && previous.is_none() {
             return Err(StorageError::new(
@@ -515,13 +514,13 @@ impl ManagedBuild {
             if ["TMP", "TEMP", "TMPDIR"].contains(&key.as_str()) {
                 continue;
             }
-            if let Some(existing) = std::env::var_os(&key) {
-                if !self.environment_override_matches(&key, &existing, &value)? {
-                    return Err(StorageError::new(
-                        "override",
-                        format!("conflicting managed environment override: {key}"),
-                    ));
-                }
+            if let Some(existing) = std::env::var_os(&key)
+                && !self.environment_override_matches(&key, &existing, &value)?
+            {
+                return Err(StorageError::new(
+                    "override",
+                    format!("conflicting managed environment override: {key}"),
+                ));
             }
         }
         Ok(())
@@ -532,17 +531,17 @@ impl ManagedBuild {
         overrides: &BTreeMap<String, String>,
     ) -> Result<(), StorageError> {
         for (key, managed_value) in self.environment() {
-            if let Some(value) = overrides.get(&key) {
-                if !self.environment_override_matches(
+            if let Some(value) = overrides.get(&key)
+                && !self.environment_override_matches(
                     &key,
                     std::ffi::OsStr::new(value),
                     &managed_value,
-                )? {
-                    return Err(StorageError::new(
-                        "override",
-                        format!("conflicting explicit managed environment override: {key}"),
-                    ));
-                }
+                )?
+            {
+                return Err(StorageError::new(
+                    "override",
+                    format!("conflicting explicit managed environment override: {key}"),
+                ));
             }
         }
         Ok(())
@@ -569,20 +568,63 @@ impl ManagedBuild {
     }
 
     pub fn measure(&self) -> Result<Measurement, StorageError> {
+        self.measure_with(|_| {})
+    }
+
+    fn measure_with(
+        &self,
+        mut before_metadata: impl FnMut(&Path),
+    ) -> Result<Measurement, StorageError> {
         self.verify_ownership()?;
-        let slot_bytes = tree_bytes(&self.paths.slot, &self.paths.slot)?;
+        let observation_roots = self.observation_roots();
+        self.verify_observation_roots(&observation_roots)?;
+        let mut slot_bytes = None;
         let mut catalog_bytes = 0u64;
         let slots = load_slots(&self.paths.catalog, &self.catalog)?;
         self.validate_active_slots(&slots)?;
-        for (path, _) in slots {
-            catalog_bytes = checked_sum(catalog_bytes, tree_bytes(&path, &path)?)?;
+        for (path, record) in slots {
+            let size = if record.slot_id == self.slot.slot_id && record.state == SlotState::Active {
+                tree_bytes_observed(&path, &path, &observation_roots, &mut before_metadata)?
+            } else {
+                tree_bytes(&path, &path)?
+            };
+            if record.slot_id == self.slot.slot_id {
+                slot_bytes = Some(size);
+            }
+            catalog_bytes = checked_sum(catalog_bytes, size)?;
         }
+        // Ephemeral entries may disappear during a finite observation. Fixed
+        // roots and ownership records must still be intact when it completes.
+        self.verify_observation_roots(&observation_roots)?;
+        self.verify_ownership()?;
+        let slot_bytes = slot_bytes.ok_or_else(|| {
+            StorageError::new("ownership", "owned slot disappeared during measurement")
+        })?;
         Ok(Measurement {
             slot_bytes,
             catalog_bytes,
             within_budget: slot_bytes <= self.config.budgets.slot_bytes
                 && catalog_bytes <= self.config.budgets.catalog_bytes,
         })
+    }
+
+    fn observation_roots(&self) -> [PathBuf; 6] {
+        [
+            self.paths.cargo_target.clone(),
+            self.paths.cargo_home.clone(),
+            self.paths.gradle_build.clone(),
+            self.paths.gradle_project_cache.clone(),
+            self.paths.gradle_user_home.clone(),
+            self.paths.scratch.clone(),
+        ]
+    }
+
+    fn verify_observation_roots(&self, roots: &[PathBuf]) -> Result<(), StorageError> {
+        verify_directory(&self.paths.slot.join("cache"))?;
+        for root in roots {
+            verify_directory(root)?;
+        }
+        Ok(())
     }
 
     pub fn finish(mut self, outcome: FinishOutcome) -> Result<FinishReceipt, StorageError> {
@@ -910,6 +952,19 @@ fn load_slots(
         let record: SlotRecord = read_record(&path.join("owner.json"))?;
         validate_slot_record(&record, &slot_id, catalog)?;
         validate_slot_entries(&path)?;
+        let scratch = path.join("scratch");
+        if record.state == SlotState::Complete
+            && scratch.exists()
+            && fs::read_dir(&scratch)
+                .map_err(|e| StorageError::io("inspect completed scratch", e))?
+                .next()
+                .is_some()
+        {
+            return Err(StorageError::new(
+                "interrupted",
+                "completed slot has unexplained residual scratch; preserved",
+            ));
+        }
         slots.push((path, record));
     }
     Ok(slots)
@@ -1375,6 +1430,15 @@ fn reject_link(path: &Path) -> Result<(), StorageError> {
 }
 
 fn tree_bytes(path: &Path, boundary: &Path) -> Result<u64, StorageError> {
+    tree_bytes_observed(path, boundary, &[], |_| {})
+}
+
+fn tree_bytes_observed(
+    path: &Path,
+    boundary: &Path,
+    ephemeral_roots: &[PathBuf],
+    mut before_metadata: impl FnMut(&Path),
+) -> Result<u64, StorageError> {
     let boundary =
         fs::canonicalize(boundary).map_err(|e| StorageError::io("resolve tree boundary", e))?;
     let mut pending = vec![(path.to_path_buf(), 0usize)];
@@ -1389,27 +1453,36 @@ fn tree_bytes(path: &Path, boundary: &Path) -> Result<u64, StorageError> {
             ));
         }
         reject_secret_path(&path)?;
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|e| StorageError::io("measure managed entry", e))?;
+        before_metadata(&path);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if vanished_ephemeral_entry(&path, &error, ephemeral_roots)? => continue,
+            Err(error) => return Err(StorageError::io("measure managed entry", error)),
+        };
         if is_link(&metadata) {
             validate_internal_link(&path, &boundary)?;
             bytes = checked_sum(bytes, metadata.len())?;
         } else if metadata.is_dir() {
-            for entry in
-                fs::read_dir(&path).map_err(|e| StorageError::io("measure directory", e))?
-            {
+            let directory = match fs::read_dir(&path) {
+                Ok(directory) => directory,
+                Err(error) if vanished_ephemeral_entry(&path, &error, ephemeral_roots)? => continue,
+                Err(error) => return Err(StorageError::io("measure directory", error)),
+            };
+            for entry in directory {
                 if pending.len() + entries >= MAX_ENTRIES {
                     return Err(StorageError::new(
                         "walk_limit",
                         "managed tree entry limit exceeded",
                     ));
                 }
-                pending.push((
-                    entry
-                        .map_err(|e| StorageError::io("measure entry", e))?
-                        .path(),
-                    depth + 1,
-                ));
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) if vanished_ephemeral_entry(&path, &error, ephemeral_roots)? => {
+                        break;
+                    }
+                    Err(error) => return Err(StorageError::io("measure entry", error)),
+                };
+                pending.push((entry.path(), depth + 1));
             }
         } else if metadata.is_file() {
             reject_secret_leaf_file(&path)?;
@@ -1422,6 +1495,103 @@ fn tree_bytes(path: &Path, boundary: &Path) -> Result<u64, StorageError> {
         }
     }
     Ok(bytes)
+}
+
+fn vanished_ephemeral_entry(
+    path: &Path,
+    error: &std::io::Error,
+    roots: &[PathBuf],
+) -> Result<bool, StorageError> {
+    if error.kind() != std::io::ErrorKind::NotFound {
+        return Ok(false);
+    }
+    let Some(root) = roots
+        .iter()
+        .find(|root| path != root.as_path() && path.starts_with(root))
+    else {
+        return Ok(false);
+    };
+    verify_directory(root)?;
+    let physical_root = fs::canonicalize(root)
+        .map_err(|e| StorageError::io("verify vanished-entry fixed root", e))?;
+    if path_identity(&physical_root) != path_identity(root) {
+        return Err(StorageError::new(
+            "ownership",
+            "observation fixed root physical identity changed",
+        ));
+    }
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| StorageError::new("path_escape", "vanished entry left fixed root"))?;
+    let components: Vec<_> = relative.components().collect();
+    if components.len() > MAX_DEPTH
+        || components
+            .iter()
+            .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return Err(StorageError::new(
+            "path_escape",
+            "vanished entry has non-owned or excessive ancestry",
+        ));
+    }
+    let mut current = root.clone();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component.as_os_str());
+        reject_secret_path(&current)?;
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(StorageError::io(
+                    "verify vanished-entry surviving ancestry",
+                    error,
+                ));
+            }
+        };
+        if is_link(&metadata) {
+            return Err(StorageError::new(
+                "link",
+                "vanished entry crosses surviving link or reparse point",
+            ));
+        }
+        if (!metadata.is_dir() && index + 1 < components.len())
+            || (!metadata.is_dir() && !metadata.is_file())
+        {
+            return Err(StorageError::new(
+                "file_type",
+                "vanished entry ancestry changed file type",
+            ));
+        }
+        if metadata.is_file() {
+            reject_secret_leaf_file(&current)?;
+        }
+        let physical = match fs::canonicalize(&current) {
+            Ok(physical) => physical,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(StorageError::io(
+                    "resolve vanished-entry surviving ancestry",
+                    error,
+                ));
+            }
+        };
+        if !physical.starts_with(&physical_root) {
+            return Err(StorageError::new(
+                "link_escape",
+                "vanished entry surviving ancestry left owned root",
+            ));
+        }
+    }
+    verify_directory(root)?;
+    let after = fs::canonicalize(root)
+        .map_err(|e| StorageError::io("reverify vanished-entry fixed root", e))?;
+    if path_identity(&after) != path_identity(&physical_root) {
+        return Err(StorageError::new(
+            "ownership",
+            "observation fixed root physical identity changed",
+        ));
+    }
+    Ok(true)
 }
 
 fn validate_internal_link(path: &Path, boundary: &Path) -> Result<(), StorageError> {

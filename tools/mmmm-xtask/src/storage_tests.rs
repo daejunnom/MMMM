@@ -42,10 +42,11 @@ impl Drop for Fixture {
         // This root was newly created and solely owns authored test data.
         // Never remove an escaped root or a replaced junction.
         let parent = fs::canonicalize(std::env::temp_dir()).expect("temp root still resolves");
-        if let Ok(resolved) = fs::canonicalize(&self.root) {
-            if resolved.parent() == Some(parent.as_path()) && reject_link(&self.root).is_ok() {
-                fs::remove_dir_all(&self.root).expect("remove owned test fixture");
-            }
+        if let Ok(resolved) = fs::canonicalize(&self.root)
+            && resolved.parent() == Some(parent.as_path())
+            && reject_link(&self.root).is_ok()
+        {
+            fs::remove_dir_all(&self.root).expect("remove owned test fixture");
         }
     }
 }
@@ -247,6 +248,24 @@ fn stale_active_slot_without_lease_is_preserved() {
         b"interrupted"
     );
     assert!(paths.slot.join("owner.json").exists());
+}
+
+#[test]
+fn completed_slot_with_unexplained_scratch_is_not_silently_reused() {
+    let fixture = Fixture::new("residual");
+    let build = fixture.acquire();
+    let scratch = build.paths().scratch.clone();
+    build.finish(outcome(0)).unwrap();
+    fs::create_dir(&scratch).unwrap();
+    fs::write(scratch.join("unexplained"), b"preserve").unwrap();
+    assert_eq!(
+        error_kind(ManagedBuild::acquire(
+            fixture.config.clone(),
+            &fixture.checkout
+        )),
+        "interrupted"
+    );
+    assert_eq!(fs::read(scratch.join("unexplained")).unwrap(), b"preserve");
 }
 
 #[test]
@@ -455,6 +474,183 @@ fn explicit_managed_environment_override_must_match_owned_path() {
         "override"
     );
     build.finish(outcome(0)).unwrap();
+}
+
+#[test]
+fn measurement_tolerates_only_owned_ephemeral_entries_deleted_by_concurrent_worker() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let fixture = Fixture::new("concurrent-churn");
+    let build = fixture.acquire();
+    for directory in [false, true] {
+        for _ in 0..8 {
+            let ephemeral = build.paths().cargo_target.join("compiler-churn");
+            if directory {
+                fs::create_dir(&ephemeral).unwrap();
+                fs::write(ephemeral.join("compiler-output"), b"temporary").unwrap();
+            } else {
+                fs::write(&ephemeral, b"temporary").unwrap();
+            }
+            let (enumerated_tx, enumerated_rx) = mpsc::channel();
+            let (deleted_tx, deleted_rx) = mpsc::channel();
+            let worker_path = ephemeral.clone();
+            let parent = fs::canonicalize(&build.paths().cargo_target).unwrap();
+            let worker = std::thread::spawn(move || {
+                enumerated_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("measurement enumerates authored entry");
+                let physical = fs::canonicalize(&worker_path).unwrap();
+                assert_eq!(physical.parent(), Some(parent.as_path()));
+                if directory {
+                    fs::remove_dir_all(&worker_path).unwrap();
+                } else {
+                    fs::remove_file(&worker_path).unwrap();
+                }
+                deleted_tx.send(()).unwrap();
+            });
+            let mut saw_entry = false;
+            let measured = build
+                .measure_with(|path| {
+                    if path == ephemeral {
+                        saw_entry = true;
+                        enumerated_tx.send(()).unwrap();
+                        deleted_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("concurrent compiler churn is bounded");
+                    }
+                })
+                .unwrap();
+            worker.join().unwrap();
+            assert!(saw_entry && measured.within_budget);
+            assert!(!ephemeral.exists());
+        }
+    }
+    assert!(build.paths().slot.join("owner.json").exists());
+    assert!(build.paths().catalog.join("lease.json").exists());
+    assert!(build.finish(outcome(0)).unwrap().lease_released);
+}
+
+#[test]
+fn measurement_rejects_disappeared_fixed_root_and_owner_during_observation() {
+    for remove_owner in [false, true] {
+        let fixture = Fixture::new("critical-disappearance");
+        let build = fixture.acquire();
+        let critical = if remove_owner {
+            build.paths().slot.join("owner.json")
+        } else {
+            build.paths().cargo_target.clone()
+        };
+        let mut removed = false;
+        let error = build.measure_with(|path| {
+            if path == critical && !removed {
+                if remove_owner {
+                    fs::remove_file(path).unwrap();
+                } else {
+                    fs::remove_dir(path).unwrap();
+                }
+                removed = true;
+            }
+        });
+        assert!(removed);
+        assert_eq!(error_kind(error), "io");
+        assert!(build.paths().catalog.join("lease.json").exists());
+        assert!(build.paths().scratch.exists());
+    }
+}
+
+#[test]
+fn missing_owner_before_measurement_is_never_treated_as_ephemeral_churn() {
+    let fixture = Fixture::new("missing-owner");
+    let build = fixture.acquire();
+    fs::remove_file(build.paths().slot.join("owner.json")).unwrap();
+    assert_eq!(error_kind(build.measure()), "io");
+    assert!(build.paths().catalog.join("lease.json").exists());
+}
+
+#[test]
+fn churn_allowance_does_not_apply_to_completed_slot_or_other_error_kinds() {
+    let fixture = Fixture::new("strict-observation");
+    let build = fixture.acquire();
+    let ephemeral = build.paths().cargo_target.join("vanishing");
+    fs::write(&ephemeral, b"temporary").unwrap();
+    let result = tree_bytes_observed(&build.paths().slot, &build.paths().slot, &[], |path| {
+        if path == ephemeral {
+            fs::remove_file(path).unwrap();
+        }
+    });
+    assert_eq!(error_kind(result), "io");
+    let roots = build.observation_roots();
+    let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+    let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    assert!(vanished_ephemeral_entry(&ephemeral, &not_found, &roots).unwrap());
+    assert!(!vanished_ephemeral_entry(&ephemeral, &denied, &roots).unwrap());
+    assert!(!vanished_ephemeral_entry(&build.paths().cargo_target, &not_found, &roots).unwrap());
+    assert!(
+        !vanished_ephemeral_entry(&build.paths().slot.join("owner.json"), &not_found, &roots)
+            .unwrap()
+    );
+    build.finish(outcome(0)).unwrap();
+}
+
+#[test]
+fn vanished_entry_allowance_rejects_nested_parent_replaced_by_external_link() {
+    let fixture = Fixture::new("churn-link-boundary");
+    let build = fixture.acquire();
+    let nested = build.paths().cargo_target.join("nested");
+    let moved = build.paths().cargo_target.join("original-nested");
+    let leaf = nested.join("compiler-output");
+    fs::create_dir(&nested).unwrap();
+    fs::write(&leaf, b"temporary").unwrap();
+    let outside = fixture.root.join("outside-original");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("keep"), b"user original").unwrap();
+    let mut replaced = false;
+    let result = build.measure_with(|path| {
+        if path == leaf && !replaced {
+            fs::rename(&nested, &moved).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&outside, &nested).unwrap();
+            #[cfg(windows)]
+            create_junction(&nested, &outside);
+            replaced = true;
+        }
+    });
+    assert!(replaced);
+    assert_eq!(error_kind(result), "link");
+    assert_eq!(fs::read(outside.join("keep")).unwrap(), b"user original");
+    assert_eq!(
+        fs::read(moved.join("compiler-output")).unwrap(),
+        b"temporary"
+    );
+    assert!(build.paths().catalog.join("lease.json").exists());
+    #[cfg(windows)]
+    fs::remove_dir(&nested).unwrap();
+}
+
+#[test]
+fn vanished_entry_guard_inspects_surviving_errored_leaf_itself() {
+    let fixture = Fixture::new("churn-leaf-boundary");
+    let build = fixture.acquire();
+    let leaf = build.paths().scratch.join("directory-leaf");
+    let outside = fixture.root.join("outside-empty");
+    fs::create_dir(&outside).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &leaf).unwrap();
+    #[cfg(windows)]
+    create_junction(&leaf, &outside);
+    let roots = build.observation_roots();
+    let synthetic_directory_race = std::io::Error::from(std::io::ErrorKind::NotFound);
+    assert_eq!(
+        error_kind(vanished_ephemeral_entry(
+            &leaf,
+            &synthetic_directory_race,
+            &roots
+        )),
+        "link"
+    );
+    assert!(build.paths().catalog.join("lease.json").exists());
+    #[cfg(windows)]
+    fs::remove_dir(&leaf).unwrap();
 }
 
 #[test]

@@ -16,6 +16,8 @@ namespace Mmmm.Bootstrap {
         public bool Drained;
         public long ElapsedMilliseconds;
         public string[] SupervisorErrors;
+        public uint MaximumPostLeaderProcesses;
+        public bool OwnedTailTerminated;
     }
 
     public static class WindowsBoundary {
@@ -28,6 +30,7 @@ namespace Mmmm.Bootstrap {
         private const uint JobActiveProcesses = 0x8;
         private const uint WaitObject0 = 0;
         private const uint WaitTimeout = 258;
+        private const long NaturalDrainGraceMilliseconds = 2000;
         private static volatile bool cancelled;
 
         [StructLayout(LayoutKind.Sequential)] private struct SecurityAttributes {
@@ -70,6 +73,7 @@ namespace Mmmm.Bootstrap {
         [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] private static extern IntPtr CreateJobObjectW(IntPtr security, string name);
         [DllImport("kernel32.dll", SetLastError=true)] private static extern bool SetInformationJobObject(IntPtr job, int kind, ref ExtendedLimit information, uint size);
         [DllImport("kernel32.dll", SetLastError=true)] private static extern bool QueryInformationJobObject(IntPtr job, int kind, out Accounting information, uint size, IntPtr returned);
+        [DllImport("kernel32.dll", EntryPoint="QueryInformationJobObject", SetLastError=true)] private static extern bool QueryJobProcessIds(IntPtr job, int kind, IntPtr information, uint size, IntPtr returned);
         [DllImport("kernel32.dll", SetLastError=true)] private static extern bool TerminateJobObject(IntPtr job, uint code);
         [DllImport("kernel32.dll", SetLastError=true)] private static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool inJob);
         [DllImport("kernel32.dll", SetLastError=true)] private static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, int flags, ref IntPtr bytes);
@@ -80,6 +84,8 @@ namespace Mmmm.Bootstrap {
         [DllImport("kernel32.dll", SetLastError=true)] private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
         [DllImport("kernel32.dll", SetLastError=true)] private static extern bool GetExitCodeProcess(IntPtr process, out uint code);
         [DllImport("kernel32.dll", SetLastError=true)] private static extern bool CloseHandle(IntPtr handle);
+        [DllImport("kernel32.dll", SetLastError=true)] private static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+        [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] private static extern bool QueryFullProcessImageNameW(IntPtr process, uint flags, StringBuilder path, ref uint size);
         [DllImport("kernel32.dll", SetLastError=true)] private static extern bool CreatePipe(out IntPtr read, out IntPtr write, ref SecurityAttributes security, uint size);
         [DllImport("kernel32.dll", SetLastError=true)] private static extern bool SetHandleInformation(IntPtr handle, uint mask, uint flags);
         [DllImport("kernel32.dll", SetLastError=true)] private static extern bool ReadFile(IntPtr file, byte[] buffer, uint requested, out uint received, IntPtr overlapped);
@@ -87,6 +93,36 @@ namespace Mmmm.Bootstrap {
         [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] private static extern uint GetFinalPathNameByHandleW(IntPtr file, StringBuilder path, uint capacity, uint flags);
 
         private static Exception NativeError(string operation) { return new Win32Exception(Marshal.GetLastWin32Error(), operation); }
+        private static string Diagnostic(string message) { return string.IsNullOrWhiteSpace(message) ? "bootstrap supervisor failure without diagnostic text" : message; }
+        private static string OwnedProcessNames(IntPtr job) {
+            // The job's configured process limit is 32. Only IDs from this job
+            // are inspected, and pinned handle membership is checked again.
+            int capacity=32; int bytes=8+IntPtr.Size*capacity;
+            IntPtr list=Marshal.AllocHGlobal(bytes);
+            try {
+                if(!QueryJobProcessIds(job,3,list,(uint)bytes,IntPtr.Zero)) return "unavailable(win32="+Marshal.GetLastWin32Error()+")";
+                uint count=unchecked((uint)Marshal.ReadInt32(list,4));
+                if(count>capacity) return "unavailable(job process list exceeded bound)";
+                List<string> names=new List<string>();
+                for(int i=0;i<count;i++) {
+                    long raw=Marshal.ReadIntPtr(list,8+IntPtr.Size*i).ToInt64();
+                    if(raw<=0 || raw>uint.MaxValue) { names.Add("invalid-job-pid"); continue; }
+                    uint pid=(uint)raw; IntPtr process=OpenProcess(0x1000,false,pid);
+                    if(process==IntPtr.Zero) { names.Add(pid+":unavailable"); continue; }
+                    try {
+                        bool member;
+                        if(!IsProcessInJob(process,job,out member) || !member) { names.Add(pid+":no-longer-job-owned"); continue; }
+                        StringBuilder image=new StringBuilder(32768); uint length=(uint)image.Capacity;
+                        if(!QueryFullProcessImageNameW(process,0,image,ref length)) { names.Add(pid+":name-unavailable"); continue; }
+                        string basename=Path.GetFileNameWithoutExtension(image.ToString());
+                        StringBuilder safe=new StringBuilder();
+                        foreach(char letter in basename) { if(safe.Length>=64) break; safe.Append(char.IsLetterOrDigit(letter)||letter=='-'||letter=='_'||letter=='.' ? letter : '_'); }
+                        names.Add(pid+":"+safe);
+                    } finally { Close(ref process); }
+                }
+                return string.Join(",",names);
+            } finally { Marshal.FreeHGlobal(list); }
+        }
         private static void Close(ref IntPtr handle) { if(handle != IntPtr.Zero && handle != new IntPtr(-1)) CloseHandle(handle); handle = IntPtr.Zero; }
         private static string Quote(string argument) {
             if(argument.IndexOf('\0') >= 0) throw new ArgumentException("NUL in process argument");
@@ -161,11 +197,22 @@ namespace Mmmm.Bootstrap {
         // The callback measures only the exact owned catalog; it returns null or a bounded diagnostic.
         public static RunResult Run(string executable, string[] arguments, string directory,
             string stdout, string stderr, int timeoutSeconds, Func<string> observeBudget) {
+            return Run(executable, arguments, directory, stdout, stderr, timeoutSeconds, observeBudget, false);
+        }
+
+        // Only an explicitly selected compiler build may clean up its whole owned
+        // Job after the leader exits. Control commands keep the strict overload.
+        public static RunResult Run(string executable, string[] arguments, string directory,
+            string stdout, string stderr, int timeoutSeconds, Func<string> observeBudget,
+            bool terminateOwnedBuildTail) {
             if(timeoutSeconds < 1 || timeoutSeconds > 3600) throw new ArgumentOutOfRangeException("timeoutSeconds");
             IntPtr job=IntPtr.Zero, attributes=IntPtr.Zero, handleValues=IntPtr.Zero, jobValues=IntPtr.Zero;
             IntPtr input=IntPtr.Zero, output=IntPtr.Zero, error=IntPtr.Zero, outputRead=IntPtr.Zero, errorRead=IntPtr.Zero;
             ProcessInfo process = new ProcessInfo(); bool initialized=false; bool created=false;
             List<string> errors = new List<string>(); int? exit=null; bool drained=false;
+            long? leaderExitedAt=null; int emptyObservations=0;
+            uint maximumPostLeaderProcesses=0;
+            long? tailCleanupStartedAt=null; bool ownedTailTerminated=false;
             Stopwatch elapsed = Stopwatch.StartNew(); Stopwatch lastMeasurement = Stopwatch.StartNew();
             Capture capture=new Capture(); Thread outputPump=null, errorPump=null; Timer watchdog=null;
             object timerGate=new object(); bool disposed=false; string watchdogFailure=null;
@@ -220,27 +267,61 @@ namespace Mmmm.Bootstrap {
                     if(wait==WaitObject0 && !exit.HasValue) {
                         uint code; if(!GetExitCodeProcess(process.Process, out code)) throw NativeError("read bootstrap command exit");
                         exit=unchecked((int)code);
+                        leaderExitedAt=elapsed.ElapsedMilliseconds;
                     }
                     Accounting accounting;
                     if(!QueryInformationJobObject(job, 1, out accounting, (uint)Marshal.SizeOf<Accounting>(), IntPtr.Zero)) throw NativeError("observe bootstrap physical drain");
+                    if(exit.HasValue) maximumPostLeaderProcesses=Math.Max(maximumPostLeaderProcesses,accounting.ActiveProcesses);
                     if(accounting.ActiveProcesses==0) {
                         if(!exit.HasValue) {
                             if(WaitForSingleObject(process.Process,1000)!=WaitObject0) throw NativeError("drained job leader did not signal");
                             uint code; if(!GetExitCodeProcess(process.Process,out code)) throw NativeError("capture drained command exit");
                             exit=unchecked((int)code);
+                            leaderExitedAt=elapsed.ElapsedMilliseconds;
                         }
-                        drained=true; break;
-                    }
+                        emptyObservations++;
+                    } else { emptyObservations=0; }
                     string failure=null;
                     lock(timerGate) { failure=watchdogFailure; }
                     if(failure!=null) { }
                     else if(cancelled) failure="cancelled";
                     else if(elapsed.Elapsed.TotalSeconds >= timeoutSeconds) failure="timeout";
-                    else if(exit.HasValue) failure="command exited with live owned children";
                     else if(capture.Failure!=null) failure=capture.Failure;
-                    else if(lastMeasurement.ElapsedMilliseconds >= 5000) { failure=observeBudget(); lastMeasurement.Restart(); }
+                    else if(lastMeasurement.ElapsedMilliseconds >= 5000) {
+                        failure=observeBudget();
+                        // PowerShell Func<string> marshals a successful $null as String.Empty.
+                        if(string.IsNullOrEmpty(failure)) failure=null;
+                        lastMeasurement.Restart();
+                    }
+                    // A catalog observation may cross a deadline. Also inspect
+                    // synchronous conditions before accepting an empty Job, so
+                    // a delayed Timer callback cannot turn a timeout into success.
+                    if(failure==null) {
+                        lock(timerGate) { failure=watchdogFailure; }
+                        if(failure==null && cancelled) failure="cancelled";
+                        if(failure==null && elapsed.Elapsed.TotalSeconds>=timeoutSeconds) failure="timeout";
+                        if(failure==null && capture.Failure!=null) failure=capture.Failure;
+                        if(failure==null && tailCleanupStartedAt.HasValue &&
+                            elapsed.ElapsedMilliseconds-tailCleanupStartedAt.Value>=30000)
+                            failure="owned bootstrap build tail drain deadline exceeded; ownership preserved";
+                    }
+                    if(failure==null && exit.HasValue && accounting.ActiveProcesses!=0 && leaderExitedAt.HasValue &&
+                        elapsed.ElapsedMilliseconds-leaderExitedAt.Value>=NaturalDrainGraceMilliseconds) {
+                        if(!terminateOwnedBuildTail) {
+                            failure="command exited with live owned children after 2000 ms natural drain grace; active="+
+                                accounting.ActiveProcesses+"; job-owned="+OwnedProcessNames(job);
+                        } else if(!tailCleanupStartedAt.HasValue) {
+                            // The command has already exited, so preserve its original
+                            // exit code. No process names, globals or breakaway policy
+                            // can weaken this whole-Job ownership boundary.
+                            if(!TerminateJobObject(job,124)) throw NativeError("terminate owned bootstrap build tail");
+                            ownedTailTerminated=true;
+                            tailCleanupStartedAt=elapsed.ElapsedMilliseconds;
+                            emptyObservations=0;
+                        }
+                    }
                     if(failure!=null) {
-                        errors.Add(failure);
+                        errors.Add(Diagnostic(failure));
                         if(!TerminateJobObject(job, 124)) throw NativeError("terminate bootstrap job");
                         Stopwatch drain=Stopwatch.StartNew();
                         while(drain.ElapsedMilliseconds < 30000) {
@@ -254,9 +335,13 @@ namespace Mmmm.Bootstrap {
                         }
                         break;
                     }
+                    if(emptyObservations>=2) { drained=true; break; }
+                    // A signaled leader handle no longer provides a timed wait.
+                    // Keep grace/accounting observations finite and separated.
+                    if(exit.HasValue) Thread.Sleep(100);
                 }
             } catch(Exception exception) {
-                errors.Add(exception.Message);
+                errors.Add(Diagnostic(exception.Message));
                 if(job!=IntPtr.Zero) {
                     if(!TerminateJobObject(job, 125)) errors.Add("terminate after supervisor failure: " + Marshal.GetLastWin32Error());
                     Stopwatch drain=Stopwatch.StartNew();
@@ -293,7 +378,7 @@ namespace Mmmm.Bootstrap {
                 if(handleValues!=IntPtr.Zero) Marshal.FreeHGlobal(handleValues);
                 if(jobValues!=IntPtr.Zero) Marshal.FreeHGlobal(jobValues);
             }
-            return new RunResult { CommandExit=exit, Drained=drained, ElapsedMilliseconds=elapsed.ElapsedMilliseconds, SupervisorErrors=errors.ToArray() };
+            return new RunResult { CommandExit=exit, Drained=drained, ElapsedMilliseconds=elapsed.ElapsedMilliseconds, SupervisorErrors=errors.ToArray(), MaximumPostLeaderProcesses=maximumPostLeaderProcesses, OwnedTailTerminated=ownedTailTerminated };
         }
     }
 }

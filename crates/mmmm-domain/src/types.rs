@@ -1,8 +1,10 @@
 //! DTOs mirror the canonical contract; only extensible payloads remain JSON.
 
 use crate::transform::Transform;
-use mmmm_contracts::{InstanceId, NodeId, PortId, PrefabId, ResourceId, ResourceLocation,
-    Sha256Digest, StateId, SymbolId, WorldId};
+use mmmm_contracts::{
+    InstanceId, NodeId, PortId, PrefabId, ResourceId, ResourceLocation, Sha256Digest, StateId,
+    SymbolId, WorldId,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
 use std::{collections::BTreeMap, error::Error, fmt};
@@ -16,10 +18,18 @@ pub struct DomainError {
 
 impl DomainError {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Self { code, message: message.into(), diagnostics: Vec::new() }
+        Self {
+            code,
+            message: message.into(),
+            diagnostics: Vec::new(),
+        }
     }
     pub fn with_diagnostics(code: &'static str, diagnostics: Vec<Diagnostic>) -> Self {
-        Self { code, message: "Authoring semantics are invalid".into(), diagnostics }
+        Self {
+            code,
+            message: "Authoring semantics are invalid".into(),
+            diagnostics,
+        }
     }
 }
 impl fmt::Display for DomainError {
@@ -43,8 +53,13 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     pub fn error(code: &str, message: impl Into<String>, object: Option<&str>, path: &str) -> Self {
-        Self { code: code.into(), severity: "error".into(), message: message.into(),
-            object_id: object.map(str::to_owned), path: Some(path.into()) }
+        Self {
+            code: code.into(),
+            severity: "error".into(),
+            message: message.into(),
+            object_id: object.map(str::to_owned),
+            path: Some(path.into()),
+        }
     }
 }
 
@@ -91,7 +106,10 @@ pub struct Node {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct PhysicsBinding { pub physics_id: mmmm_contracts::PhysicsId, pub body_id: mmmm_contracts::BodyId }
+pub struct PhysicsBinding {
+    pub physics_id: mmmm_contracts::PhysicsId,
+    pub body_id: mmmm_contracts::BodyId,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -113,7 +131,12 @@ pub struct BlockGeometry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct CellBounds { pub min: [i64; 3], pub max_exclusive: [i64; 3] }
+pub struct CellBounds {
+    #[serde(deserialize_with = "mmmm_contracts::deserialize_i32_vec3")]
+    pub min: [i32; 3],
+    #[serde(deserialize_with = "mmmm_contracts::deserialize_i32_vec3")]
+    pub max_exclusive: [i32; 3],
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -145,15 +168,27 @@ pub struct Port {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum StateScope { Project, Instance, Player, Ephemeral }
+pub enum StateScope {
+    Project,
+    Instance,
+    Player,
+    Ephemeral,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum StateType { Int32, Float32, Boolean }
+pub enum StateType {
+    Int32,
+    Float32,
+    Boolean,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum ScalarValue { Boolean(bool), Number(Number) }
+pub enum ScalarValue {
+    Boolean(bool),
+    Number(Number),
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -172,7 +207,11 @@ pub struct StateVariable {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ReferenceScope { Local, Project, External }
+pub enum ReferenceScope {
+    Local,
+    Project,
+    External,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -201,20 +240,44 @@ pub struct Instance {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Lifecycle { Planned, Applied, Drifted, Detached }
+pub enum Lifecycle {
+    Planned,
+    Applied,
+    Drifted,
+    Detached,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SymbolBinding { pub symbol_id: SymbolId, pub target_id: String }
+pub struct SymbolBinding {
+    pub symbol_id: SymbolId,
+    pub target_id: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InstanceOverride {
-    Transform { #[serde(rename = "nodeId")] node_id: NodeId, transform: Transform },
-    Display { #[serde(rename = "nodeId")] node_id: NodeId, display: Display },
-    StateDefault { #[serde(rename = "stateId")] state_id: StateId, value: ScalarValue },
-    Reference { #[serde(rename = "symbolId")] symbol_id: SymbolId,
-        #[serde(rename = "targetId")] target_id: mmmm_contracts::TargetId },
+    Transform {
+        #[serde(rename = "nodeId")]
+        node_id: NodeId,
+        transform: Transform,
+    },
+    Display {
+        #[serde(rename = "nodeId")]
+        node_id: NodeId,
+        display: Display,
+    },
+    StateDefault {
+        #[serde(rename = "stateId")]
+        state_id: StateId,
+        value: ScalarValue,
+    },
+    Reference {
+        #[serde(rename = "symbolId")]
+        symbol_id: SymbolId,
+        #[serde(rename = "targetId")]
+        target_id: mmmm_contracts::TargetId,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

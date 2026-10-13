@@ -17,7 +17,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const POLL: Duration = Duration::from_millis(50);
+const NATURAL_EXIT_GRACE: Duration = Duration::from_secs(2);
 const READ_BATCH_BYTES: usize = 256 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TailPolicy {
+    #[default]
+    Reject,
+    /// Only an explicitly supervised build may terminate its owned native tail
+    /// after leader exit. This never permits detached processes or partial drain.
+    TerminateForBuild,
+}
 
 #[derive(Clone, Debug)]
 pub struct ProcessSpec {
@@ -33,14 +44,24 @@ pub struct ProcessSpec {
     pub drain_timeout: Duration,
     /// Combined retained stdout and stderr bytes. Excess output fails the run.
     pub max_log_bytes: u64,
+    pub tail_policy: TailPolicy,
 }
 
 impl ProcessSpec {
     pub fn new(program: PathBuf, cwd: PathBuf, stdout_log: PathBuf, stderr_log: PathBuf) -> Self {
-        Self { program, args: Vec::new(), cwd, env: BTreeMap::new(), stdout_log,
-            stderr_log, timeout: Duration::from_secs(1200),
+        Self {
+            program,
+            args: Vec::new(),
+            cwd,
+            env: BTreeMap::new(),
+            stdout_log,
+            stderr_log,
+            timeout: Duration::from_secs(1200),
             observation_interval: Duration::from_secs(5),
-            drain_timeout: Duration::from_secs(15), max_log_bytes: 64 * 1024 * 1024 }
+            drain_timeout: Duration::from_secs(15),
+            max_log_bytes: 64 * 1024 * 1024,
+            tail_policy: TailPolicy::Reject,
+        }
     }
 }
 
@@ -48,6 +69,7 @@ impl ProcessSpec {
 #[serde(rename_all = "snake_case")]
 pub enum TerminationReason {
     Completed,
+    CompletedAfterOwnedTailCleanup,
     Cancelled,
     Timeout,
     OutputLimit,
@@ -69,6 +91,9 @@ pub struct ProcessOutcome {
     pub stderr_bytes: u64,
     /// False on an output cap/read/flush failure; retained logs are still evidence.
     pub output_complete: bool,
+    /// Explicit build-tail termination of the live owned native scope was
+    /// accepted. Drain and capture remain independent completion requirements.
+    pub owned_tail_terminated: bool,
     pub native_scope: &'static str,
 }
 
@@ -81,7 +106,11 @@ pub struct ProcessError {
 }
 impl ProcessError {
     fn new(kind: &'static str, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into(), drained: true }
+        Self {
+            kind,
+            message: message.into(),
+            drained: true,
+        }
     }
     fn io(context: &str, error: std::io::Error) -> Self {
         Self::new("io", format!("{context}: {error}"))
@@ -106,60 +135,139 @@ pub fn supervise(
     let started = Instant::now();
     let mut stdout_log = create_log(&spec.stdout_log)?;
     let mut stderr_log = create_log(&spec.stderr_log)?;
-    let mut outcome = ProcessOutcome { command_exit: None, command_signal: None,
-        supervisor_errors: Vec::new(), drained: false,
-        termination_reason: TerminationReason::Completed, elapsed_ms: 0,
-        stdout_bytes: 0, stderr_bytes: 0, output_complete: true, native_scope: native::SCOPE };
+    let mut outcome = ProcessOutcome {
+        command_exit: None,
+        command_signal: None,
+        supervisor_errors: Vec::new(),
+        drained: false,
+        termination_reason: TerminationReason::Completed,
+        elapsed_ms: 0,
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        output_complete: true,
+        owned_tail_terminated: false,
+        native_scope: native::SCOPE,
+    };
     if cancellation.load(Ordering::Acquire) {
         outcome.drained = true;
         outcome.termination_reason = TerminationReason::Cancelled;
-        outcome.supervisor_errors.push("cancelled before process creation".into());
+        outcome
+            .supervisor_errors
+            .push("cancelled before process creation".into());
         return Ok(outcome);
     }
     let mut process = native::Process::spawn(spec)?;
     let mut last_observation = started;
     let mut stopping_at = None;
     let mut exited_at = None;
+    let mut leader_exited_at = None;
     let mut capture_failed = false;
     let mut empty_observations = 0u8;
     loop {
         if !capture_failed {
             let capture = process.capture(
-                &mut stdout_log, &mut stderr_log,
-                &mut outcome.stdout_bytes, &mut outcome.stderr_bytes, spec.max_log_bytes);
+                &mut stdout_log,
+                &mut stderr_log,
+                &mut outcome.stdout_bytes,
+                &mut outcome.stderr_bytes,
+                spec.max_log_bytes,
+            );
             if let Err(error) = capture {
                 capture_failed = true;
                 outcome.output_complete = false;
                 let reason = if error.kind == "output_limit" {
                     TerminationReason::OutputLimit
-                } else { TerminationReason::SupervisorFailure };
-                request_stop(&mut process, &mut outcome, &mut stopping_at, reason, error.to_string());
+                } else {
+                    TerminationReason::SupervisorFailure
+                };
+                request_stop(
+                    &mut process,
+                    &mut outcome,
+                    &mut stopping_at,
+                    reason,
+                    error.to_string(),
+                );
+            }
+        }
+        // Optional build-tail cleanup remains subject to cancellation, time,
+        // output and managed-storage observations until physical completion.
+        if failure_checks_active(&outcome, stopping_at) && cancellation.load(Ordering::Acquire) {
+            request_stop(
+                &mut process,
+                &mut outcome,
+                &mut stopping_at,
+                TerminationReason::Cancelled,
+                "command cancelled".into(),
+            );
+        }
+        if failure_checks_active(&outcome, stopping_at) && started.elapsed() >= spec.timeout {
+            request_stop(
+                &mut process,
+                &mut outcome,
+                &mut stopping_at,
+                TerminationReason::Timeout,
+                "command timeout exceeded".into(),
+            );
+        }
+        if failure_checks_active(&outcome, stopping_at)
+            && last_observation.elapsed() >= spec.observation_interval
+        {
+            last_observation = Instant::now();
+            if let Err(error) = observe() {
+                request_stop(
+                    &mut process,
+                    &mut outcome,
+                    &mut stopping_at,
+                    TerminationReason::ObservationFailure,
+                    format!("managed observation failed: {error}"),
+                );
             }
         }
         let leader = match process.leader_exit() {
             Ok(value) => value,
             Err(error) => {
-                request_stop(&mut process, &mut outcome, &mut stopping_at,
-                    TerminationReason::SupervisorFailure, error.to_string());
+                request_stop(
+                    &mut process,
+                    &mut outcome,
+                    &mut stopping_at,
+                    TerminationReason::SupervisorFailure,
+                    error.to_string(),
+                );
                 None
             }
         };
         if let Some(exit) = leader {
             outcome.command_exit = exit.code;
             outcome.command_signal = exit.signal;
+            leader_exited_at.get_or_insert_with(Instant::now);
         }
         let raw_scope_empty = match process.scope_empty() {
             Ok(value) => value,
             Err(error) => {
-                request_stop(&mut process, &mut outcome, &mut stopping_at,
-                    TerminationReason::SupervisorFailure, error.to_string());
+                request_stop(
+                    &mut process,
+                    &mut outcome,
+                    &mut stopping_at,
+                    TerminationReason::SupervisorFailure,
+                    error.to_string(),
+                );
                 false
             }
         };
         empty_observations = if leader.is_some() && raw_scope_empty {
             empty_observations.saturating_add(1)
-        } else { 0 };
+        } else {
+            0
+        };
         let scope_empty = raw_scope_empty && empty_observations >= 2;
+        let drain_deadline_exceeded =
+            stopping_at.is_some_and(|at: Instant| at.elapsed() >= spec.drain_timeout);
+        if drain_deadline_exceeded {
+            outcome.supervisor_errors.push("owned scope drain deadline exceeded; lease must be preserved unless subsequent native proof certifies drain".into());
+            if outcome.termination_reason == TerminationReason::CompletedAfterOwnedTailCleanup {
+                outcome.termination_reason = TerminationReason::SupervisorFailure;
+            }
+        }
         if leader.is_some() && scope_empty && (capture_failed || process.outputs_closed()) {
             match process.reap() {
                 Ok(()) => outcome.drained = true,
@@ -170,6 +278,9 @@ pub fn supervise(
             }
             break;
         }
+        if drain_deadline_exceeded {
+            break;
+        }
         if leader.is_some() && raw_scope_empty {
             // EOF is independent from leader/group termination. An escaped
             // writer retaining an inherited pipe must not block forever or be
@@ -177,34 +288,42 @@ pub fn supervise(
             let at = exited_at.get_or_insert_with(Instant::now);
             if at.elapsed() >= spec.drain_timeout {
                 outcome.output_complete = false;
-                outcome.supervisor_errors.push("output pipes remained open after owned scope exit; drain cannot be certified".into());
+                outcome.supervisor_errors.push(
+                    "output pipes remained open after owned scope exit; drain cannot be certified"
+                        .into(),
+                );
                 outcome.termination_reason = TerminationReason::SupervisorFailure;
                 break;
             }
         }
-        if leader.is_some() && !raw_scope_empty && stopping_at.is_none() {
-            request_stop(&mut process, &mut outcome, &mut stopping_at,
-                TerminationReason::RemainingChildren,
-                "command leader exited while owned children remained".into());
-        }
-        if stopping_at.is_none() && cancellation.load(Ordering::Acquire) {
-            request_stop(&mut process, &mut outcome, &mut stopping_at,
-                TerminationReason::Cancelled, "command cancelled".into());
-        }
-        if stopping_at.is_none() && started.elapsed() >= spec.timeout {
-            request_stop(&mut process, &mut outcome, &mut stopping_at,
-                TerminationReason::Timeout, "command timeout exceeded".into());
-        }
-        if stopping_at.is_none() && last_observation.elapsed() >= spec.observation_interval {
-            last_observation = Instant::now();
-            if let Err(error) = observe() {
-                request_stop(&mut process, &mut outcome, &mut stopping_at,
-                    TerminationReason::ObservationFailure, format!("managed observation failed: {error}"));
+        if leader.is_some()
+            && !raw_scope_empty
+            && stopping_at.is_none()
+            && leader_exited_at.is_some_and(|at: Instant| at.elapsed() >= NATURAL_EXIT_GRACE)
+        {
+            match spec.tail_policy {
+                TailPolicy::Reject => request_stop(
+                    &mut process,
+                    &mut outcome,
+                    &mut stopping_at,
+                    TerminationReason::RemainingChildren,
+                    "owned children remained after the finite natural exit grace".into(),
+                ),
+                TailPolicy::TerminateForBuild => {
+                    stopping_at = Some(Instant::now());
+                    match process.terminate() {
+                        Ok(()) => {
+                            outcome.owned_tail_terminated = true;
+                            outcome.termination_reason =
+                                TerminationReason::CompletedAfterOwnedTailCleanup;
+                        }
+                        Err(error) => {
+                            outcome.termination_reason = TerminationReason::SupervisorFailure;
+                            outcome.supervisor_errors.push(error.to_string());
+                        }
+                    }
+                }
             }
-        }
-        if stopping_at.is_some_and(|at: Instant| at.elapsed() >= spec.drain_timeout) {
-            outcome.supervisor_errors.push("owned scope drain deadline exceeded; lease must be preserved".into());
-            break;
         }
         std::thread::sleep(POLL);
     }
@@ -212,71 +331,134 @@ pub fn supervise(
     for (label, log) in [("stdout", &mut stdout_log), ("stderr", &mut stderr_log)] {
         if let Err(error) = log.sync_all() {
             outcome.output_complete = false;
-            outcome.supervisor_errors.push(format!("flush {label} evidence: {error}"));
-            if outcome.termination_reason == TerminationReason::Completed {
+            outcome
+                .supervisor_errors
+                .push(format!("flush {label} evidence: {error}"));
+            if matches!(
+                outcome.termination_reason,
+                TerminationReason::Completed | TerminationReason::CompletedAfterOwnedTailCleanup
+            ) {
                 outcome.termination_reason = TerminationReason::SupervisorFailure;
             }
         }
+    }
+    if outcome.termination_reason == TerminationReason::CompletedAfterOwnedTailCleanup
+        && (!outcome.drained || !outcome.output_complete || !outcome.supervisor_errors.is_empty())
+    {
+        outcome.termination_reason = TerminationReason::SupervisorFailure;
     }
     outcome.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     Ok(outcome)
 }
 
+fn failure_checks_active(outcome: &ProcessOutcome, stopping_at: Option<Instant>) -> bool {
+    stopping_at.is_none()
+        || outcome.termination_reason == TerminationReason::CompletedAfterOwnedTailCleanup
+}
+
 fn request_stop(
-    process: &mut native::Process, outcome: &mut ProcessOutcome,
-    stopping_at: &mut Option<Instant>, reason: TerminationReason, error: String,
+    process: &mut native::Process,
+    outcome: &mut ProcessOutcome,
+    stopping_at: &mut Option<Instant>,
+    reason: TerminationReason,
+    error: String,
 ) {
-    if stopping_at.is_some() { return; }
-    *stopping_at = Some(Instant::now());
+    if !failure_checks_active(outcome, *stopping_at) {
+        return;
+    }
+    stopping_at.get_or_insert_with(Instant::now);
     outcome.termination_reason = reason;
     outcome.supervisor_errors.push(error);
-    if let Err(error) = process.terminate() { outcome.supervisor_errors.push(error.to_string()); }
+    if let Err(error) = process.terminate() {
+        outcome.supervisor_errors.push(error.to_string());
+    }
 }
 
 fn validate(spec: &ProcessSpec) -> Result<(), ProcessError> {
-    if spec.timeout < Duration::from_secs(1) || spec.timeout > Duration::from_secs(3600)
-        || spec.observation_interval.is_zero() || spec.observation_interval > Duration::from_secs(5)
-        || spec.drain_timeout.is_zero() || spec.drain_timeout > Duration::from_secs(60)
-        || spec.max_log_bytes == 0 {
-        return Err(ProcessError::new("budget", "timeout must be 1..3600 seconds, observation <=5 seconds, drain <=60 seconds and output budget positive"));
+    if spec.timeout < Duration::from_secs(1)
+        || spec.timeout > Duration::from_secs(3600)
+        || spec.observation_interval.is_zero()
+        || spec.observation_interval > Duration::from_secs(5)
+        || spec.drain_timeout.is_zero()
+        || spec.drain_timeout > Duration::from_secs(60)
+        || spec.max_log_bytes == 0
+    {
+        return Err(ProcessError::new(
+            "budget",
+            "timeout must be 1..3600 seconds, observation <=5 seconds, drain <=60 seconds and output budget positive",
+        ));
     }
     for path in [&spec.program, &spec.cwd, &spec.stdout_log, &spec.stderr_log] {
-        if !path.is_absolute() || path.components().any(|p| matches!(p, Component::CurDir | Component::ParentDir)) {
-            return Err(ProcessError::new("path", "resolved absolute paths without parent/current components are required"));
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|p| matches!(p, Component::CurDir | Component::ParentDir))
+        {
+            return Err(ProcessError::new(
+                "path",
+                "resolved absolute paths without parent/current components are required",
+            ));
         }
         reject_secret_path(path)?;
     }
     if spec.stdout_log == spec.stderr_log {
-        return Err(ProcessError::new("path", "stdout and stderr require distinct new evidence files"));
+        return Err(ProcessError::new(
+            "path",
+            "stdout and stderr require distinct new evidence files",
+        ));
     }
+    // Reject network/device cwd prefixes before any filesystem metadata query.
+    #[cfg(windows)]
+    native::working_directory_prefix(&spec.cwd)?;
     if !spec.program.is_file() || !spec.cwd.is_dir() {
-        return Err(ProcessError::new("path", "program file and working directory must exist"));
+        return Err(ProcessError::new(
+            "path",
+            "program file and working directory must exist",
+        ));
     }
-    for (name, _) in &spec.env {
+    for name in spec.env.keys() {
         if name.is_empty() || name.to_string_lossy().contains(['=', '\0']) {
-            return Err(ProcessError::new("environment", "invalid environment override name"));
+            return Err(ProcessError::new(
+                "environment",
+                "invalid environment override name",
+            ));
         }
     }
     Ok(())
 }
 
 fn create_log(path: &Path) -> Result<File, ProcessError> {
-    let parent = path.parent().ok_or_else(|| ProcessError::new("path", "evidence file has no parent"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| ProcessError::new("path", "evidence file has no parent"))?;
     for ancestor in parent.ancestors() {
-        if ancestor.as_os_str().is_empty() { continue; }
-        let metadata = fs::symlink_metadata(ancestor).map_err(|e| ProcessError::io("inspect evidence ancestry", e))?;
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(ancestor)
+            .map_err(|e| ProcessError::io("inspect evidence ancestry", e))?;
         let link = metadata.file_type().is_symlink();
-        #[cfg(windows)] {
+        #[cfg(windows)]
+        {
             use std::os::windows::fs::MetadataExt;
             if metadata.file_attributes() & 0x400 != 0 {
-                return Err(ProcessError::new("path", "evidence ancestry contains a reparse point"));
+                return Err(ProcessError::new(
+                    "path",
+                    "evidence ancestry contains a reparse point",
+                ));
             }
         }
         if link || !metadata.is_dir() {
-            return Err(ProcessError::new("path", "evidence ancestry contains a link, reparse point or nondirectory"));
+            return Err(ProcessError::new(
+                "path",
+                "evidence ancestry contains a link, reparse point or nondirectory",
+            ));
         }
     }
-    OpenOptions::new().write(true).create_new(true).open(path)
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
         .map_err(|e| ProcessError::io("create new evidence log", e))
 }
 
@@ -284,12 +466,23 @@ fn reject_secret_path(path: &Path) -> Result<(), ProcessError> {
     for component in path.components() {
         if let Component::Normal(name) = component {
             let name = name.to_string_lossy().to_ascii_lowercase();
-            if name == ".env" || name.starts_with(".env.") || name == ".ssh"
-                || name.contains("credential") || name.contains("service-account")
-                || name.contains("service_account") || name.starts_with("id_rsa") || name.starts_with("id_ed25519")
-                || [".pem", ".key", ".p12", ".pfx"].iter().any(|suffix| name.ends_with(suffix))
-                || ["api-key", "api_key", "api-keys", "api_keys"].contains(&name.as_str()) {
-                return Err(ProcessError::new("secret_path", "secret-named paths are not inspected or executed"));
+            if name == ".env"
+                || name.starts_with(".env.")
+                || name == ".ssh"
+                || name.contains("credential")
+                || name.contains("service-account")
+                || name.contains("service_account")
+                || name.starts_with("id_rsa")
+                || name.starts_with("id_ed25519")
+                || [".pem", ".key", ".p12", ".pfx"]
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+                || ["api-key", "api_key", "api-keys", "api_keys"].contains(&name.as_str())
+            {
+                return Err(ProcessError::new(
+                    "secret_path",
+                    "secret-named paths are not inspected or executed",
+                ));
             }
         }
     }
@@ -297,14 +490,29 @@ fn reject_secret_path(path: &Path) -> Result<(), ProcessError> {
 }
 
 #[derive(Clone, Copy)]
-struct LeaderExit { code: Option<i32>, signal: Option<i32> }
+struct LeaderExit {
+    code: Option<i32>,
+    signal: Option<i32>,
+}
 
-fn retain_output(log: &mut File, bytes: &[u8], count: &mut u64, total: u64, cap: u64) -> Result<(), ProcessError> {
-    let allowed = usize::try_from(cap.saturating_sub(total)).unwrap_or(usize::MAX).min(bytes.len());
-    log.write_all(&bytes[..allowed]).map_err(|e| ProcessError::io("write process evidence", e))?;
+fn retain_output(
+    log: &mut File,
+    bytes: &[u8],
+    count: &mut u64,
+    total: u64,
+    cap: u64,
+) -> Result<(), ProcessError> {
+    let allowed = usize::try_from(cap.saturating_sub(total))
+        .unwrap_or(usize::MAX)
+        .min(bytes.len());
+    log.write_all(&bytes[..allowed])
+        .map_err(|e| ProcessError::io("write process evidence", e))?;
     *count += allowed as u64;
     if allowed != bytes.len() {
-        return Err(ProcessError::new("output_limit", "combined stdout/stderr retention budget exceeded; excess bytes were not retained"));
+        return Err(ProcessError::new(
+            "output_limit",
+            "combined stdout/stderr retention budget exceeded; excess bytes were not retained",
+        ));
     }
     Ok(())
 }
@@ -314,66 +522,151 @@ mod native {
     use super::*;
     use std::ffi::OsStr;
     use std::mem::{size_of, size_of_val, zeroed};
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::Prefix;
     use std::ptr::{null, null_mut};
-    use windows_sys::Win32::Foundation::{CloseHandle, SetHandleInformation, ERROR_BROKEN_PIPE, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_BROKEN_PIPE, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT,
+        INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, ReadFile, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
-    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        ReadFile,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+        TerminateJobObject,
+    };
     use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
-    use windows_sys::Win32::System::Threading::{CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess, InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW};
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+        DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
+        InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    };
 
     pub(super) const SCOPE: &str = "windows_job";
     struct Handle(HANDLE);
-    impl Drop for Handle { fn drop(&mut self) { unsafe { CloseHandle(self.0); } } }
-    struct Pipe { read: Handle, eof: bool }
-    pub(super) struct Process { job: Handle, leader: Handle, stdout: Pipe, stderr: Pipe }
-    struct Attributes { storage: Vec<usize> }
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+    struct Pipe {
+        read: Handle,
+        eof: bool,
+    }
+    pub(super) struct Process {
+        job: Handle,
+        leader: Handle,
+        stdout: Pipe,
+        stderr: Pipe,
+    }
+    struct Attributes {
+        storage: Vec<usize>,
+    }
     impl Attributes {
-        fn pointer(&mut self) -> *mut std::ffi::c_void { self.storage.as_mut_ptr().cast() }
+        fn pointer(&mut self) -> *mut std::ffi::c_void {
+            self.storage.as_mut_ptr().cast()
+        }
         fn new() -> Result<Self, ProcessError> {
             let mut bytes = 0;
-            unsafe { InitializeProcThreadAttributeList(null_mut(), 2, 0, &mut bytes); }
-            if bytes == 0 { return Err(last("size native process attributes")); }
+            unsafe {
+                InitializeProcThreadAttributeList(null_mut(), 2, 0, &mut bytes);
+            }
+            if bytes == 0 {
+                return Err(last("size native process attributes"));
+            }
             let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
-            if unsafe { InitializeProcThreadAttributeList(storage.as_mut_ptr().cast(), 2, 0, &mut bytes) } == 0 {
+            if unsafe {
+                InitializeProcThreadAttributeList(storage.as_mut_ptr().cast(), 2, 0, &mut bytes)
+            } == 0
+            {
                 // A failed initialization must not be passed to Delete.
                 return Err(last("initialize native process attributes"));
             }
             Ok(Self { storage })
         }
     }
-    impl Drop for Attributes { fn drop(&mut self) { unsafe { DeleteProcThreadAttributeList(self.pointer()); } } }
+    impl Drop for Attributes {
+        fn drop(&mut self) {
+            unsafe {
+                DeleteProcThreadAttributeList(self.pointer());
+            }
+        }
+    }
 
     impl Process {
         pub(super) fn spawn(spec: &ProcessSpec) -> Result<Self, ProcessError> {
             unsafe {
                 let job = Handle(CreateJobObjectW(null(), null()));
-                if job.0.is_null() { return Err(last("create owned job")); }
+                if job.0.is_null() {
+                    return Err(last("create owned job"));
+                }
                 let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
                 limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                if SetInformationJobObject(job.0, JobObjectExtendedLimitInformation,
-                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(), size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32) == 0 {
+                if SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                ) == 0
+                {
                     return Err(last("set kill-on-close job boundary"));
                 }
                 let (stdout, stdout_write) = pipe()?;
                 let (stderr, stderr_write) = pipe()?;
-                let attributes = SECURITY_ATTRIBUTES { nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-                    lpSecurityDescriptor: null_mut(), bInheritHandle: 1 };
-                let stdin = Handle(CreateFileW(wide(OsStr::new("NUL")).as_ptr(), GENERIC_READ,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE, &attributes, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null_mut()));
-                if stdin.0 == INVALID_HANDLE_VALUE { return Err(last("open null stdin")); }
+                let attributes = SECURITY_ATTRIBUTES {
+                    nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                    lpSecurityDescriptor: null_mut(),
+                    bInheritHandle: 1,
+                };
+                let stdin = Handle(CreateFileW(
+                    wide(OsStr::new("NUL")).as_ptr(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    &attributes,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    null_mut(),
+                ));
+                if stdin.0 == INVALID_HANDLE_VALUE {
+                    return Err(last("open null stdin"));
+                }
                 let mut inherited = [stdin.0, stdout_write.0, stderr_write.0];
                 let mut jobs = [job.0];
                 let mut attributes = Attributes::new()?;
-                if UpdateProcThreadAttribute(attributes.pointer(), 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                    inherited.as_mut_ptr().cast(), size_of_val(&inherited), null_mut(), null_mut()) == 0 {
+                if UpdateProcThreadAttribute(
+                    attributes.pointer(),
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                    inherited.as_mut_ptr().cast(),
+                    size_of_val(&inherited),
+                    null_mut(),
+                    null_mut(),
+                ) == 0
+                {
                     return Err(last("restrict inherited process handles"));
                 }
                 // Atomic association prevents an orphan if the supervisor is killed
                 // between CreateProcessW and the suspended verification below.
-                if UpdateProcThreadAttribute(attributes.pointer(), 0, PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
-                    jobs.as_mut_ptr().cast(), size_of_val(&jobs), null_mut(), null_mut()) == 0 {
+                if UpdateProcThreadAttribute(
+                    attributes.pointer(),
+                    0,
+                    PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                    jobs.as_mut_ptr().cast(),
+                    size_of_val(&jobs),
+                    null_mut(),
+                    null_mut(),
+                ) == 0
+                {
                     return Err(last("set atomic owned job association"));
                 }
                 let mut startup: STARTUPINFOEXW = zeroed();
@@ -384,28 +677,55 @@ mod native {
                 startup.StartupInfo.hStdError = stderr_write.0;
                 startup.lpAttributeList = attributes.pointer();
                 let application = wide(spec.program.as_os_str());
-                let directory = wide(spec.cwd.as_os_str());
+                let directory = current_directory(&spec.cwd)?;
                 let mut command = command_line(spec)?;
                 let mut environment = environment_block(&spec.env)?;
                 let mut info: PROCESS_INFORMATION = zeroed();
-                if CreateProcessW(application.as_ptr(), command.as_mut_ptr(), null(), null(), 1,
-                    CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-                    environment.as_mut_ptr().cast(), directory.as_ptr(), &startup.StartupInfo, &mut info) == 0 {
+                if CreateProcessW(
+                    application.as_ptr(),
+                    command.as_mut_ptr(),
+                    null(),
+                    null(),
+                    1,
+                    CREATE_SUSPENDED
+                        | CREATE_NO_WINDOW
+                        | EXTENDED_STARTUPINFO_PRESENT
+                        | CREATE_UNICODE_ENVIRONMENT,
+                    environment.as_mut_ptr().cast(),
+                    directory.as_ptr(),
+                    &startup.StartupInfo,
+                    &mut info,
+                ) == 0
+                {
                     return Err(last("create suspended owned command"));
                 }
                 let leader = Handle(info.hProcess);
                 let thread = Handle(info.hThread);
                 let mut inside = 0;
                 if IsProcessInJob(leader.0, job.0, &mut inside) == 0
-                    || (inside == 0 && AssignProcessToJobObject(job.0, leader.0) == 0) {
+                    || (inside == 0 && AssignProcessToJobObject(job.0, leader.0) == 0)
+                {
                     let mut error = last("verify suspended owned job association");
                     TerminateProcess(leader.0, 125);
                     error.drained = WaitForSingleObject(leader.0, 15_000) == WAIT_OBJECT_0;
                     return Err(error);
                 }
-                let process = Self { job, leader, stdout, stderr };
-                if ResumeThread(thread.0) == u32::MAX {
-                    let mut error = last("resume owned command");
+                let process = Self {
+                    job,
+                    leader,
+                    stdout,
+                    stderr,
+                };
+                let suspend_count = ResumeThread(thread.0);
+                if suspend_count != 1 {
+                    let mut error = if suspend_count == u32::MAX {
+                        last("resume owned command")
+                    } else {
+                        ProcessError::new(
+                            "process_startup",
+                            format!("unexpected initial thread suspend count: {suspend_count}"),
+                        )
+                    };
                     TerminateJobObject(process.job.0, 125);
                     error.drained = WaitForSingleObject(process.leader.0, 15_000) == WAIT_OBJECT_0
                         && process.scope_empty().unwrap_or(false);
@@ -419,81 +739,252 @@ mod native {
                 WAIT_TIMEOUT => Ok(None),
                 WAIT_OBJECT_0 => {
                     let mut code = 0;
-                    if unsafe { GetExitCodeProcess(self.leader.0, &mut code) } == 0 { return Err(last("read command exit")); }
-                    Ok(Some(LeaderExit { code: Some(code as i32), signal: None }))
+                    if unsafe { GetExitCodeProcess(self.leader.0, &mut code) } == 0 {
+                        return Err(last("read command exit"));
+                    }
+                    Ok(Some(LeaderExit {
+                        code: Some(code as i32),
+                        signal: None,
+                    }))
                 }
                 _ => Err(last("observe command handle")),
             }
         }
         pub(super) fn scope_empty(&self) -> Result<bool, ProcessError> {
             let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { zeroed() };
-            if unsafe { QueryInformationJobObject(self.job.0, JobObjectBasicAccountingInformation,
-                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
-                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32, null_mut()) } == 0 {
+            if unsafe {
+                QueryInformationJobObject(
+                    self.job.0,
+                    JobObjectBasicAccountingInformation,
+                    (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                    size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                    null_mut(),
+                )
+            } == 0
+            {
                 return Err(last("observe owned job drain"));
             }
             Ok(accounting.ActiveProcesses == 0)
         }
         pub(super) fn terminate(&mut self) -> Result<(), ProcessError> {
-            if unsafe { TerminateJobObject(self.job.0, 124) } == 0 { Err(last("terminate owned job")) } else { Ok(()) }
+            if unsafe { TerminateJobObject(self.job.0, 124) } == 0 {
+                Err(last("terminate owned job"))
+            } else {
+                Ok(())
+            }
         }
         pub(super) fn reap(&mut self) -> Result<(), ProcessError> {
-            if unsafe { WaitForSingleObject(self.leader.0, 0) } == WAIT_OBJECT_0 { Ok(()) }
-            else { Err(last("verify command termination")) }
+            if unsafe { WaitForSingleObject(self.leader.0, 0) } == WAIT_OBJECT_0 {
+                Ok(())
+            } else {
+                Err(last("verify command termination"))
+            }
         }
-        pub(super) fn capture(&mut self, stdout: &mut File, stderr: &mut File,
-            stdout_count: &mut u64, stderr_count: &mut u64, cap: u64) -> Result<(), ProcessError> {
-            self.stdout.capture(stdout, stdout_count, *stderr_count, cap)?;
-            self.stderr.capture(stderr, stderr_count, *stdout_count, cap)
+        pub(super) fn capture(
+            &mut self,
+            stdout: &mut File,
+            stderr: &mut File,
+            stdout_count: &mut u64,
+            stderr_count: &mut u64,
+            cap: u64,
+        ) -> Result<(), ProcessError> {
+            self.stdout
+                .capture(stdout, stdout_count, *stderr_count, cap)?;
+            self.stderr
+                .capture(stderr, stderr_count, *stdout_count, cap)
         }
-        pub(super) fn outputs_closed(&self) -> bool { self.stdout.eof && self.stderr.eof }
+        pub(super) fn outputs_closed(&self) -> bool {
+            self.stdout.eof && self.stderr.eof
+        }
     }
     impl Pipe {
-        fn capture(&mut self, log: &mut File, count: &mut u64, other: u64, cap: u64) -> Result<(), ProcessError> {
-            if self.eof { return Ok(()); }
+        fn capture(
+            &mut self,
+            log: &mut File,
+            count: &mut u64,
+            other: u64,
+            cap: u64,
+        ) -> Result<(), ProcessError> {
+            if self.eof {
+                return Ok(());
+            }
             let mut processed = 0;
             loop {
                 let mut available = 0;
-                if unsafe { PeekNamedPipe(self.read.0, null_mut(), 0, null_mut(), &mut available, null_mut()) } == 0 {
+                if unsafe {
+                    PeekNamedPipe(
+                        self.read.0,
+                        null_mut(),
+                        0,
+                        null_mut(),
+                        &mut available,
+                        null_mut(),
+                    )
+                } == 0
+                {
                     let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) { self.eof = true; return Ok(()); }
+                    if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                        self.eof = true;
+                        return Ok(());
+                    }
                     return Err(ProcessError::io("observe output pipe", error));
                 }
-                if available == 0 || processed >= READ_BATCH_BYTES { return Ok(()); }
+                if available == 0 || processed >= READ_BATCH_BYTES {
+                    return Ok(());
+                }
                 let mut bytes = [0u8; 8192];
                 let mut read = 0;
-                if unsafe { ReadFile(self.read.0, bytes.as_mut_ptr(), available.min(bytes.len() as u32), &mut read, null_mut()) } == 0 {
+                if unsafe {
+                    ReadFile(
+                        self.read.0,
+                        bytes.as_mut_ptr(),
+                        available.min(bytes.len() as u32),
+                        &mut read,
+                        null_mut(),
+                    )
+                } == 0
+                {
                     return Err(last("read output pipe"));
                 }
-                if read == 0 { return Ok(()); }
+                if read == 0 {
+                    return Ok(());
+                }
                 retain_output(log, &bytes[..read as usize], count, *count + other, cap)?;
                 processed += read as usize;
             }
         }
     }
     fn pipe() -> Result<(Pipe, Handle), ProcessError> {
-        let attributes = SECURITY_ATTRIBUTES { nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: null_mut(), bInheritHandle: 1 };
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: null_mut(),
+            bInheritHandle: 1,
+        };
         let mut read = null_mut();
         let mut write = null_mut();
-        if unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) } == 0 { return Err(last("create bounded output pipe")); }
+        if unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) } == 0 {
+            return Err(last("create bounded output pipe"));
+        }
         let read = Handle(read);
         let write = Handle(write);
-        if unsafe { SetHandleInformation(read.0, HANDLE_FLAG_INHERIT, 0) } == 0 { return Err(last("protect supervisor pipe handle")); }
+        if unsafe { SetHandleInformation(read.0, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(last("protect supervisor pipe handle"));
+        }
         Ok((Pipe { read, eof: false }, write))
     }
-    fn last(context: &str) -> ProcessError { ProcessError::io(context, std::io::Error::last_os_error()) }
-    fn wide(value: &OsStr) -> Vec<u16> { value.encode_wide().chain(Some(0)).collect() }
+    fn last(context: &str) -> ProcessError {
+        ProcessError::io(context, std::io::Error::last_os_error())
+    }
+    fn wide(value: &OsStr) -> Vec<u16> {
+        value.encode_wide().chain(Some(0)).collect()
+    }
+    pub(super) fn working_directory_prefix(path: &Path) -> Result<(), ProcessError> {
+        match path.components().next() {
+            Some(Component::Prefix(prefix))
+                if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) =>
+            {
+                Ok(())
+            }
+            _ => Err(ProcessError::new(
+                "path_transport",
+                "network, device and non-drive working-directory transports are unsupported",
+            )),
+        }
+    }
+    /// Win32 process startup needs a DOS cwd transport even when managed path
+    /// identity is represented with a verified VerbatimDisk prefix. Keep that
+    /// authoritative identity unchanged and prove both paths resolve identically.
+    pub(super) fn current_directory(path: &Path) -> Result<Vec<u16>, ProcessError> {
+        working_directory_prefix(path)?;
+        let prefix = path
+            .components()
+            .next()
+            .and_then(|component| match component {
+                Component::Prefix(prefix) => Some(prefix.kind()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                ProcessError::new(
+                    "path_transport",
+                    "Windows working directory requires a local drive prefix",
+                )
+            })?;
+        let transport = match prefix {
+            Prefix::Disk(_) => path.to_path_buf(),
+            Prefix::VerbatimDisk(_) => {
+                let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+                let expected = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+                if !units.starts_with(&expected) {
+                    return Err(ProcessError::new(
+                        "path_transport",
+                        "unsupported verbatim working-directory representation",
+                    ));
+                }
+                PathBuf::from(OsString::from_wide(&units[expected.len()..]))
+            }
+            _ => {
+                return Err(ProcessError::new(
+                    "path_transport",
+                    "network and device working-directory transports are unsupported",
+                ));
+            }
+        };
+        let directory = wide(transport.as_os_str());
+        // SetCurrentDirectory retains a trailing separator. Reserve its space
+        // as well as the NUL rather than accept a transport at the native edge.
+        let needs_separator = !matches!(directory.get(directory.len().saturating_sub(2)),
+            Some(unit) if *unit == b'\\' as u16 || *unit == b'/' as u16);
+        if directory.len().saturating_add(usize::from(needs_separator)) > 260 {
+            return Err(ProcessError::new(
+                "path_transport",
+                "working directory exceeds the supported DOS transport length",
+            ));
+        }
+        let original = fs::canonicalize(path)
+            .map_err(|e| ProcessError::io("resolve authoritative working directory", e))?;
+        let resolved = fs::canonicalize(&transport)
+            .map_err(|e| ProcessError::io("resolve working-directory transport", e))?;
+        if !matches!(original.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_)))
+        {
+            return Err(ProcessError::new(
+                "path_transport",
+                "resolved working directory is not a local disk path",
+            ));
+        }
+        if original != resolved {
+            return Err(ProcessError::new(
+                "path_transport",
+                "DOS working-directory transport changes the authoritative physical path",
+            ));
+        }
+        Ok(directory)
+    }
     fn command_line(spec: &ProcessSpec) -> Result<Vec<u16>, ProcessError> {
         let mut command = Vec::new();
-        for arg in std::iter::once(spec.program.as_os_str()).chain(spec.args.iter().map(OsString::as_os_str)) {
-            if !command.is_empty() { command.push(b' ' as u16); }
+        for arg in std::iter::once(spec.program.as_os_str())
+            .chain(spec.args.iter().map(OsString::as_os_str))
+        {
+            if !command.is_empty() {
+                command.push(b' ' as u16);
+            }
             command.push(b'"' as u16);
             let mut slashes = 0;
             for unit in arg.encode_wide() {
-                if unit == 0 { return Err(ProcessError::new("argument", "NUL in command argument")); }
-                if unit == b'\\' as u16 { slashes += 1; continue; }
-                command.extend(std::iter::repeat_n(b'\\' as u16, if unit == b'"' as u16 { slashes * 2 + 1 } else { slashes }));
+                if unit == 0 {
+                    return Err(ProcessError::new("argument", "NUL in command argument"));
+                }
+                if unit == b'\\' as u16 {
+                    slashes += 1;
+                    continue;
+                }
+                command.extend(std::iter::repeat_n(
+                    b'\\' as u16,
+                    if unit == b'"' as u16 {
+                        slashes * 2 + 1
+                    } else {
+                        slashes
+                    },
+                ));
                 slashes = 0;
                 command.push(unit);
             }
@@ -501,25 +992,45 @@ mod native {
             command.push(b'"' as u16);
         }
         command.push(0);
-        if command.len() > 32767 { return Err(ProcessError::new("argument", "Windows command line exceeds native bound")); }
+        if command.len() > 32767 {
+            return Err(ProcessError::new(
+                "argument",
+                "Windows command line exceeds native bound",
+            ));
+        }
         Ok(command)
     }
-    fn environment_block(overrides: &BTreeMap<OsString, OsString>) -> Result<Vec<u16>, ProcessError> {
+    fn environment_block(
+        overrides: &BTreeMap<OsString, OsString>,
+    ) -> Result<Vec<u16>, ProcessError> {
         // Inheritance is used for executable/toolchain discovery. Values are
         // passed to the child only; they are never logged or put into receipts.
         let mut entries = BTreeMap::new();
-        for (name, value) in std::env::vars_os().chain(overrides.iter().map(|(k,v)| (k.clone(), v.clone()))) {
+        for (name, value) in
+            std::env::vars_os().chain(overrides.iter().map(|(k, v)| (k.clone(), v.clone())))
+        {
             entries.insert(name.to_string_lossy().to_uppercase(), (name, value));
         }
         let mut block = Vec::new();
         for (_, (name, value)) in entries {
-            let entry: Vec<u16> = name.encode_wide().chain(Some(b'=' as u16)).chain(value.encode_wide()).collect();
-            if entry.contains(&0) { return Err(ProcessError::new("environment", "NUL in process environment override")); }
+            let entry: Vec<u16> = name
+                .encode_wide()
+                .chain(Some(b'=' as u16))
+                .chain(value.encode_wide())
+                .collect();
+            if entry.contains(&0) {
+                return Err(ProcessError::new(
+                    "environment",
+                    "NUL in process environment override",
+                ));
+            }
             block.extend(entry);
             block.push(0);
         }
         block.push(0);
-        if block.len() == 1 { block.push(0); }
+        if block.len() == 1 {
+            block.push(0);
+        }
         Ok(block)
     }
 }
@@ -531,39 +1042,86 @@ mod native {
     use std::os::fd::{AsRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
-    #[cfg(target_os = "linux")] pub(super) const SCOPE: &str = "linux_process_group";
-    #[cfg(target_os = "macos")] pub(super) const SCOPE: &str = "macos_process_group_libproc";
-    struct Pipe { file: File, eof: bool }
+    #[cfg(target_os = "linux")]
+    pub(super) const SCOPE: &str = "linux_process_group";
+    #[cfg(target_os = "macos")]
+    pub(super) const SCOPE: &str = "macos_process_group_libproc";
+    struct Pipe {
+        file: File,
+        eof: bool,
+    }
     pub(super) struct Process {
-        child: Child, pid: libc::pid_t, stdout: Pipe, stderr: Pipe,
-        reaped: bool, reservation_valid: bool,
+        child: Child,
+        pid: libc::pid_t,
+        stdout: Pipe,
+        stderr: Pipe,
+        reaped: bool,
+        reservation_valid: bool,
         #[cfg(target_os = "macos")]
         mac_leader_identity: Option<(u64, u64)>,
     }
     impl Process {
         pub(super) fn spawn(spec: &ProcessSpec) -> Result<Self, ProcessError> {
             let mut command = Command::new(&spec.program);
-            command.args(&spec.args).current_dir(&spec.cwd).envs(&spec.env)
-                .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            command
+                .args(&spec.args)
+                .current_dir(&spec.cwd)
+                .envs(&spec.env)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             // Only async-signal-safe libc calls occur between fork and exec.
-            unsafe { command.pre_exec(|| {
-                if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
-            }); }
-            let mut child = command.spawn().map_err(|e| ProcessError::io("spawn owned session", e))?;
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+            let mut child = command
+                .spawn()
+                .map_err(|e| ProcessError::io("spawn owned session", e))?;
             let pid = child.id() as libc::pid_t;
-            let stdout = child.stdout.take().ok_or_else(|| ProcessError::new("pipe", "missing stdout pipe"))?;
-            let stderr = child.stderr.take().ok_or_else(|| ProcessError::new("pipe", "missing stderr pipe"))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| ProcessError::new("pipe", "missing stdout pipe"))?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| ProcessError::new("pipe", "missing stderr pipe"))?;
             let stdout: OwnedFd = stdout.into();
             let stderr: OwnedFd = stderr.into();
-            let mut process = Self { child, pid, stdout: Pipe { file: stdout.into(), eof: false },
-                stderr: Pipe { file: stderr.into(), eof: false }, reaped: false, reservation_valid: true,
+            let mut process = Self {
+                child,
+                pid,
+                stdout: Pipe {
+                    file: stdout.into(),
+                    eof: false,
+                },
+                stderr: Pipe {
+                    file: stderr.into(),
+                    eof: false,
+                },
+                reaped: false,
+                reservation_valid: true,
                 #[cfg(target_os = "macos")]
                 mac_leader_identity: None,
             };
-            for fd in [process.stdout.file.as_raw_fd(), process.stderr.file.as_raw_fd()] {
+            for fd in [
+                process.stdout.file.as_raw_fd(),
+                process.stderr.file.as_raw_fd(),
+            ] {
                 let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-                if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-                    let mut error = ProcessError::io("make bounded output nonblocking", std::io::Error::last_os_error());
+                if flags < 0
+                    || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+                {
+                    let mut error = ProcessError::io(
+                        "make bounded output nonblocking",
+                        std::io::Error::last_os_error(),
+                    );
                     let _ = process.terminate();
                     error.drained = false;
                     return Err(error);
@@ -571,18 +1129,27 @@ mod native {
             }
             #[cfg(target_os = "macos")]
             {
-                let identity = mac_bsd_info(pid, true).and_then(|value| value.ok_or_else(||
-                    ProcessError::new("process_identity", "new reserved macOS leader missing")));
+                let identity = mac_bsd_info(pid, true).and_then(|value| {
+                    value.ok_or_else(|| {
+                        ProcessError::new("process_identity", "new reserved macOS leader missing")
+                    })
+                });
                 match identity {
                     Ok(info) if info.pid == pid as u32 && info.pgid == pid as u32 => {
                         process.mac_leader_identity = Some((info.start_sec, info.start_usec));
                     }
                     Ok(_) => {
-                        let mut error = ProcessError::new("process_identity", "new macOS leader has inconsistent process-group identity");
+                        let mut error = ProcessError::new(
+                            "process_identity",
+                            "new macOS leader has inconsistent process-group identity",
+                        );
                         error.drained = false;
                         return Err(error);
                     }
-                    Err(mut error) => { error.drained = false; return Err(error); }
+                    Err(mut error) => {
+                        error.drained = false;
+                        return Err(error);
+                    }
                 }
             }
             Ok(process)
@@ -591,39 +1158,68 @@ mod native {
             // WNOWAIT preserves the leader identity, so its process group ID
             // cannot be recycled before the final owned-group observation.
             let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            if unsafe { libc::waitid(libc::P_PID, self.pid as libc::id_t, &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) } == -1 {
+            if unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            } == -1
+            {
                 let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ECHILD) { self.reservation_valid = false; }
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    self.reservation_valid = false;
+                }
                 return Err(ProcessError::io("observe unreaped command leader", error));
             }
             #[cfg(target_os = "linux")]
             let pid = unsafe { info.si_pid() };
             #[cfg(target_os = "macos")]
             let pid = info.si_pid;
-            if pid == 0 { return Ok(None); }
+            if pid == 0 {
+                return Ok(None);
+            }
             #[cfg(target_os = "linux")]
             let status = unsafe { info.si_status() };
             #[cfg(target_os = "macos")]
             let status = info.si_status;
-            if info.si_code == libc::CLD_EXITED { Ok(Some(LeaderExit { code: Some(status), signal: None })) }
-            else { Ok(Some(LeaderExit { code: None, signal: Some(status) })) }
+            if info.si_code == libc::CLD_EXITED {
+                Ok(Some(LeaderExit {
+                    code: Some(status),
+                    signal: None,
+                }))
+            } else {
+                Ok(Some(LeaderExit {
+                    code: None,
+                    signal: Some(status),
+                }))
+            }
         }
         pub(super) fn scope_empty(&self) -> Result<bool, ProcessError> {
             #[cfg(target_os = "linux")]
             let members = live_group_members(self.pid)?;
             #[cfg(target_os = "macos")]
-            let members = live_group_members(self.pid, self.mac_leader_identity.ok_or_else(||
-                ProcessError::new("process_identity", "missing reserved macOS leader identity"))?)?;
+            let members = live_group_members(
+                self.pid,
+                self.mac_leader_identity.ok_or_else(|| {
+                    ProcessError::new("process_identity", "missing reserved macOS leader identity")
+                })?,
+            )?;
             Ok(members == 0)
         }
         pub(super) fn terminate(&mut self) -> Result<(), ProcessError> {
             if self.reaped || !self.reservation_valid {
-                return Err(ProcessError::new("identity", "refusing to signal a process group whose leader reservation was lost"));
+                return Err(ProcessError::new(
+                    "identity",
+                    "refusing to signal a process group whose leader reservation was lost",
+                ));
             }
             if unsafe { libc::kill(-self.pid, libc::SIGKILL) } == -1 {
                 let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) { return Err(ProcessError::io("terminate owned process group", error)); }
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(ProcessError::io("terminate owned process group", error));
+                }
             }
             Ok(())
         }
@@ -637,32 +1233,57 @@ mod native {
             self.reaped = true;
             Ok(())
         }
-        pub(super) fn capture(&mut self, stdout: &mut File, stderr: &mut File,
-            stdout_count: &mut u64, stderr_count: &mut u64, cap: u64) -> Result<(), ProcessError> {
-            self.stdout.capture(stdout, stdout_count, *stderr_count, cap)?;
-            self.stderr.capture(stderr, stderr_count, *stdout_count, cap)
+        pub(super) fn capture(
+            &mut self,
+            stdout: &mut File,
+            stderr: &mut File,
+            stdout_count: &mut u64,
+            stderr_count: &mut u64,
+            cap: u64,
+        ) -> Result<(), ProcessError> {
+            self.stdout
+                .capture(stdout, stdout_count, *stderr_count, cap)?;
+            self.stderr
+                .capture(stderr, stderr_count, *stdout_count, cap)
         }
-        pub(super) fn outputs_closed(&self) -> bool { self.stdout.eof && self.stderr.eof }
+        pub(super) fn outputs_closed(&self) -> bool {
+            self.stdout.eof && self.stderr.eof
+        }
     }
     impl Drop for Process {
         fn drop(&mut self) {
             // A panic/error never grants storage cleanup. Best-effort termination
             // is limited to the still-reserved group; no unrelated PID is used.
-            if !self.reaped { let _ = self.terminate(); }
+            if !self.reaped {
+                let _ = self.terminate();
+            }
         }
     }
     impl Pipe {
-        fn capture(&mut self, log: &mut File, count: &mut u64, other: u64, cap: u64) -> Result<(), ProcessError> {
-            if self.eof { return Ok(()); }
+        fn capture(
+            &mut self,
+            log: &mut File,
+            count: &mut u64,
+            other: u64,
+            cap: u64,
+        ) -> Result<(), ProcessError> {
+            if self.eof {
+                return Ok(());
+            }
             let mut processed = 0;
             loop {
                 let mut bytes = [0u8; 8192];
                 match self.file.read(&mut bytes) {
-                    Ok(0) => { self.eof = true; return Ok(()); }
+                    Ok(0) => {
+                        self.eof = true;
+                        return Ok(());
+                    }
                     Ok(read) => {
                         retain_output(log, &bytes[..read], count, *count + other, cap)?;
                         processed += read;
-                        if processed >= READ_BATCH_BYTES { return Ok(()); }
+                        if processed >= READ_BATCH_BYTES {
+                            return Ok(());
+                        }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -676,39 +1297,87 @@ mod native {
         let mut members = 0;
         let mut entries = 0;
         let mut leader_seen = false;
-        for entry in fs::read_dir("/proc").map_err(|e| ProcessError::io("observe native process group", e))? {
+        for entry in fs::read_dir("/proc")
+            .map_err(|e| ProcessError::io("observe native process group", e))?
+        {
             entries += 1;
-            if entries > 100_000 { return Err(ProcessError::new("process_limit", "native process observation exceeds entry bound")); }
+            if entries > 100_000 {
+                return Err(ProcessError::new(
+                    "process_limit",
+                    "native process observation exceeds entry bound",
+                ));
+            }
             let entry = entry.map_err(|e| ProcessError::io("observe native process entry", e))?;
-            if !entry.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()) { continue; }
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+            {
+                continue;
+            }
             let mut stat = Vec::new();
             let metadata = File::open(entry.path().join("stat"))
                 .and_then(|file| file.take(8193).read_to_end(&mut stat));
             let stat = match metadata {
                 Ok(_) if stat.len() <= 8192 => stat,
-                Ok(_) => return Err(ProcessError::new("process_limit", "native process metadata exceeds bound")),
+                Ok(_) => {
+                    return Err(ProcessError::new(
+                        "process_limit",
+                        "native process metadata exceeds bound",
+                    ));
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(ProcessError::io("read native process metadata", error)),
             };
-            let end = stat.iter().rposition(|b| *b == b')').ok_or_else(|| ProcessError::new("process_metadata", "invalid native process metadata"))?;
-            let fields: Vec<_> = stat[end + 1..].split(|b| b.is_ascii_whitespace()).filter(|s| !s.is_empty()).collect();
-            if fields.len() < 4 { return Err(ProcessError::new("process_metadata", "incomplete native process metadata")); }
-            let parse = |field: &[u8]| std::str::from_utf8(field).ok().and_then(|s| s.parse::<i32>().ok())
-                .ok_or_else(|| ProcessError::new("process_metadata", "invalid native process identity"));
+            let end = stat.iter().rposition(|b| *b == b')').ok_or_else(|| {
+                ProcessError::new("process_metadata", "invalid native process metadata")
+            })?;
+            let fields: Vec<_> = stat[end + 1..]
+                .split(|b| b.is_ascii_whitespace())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if fields.len() < 4 {
+                return Err(ProcessError::new(
+                    "process_metadata",
+                    "incomplete native process metadata",
+                ));
+            }
+            let parse = |field: &[u8]| {
+                std::str::from_utf8(field)
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .ok_or_else(|| {
+                        ProcessError::new("process_metadata", "invalid native process identity")
+                    })
+            };
             let pgrp = parse(fields[2])?;
             let session = parse(fields[3])?;
             if entry.file_name().to_string_lossy().parse::<i32>().ok() == Some(group) {
                 if pgrp != group || session != group {
-                    return Err(ProcessError::new("process_identity", "reserved group leader changed native identity"));
+                    return Err(ProcessError::new(
+                        "process_identity",
+                        "reserved group leader changed native identity",
+                    ));
                 }
                 leader_seen = true;
             }
             if session == group && pgrp != group && fields[0] != b"Z" && fields[0] != b"X" {
-                return Err(ProcessError::new("scope_escape", "owned session member changed process group; drain cannot be certified"));
+                return Err(ProcessError::new(
+                    "scope_escape",
+                    "owned session member changed process group; drain cannot be certified",
+                ));
             }
-            if pgrp == group && fields[0] != b"Z" && fields[0] != b"X" { members += 1; }
+            if pgrp == group && fields[0] != b"Z" && fields[0] != b"X" {
+                members += 1;
+            }
         }
-        if !leader_seen { return Err(ProcessError::new("process_identity", "reserved group leader missing from native snapshot")); }
+        if !leader_seen {
+            return Err(ProcessError::new(
+                "process_identity",
+                "reserved group leader missing from native snapshot",
+            ));
+        }
         Ok(members)
     }
     // ABI and constants are from Apple's public libproc/proc_info headers.
@@ -716,49 +1385,109 @@ mod native {
     #[cfg(target_os = "macos")]
     #[repr(C)]
     struct BsdInfo {
-        flags: u32, status: u32, xstatus: u32, pid: u32, ppid: u32,
-        uid: u32, gid: u32, ruid: u32, rgid: u32, svuid: u32, svgid: u32, rfu: u32,
-        comm: [u8; 16], name: [u8; 32], nfiles: u32, pgid: u32, jobc: u32,
-        tdev: u32, tpgid: u32, nice: i32, start_sec: u64, start_usec: u64,
+        flags: u32,
+        status: u32,
+        xstatus: u32,
+        pid: u32,
+        ppid: u32,
+        uid: u32,
+        gid: u32,
+        ruid: u32,
+        rgid: u32,
+        svuid: u32,
+        svgid: u32,
+        rfu: u32,
+        comm: [u8; 16],
+        name: [u8; 32],
+        nfiles: u32,
+        pgid: u32,
+        jobc: u32,
+        tdev: u32,
+        tpgid: u32,
+        nice: i32,
+        start_sec: u64,
+        start_usec: u64,
     }
     #[cfg(target_os = "macos")]
     fn mac_bsd_info(pid: i32, include_zombie: bool) -> Result<Option<BsdInfo>, ProcessError> {
         #[link(name = "proc")]
         unsafe extern "C" {
-            fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut std::ffi::c_void, bytes: i32) -> i32;
+            fn proc_pidinfo(
+                pid: i32,
+                flavor: i32,
+                arg: u64,
+                buffer: *mut std::ffi::c_void,
+                bytes: i32,
+            ) -> i32;
         }
         let mut info: BsdInfo = unsafe { std::mem::zeroed() };
-        let bytes = unsafe { proc_pidinfo(pid, 3, u64::from(include_zombie),
-            (&mut info as *mut BsdInfo).cast(), std::mem::size_of::<BsdInfo>() as i32) };
+        let bytes = unsafe {
+            proc_pidinfo(
+                pid,
+                3,
+                u64::from(include_zombie),
+                (&mut info as *mut BsdInfo).cast(),
+                std::mem::size_of::<BsdInfo>() as i32,
+            )
+        };
         if bytes == 0 {
             let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) { return Ok(None); }
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(None);
+            }
             return Err(ProcessError::io("observe macOS process identity", error));
         }
         if bytes as usize != std::mem::size_of::<BsdInfo>() {
-            return Err(ProcessError::new("process_metadata", "macOS BSD identity has unexpected byte length"));
+            return Err(ProcessError::new(
+                "process_metadata",
+                "macOS BSD identity has unexpected byte length",
+            ));
         }
         Ok(Some(info))
     }
     #[cfg(target_os = "macos")]
-    fn live_group_members(group: libc::pid_t, leader_identity: (u64, u64)) -> Result<usize, ProcessError> {
+    fn live_group_members(
+        group: libc::pid_t,
+        leader_identity: (u64, u64),
+    ) -> Result<usize, ProcessError> {
         #[link(name = "proc")]
         unsafe extern "C" {
-            fn proc_listpids(kind: u32, typeinfo: u32, buffer: *mut std::ffi::c_void, bytes: i32) -> i32;
+            fn proc_listpids(
+                kind: u32,
+                typeinfo: u32,
+                buffer: *mut std::ffi::c_void,
+                bytes: i32,
+            ) -> i32;
         }
         let mut capacity = 1024usize;
         let pids = loop {
             let mut pids = vec![0i32; capacity];
-            let bytes = unsafe { proc_listpids(1, 0, pids.as_mut_ptr().cast(), (capacity * 4) as i32) };
+            let bytes =
+                unsafe { proc_listpids(1, 0, pids.as_mut_ptr().cast(), (capacity * 4) as i32) };
             // Apple libproc returns zero on syscall error, not -1. A native
             // snapshot containing our reserved leader cannot legitimately be empty.
-            if bytes <= 0 { return Err(ProcessError::io("observe macOS process snapshot", std::io::Error::last_os_error())); }
+            if bytes <= 0 {
+                return Err(ProcessError::io(
+                    "observe macOS process snapshot",
+                    std::io::Error::last_os_error(),
+                ));
+            }
             if bytes as usize >= capacity * 4 {
-                if capacity >= 100_000 { return Err(ProcessError::new("process_limit", "macOS process group exceeds observation bound")); }
+                if capacity >= 100_000 {
+                    return Err(ProcessError::new(
+                        "process_limit",
+                        "macOS process group exceeds observation bound",
+                    ));
+                }
                 capacity = (capacity * 2).min(100_000);
                 continue;
             }
-            if bytes % 4 != 0 { return Err(ProcessError::new("process_metadata", "macOS PID list has invalid byte length")); }
+            if bytes % 4 != 0 {
+                return Err(ProcessError::new(
+                    "process_metadata",
+                    "macOS PID list has invalid byte length",
+                ));
+            }
             pids.truncate(bytes as usize / 4);
             break pids;
         };
@@ -768,40 +1497,81 @@ mod native {
             if pid == group {
                 // Darwin getsid cannot find a zombie. proc_pidinfo arg=1
                 // explicitly includes it; WNOWAIT still reserves its identity.
-                let before = mac_bsd_info(pid, true)?.ok_or_else(|| ProcessError::new("process_identity", "reserved macOS leader missing"))?;
-                let after = mac_bsd_info(pid, true)?.ok_or_else(|| ProcessError::new("process_identity", "reserved macOS leader disappeared"))?;
-                if before.pid != group as u32 || after.pid != group as u32
-                    || before.pgid != group as u32 || after.pgid != group as u32
+                let before = mac_bsd_info(pid, true)?.ok_or_else(|| {
+                    ProcessError::new("process_identity", "reserved macOS leader missing")
+                })?;
+                let after = mac_bsd_info(pid, true)?.ok_or_else(|| {
+                    ProcessError::new("process_identity", "reserved macOS leader disappeared")
+                })?;
+                if before.pid != group as u32
+                    || after.pid != group as u32
+                    || before.pgid != group as u32
+                    || after.pgid != group as u32
                     || (before.start_sec, before.start_usec) != leader_identity
-                    || (after.start_sec, after.start_usec) != leader_identity {
-                    return Err(ProcessError::new("process_identity", "reserved macOS leader identity changed"));
+                    || (after.start_sec, after.start_usec) != leader_identity
+                {
+                    return Err(ProcessError::new(
+                        "process_identity",
+                        "reserved macOS leader identity changed",
+                    ));
                 }
                 leader_seen = true;
-                if after.status != 5 { members += 1; }
+                if after.status != 5 {
+                    members += 1;
+                }
                 continue;
             }
             let session = unsafe { libc::getsid(pid) };
             if session == -1 {
                 let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ESRCH) { continue; }
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    continue;
+                }
                 return Err(ProcessError::io("observe macOS process session", error));
             }
-            if session != group { continue; }
-            let Some(before) = mac_bsd_info(pid, false)? else { continue; };
+            if session != group {
+                continue;
+            }
+            let Some(before) = mac_bsd_info(pid, false)? else {
+                continue;
+            };
             let session_after = unsafe { libc::getsid(pid) };
-            if session_after == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) { continue; }
-            let Some(after) = mac_bsd_info(pid, false)? else { continue; };
-            if session_after != group || before.pid != pid as u32 || after.pid != pid as u32
-                || before.start_sec != after.start_sec || before.start_usec != after.start_usec
-                || before.pgid != after.pgid {
-                return Err(ProcessError::new("process_identity", "macOS native identity changed during session observation"));
+            if session_after == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                continue;
+            }
+            let Some(after) = mac_bsd_info(pid, false)? else {
+                continue;
+            };
+            if session_after != group
+                || before.pid != pid as u32
+                || after.pid != pid as u32
+                || before.start_sec != after.start_sec
+                || before.start_usec != after.start_usec
+                || before.pgid != after.pgid
+            {
+                return Err(ProcessError::new(
+                    "process_identity",
+                    "macOS native identity changed during session observation",
+                ));
             }
             if after.pgid != group as u32 && after.status != 5 {
-                return Err(ProcessError::new("scope_escape", "owned macOS session member changed process group; drain cannot be certified"));
+                return Err(ProcessError::new(
+                    "scope_escape",
+                    "owned macOS session member changed process group; drain cannot be certified",
+                ));
             }
-            if after.pgid == group as u32 && after.status != 5 { members += 1; }
+            if after.pgid == group as u32 && after.status != 5 {
+                members += 1;
+            }
         }
-        if !leader_seen { return Err(ProcessError::new("process_identity", "reserved macOS group leader missing from native snapshot")); }
+        if !leader_seen {
+            return Err(ProcessError::new(
+                "process_identity",
+                "reserved macOS group leader missing from native snapshot",
+            ));
+        }
         Ok(members)
     }
 }
@@ -812,13 +1582,37 @@ mod native {
     pub(super) const SCOPE: &str = "unsupported";
     pub(super) struct Process;
     impl Process {
-        pub(super) fn spawn(_: &ProcessSpec) -> Result<Self, ProcessError> { Err(ProcessError::new("unsupported_os", "no native owned process boundary for this OS")) }
-        pub(super) fn leader_exit(&self) -> Result<Option<LeaderExit>, ProcessError> { unreachable!() }
-        pub(super) fn scope_empty(&self) -> Result<bool, ProcessError> { unreachable!() }
-        pub(super) fn terminate(&mut self) -> Result<(), ProcessError> { unreachable!() }
-        pub(super) fn reap(&mut self) -> Result<(), ProcessError> { unreachable!() }
-        pub(super) fn capture(&mut self, _: &mut File, _: &mut File, _: &mut u64, _: &mut u64, _: u64) -> Result<(), ProcessError> { unreachable!() }
-        pub(super) fn outputs_closed(&self) -> bool { unreachable!() }
+        pub(super) fn spawn(_: &ProcessSpec) -> Result<Self, ProcessError> {
+            Err(ProcessError::new(
+                "unsupported_os",
+                "no native owned process boundary for this OS",
+            ))
+        }
+        pub(super) fn leader_exit(&self) -> Result<Option<LeaderExit>, ProcessError> {
+            unreachable!()
+        }
+        pub(super) fn scope_empty(&self) -> Result<bool, ProcessError> {
+            unreachable!()
+        }
+        pub(super) fn terminate(&mut self) -> Result<(), ProcessError> {
+            unreachable!()
+        }
+        pub(super) fn reap(&mut self) -> Result<(), ProcessError> {
+            unreachable!()
+        }
+        pub(super) fn capture(
+            &mut self,
+            _: &mut File,
+            _: &mut File,
+            _: &mut u64,
+            _: &mut u64,
+            _: u64,
+        ) -> Result<(), ProcessError> {
+            unreachable!()
+        }
+        pub(super) fn outputs_closed(&self) -> bool {
+            unreachable!()
+        }
     }
 }
 
@@ -827,14 +1621,40 @@ mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicU64};
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    struct TestRun { root: PathBuf, spec: ProcessSpec }
+    struct TestRun {
+        root: PathBuf,
+        spec: ProcessSpec,
+    }
     impl TestRun {
         fn new(mode: &str) -> Self {
-            let root = std::env::temp_dir().join(format!("mmmm-process-test-{}-{}", std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed)));
+            let root = std::env::temp_dir().join(format!(
+                "mmmm-process-test-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
             assert!(!root.exists(), "test root must be new");
             fs::create_dir(&root).unwrap();
-            let mut spec = ProcessSpec::new(std::env::current_exe().unwrap(), root.clone(), root.join("stdout.log"), root.join("stderr.log"));
-            spec.args = ["--exact", "process::tests::process_fixture_child", "--ignored", "--nocapture"].into_iter().map(OsString::from).collect();
+            // Reproduce managed Windows canonical paths even when the outer
+            // runner's TMP happens to use a DOS representation.
+            #[cfg(windows)]
+            let cwd = fs::canonicalize(&root).unwrap();
+            #[cfg(not(windows))]
+            let cwd = root.clone();
+            let mut spec = ProcessSpec::new(
+                std::env::current_exe().unwrap(),
+                cwd,
+                root.join("stdout.log"),
+                root.join("stderr.log"),
+            );
+            spec.args = [
+                "--exact",
+                "process::tests::process_fixture_child",
+                "--ignored",
+                "--nocapture",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
             spec.env.insert("MMMM_PROCESS_FIXTURE".into(), mode.into());
             spec.timeout = Duration::from_secs(3);
             spec.drain_timeout = Duration::from_secs(5);
@@ -844,7 +1664,12 @@ mod tests {
             if drained {
                 let root = fs::canonicalize(&self.root).unwrap();
                 assert!(root.starts_with(fs::canonicalize(std::env::temp_dir()).unwrap()));
-                assert!(!fs::symlink_metadata(&self.root).unwrap().file_type().is_symlink());
+                assert!(
+                    !fs::symlink_metadata(&self.root)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
                 fs::remove_dir_all(root).unwrap();
             }
         }
@@ -854,17 +1679,44 @@ mod tests {
     fn process_fixture_child() {
         let mode = std::env::var("MMMM_PROCESS_FIXTURE").expect("fixture mode");
         match mode.as_str() {
-            "normal" => { println!("owned-output"); eprintln!("owned-error"); }
+            "normal" => {
+                println!("owned-output");
+                eprintln!("owned-error");
+            }
             "failure" => std::process::exit(23),
             "hold" => std::thread::sleep(Duration::from_secs(30)),
-            "remaining" => {
+            "brief_hold" => std::thread::sleep(Duration::from_millis(500)),
+            "remaining" | "remaining_brief" | "remaining_failure" => {
+                // The fixture leader must exit before this child. The enclosing
+                // native scope owns and drains it; waiting here would remove the
+                // remaining-child condition these supervision tests must observe.
+                #[allow(clippy::zombie_processes)]
                 let child = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", "process::tests::process_fixture_child", "--ignored", "--nocapture"])
-                    .env("MMMM_PROCESS_FIXTURE", "hold").spawn().unwrap();
+                    .args([
+                        "--exact",
+                        "process::tests::process_fixture_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env(
+                        "MMMM_PROCESS_FIXTURE",
+                        if mode == "remaining_brief" {
+                            "brief_hold"
+                        } else {
+                            "hold"
+                        },
+                    )
+                    .spawn()
+                    .unwrap();
                 println!("owned child {}", child.id());
                 std::thread::sleep(Duration::from_millis(100));
+                if mode == "remaining_failure" {
+                    std::process::exit(23);
+                }
             }
-            "output" => std::io::stdout().write_all(&vec![b'x'; 128 * 1024]).unwrap(),
+            "output" => std::io::stdout()
+                .write_all(&vec![b'x'; 128 * 1024])
+                .unwrap(),
             _ => panic!("unknown child fixture"),
         }
     }
@@ -875,8 +1727,16 @@ mod tests {
         assert_eq!(result.command_exit, Some(0));
         assert_eq!(result.termination_reason, TerminationReason::Completed);
         assert!(result.drained && result.supervisor_errors.is_empty());
-        assert!(fs::read_to_string(&run.spec.stdout_log).unwrap().contains("owned-output"));
-        assert!(fs::read_to_string(&run.spec.stderr_log).unwrap().contains("owned-error"));
+        assert!(
+            fs::read_to_string(&run.spec.stdout_log)
+                .unwrap()
+                .contains("owned-output")
+        );
+        assert!(
+            fs::read_to_string(&run.spec.stderr_log)
+                .unwrap()
+                .contains("owned-error")
+        );
         run.cleanup(result.drained);
     }
     #[test]
@@ -902,7 +1762,10 @@ mod tests {
         let run = TestRun::new("hold");
         let cancellation = Arc::new(AtomicBool::new(false));
         let cancel = cancellation.clone();
-        let sender = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(250)); cancel.store(true, Ordering::Release); });
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            cancel.store(true, Ordering::Release);
+        });
         let result = supervise(&run.spec, &cancellation, || Ok(())).unwrap();
         sender.join().unwrap();
         assert_eq!(result.termination_reason, TerminationReason::Cancelled);
@@ -914,8 +1777,54 @@ mod tests {
         let run = TestRun::new("remaining");
         let result = supervise(&run.spec, &AtomicBool::new(false), || Ok(())).unwrap();
         assert_eq!(result.command_exit, Some(0));
-        assert_eq!(result.termination_reason, TerminationReason::RemainingChildren);
+        assert_eq!(
+            result.termination_reason,
+            TerminationReason::RemainingChildren
+        );
+        assert!(!result.owned_tail_terminated);
         assert!(result.drained);
+        run.cleanup(result.drained);
+    }
+    #[test]
+    fn explicit_build_tail_cleanup_preserves_leader_exit_and_records_native_drain() {
+        // Existing remaining-child fixtures model compiler telemetry helpers.
+        // Opt-in may clean that owned tail without replacing the leader result.
+        for (mode, code) in [("remaining", 0), ("remaining_failure", 23)] {
+            let mut run = TestRun::new(mode);
+            assert_eq!(run.spec.tail_policy, TailPolicy::Reject);
+            run.spec.tail_policy = TailPolicy::TerminateForBuild;
+            let result = supervise(&run.spec, &AtomicBool::new(false), || Ok(())).unwrap();
+            assert_eq!(result.command_exit, Some(code));
+            assert_eq!(
+                result.termination_reason,
+                TerminationReason::CompletedAfterOwnedTailCleanup
+            );
+            assert!(result.owned_tail_terminated);
+            assert!(
+                result.drained && result.output_complete && result.supervisor_errors.is_empty()
+            );
+            run.cleanup(result.drained);
+        }
+    }
+    #[test]
+    fn explicit_build_tail_policy_does_not_override_timeout() {
+        let mut run = TestRun::new("remaining");
+        run.spec.tail_policy = TailPolicy::TerminateForBuild;
+        run.spec.timeout = Duration::from_secs(1);
+        let result = supervise(&run.spec, &AtomicBool::new(false), || Ok(())).unwrap();
+        assert_eq!(result.command_exit, Some(0));
+        assert_eq!(result.termination_reason, TerminationReason::Timeout);
+        assert!(!result.owned_tail_terminated);
+        assert!(result.drained && !result.supervisor_errors.is_empty());
+        run.cleanup(result.drained);
+    }
+    #[test]
+    fn child_finishing_during_natural_grace_is_completed() {
+        let run = TestRun::new("remaining_brief");
+        let result = supervise(&run.spec, &AtomicBool::new(false), || Ok(())).unwrap();
+        assert_eq!(result.command_exit, Some(0));
+        assert_eq!(result.termination_reason, TerminationReason::Completed);
+        assert!(result.drained && result.output_complete && result.supervisor_errors.is_empty());
         run.cleanup(result.drained);
     }
     #[test]
@@ -935,10 +1844,42 @@ mod tests {
         let mut calls = 0;
         let result = supervise(&run.spec, &AtomicBool::new(false), || {
             calls += 1;
-            if calls == 1 { Ok(()) } else { Err("ownership changed".into()) }
-        }).unwrap();
-        assert_eq!(result.termination_reason, TerminationReason::ObservationFailure);
+            if calls == 1 {
+                Ok(())
+            } else {
+                Err("ownership changed".into())
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            result.termination_reason,
+            TerminationReason::ObservationFailure
+        );
         assert!(result.drained);
         run.cleanup(result.drained);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_cwd_transport_preserves_physical_identity() {
+        use std::os::windows::ffi::OsStringExt;
+        let run = TestRun::new("normal");
+        let authoritative = fs::canonicalize(&run.spec.cwd).unwrap();
+        let transport = native::current_directory(&authoritative).unwrap();
+        let path = PathBuf::from(OsString::from_wide(&transport[..transport.len() - 1]));
+        assert!(!path.to_string_lossy().starts_with(r"\\?\"));
+        assert_eq!(fs::canonicalize(&path).unwrap(), authoritative);
+        run.cleanup(true);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_cwd_transport_rejects_network_and_device_before_lookup() {
+        for path in [
+            r"\\server\share\mmmm",
+            r"\\?\UNC\server\share\mmmm",
+            r"\\.\C:\mmmm",
+        ] {
+            let error = native::current_directory(Path::new(path)).unwrap_err();
+            assert_eq!(error.kind, "path_transport");
+        }
     }
 }

@@ -6,15 +6,16 @@
 
 ## 현재 기준
 
-현재 구성은 작업 규약, 구현 및 수명 기준, PR 템플릿, 선언 구조 정책과 원본 계약이다.
-구조 검사기와 빌드 관리 도구 소스를 구현 중이며 제품 인수와 CI는 아직 완료되지 않았다.
-Git 초기화, 원격 반영과 보호 설정은 문서 생성만으로 완료 처리하지 않는다.
+현재 구성은 작업 규약, 구현 및 수명 기준, PR 템플릿, 선언 구조 정책, 원본 계약과
+Rust 구현 기반이다. 원격 `main`, `develop`과 기능 브랜치에 기준선을 반영했고,
+제품 구현은 Draft PR #1에서 진행한다. 원격 보호 설정은 아직 완료되지 않았다.
+Windows의 빌드 관리 도구 bootstrap은 실제로 통과했으며, 제품 인수와 CI는 미완료다.
 
 ## G0 선행 조건
 
 - [x] 원본 `contracts/mmmm.schema.json`, `contracts/function-index.json`과 예제 패키지를 확보한다.
 - [ ] 원본의 버전, provenance, digest와 문서 의미를 확인하고 저장 및 wire 계약 `0.2.0`을 도입한다.
-- [ ] 현재 배정에 Git 구성이 포함되면 빈 원격 상태를 확인하고 bootstrap을 수행한다.
+- [x] 현재 배정에 Git 구성이 포함되면 빈 원격 상태를 확인하고 bootstrap을 수행한다.
 - [ ] 첫 Rust와 JVM 빌드로 실제 toolchain, feature, JDK, Gradle 및 의존성을 고정한다.
 - [ ] 관리 도구 bootstrap부터 모든 대형 빌드 및 테스트 출력을 외부 소유 슬롯에 둔다.
 - [ ] Windows, Linux와 macOS에서 성공, 실패, timeout, 취소 및 자식 종료 확인을 검증한다.
@@ -27,6 +28,32 @@ Git 초기화, 원격 반영과 보호 설정은 문서 생성만으로 완료 �
 `contracts/handoff-input.json`에 기록했다. 계약의 의미, DTO와 공식 JCS 검증은
 별도로 진행한다. 관리 도구와 구조 검사를 검증하기 전 실행 명령 또는 자동 정리의
 완료를 보고하지 않는다.
+
+## 2026-10-14 로컬 구현 검증
+
+| 검증 | 실제 결과 | 적용 범위와 남은 조건 |
+|---|---|---|
+| 원본 패키지 | SHA-256 목록 70개 일치 | 선택 도입 61개 파일의 원본 바이트 보존 |
+| Windows PowerShell/C# 관측 callback | 실제 자식 6.2초, callback 1회, 종료 0, Job drain, 오류 없음 | 빈 문자열 상호 운용 오류의 재현 및 수정 검증 |
+| Windows 관리 도구 bootstrap | Cargo 종료 0, Job drain, export, scratch 정리와 lease 해제 | 짧은 외부 출력 루트 사용; 다른 OS는 미실행 |
+| Windows 관리 도구 첫 Rust 검사 | 40 통과, 5 실패, 자식 fixture 1개 직접 실행 제외 | 실제 프로세스 시작과 로그 export 경로 수정 후 재검사 필요 |
+| 프로세스 경로 비교 | 일반 경로의 내부 normal 검사는 통과; 같은 경로의 VerbatimDisk 형식은 timeout | 작업 디렉터리 전달 형식의 원인 조사 근거이며 수정 인수는 별도 |
+| Windows 관리 도구 최종 관측 경계 재검사 | 55 통과, 실패 없음, 자식 fixture 1개는 감독 검사가 직접 호출 | 파일·디렉터리 삭제 경합, 소유 기록·고정 루트 누락과 중첩 링크 거절 포함; 출력 보존, 정리와 lease 해제 통과 |
+| Windows native bridge | callback, 자연 종료, 엄격한 잔여 자식 거절, 명시적 소유 자식 정리의 4개 실행 통과 | 엄격한 실패를 성공으로 바꾸지 않고 원래 명령 code와 실제 drain을 보존 |
+| Git 구조 검사 | stage 0 파일 130개 검사, 위반 없음 | 정책 JSON 하나만 내용 조회; 이후 stage 변경은 재검사 |
+| Windows 제품 모듈 첫 통합 검사 | 6개 crate 컴파일 성공; Provider 15, 계약 26, 도메인 43, 정보 카탈로그 16 검사 통과 | 저장 원장 13개는 Windows 경로 검사에서 실패하여 원인 수정 중; 빌드 도구 검사는 해당 실행에서 시작되지 않음 |
+| 활성 임시 파일 관측 보완 bootstrap | Cargo 종료 0, drain, export와 lease 해제 통과 | 소유 활성 임시 하위 항목의 삭제 경합만 허용; 누락 허용 전 상위 경로와 오류 항목 자체의 링크 경계 검사 포함 |
+| 의존성 및 출시 순수 판정 | 30개 검사 통과, Cargo 종료 0, export 및 lease 해제 | 인증 모사 fixture의 판정기 검증이며 실제 vendor 채택, 실제 게임 또는 출시 근거가 아님 |
+| Windows 저장 원장 경로 수정 재검사 | 15개 검사 통과, Cargo 종료 0, export 및 lease 해제 | 실제 임시 SQLite/CAS, canonical 경로, 재시작·중복 방지·관측 효과 보존과 후속 dispatch 차단; 전원 손실 검증은 별도 |
+| 공통 application 경로 | 16개 검사 통과, Cargo 종료 0, export 및 lease 해제 | 실제 임시 SQLite/CAS와 stateful 독립 target fixture; actual host·게임 및 인증 transport는 통합 중 |
+| Windows 전체 workspace 검사 | 8개 crate의 216개 검사 통과, 실패 없음 | 자식 fixture 1개는 감독 검사가 직접 호출; 인수 ID 82개 및 실제 게임의 통과 수와 구분 |
+| Windows 코드 검사 | workspace 전체 formatting 및 all-targets Clippy `-D warnings` 통과 | 수학 반복문 정리 후 도메인 43개 재검사 통과; 다른 OS는 CI에서 실제 검증 |
+
+실패한 실행의 원본 판정은 유지한다. native drain과 정확한 소유 기록을 확인하고
+로그를 별도로 내보내며 digest를 대조한 경우에만 해당 실행의 알려진 임시 파일을
+정리했다. 원래 자동 export 실패와 수동 보존 성공을 같은 결과로 기록하지 않는다.
+원본 증거와 회수 기록은 저장소 밖에 보존한다. 이 표는 로컬 WIP 소스의 관측이며
+고정된 출시 SHA, 3개 OS 통과 또는 실제 게임 인수를 의미하지 않는다.
 
 ## 단계별 규약 적용
 

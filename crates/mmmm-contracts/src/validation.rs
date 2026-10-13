@@ -156,6 +156,8 @@ impl ContractValidator {
 
     fn build_embedded() -> Result<Self, ContractError> {
         let schema = parse_json(CANONICAL_SCHEMA)?;
+        jsonschema::draft202012::meta::validate(&schema)
+            .map_err(|error| ContractError::InvalidSchema(error.masked().to_string()))?;
         if schema["$id"] != CANONICAL_SCHEMA_ID
             || schema["$schema"] != "https://json-schema.org/draft/2020-12/schema"
         {
@@ -282,6 +284,16 @@ impl ContractValidator {
         schema: &Value,
     ) -> Result<OfflineActionSchema, ContractError> {
         check_value(schema, JsonLimits::default())?;
+        if schema
+            .get("$schema")
+            .is_some_and(|draft| draft != "https://json-schema.org/draft/2020-12/schema")
+        {
+            return Err(ContractError::InvalidSchema(
+                "Action schemas must use Draft 2020-12".into(),
+            ));
+        }
+        jsonschema::draft202012::meta::validate(schema)
+            .map_err(|error| ContractError::InvalidSchema(error.masked().to_string()))?;
         let registry = Registry::new()
             .add(
                 CANONICAL_SCHEMA_ID,
@@ -410,6 +422,11 @@ mod tests {
     fn action_schema_meta_validation_and_resolution_are_offline() {
         let invalid = json!({"type":42});
         assert!(validator().compile_action_schema(&invalid).is_err());
+        assert!(
+            validator()
+                .compile_action_schema(&json!({"type":"string", "$defs":{"unused":{"type":42}}}))
+                .is_err()
+        );
         for reference in [
             "https://example.invalid/schema.json",
             "file:///unavailable.json",

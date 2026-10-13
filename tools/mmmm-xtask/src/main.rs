@@ -69,7 +69,9 @@ fn write_new_json(
 }
 
 fn export_log(source: &Path, destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    validate_record_ancestry(source, false)?;
+    // Managed storage resolves local Windows paths to VerbatimDisk paths.
+    // Public bootstrap inputs keep the stricter drive-only admission below.
+    validate_local_ancestry(source, false, true)?;
     let metadata = fs::symlink_metadata(source)?;
     if !metadata.is_file() || is_link(&metadata) || metadata.len() > 64 * 1024 * 1024 {
         return Err("managed command log kind or size invalid".into());
@@ -102,6 +104,11 @@ fn run_managed(
     if !(1..=3600).contains(&timeout) {
         return Err("timeout must be 1..3600 seconds".into());
     }
+    let tail_policy = match flags.remove("--owned-tail-policy").as_deref() {
+        None | Some("reject") => process::TailPolicy::Reject,
+        Some("terminate-build") => process::TailPolicy::TerminateForBuild,
+        Some(_) => return Err("owned tail policy must be reject or terminate-build".into()),
+    };
     reject_remaining(&flags)?;
     let program = child_args
         .first()
@@ -142,6 +149,7 @@ fn run_managed(
         .collect();
     spec.env.insert("CARGO_BUILD_JOBS".into(), "2".into());
     spec.timeout = Duration::from_secs(timeout);
+    spec.tail_policy = tail_policy;
     let result = process::supervise(&spec, &cancellation, || {
         let measurement = build.measure().map_err(|error| error.to_string())?;
         if !measurement.within_budget {
@@ -192,6 +200,16 @@ fn run_managed(
         Ok(()) => exported = true,
         Err(error) => supervisor_errors.push(format!("evidence export: {error}")),
     }
+    write_new_json(
+        &build.paths().evidence.join("finalization-input.json"),
+        &serde_json::json!({
+            "schema": "mmmm-build-finalization-input/1",
+            "command_exit": command_exit,
+            "drained": drained,
+            "evidence_exported": exported,
+            "supervisor_errors": supervisor_errors,
+        }),
+    )?;
     let receipt = build.finish(storage::FinishOutcome {
         command_exit,
         supervisor_errors,
@@ -233,6 +251,8 @@ struct BootstrapProof {
     drained: bool,
     evidence_exported: bool,
     supervisor_errors: Vec<String>,
+    #[serde(default)]
+    owned_tail_terminated: bool,
 }
 
 fn bounded_record(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -284,6 +304,16 @@ fn validate_record_ancestry(
     path: &Path,
     directory: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    validate_local_ancestry(path, directory, false)
+}
+
+fn validate_local_ancestry(
+    path: &Path,
+    directory: bool,
+    managed_verbatim_disk: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(not(windows))]
+    let _ = managed_verbatim_disk;
     if !path.is_absolute() {
         return Err("bootstrap evidence path must be absolute".into());
     }
@@ -295,7 +325,10 @@ fn validate_record_ancestry(
             }
             Component::Prefix(prefix) => {
                 #[cfg(windows)]
-                if !matches!(prefix.kind(), std::path::Prefix::Disk(_)) {
+                if !(matches!(prefix.kind(), std::path::Prefix::Disk(_))
+                    || managed_verbatim_disk
+                        && matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_)))
+                {
                     return Err("bootstrap evidence requires a local drive path".into());
                 }
                 current.push(prefix.as_os_str());
@@ -399,6 +432,7 @@ fn complete_bootstrap(
         "schema": "mmmm-bootstrap-complete/1", "token": token,
         "slot_id": receipt.slot_id, "lease_released": receipt.lease_released,
         "receipt": receipt,
+        "owned_tail_terminated": proof.owned_tail_terminated,
     });
     let destination = evidence.join("bootstrap-complete.json");
     let mut file = OpenOptions::new()

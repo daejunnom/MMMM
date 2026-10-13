@@ -83,9 +83,15 @@ impl TryFrom<TransformWire> for Transform {
 
     fn try_from(wire: TransformWire) -> Result<Self, Self::Error> {
         let transform = match wire {
-            TransformWire::Trs { translation, rotation_xyzw, scale } => {
-                Self::Trs { translation, rotation_xyzw, scale }
-            }
+            TransformWire::Trs {
+                translation,
+                rotation_xyzw,
+                scale,
+            } => Self::Trs {
+                translation,
+                rotation_xyzw,
+                scale,
+            },
             TransformWire::Matrix { layout, values } => Self::Matrix { layout, values },
         };
         transform.validate()?;
@@ -95,8 +101,7 @@ impl TryFrom<TransformWire> for Transform {
 
 impl<'de> Deserialize<'de> for Transform {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Self::try_from(TransformWire::deserialize(deserializer)?)
-            .map_err(serde::de::Error::custom)
+        Self::try_from(TransformWire::deserialize(deserializer)?).map_err(serde::de::Error::custom)
     }
 }
 
@@ -117,13 +122,16 @@ impl Transform {
 
     pub fn to_value(&self) -> Result<Value, TransformError> {
         self.validate()?;
-        serde_json::to_value(self)
-            .map_err(|error| TransformError::SchemaInvalid(error.to_string()))
+        serde_json::to_value(self).map_err(|error| TransformError::SchemaInvalid(error.to_string()))
     }
 
     pub fn validate(&self) -> Result<(), TransformError> {
         match self {
-            Self::Trs { translation, rotation_xyzw, scale } => {
+            Self::Trs {
+                translation,
+                rotation_xyzw,
+                scale,
+            } => {
                 require_finite(translation, "translation")?;
                 require_finite(rotation_xyzw, "rotationXyzw")?;
                 require_finite(scale, "scale")?;
@@ -146,7 +154,11 @@ impl Transform {
         self.validate()?;
         match self {
             Self::Matrix { values, .. } => Matrix4::from_values(*values),
-            Self::Trs { translation: t, rotation_xyzw: [x, y, z, w], scale: s } => {
+            Self::Trs {
+                translation: t,
+                rotation_xyzw: [x, y, z, w],
+                scale: s,
+            } => {
                 let [x, y, z, w] = [*x, *y, *z, *w];
                 Matrix4::from_computed_values([
                     (1.0 - 2.0 * (y * y + z * z)) * s[0],
@@ -161,14 +173,20 @@ impl Transform {
                     2.0 * (y * z + x * w) * s[1],
                     (1.0 - 2.0 * (x * x + y * y)) * s[2],
                     t[2],
-                    0.0, 0.0, 0.0, 1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
                 ])
             }
         }
     }
 
     pub fn from_matrix(matrix: Matrix4) -> Self {
-        Self::Matrix { layout: MatrixLayout::RowMajorColumnVector, values: matrix.0 }
+        Self::Matrix {
+            layout: MatrixLayout::RowMajorColumnVector,
+            values: matrix.0,
+        }
     }
 }
 
@@ -189,10 +207,7 @@ impl Matrix4 {
 
     pub const fn identity() -> Self {
         Self([
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ])
     }
 
@@ -235,13 +250,13 @@ impl Matrix4 {
     pub fn inverse_affine(&self) -> Result<Self, TransformError> {
         let mut rows = [[0.0; 6]; 3];
         let mut scales = [0.0_f64; 3];
-        for row in 0..3 {
-            for column in 0..3 {
-                rows[row][column] = self.0[row * 4 + column];
-                scales[row] = scales[row].max(rows[row][column].abs());
+        for (row, (entries, scale)) in rows.iter_mut().zip(&mut scales).enumerate() {
+            for (column, entry) in entries.iter_mut().take(3).enumerate() {
+                *entry = self.0[row * 4 + column];
+                *scale = (*scale).max(entry.abs());
             }
-            rows[row][row + 3] = 1.0;
-            if scales[row] == 0.0 {
+            entries[row + 3] = 1.0;
+            if *scale == 0.0 {
                 return Err(TransformError::NoninvertibleTransform);
             }
         }
@@ -268,13 +283,13 @@ impl Matrix4 {
             }
             require_representable(&rows[column])?;
             let normalized = rows[column];
-            for row in 0..3 {
+            for (row, entries) in rows.iter_mut().enumerate() {
                 if row != column {
-                    let factor = rows[row][column];
-                    for item in 0..6 {
-                        rows[row][item] -= factor * normalized[item];
+                    let factor = entries[column];
+                    for (entry, normalized_entry) in entries.iter_mut().zip(normalized) {
+                        *entry -= factor * normalized_entry;
                     }
-                    require_representable(&rows[row])?;
+                    require_representable(entries)?;
                 }
             }
         }
@@ -284,9 +299,8 @@ impl Matrix4 {
             for column in 0..3 {
                 result[row * 4 + column] = rows[row][column + 3];
             }
-            result[row * 4 + 3] = -(rows[row][3] * self.0[3]
-                + rows[row][4] * self.0[7]
-                + rows[row][5] * self.0[11]);
+            result[row * 4 + 3] =
+                -(rows[row][3] * self.0[3] + rows[row][4] * self.0[7] + rows[row][5] * self.0[11]);
         }
         Self::from_computed_values(result)
     }
@@ -300,10 +314,7 @@ impl Matrix4 {
             _ => (0.0, -1.0),
         };
         Self([
-            cosine, 0.0, sine, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            -sine, 0.0, cosine, 0.0,
-            0.0, 0.0, 0.0, 1.0,
+            cosine, 0.0, sine, 0.0, 0.0, 1.0, 0.0, 0.0, -sine, 0.0, cosine, 0.0, 0.0, 0.0, 0.0, 1.0,
         ])
     }
 }
@@ -336,10 +347,12 @@ pub fn rotate_block_cell_y(
     };
     let mut result = [0; 3];
     for axis in 0..3 {
-        result[axis] = i64::try_from(rotated[axis] + i128::from(translation[axis]))
-            .map_err(|_| TransformError::UnsupportedTransform(
-                "integer block placement exceeds coordinate range".to_owned(),
-            ))?;
+        result[axis] =
+            i64::try_from(rotated[axis] + i128::from(translation[axis])).map_err(|_| {
+                TransformError::UnsupportedTransform(
+                    "integer block placement exceeds coordinate range".to_owned(),
+                )
+            })?;
     }
     Ok(result)
 }
@@ -370,8 +383,10 @@ mod tests {
     fn assert_close(actual: &[f64], expected: &[f64]) {
         for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
             let tolerance = 1e-11 * expected.abs().max(1.0);
-            assert!((actual - expected).abs() <= tolerance,
-                "component {index}: {actual} != {expected}");
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "component {index}: {actual} != {expected}"
+            );
         }
     }
 
@@ -381,13 +396,19 @@ mod tests {
             "kind": "trs", "translation": [2.0, 3.0, 4.0],
             "rotationXyzw": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]
         });
-        assert_eq!(Transform::from_value(&value).unwrap().to_value().unwrap(), value);
+        assert_eq!(
+            Transform::from_value(&value).unwrap().to_value().unwrap(),
+            value
+        );
         let mut extra = value.clone();
         extra["pivot"] = json!([0, 0, 0]);
         assert!(Transform::from_value(&extra).is_err());
         let mut invalid = value;
         invalid["rotationXyzw"] = json!([0, 0, 0, 2]);
-        assert_eq!(Transform::from_value(&invalid).unwrap_err().code(), "SCHEMA_INVALID");
+        assert_eq!(
+            Transform::from_value(&invalid).unwrap_err().code(),
+            "SCHEMA_INVALID"
+        );
         assert!(serde_json::from_value::<Transform>(invalid).is_err());
     }
 
@@ -400,36 +421,50 @@ mod tests {
             scale: [2.0, 3.0, 4.0],
         };
         let matrix = transform.matrix().unwrap();
-        assert_close(&matrix.transform_point([1.0, 2.0, 3.0]).unwrap(), &[22.0, 26.0, 28.0]);
+        assert_close(
+            &matrix.transform_point([1.0, 2.0, 3.0]).unwrap(),
+            &[22.0, 26.0, 28.0],
+        );
     }
 
     #[test]
     fn raw_shear_reflection_and_thin_scale_round_trip_and_invert() {
         let values = [
-            -2.0, 3.0, 0.0, 7.0,
-            0.0, 4.0, 0.0, 8.0,
-            0.0, 0.0, 0.00005, 9.0,
-            0.0, 0.0, 0.0, 1.0,
+            -2.0, 3.0, 0.0, 7.0, 0.0, 4.0, 0.0, 8.0, 0.0, 0.0, 0.00005, 9.0, 0.0, 0.0, 0.0, 1.0,
         ];
         let matrix = Matrix4::from_values(values).unwrap();
         let transform = Transform::from_matrix(matrix);
-        assert_eq!(Transform::from_value(&transform.to_value().unwrap()).unwrap().matrix().unwrap().values(), &values);
+        assert_eq!(
+            Transform::from_value(&transform.to_value().unwrap())
+                .unwrap()
+                .matrix()
+                .unwrap()
+                .values(),
+            &values
+        );
         let inverse = matrix.inverse_affine().unwrap();
-        assert_close(inverse.values(), &[
-            -0.5, 0.375, 0.0, 0.5,
-            0.0, 0.25, 0.0, -2.0,
-            0.0, 0.0, 20000.0, -180000.0,
-            0.0, 0.0, 0.0, 1.0,
-        ]);
-        assert_close(matrix.multiply(&inverse).unwrap().values(), Matrix4::identity().values());
+        assert_close(
+            inverse.values(),
+            &[
+                -0.5, 0.375, 0.0, 0.5, 0.0, 0.25, 0.0, -2.0, 0.0, 0.0, 20000.0, -180000.0, 0.0,
+                0.0, 0.0, 1.0,
+            ],
+        );
+        assert_close(
+            matrix.multiply(&inverse).unwrap().values(),
+            Matrix4::identity().values(),
+        );
     }
 
     #[test]
     fn tiny_nonzero_scale_is_not_rejected_as_singular() {
         let matrix = Transform::Trs {
-            translation: [0.0; 3], rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            translation: [0.0; 3],
+            rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
             scale: [1e-200, 1.0, 1.0],
-        }.matrix().unwrap();
+        }
+        .matrix()
+        .unwrap();
         assert_eq!(matrix.values()[0], 1e-200);
         assert_close(&[matrix.inverse_affine().unwrap().values()[0]], &[1e200]);
     }
@@ -437,46 +472,74 @@ mod tests {
     #[test]
     fn singular_child_is_renderable_but_new_singular_parent_cannot_reparent() {
         let child = Transform::Trs {
-            translation: [3.0, 4.0, 5.0], rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            translation: [3.0, 4.0, 5.0],
+            rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
             scale: [0.0, -1.0, 0.00005],
         };
         let singular = child.matrix().unwrap();
-        assert_eq!(singular.transform_point([9.0, 2.0, 0.0]).unwrap(), [3.0, 2.0, 5.0]);
-        let retained = reparent_keep_world(&Matrix4::identity(), &child, &Matrix4::identity()).unwrap();
+        assert_eq!(
+            singular.transform_point([9.0, 2.0, 0.0]).unwrap(),
+            [3.0, 2.0, 5.0]
+        );
+        let retained =
+            reparent_keep_world(&Matrix4::identity(), &child, &Matrix4::identity()).unwrap();
         assert_eq!(retained.matrix().unwrap(), singular);
-        assert_eq!(reparent_keep_world(&Matrix4::identity(), &child, &singular).unwrap_err().code(), "NONINVERTIBLE_TRANSFORM");
+        assert_eq!(
+            reparent_keep_world(&Matrix4::identity(), &child, &singular)
+                .unwrap_err()
+                .code(),
+            "NONINVERTIBLE_TRANSFORM"
+        );
     }
 
     #[test]
     fn keep_world_retains_affine_shape_and_world_points() {
         let old_parent = Matrix4::from_values([
-            1.0, 0.0, 0.0, 5.0, 0.0, 1.0, 0.0, -2.0,
-            0.0, 0.0, 1.0, 3.0, 0.0, 0.0, 0.0, 1.0,
-        ]).unwrap();
+            1.0, 0.0, 0.0, 5.0, 0.0, 1.0, 0.0, -2.0, 0.0, 0.0, 1.0, 3.0, 0.0, 0.0, 0.0, 1.0,
+        ])
+        .unwrap();
         let new_parent = Matrix4::quarter_turn_y(1);
-        let child = Transform::from_matrix(Matrix4::from_values([
-            -1.0, 0.25, 0.0, 4.0, 0.0, 2.0, 0.0, 1.0,
-            0.0, 0.0, 0.00005, 2.0, 0.0, 0.0, 0.0, 1.0,
-        ]).unwrap());
+        let child = Transform::from_matrix(
+            Matrix4::from_values([
+                -1.0, 0.25, 0.0, 4.0, 0.0, 2.0, 0.0, 1.0, 0.0, 0.0, 0.00005, 2.0, 0.0, 0.0, 0.0,
+                1.0,
+            ])
+            .unwrap(),
+        );
         let changed = reparent_keep_world(&old_parent, &child, &new_parent).unwrap();
         assert!(matches!(changed, Transform::Matrix { .. }));
         let old_world = old_parent.multiply(&child.matrix().unwrap()).unwrap();
         let new_world = new_parent.multiply(&changed.matrix().unwrap()).unwrap();
         assert_close(old_world.values(), new_world.values());
-        assert_close(&old_world.transform_point([2.0, -3.0, 4.0]).unwrap(), &new_world.transform_point([2.0, -3.0, 4.0]).unwrap());
+        assert_close(
+            &old_world.transform_point([2.0, -3.0, 4.0]).unwrap(),
+            &new_world.transform_point([2.0, -3.0, 4.0]).unwrap(),
+        );
     }
 
     #[test]
     fn quarter_turn_block_placement_uses_rotated_cell_minimum() {
-        assert_eq!(rotate_block_cell_y([2, 3, 4], 1, [10, 20, 30]).unwrap(), [14, 23, 27]);
-        assert_eq!(rotate_block_cell_y([2, 3, 4], 2, [0; 3]).unwrap(), [-3, 3, -5]);
-        assert_eq!(rotate_block_cell_y([2, 3, 4], -1, [0; 3]).unwrap(), [-5, 3, 2]);
+        assert_eq!(
+            rotate_block_cell_y([2, 3, 4], 1, [10, 20, 30]).unwrap(),
+            [14, 23, 27]
+        );
+        assert_eq!(
+            rotate_block_cell_y([2, 3, 4], 2, [0; 3]).unwrap(),
+            [-3, 3, -5]
+        );
+        assert_eq!(
+            rotate_block_cell_y([2, 3, 4], -1, [0; 3]).unwrap(),
+            [-5, 3, 2]
+        );
         let mut cell = [2, 3, 4];
         for _ in 0..4 {
             cell = rotate_block_cell_y(cell, 1, [0; 3]).unwrap();
         }
         assert_eq!(cell, [2, 3, 4]);
-        assert_eq!(rotate_block_cell_y([i64::MAX, 0, 0], 1, [0; 3]).unwrap(), [0, 0, i64::MIN]);
+        assert_eq!(
+            rotate_block_cell_y([i64::MAX, 0, 0], 1, [0; 3]).unwrap(),
+            [0, 0, i64::MIN]
+        );
         assert!(rotate_block_cell_y([i64::MAX, 0, 0], 0, [1, 0, 0]).is_err());
     }
 
@@ -484,9 +547,15 @@ mod tests {
     fn nonfinite_and_nonaffine_values_are_rejected() {
         let mut values = *Matrix4::identity().values();
         values[0] = f64::NAN;
-        assert_eq!(Matrix4::from_values(values).unwrap_err().code(), "SCHEMA_INVALID");
+        assert_eq!(
+            Matrix4::from_values(values).unwrap_err().code(),
+            "SCHEMA_INVALID"
+        );
         values = *Matrix4::identity().values();
         values[12] = 0.5;
-        assert_eq!(Matrix4::from_values(values).unwrap_err().code(), "UNSUPPORTED_TRANSFORM");
+        assert_eq!(
+            Matrix4::from_values(values).unwrap_err().code(),
+            "UNSUPPORTED_TRANSFORM"
+        );
     }
 }

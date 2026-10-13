@@ -3,6 +3,7 @@
 
 pub mod digest;
 pub mod identity;
+pub mod number;
 pub mod strict_json;
 pub mod time;
 pub mod validation;
@@ -12,6 +13,7 @@ pub use digest::{
     verify_projected_digest,
 };
 pub use identity::*;
+pub use number::{Int32, deserialize_i32, deserialize_i32_vec3};
 pub use strict_json::{JsonError, JsonLimits, encode_json, parse_json, parse_json_with_limits};
 pub use time::{RationalTime, SignedDecimal, TimeError, UnsignedDecimal};
 pub use validation::{
