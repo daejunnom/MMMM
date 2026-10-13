@@ -691,6 +691,119 @@ fn missing_owner_before_measurement_is_never_treated_as_ephemeral_churn() {
 }
 
 #[test]
+fn generated_entry_diagnostic_keeps_relative_labels_bounded_and_private() {
+    let fixture = Fixture::new("entry-diagnostic");
+    let build = fixture.acquire();
+    let prefix = "special filesystem entry is preserved; stage=measurement; native_kind=other_special; generated_relative=";
+    let long = generated_entry_context(
+        prefix.into(),
+        &build
+            .paths()
+            .scratch
+            .join(format!("runtime\n{}", "한".repeat(1024))),
+        &build.paths().slot,
+    );
+    assert!(long.len() <= 512 && long.ends_with("..."));
+    assert!(long.contains("generated_relative=scratch"));
+    assert!(long.contains("runtime\\n") && !long.contains('\n'));
+    assert!(!long.contains(fixture.root.to_string_lossy().as_ref()));
+
+    // These are labels only: no protected path is created, inspected or read.
+    for leaf in [".env", "credential", "service-account.json", "private-key"] {
+        let withheld = generated_entry_context(
+            prefix.into(),
+            &build.paths().scratch.join(leaf),
+            &build.paths().slot,
+        );
+        assert!(withheld.ends_with("<withheld by path policy>"));
+        assert!(!withheld.contains(leaf));
+    }
+    let outside = generated_entry_context(
+        prefix.into(),
+        &fixture.checkout.join("private-original"),
+        &build.paths().slot,
+    );
+    assert!(outside.ends_with("<outside generated boundary>"));
+    assert!(!outside.contains("private-original"));
+    assert!(!outside.contains(fixture.root.to_string_lossy().as_ref()));
+    assert!(
+        generated_entry_context(prefix.into(), &build.paths().slot, &build.paths().slot)
+            .ends_with("generated_relative=.")
+    );
+    build.finish(outcome(0)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn native_socket_kind_uses_owned_descriptor_metadata_without_opening_a_path() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixDatagram;
+
+    // An unbound descriptor avoids platform-specific Unix socket pathname
+    // limits in the deeply nested managed scratch root. Only fstat is used.
+    let socket = UnixDatagram::unbound().unwrap();
+    let descriptor: OwnedFd = socket.into();
+    let socket_file = File::from(descriptor);
+    assert_eq!(
+        native_file_kind(&socket_file.metadata().unwrap()),
+        "unix_socket"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn actual_fifo_blocks_measurement_and_cleanup_with_native_relative_diagnostic() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
+
+    let fixture = Fixture::new("native-special-entry");
+    let build = fixture.acquire();
+    let paths = build.paths().clone();
+    let fifo = paths.scratch.join("owned-runtime-fifo");
+    let native_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: this terminated path names a newly created fixture's owned
+    // scratch entry. mkfifo does not open it or access another process.
+    assert_eq!(unsafe { libc::mkfifo(native_path.as_ptr(), 0o600) }, 0);
+    let sentinel = paths.scratch.join("retained-original");
+    fs::write(&sentinel, b"keep authored fixture").unwrap();
+
+    let error = build.measure().unwrap_err();
+    assert_eq!(error.kind, "file_type");
+    assert!(error.message.contains("stage=measurement"));
+    assert!(error.message.contains("native_kind=unix_fifo"));
+    assert!(
+        error
+            .message
+            .contains("generated_relative=scratch/owned-runtime-fifo")
+    );
+    assert!(
+        !error
+            .message
+            .contains(fixture.root.to_string_lossy().as_ref())
+    );
+    assert!(error.message.len() <= 512);
+
+    let preflight = unlink_internal_links(
+        &paths.scratch,
+        &paths.slot,
+        &paths.slot.join("owner.json"),
+        &build.slot_bytes,
+        &|| Ok(()),
+    )
+    .unwrap_err();
+    assert_eq!(preflight.kind, "file_type");
+    assert!(preflight.message.contains("stage=link_preflight"));
+    assert!(preflight.message.contains("native_kind=unix_fifo"));
+    assert_eq!(error_kind(build.remove_owned_scratch()), "file_type");
+    assert_eq!(error_kind(build.finish(outcome(0))), "file_type");
+    assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+    assert_eq!(fs::read(&sentinel).unwrap(), b"keep authored fixture");
+    assert!(paths.catalog.join("lease.json").is_file());
+    assert!(paths.slot.join("owner.json").is_file());
+}
+
+#[test]
 fn churn_allowance_does_not_apply_to_completed_slot_or_other_error_kinds() {
     let fixture = Fixture::new("strict-observation");
     let build = fixture.acquire();

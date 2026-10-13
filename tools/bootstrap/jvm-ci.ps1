@@ -167,10 +167,14 @@ function Export-TestSummary([string]$Module, [string]$ResultRoot) {
         $settings.MaxCharactersInDocument = 4MB
         $reader = [System.Xml.XmlReader]::Create($full, $settings)
         try { $document = [System.Xml.XmlDocument]::new(); $document.XmlResolver = $null; $document.Load($reader) } finally { $reader.Dispose() }
-        if ($document.DocumentElement.Name -cne 'testsuite') { throw 'TEST_REPORT_ROOT_INVALID' }
+        # PowerShell's XML adapter maps the Gradle testsuite @name attribute
+        # onto .Name. Read the actual XML element, with no namespace accepted.
+        $rootElement = $document.PSBase.DocumentElement
+        if ($null -eq $rootElement -or $rootElement.PSBase.Name -cne 'testsuite' -or
+            $rootElement.PSBase.LocalName -cne 'testsuite' -or $rootElement.PSBase.NamespaceURI -cne '') { throw 'TEST_REPORT_ROOT_INVALID' }
         $counts = @{}
         foreach ($key in @('tests','failures','errors','skipped')) {
-            $value = $document.DocumentElement.GetAttribute($key)
+            $value = $rootElement.PSBase.GetAttribute($key)
             $parsed = 0L
             if ($value -cnotmatch '^[0-9]+$' -or -not [long]::TryParse($value, [ref]$parsed) -or $parsed -gt 100000) { throw 'TEST_REPORT_COUNTS_INVALID' }
             $counts[$key] = $parsed

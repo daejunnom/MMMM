@@ -1591,9 +1591,11 @@ fn tree_bytes_observed_with_progress(
             reject_secret_leaf_file(&path)?;
             bytes = checked_sum(bytes, metadata.len())?;
         } else {
-            return Err(StorageError::new(
-                "file_type",
-                "special filesystem entry is preserved",
+            return Err(special_entry_error(
+                "measurement",
+                &path,
+                &boundary,
+                &metadata,
             ));
         }
     }
@@ -1610,12 +1612,68 @@ fn measurement_io_error(
     // A failed metadata open cannot establish whether Windows access denial
     // came from deletion, sharing or access control. Keep the error fatal and
     // preserve its native cause, while identifying only the generated leaf.
-    const CONTEXT_LIMIT: usize = 512;
-    let mut context = format!(
+    let context = format!(
         "measure {stage}; attempts=1; kind={:?}; raw_os_error={:?}; generated_relative=",
         error.kind(),
         error.raw_os_error()
     );
+    StorageError::io(&generated_entry_context(context, path, boundary), error)
+}
+
+fn special_entry_error(
+    stage: &'static str,
+    path: &Path,
+    boundary: &Path,
+    metadata: &fs::Metadata,
+) -> StorageError {
+    // Classify only the metadata already observed by this walk. Do not open,
+    // read, connect to or remove an entry in order to identify its producer.
+    let native_kind = native_file_kind(metadata);
+    StorageError::new(
+        "file_type",
+        generated_entry_context(
+            format!(
+                "special filesystem entry is preserved; stage={stage}; native_kind={native_kind}; generated_relative="
+            ),
+            path,
+            boundary,
+        ),
+    )
+}
+
+fn native_file_kind(metadata: &fs::Metadata) -> &'static str {
+    let file_type = metadata.file_type();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if file_type.is_socket() {
+            return "unix_socket";
+        }
+        if file_type.is_fifo() {
+            return "unix_fifo";
+        }
+        if file_type.is_block_device() {
+            return "unix_block_device";
+        }
+        if file_type.is_char_device() {
+            return "unix_char_device";
+        }
+    }
+    // Keep these distinctions available if an entry changes type between
+    // bounded preflight and removal; no unexpected type grants permission.
+    if file_type.is_file() {
+        "regular_file"
+    } else if file_type.is_dir() {
+        "directory"
+    } else if file_type.is_symlink() {
+        "symlink"
+    } else {
+        "other_special"
+    }
+}
+
+fn generated_entry_context(mut context: String, path: &Path, boundary: &Path) -> String {
+    const CONTEXT_LIMIT: usize = 512;
     // Apply the path policy before even formatting a relative label. No file
     // contents or metadata are read to produce this diagnostic.
     let relative = if reject_secret_leaf_file(path).is_err() {
@@ -1634,7 +1692,7 @@ fn measurement_io_error(
         }
         context.push(character);
     }
-    StorageError::io(&context, error)
+    context
 }
 
 fn vanished_ephemeral_entry(
@@ -1843,10 +1901,7 @@ fn remove_tree(
             reject_secret_leaf_file(&path)?;
             fs::remove_file(&path).map_err(|e| StorageError::io("remove owned file", e))?;
         } else {
-            return Err(StorageError::new(
-                "file_type",
-                "special filesystem entry is preserved",
-            ));
+            return Err(special_entry_error("removal", &path, &boundary, &metadata));
         }
     }
     Ok(())
@@ -1899,9 +1954,11 @@ fn unlink_internal_links(
         } else if metadata.is_file() {
             reject_secret_leaf_file(&path)?;
         } else {
-            return Err(StorageError::new(
-                "file_type",
-                "special preflight entry is preserved",
+            return Err(special_entry_error(
+                "link_preflight",
+                &path,
+                boundary,
+                &metadata,
             ));
         }
     }
