@@ -35,6 +35,8 @@ PROCESS_LIMIT = 32
 DARWIN_VM_LIMIT = 512 * 1024**3
 DARWIN_SAMPLE_TARGET = 0.1
 DARWIN_SAMPLE_GAP = 1.0
+# Public XNU bsd/sys/proc_info.h, existing proc_bsdinfo.pbi_flags.
+PROC_FLAG_INEXIT = 4
 U64_MAX = 2**64 - 1
 MAX_ENTRIES = 100000
 CATALOG_FIELDS = {"schema", "catalog_id"}
@@ -449,6 +451,15 @@ def checked_resource_sum(total, value):
 class DarwinProcessExited(RuntimeError):
     """An exit-class resource result still requires native identity proof."""
 
+    def __init__(self, message, stage, result, number, start_observed=None, exit_observed=None):
+        super().__init__(message)
+        # Capture before bsd_info resets ctypes errno. No native identities or
+        # absolute timestamps enter this bounded diagnostic projection.
+        self.observation = {
+            "stage": stage, "native_result": result, "native_errno": number,
+            "rusage_start_observed": start_observed, "rusage_exit_observed": exit_observed,
+        }
+
 
 class NativeSnapshot:
     def __init__(self, target_os):
@@ -505,34 +516,72 @@ class NativeSnapshot:
         size = native_call("observe Darwin task memory", self.libproc.proc_pidinfo,
                            pid, 4, 0, ctypes.byref(task), ctypes.sizeof(task))
         if size != ctypes.sizeof(task):
-            if size == 0 and ctypes.get_errno() == errno.ESRCH:
-                raise DarwinProcessExited("Darwin task resource process exit requires identity confirmation")
+            number = ctypes.get_errno()
+            if size == 0 and number == errno.ESRCH:
+                raise DarwinProcessExited("Darwin task resource process exit requires identity confirmation",
+                                          "task_info", size, number)
             raise RuntimeError("Darwin task resource observation unavailable; bytes=" + str(size)
-                               + "; errno=" + str(ctypes.get_errno()))
+                               + "; errno=" + str(number))
         ctypes.set_errno(0)
         result = native_call("observe Darwin physical footprint", self.libproc.proc_pid_rusage,
                              pid, 0, ctypes.byref(usage))
         if result != 0:
-            if ctypes.get_errno() == errno.ESRCH:
-                raise DarwinProcessExited("Darwin footprint process exit requires identity confirmation")
-            raise RuntimeError("Darwin footprint observation unavailable; errno=" + str(ctypes.get_errno()))
+            number = ctypes.get_errno()
+            if number == errno.ESRCH:
+                raise DarwinProcessExited("Darwin footprint process exit requires identity confirmation",
+                                          "rusage", result, number)
+            raise RuntimeError("Darwin footprint observation unavailable; errno=" + str(number))
         if usage.start_abstime == 0:
             raise RuntimeError("Darwin resource observation does not identify a live process")
         if usage.exit_abstime != 0:
-            raise DarwinProcessExited("Darwin resource process exit requires identity confirmation")
+            raise DarwinProcessExited("Darwin resource process exit requires identity confirmation",
+                                      "rusage", result, ctypes.get_errno(),
+                                      usage.start_abstime != 0, usage.exit_abstime != 0)
         return task.virtual_size, max(task.resident_size, usage.resident_size), usage.phys_footprint
 
-    def memory_or_confirmed_zombie(self, pid, before):
+    def memory_or_confirmed_zombie(self, pid, before, reserved_leader,
+                                   leader_anchor_checked, leader_anchor_match):
         try:
             return self.memory_info(pid)
-        except DarwinProcessExited:
-            after = self.bsd_info(pid, True)
-            self.verify_memory_identity(before, after, pid)
-            if after.status != 5:
-                raise RuntimeError("Darwin resource process exit not confirmed by native zombie identity")
-            # The reserved group ID plus unchanged start/PGID identifies a
-            # departed member. This omits an ended process, never a zero sample.
-            return None
+        except DarwinProcessExited as error:
+            observation = {
+                **error.observation,
+                "role": "reserved_leader" if reserved_leader else "observed_member",
+                "before_status": before.status if before is not None else None,
+                "after_status": None,
+                "before_inexit": bool(before.flags & PROC_FLAG_INEXIT) if before is not None else None,
+                "after_inexit": None,
+                "memory_identity_check_performed": False, "memory_identity_match": None,
+                # Facts at this memory boundary only. The existing leader
+                # anchor check remains later in observe, with no early probe.
+                "leader_anchor_check_performed": leader_anchor_checked,
+                "leader_anchor_match": leader_anchor_match,
+            }
+            try:
+                after = self.bsd_info(pid, True)
+                if after is not None:
+                    observation["after_status"] = after.status
+                    observation["after_inexit"] = bool(after.flags & PROC_FLAG_INEXIT)
+                observation["memory_identity_check_performed"] = True
+                observation["memory_identity_match"] = False
+                self.verify_memory_identity(before, after, pid)
+                observation["memory_identity_match"] = True
+                if after.status != 5:
+                    raise RuntimeError("Darwin resource process exit not confirmed by native zombie identity")
+                # The reserved group ID plus unchanged start/PGID identifies a
+                # departed member. This omits an ended process, never a zero sample.
+                return None
+            finally:
+                # Save even when BSD or identity confirmation itself fails.
+                # Only first/last closed facts and a saturating count survive.
+                history = self.resources.get("native_memory_exits")
+                if history is None:
+                    self.resources["native_memory_exits"] = {
+                        "observations": 1, "first": observation, "last": observation,
+                    }
+                else:
+                    history["observations"] = min(U64_MAX, history["observations"] + 1)
+                    history["last"] = observation
 
     @staticmethod
     def verify_memory_identity(before, after, pid):
@@ -607,6 +656,7 @@ class NativeSnapshot:
                 raise RuntimeError("Darwin native PID snapshot bound exceeded")
             capacity = min(MAX_ENTRIES, capacity * 2)
         count, seen = 0, False
+        leader_anchor_checked, leader_anchor_match = False, None
         for pid in pids[:size // 4]:
             if pid <= 0:
                 continue
@@ -614,7 +664,9 @@ class NativeSnapshot:
                 before = self.bsd_info(pid, True)
                 if before is not None and before.status != 5 and os.getsid(pid) != leader:
                     raise RuntimeError("reserved Darwin leader changed session identity")
-                values = self.memory_or_confirmed_zombie(pid, before) if sample_memory and before is not None and before.status != 5 else None
+                values = self.memory_or_confirmed_zombie(
+                    pid, before, True, leader_anchor_checked, leader_anchor_match
+                ) if sample_memory and before is not None and before.status != 5 else None
                 after = self.bsd_info(pid, True)
                 if before is None or after is None or before.pid != leader or after.pid != leader:
                     raise RuntimeError("reserved Darwin leader disappeared")
@@ -623,6 +675,10 @@ class NativeSnapshot:
                         or start != (after.start_sec, after.start_usec)
                         or self.leader_start is not None and self.leader_start != start):
                     raise RuntimeError("reserved Darwin leader changed identity")
+                # The preceding, original short-circuit check reached its
+                # stored-anchor comparison only when an anchor already existed.
+                leader_anchor_checked = self.leader_start is not None
+                leader_anchor_match = True if leader_anchor_checked else None
                 self.leader_start, seen = start, True
                 if values is not None:
                     self.verify_memory_identity(before, after, pid)
@@ -643,7 +699,9 @@ class NativeSnapshot:
             before = self.bsd_info(pid)
             if before is None:
                 continue
-            values = self.memory_or_confirmed_zombie(pid, before) if sample_memory and before.status != 5 else None
+            values = self.memory_or_confirmed_zombie(
+                pid, before, False, leader_anchor_checked, leader_anchor_match
+            ) if sample_memory and before.status != 5 else None
             try:
                 session_after = os.getsid(pid)
             except ProcessLookupError:

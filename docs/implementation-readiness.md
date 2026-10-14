@@ -639,6 +639,28 @@ bytes·worker 9개는 기존 상한 안이다. 원 native stage/result/errno·BS
 집계 성공 metadata를 확인했으나 이 기록에서는 새 JVM archive를 대조하지 않았다.
 위 로컬 CLI 연결 변경은 이 CI source에 포함되지 않는다.
 
+Darwin bootstrap의 진단 유실은 D051로 보강했다. 이미 실행한 원 native stage/result와
+즉시 errno, BSD status·INEXIT·identity 및 기존 anchor 검사의 실제 도달 여부만
+optional first/last/포화 count에 보존한다. 원 strict 실패·정상 반환·native 조회와
+신호·기한·자원 상한은 유지한다. 독립 diff 검토에서 추가 finding 0을 확인했고,
+Windows Python 3.10의 isolated/no-bytecode 실행으로 실제 생산 정의를 AST 선별한
+22개 순수 사례가 command 0·219 ms·자연 종료했다. native libproc·fork·실제 OS 관측은
+차단한 mock이며 실제 macOS 실행 성공이나 CI46 실패 원인의 소급 확정은 아니다.
+drain·출력·export·scratch 정리·lease 해제와 supervisor/cleanup 오류 0을 확인했다.
+
+현재 공개 source `090845b1bf9a88acda6833930bbd7fe45f3e0dd2`의
+[Rust CI 47](https://github.com/daejunnom/MMMM/actions/runs/38641694293)은 macOS job
+성공, Linux test 관리 실행 실패를 관측했다. Linux 실제 archive 16,440 bytes·SHA
+`76c05d02a4a1efabd179e7dd5b7b8073e9c9c459133f631d32b96c226f78591b`는 컴파일 중
+69,058 ms에 enumerated candidate의 stat open/ESRCH 3으로 supervisor failure가 났다.
+stdout 0·Compiling 147건·Finished/test result 0건이므로 실제 테스트 실패를 관측한
+것이 아니다. command exit null·signal 9와 원 오류, 정상 cleanup·scratch 및 lease
+해제를 함께 보존했다. 해당 순간 candidate의 identity·group·pidfd는 미관측이며
+불일치나 owned member로 추정하지 않는다. 같은 source의
+[JVM CI 38](https://github.com/daejunnom/MMMM/actions/runs/38641694259)은 세 OS와 집계
+성공 metadata다. Windows Rust job과 새 성공 archive 전체의 인수는 이 기록에서
+아직 확정하지 않았다. D051은 이 CI source에 포함되지 않는다.
+
 ### 게임 실행 전의 launcher 및 보존 경로 준비
 
 Windows의 별도 help action에서 실제 `:fabric-host:runServer` task의 metadata만
@@ -692,8 +714,39 @@ drain/output/export/scratch/lease를 따로 확인했다. 미실행 이전 helpe
 보존 결과를 유지하고 지원 profile이나 상한을 바꾸지 않았다. vendor 도구 입력 관측과
 제품 source inventory 인수는 별개다. 같은 held input의 선택한 installer 선언/bytecode를
 실제 javap로 읽은 command는 0/1,929 ms·자연 종료다. manifest의 진입점은 실제 게임을
-시작하는 ServerLauncher이며, 명시적인 Main의 server 설치 분기와 구분한다. installer 및
-그 전이 호출·실제 설치 결과는 아직 미실행이며 EULA 수락·게임 인수로 올리지 않는다.
+시작하는 ServerLauncher이며, 명시적인 Main의 server 설치 분기와 구분한다. 나머지
+일곱 전이 class도 실제 javap command 0·3,039 ms로 읽어 installer Main의 명시 버전
+선택·library/server 다운로드와 return을 확인했다. 이 정적 관측은 게임 실행이 아니다.
+
+외부 준비 helper는 실행 전 독립 검토에서 drive 경로 표현, Java 실행 파일 pin과
+실패한 hash의 상태 격리를 수정했다. 미실행 v1/v2를 보존하고 최종 v3
+13,475 bytes·SHA `c7b5f73c851c376d6230607835b129c4252d3bcdd66ffc4dc2bacee8dc1d5e8c`를
+재검토·구문 검사한 뒤 실행했다. held Java는 50,304 bytes·SHA
+`5808527e3dfc4eb285c7664ba356bc267055ef906e83ed4660d9f7976da7349b`이며 기존 관측과
+전후 일치했다. upstream executable digest 대조나 whole-JDK 인수로 확대하지 않는다.
+installer Main은 command 0·4,462 ms·자연 종료, 원 Java exit 0·pre/post 두 pin 일치·
+helper 오류 0이었다. 별도 root의 game 자료 66,202,949 bytes를 보존하고 native
+drain·출력·export·scratch 정리와 root/build lease 해제를 확인했다. 300초 협력 및
+360초 native 기한을 사용했으며 이 단계는 게임 main과 EULA 수락을 호출하지 않았다.
+
+소유 root를 재획득한 정적 관측에서 생성된 `fabric-server-launch.jar`는 616 bytes·SHA
+`9421951533f7b894cb203594fe0aef08a89a7fd7332d71c4924f5333d44c5596`였다. 두 member 중
+manifest의 Main-Class는 `net.fabricmc.loader.impl.launch.server.FabricServerLauncher`,
+classpath는 relative libraries 경로 7개다. `server.jar`는 62,294,556 bytes·SHA
+`d052f14d7a173734fba553711e5b570162e2f2a313267ee31a21b975a679be64`로 관측했다.
+command 0·725 ms이며 whole-library closure·loaded definition·SourceAdmission은
+발급하지 않았다.
+
+별도 helper의 독립 검토와 구문 검사 뒤 두 고정 mod JAR을 held source pin에 대조해
+CreateNew·64 KiB 복사·flush·동일 destination handle hash로 배치했다. 호스트는 위의
+3,509,931-byte digest와 같고, API는 1,772,377 bytes·SHA
+`8626c189b702f466800b1c8ddac6203cf8a1e0bdaee75a5f9a33b18c2baa81b1`다. loopback IP·
+online mode·RCON/query 비활성화·2명·view/simulation 2의 고정 properties 185 bytes·SHA
+`81bd0ebfefa00f70772af044ee4f99735afc71ea1cb5810895be0ea404aca3db`도 CreateNew로 준비했다.
+command 0·932 ms·helper 524 ms·stderr 0·오류 0이며 원 파일을 덮거나 삭제하지 않았다.
+정상 drain·출력·export·scratch 정리와 root/build lease 해제 뒤 자료를 보존했다.
+이 준비는 실제 mod 로드·ordinary origin 검사·observer 설치나 관리자 pairing을
+대신하지 않는다. EULA와 게임은 계속 미실행이다.
 
 실패한 실행의 원본 판정은 유지한다. native drain과 정확한 소유 기록을 확인하고
 로그를 별도로 내보내며 digest를 대조한 경우에만 해당 실행의 알려진 임시 파일을

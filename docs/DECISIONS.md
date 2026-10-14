@@ -77,6 +77,8 @@
 
 | MMMM-D050 | 개발용 게임 검증은 build scratch와 분리한 명시 retained root를 사용하고, 정상 종료 입력을 native 종료 및 저장 인수와 구분한다. | RetainedGame은 현재 ManagedBuild를 borrow하며 closed owner·현재 catalog/slot/token·checkout digest와 열린 root/game directory identity를 확인한다. 직접 새로 만든 root 또는 정확한 complete owner만 재사용하고 중단·불명 lease를 채택하지 않는다. game tree는 metadata 앞의 secret guard, 깊이 64·100000 entries·link/hardlink 거절과 원 checkpoint로 실제 길이를 측정한다. 선택한 retained root와 현재 build slot/catalog를 checked 합산하여 기존 8/12 GiB에 대조하되 다른 retained root 전체 quota를 주장하지 않는다. native drain·증거 export 뒤 실패한 실행도 world/config를 보존하며 lease만 해제하고 Drop·cache eviction으로 game 자료를 삭제하지 않는다. lease 해제는 기존 managed storage와 같은 cooperative verification→path unlink이며 hostile 동일 UID의 교체에 대한 atomic conditional unlink 보장은 아니다. ProcessSpec의 기본 null stdin을 유지하고 opt-in one-use handle만 private stop LF 5 bytes를 전달한다. Windows는 확인한 빈 pipe 용량 안의 독점 cooperative write, Unix는 nonblocking write이며 partial/native/close 오류와 실제 bytes를 보존한다. 원 기한·취소·자원·출력·drain 조건은 계속 적용하며 Minecraft 처리·저장 acknowledgement는 발급하지 않는다. 실제 launcher 연결·EULA 동의·게임 시작·관리자 pairing 및 3개 OS 게임 인수는 별도 검증이다. |
 
+| MMMM-D051 | Unix bootstrap의 Darwin 종료 진단은 이미 수행한 native 관측과 검증 도달 여부만 보존하고 strict 판정을 바꾸지 않는다. | TaskInfo·Rusage의 원 stage/result/errno를 BSD 재조회 전에 캡처하고, 성공한 Rusage에서만 start/exit timestamp 존재 bool을 남긴다. 이미 읽은 BSD status·INEXIT와 memory identity 검사의 수행·결과, 현재 scan의 기존 leader anchor 비교까지 실제 도달했는지를 닫힌 optional first/last/포화 count로 보존한다. 후속 BSD·identity 실패와 membership-only cleanup에서도 원 사실을 잃지 않으며 raw PID·UID·PGID·birth·token·경로는 직렬화하지 않는다. 검사를 앞당기거나 native query·retry·sleep을 추가하지 않고 원 오류 문자열·분류·정상 반환·signal·기한·cadence·자원 상한을 유지한다. 순수 AST 검사는 실제 정의를 mock으로 실행하며 실제 macOS 전이·과거 실패 원인 복원·게임 인수를 발급하지 않는다. |
+
 ## 구현 전에 확인할 항목
 
 - 원본 계약과 예제 패키지의 내용, 버전 및 digest.
