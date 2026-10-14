@@ -2,11 +2,16 @@
 //! from an authenticated local bootstrap; public function DTOs cannot install
 //! a host, principal, context, authority or replacement binding.
 
-use crate::client::{ClientError, HostClientReply, HostRpcClient};
+use crate::{
+    authority::LocalAuthority,
+    bootstrap::CompletedPairingObservation,
+    client::{ClientError, HostClientReply, HostRpcClient},
+    service::RequestContextWitness,
+};
 use mmmm_application::{AppError, AppResult, ProviderPort};
 use mmmm_contracts::{
     ActionId, BindingId, ContextId, ContractValidator, InvocationId, OperationId, PrincipalId,
-    Sha256Digest, StepId, encode_json, raw_digest, verify_projected_digest,
+    ProjectId, Sha256Digest, StepId, encode_json, raw_digest, verify_projected_digest,
 };
 use mmmm_runtime::storage::DurableStore;
 use serde_json::{Value, json};
@@ -103,6 +108,7 @@ struct PairedHost {
     hello: Value,
     expires: Instant,
     generation: [u8; 16],
+    completed_pairing: Option<Arc<CompletedPairingObservation>>,
 }
 const MAX_RETAINED_ROUTES: usize = 8;
 const MAX_RETAINED_INVOCATIONS: usize = 1024;
@@ -218,6 +224,114 @@ pub struct HostRouteOwner {
     context_id: ContextId,
     generation: [u8; 16],
 }
+/// Factual delivery provenance for one currently entered request and exact
+/// route generation. It grants no read/source/target permission and cannot be
+/// constructed from a DTO, a matching digest or a host response. Consumers
+/// still acquire fresh kernel-owner/same-Store/Project-owner authority and
+/// source/mode rights before using this provenance to issue any source grant.
+pub struct CompletedPairingWitness {
+    state: Arc<Mutex<BridgeState>>,
+    request: RequestContextWitness,
+    context_id: ContextId,
+    generation: [u8; 16],
+    observation: Arc<CompletedPairingObservation>,
+}
+impl std::fmt::Debug for CompletedPairingWitness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompletedPairingWitness")
+            .finish_non_exhaustive()
+    }
+}
+impl CompletedPairingWitness {
+    pub fn check_current(&self, authority: &LocalAuthority) -> AppResult<()> {
+        self.request
+            .check_local()
+            .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
+        let principal = self.request.authenticated().principal();
+        if principal != self.observation.principal()
+            || !self
+                .request
+                .authenticated()
+                .permits_context(self.context_id.as_str())
+            || !self.observation.check_delivery()
+        {
+            return Err(error(
+                "PERMISSION_REQUIRED",
+                "Completed native pairing is no longer current",
+            ));
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
+        let host = checked_host(&state, &self.context_id, Some(principal))?;
+        if host.generation != self.generation
+            || host.context != *self.observation.context()
+            || host
+                .completed_pairing
+                .as_ref()
+                .is_none_or(|actual| !Arc::ptr_eq(actual, &self.observation))
+        {
+            return Err(error(
+                "SESSION_ROUTE_CHANGED",
+                "Original completed pairing route was replaced",
+            ));
+        }
+        authority.authorize_retained_scope(
+            principal,
+            self.observation.project(),
+            &self.context_id,
+            self.observation.policy(),
+            &self.observation.context()["scope"],
+        )?;
+        self.request
+            .check_local()
+            .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))
+    }
+    pub fn principal(&self) -> &PrincipalId {
+        self.observation.principal()
+    }
+    pub fn project(&self) -> &ProjectId {
+        self.observation.project()
+    }
+    pub fn context(&self) -> &Value {
+        self.observation.context()
+    }
+    pub fn native_owner(&self) -> &PrincipalId {
+        self.observation.native_owner()
+    }
+    pub fn offer_digest(&self) -> &Sha256Digest {
+        self.observation.offer_digest()
+    }
+    pub fn completed_at(&self) -> Instant {
+        self.observation.completed_at()
+    }
+    pub fn original_deadline(&self) -> Instant {
+        self.observation.original_deadline()
+    }
+    pub fn lease_expires(&self) -> Instant {
+        self.observation.lease_expires()
+    }
+
+    /// Only a trusted source consumer may inspect the original bounded offer.
+    /// This private borrow never belongs in RPC output, Debug or diagnostics.
+    /// Same-Store and refreshed native owner checks remain consumer duties.
+    #[allow(
+        dead_code,
+        reason = "The real source-registration consumer is composed separately from this delivery producer"
+    )]
+    pub(crate) fn with_current_original_offer<T>(
+        &self,
+        authority: &LocalAuthority,
+        inspect: impl FnOnce(&Value) -> AppResult<T>,
+    ) -> AppResult<T> {
+        self.check_current(authority)?;
+        let output = inspect(self.observation.original_offer())?;
+        self.check_current(authority)?;
+        Ok(output)
+    }
+}
 /// An actual bounded native context observation bound to this exact installed
 /// route. Runtime transaction checkpoints may validate this witness locally;
 /// they must not perform another transport/native call while SQLite is locked.
@@ -251,6 +365,84 @@ impl HostContextWitness {
     }
 }
 impl HostBridge {
+    /// Bootstrap alone can construct this actual completion observation.
+    /// Publication checks route ownership and active grant under the same
+    /// route lock, so a replacement cannot inherit another exchange's receipt.
+    /// This performs local checks only and creates no new acquisition budget.
+    pub(crate) fn record_completed_pairing(
+        &self,
+        owner: &HostRouteOwner,
+        observation: Arc<CompletedPairingObservation>,
+        authority: &LocalAuthority,
+    ) -> AppResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
+        let host = checked_host(&state, &owner.context_id, Some(observation.principal()))?;
+        if host.generation != owner.generation
+            || host.context != *observation.context()
+            || host.hello != observation.original_offer()["hostHello"]
+            || observation.context()["contextId"] != owner.context_id.as_str()
+            || observation.context()["projectId"] != observation.project().as_str()
+            || observation.context()["policyRevision"] != observation.policy().as_str()
+            || !observation.check_delivery()
+            || host.completed_pairing.is_some()
+        {
+            return Err(error(
+                "SESSION_ROUTE_CHANGED",
+                "Completed native pairing differs from the exact installed route",
+            ));
+        }
+        authority.authorize_retained_scope(
+            observation.principal(),
+            observation.project(),
+            &owner.context_id,
+            observation.policy(),
+            &observation.context()["scope"],
+        )?;
+        state
+            .hosts
+            .get_mut(&owner.context_id)
+            .ok_or_else(|| error("STALE_CONTEXT", "Original native route is unavailable"))?
+            .completed_pairing = Some(observation);
+        Ok(())
+    }
+    /// Resolve only the currently installed route, never retained invocation
+    /// routes. The exact entered request supplies its original cancellation
+    /// and deadline; this query does not refresh native owner or source rights.
+    pub fn completed_pairing_witness(
+        &self,
+        request: &RequestContextWitness,
+        authority: &LocalAuthority,
+        id: &ContextId,
+    ) -> AppResult<CompletedPairingWitness> {
+        request
+            .check_local()
+            .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
+        let witness = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
+            let host = checked_host(&state, id, Some(request.authenticated().principal()))?;
+            let observation = host.completed_pairing.clone().ok_or_else(|| {
+                error(
+                    "SOURCE_UNAVAILABLE",
+                    "No actual completed native pairing is recorded for this route",
+                )
+            })?;
+            CompletedPairingWitness {
+                state: self.state.clone(),
+                request: request.clone(),
+                context_id: id.clone(),
+                generation: host.generation,
+                observation,
+            }
+        };
+        witness.check_current(authority)?;
+        Ok(witness)
+    }
     /// Trusted bootstrap only. The host is independently queried before this
     /// exact immutable context becomes routable. An approval may rotate the
     /// same actual context/runtime; original dispatch routes remain read-only.
@@ -377,6 +569,7 @@ impl HostBridge {
                 hello: actual_hello,
                 expires: lease_expires,
                 generation,
+                completed_pairing: None,
             },
         );
         Ok(owner)
@@ -1614,6 +1807,12 @@ fn validate_job_observation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn completed_pairing_provenance_keeps_host_bridge_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<HostBridge>();
+        assert_send_sync::<CompletedPairingObservation>();
+    }
     fn local_route_witness() -> (HostBridge, HostContextWitness) {
         // This fixture checks local transaction fencing only. No listener or
         // native game is started, and no native observation is claimed.
@@ -1649,6 +1848,7 @@ mod tests {
                 hello,
                 expires: Instant::now() + Duration::from_secs(30),
                 generation,
+                completed_pairing: None,
             },
         );
         let witness = HostContextWitness {

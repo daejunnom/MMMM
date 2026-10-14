@@ -7,7 +7,9 @@ use mmmm_application::{Access, AuthorityPort};
 use mmmm_contracts::{parse_json, verify_projected_digest};
 use mmmm_runtime::storage::StoreConfig;
 use std::{
+    cell::RefCell,
     fs,
+    rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -615,6 +617,496 @@ fn actual_host_responses_then_terminal_receipt_activate_exact_session() {
             .is_empty()
     );
     processor.shutdown().unwrap();
+}
+
+// These are actual finite TCP Hello/context exchanges and the existing opaque
+// native-completion test seam. They prove delivery-provenance composition,
+// not a real game's native ACK/EOF, read rights or shape acceptance.
+struct ObservedPairingFixture {
+    store: DurableStore,
+    processor: HostBootstrapProcessor,
+    authority: LocalAuthority,
+    witness: BootstrapWitness,
+    budget: BootstrapBudget,
+    context: Value,
+    hello: Value,
+    _root: Root,
+}
+fn observed_pairing_fixture(nonce: &str) -> ObservedPairingFixture {
+    let root = Root::new();
+    let mut store = root.open();
+    project(&mut store);
+    approve_fixture(&mut store, finite_scope());
+    let (mut processor, authority) = processor();
+    let offer = offer(&root, nonce, finite_scope());
+    let witness = offer.witness().clone();
+    let hello = offer.public().value()["hostHello"].clone();
+    let budget = BootstrapBudget::new();
+    let reply = processor
+        .handle_with_budget(
+            &mut store,
+            ManagementRequest::Offer(offer),
+            &epoch(),
+            &budget,
+        )
+        .unwrap()
+        .unwrap();
+    let context = reply.value()["contexts"][0].clone();
+    let (address, host) = host_response_fixture(hello.clone(), context.clone());
+    let installed = PublicFrame::from_value(json!({
+        "kind":"host_pairing_installed", "protocolVersion":"0.2.0", "nonce":nonce,
+        "hostEndpoint":{"address":address.to_string(), "path":"/rpc", "hostEpoch":"epoch-fixture-01"},
+    })).unwrap();
+    let installed_result = processor.handle_with_reply_deadline(
+        &mut store,
+        ManagementRequest::installed(installed, witness.clone()).unwrap(),
+        &epoch(),
+        &budget,
+        Instant::now() + Duration::from_secs(5),
+    );
+    host.join().unwrap().unwrap();
+    assert_eq!(
+        installed_result.unwrap().unwrap().kind(),
+        ManagementKind::Complete
+    );
+    ObservedPairingFixture {
+        store,
+        processor,
+        authority,
+        witness,
+        budget,
+        context,
+        hello,
+        _root: root,
+    }
+}
+fn finish_observed_pairing(
+    fixture: &mut ObservedPairingFixture,
+    delivered: bool,
+) -> Result<(), ManagementError> {
+    fixture
+        .processor
+        .handle_with_budget(
+            &mut fixture.store,
+            native_receipt(&fixture.witness, delivered, &fixture.budget),
+            &epoch(),
+            &fixture.budget,
+        )
+        .map(|_| ())
+}
+
+struct NoPairingApplicationCalls;
+impl mmmm_application::AuthorityPort for NoPairingApplicationCalls {
+    fn authorize(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectId,
+        _: Access,
+        _: Option<&Value>,
+        _: Option<&Value>,
+    ) -> mmmm_application::AppResult<()> {
+        panic!("Unexpected application authority in pairing provenance fixture")
+    }
+}
+impl mmmm_application::PlanningPort for NoPairingApplicationCalls {
+    fn inspect_project(
+        &mut self,
+        _: &PrincipalId,
+        _: &Value,
+    ) -> mmmm_application::AppResult<mmmm_application::ProjectInspection> {
+        panic!("Unexpected application inspection")
+    }
+    fn prepare(
+        &mut self,
+        _: &PrincipalId,
+        _: &Value,
+        _: &Value,
+        _: &Value,
+    ) -> mmmm_application::AppResult<mmmm_application::PreparedPlan> {
+        panic!("Unexpected application plan")
+    }
+    fn prepare_recovery(
+        &mut self,
+        _: &PrincipalId,
+        _: &mmmm_application::RecoveryPreparation,
+        _: &Value,
+        _: &Value,
+    ) -> mmmm_application::AppResult<mmmm_application::PreparedPlan> {
+        panic!("Unexpected recovery plan")
+    }
+}
+impl mmmm_application::ProviderPort for NoPairingApplicationCalls {
+    fn context(&mut self, _: &PrincipalId, _: &ContextId) -> mmmm_application::AppResult<Value> {
+        panic!("Unexpected provider context")
+    }
+    fn action_descriptor(&mut self, _: &Value, _: &Value) -> mmmm_application::AppResult<Value> {
+        panic!("Unexpected action descriptor")
+    }
+    fn observe_precondition(
+        &mut self,
+        _: &Value,
+        _: &Value,
+    ) -> mmmm_application::AppResult<Sha256Digest> {
+        panic!("Unexpected precondition")
+    }
+    fn verify_dependencies(&mut self, _: &[Value], _: &Value) -> mmmm_application::AppResult<()> {
+        panic!("Unexpected dependency call")
+    }
+    fn dispatch(&mut self, _: &Value) -> mmmm_application::AppResult<Value> {
+        panic!("Pairing provenance cannot dispatch")
+    }
+    fn poll(&mut self, _: &Value, _: Option<&str>) -> mmmm_application::AppResult<Option<Value>> {
+        panic!("Unexpected provider poll")
+    }
+    fn request_cancel(&mut self, _: &Value, _: Option<&str>) -> mmmm_application::AppResult<()> {
+        panic!("Unexpected provider cancellation")
+    }
+}
+impl mmmm_application::IndependentObserverPort for NoPairingApplicationCalls {
+    fn readback(
+        &mut self,
+        _: &Value,
+        _: &WriteScope,
+    ) -> mmmm_application::AppResult<mmmm_application::ReadbackEvidence> {
+        panic!("Unexpected native readback")
+    }
+    fn read_target(&mut self, _: &Value, _: &str) -> mmmm_application::AppResult<Vec<u8>> {
+        panic!("Unexpected native target read")
+    }
+}
+impl mmmm_application::IdSource for NoPairingApplicationCalls {
+    fn next_id(&mut self, _: mmmm_application::IdKind) -> mmmm_application::AppResult<String> {
+        panic!("Pairing provenance cannot allocate product IDs")
+    }
+}
+impl mmmm_application::Clock for NoPairingApplicationCalls {
+    fn unix_nanos(&self) -> i128 {
+        0
+    }
+}
+type PairingProbeCall =
+    dyn FnMut(crate::service::RequestContextWitness) -> mmmm_application::AppResult<()>;
+struct PairingProbeExtension {
+    request: crate::service::RequestContextSlot,
+    inspect: Box<PairingProbeCall>,
+}
+impl crate::service::ServiceExtension for PairingProbeExtension {
+    fn call(
+        &mut self,
+        method: &str,
+        _: &Value,
+        context: &mut crate::service::ServiceExtensionContext<'_>,
+    ) -> Result<Value, crate::service::ServiceError> {
+        context.check(method)?;
+        let request = self.request.current_witness(method)?;
+        (self.inspect)(request).map_err(|cause| {
+            crate::service::ServiceError::caused_by(cause.code, cause.message, cause)
+        })?;
+        Ok(json!({}))
+    }
+}
+fn pairing_request_probe(
+    store: DurableStore,
+    policy: SessionPolicy,
+    inspect: impl FnMut(crate::service::RequestContextWitness) -> mmmm_application::AppResult<()>
+    + 'static,
+) {
+    use crate::service::{
+        ApplicationPorts, ApplicationService, ExtensionRouter, RequestBudget, RequestContextSlot,
+        ServiceDispatcher,
+    };
+    let request = RequestContextSlot::default();
+    let mut sessions = crate::auth::SessionAuthority::new(1).unwrap();
+    let token = sessions.install(policy).unwrap();
+    let authenticated = sessions.authenticate_token(&token).unwrap();
+    let mut service = ApplicationService::from_store(
+        store,
+        ApplicationPorts {
+            authority: Box::new(NoPairingApplicationCalls),
+            planner: Box::new(NoPairingApplicationCalls),
+            provider: Box::new(NoPairingApplicationCalls),
+            observer: Box::new(NoPairingApplicationCalls),
+            ids: Box::new(NoPairingApplicationCalls),
+            clock: Box::new(NoPairingApplicationCalls),
+        },
+    );
+    service.bind_request_context(request.clone());
+    let mut router = ExtensionRouter::default();
+    router
+        .register(
+            ["catalog.capture"],
+            Box::new(PairingProbeExtension {
+                request,
+                inspect: Box::new(inspect),
+            }),
+        )
+        .unwrap();
+    service.set_extensions(router);
+    let budget = RequestBudget::new(
+        Duration::from_secs(5),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .unwrap();
+    service
+        .call(&authenticated, "catalog.capture", &json!({}), &budget)
+        .unwrap();
+}
+
+#[test]
+fn completed_pairing_uses_current_request_without_restarting_native_budget() {
+    let mut fixture = observed_pairing_fixture("pair-completion-provenance");
+    let native = native_receipt(&fixture.witness, true, &fixture.budget);
+    let ManagementRequest::Finished(ref native_receipt) = native else {
+        panic!("Opaque receipt required");
+    };
+    let completed_at = native_receipt.completed_at();
+    let original_deadline = fixture.budget.deadline();
+    // Completion already happened. A later original-budget cancellation must
+    // not turn that native observation into an acquisition timeout.
+    fixture.budget.cancel();
+    fixture
+        .processor
+        .handle_with_budget(&mut fixture.store, native, &epoch(), &fixture.budget)
+        .unwrap();
+    let hosts = fixture.processor.hosts.clone();
+    let id = ContextId::new(fixture.context["contextId"].as_str().unwrap()).unwrap();
+    let authority = fixture.authority.clone();
+    let held = Rc::new(RefCell::new(None));
+    let capture = held.clone();
+    let policy = fixture.processor.current_session_policy().unwrap();
+    let digest = fixture.witness.offer_digest().clone();
+    pairing_request_probe(fixture.store, policy, move |request| {
+        let witness = hosts.completed_pairing_witness(&request, &authority, &id)?;
+        assert_eq!(witness.completed_at(), completed_at);
+        assert_eq!(witness.original_deadline(), original_deadline);
+        assert_eq!(witness.offer_digest(), &digest);
+        assert_eq!(witness.native_owner(), &local_owner_principal().unwrap());
+        witness.with_current_original_offer(&authority, |offer| {
+            assert_eq!(canonical_digest(offer).unwrap(), digest);
+            Ok(())
+        })?;
+        let debug = format!("{witness:?}");
+        assert!(!debug.contains("pair-completion-provenance"));
+        assert!(!debug.contains("dataRoot"));
+        *capture.borrow_mut() = Some(witness);
+        Ok(())
+    });
+    assert!(
+        held.borrow()
+            .as_ref()
+            .unwrap()
+            .check_current(&fixture.authority)
+            .is_err()
+    );
+    fixture.processor.shutdown().unwrap();
+}
+
+#[test]
+fn completed_pairing_witness_rechecks_active_policy() {
+    let mut fixture = observed_pairing_fixture("pair-revoked-provenance");
+    finish_observed_pairing(&mut fixture, true).unwrap();
+    let policy = fixture.processor.current_session_policy().unwrap();
+    let hosts = fixture.processor.hosts.clone();
+    let authority = fixture.authority.clone();
+    let context = fixture.context.clone();
+    pairing_request_probe(fixture.store, policy, move |request| {
+        let id = ContextId::new(context["contextId"].as_str().unwrap()).unwrap();
+        let witness = hosts.completed_pairing_witness(&request, &authority, &id)?;
+        let project = witness.project().clone();
+        let principal = witness.principal().clone();
+        let policy = Sha256Digest::new(context["policyRevision"].as_str().unwrap()).unwrap();
+        authority.revoke_staged_project(&principal, &project, &policy)?;
+        assert!(witness.check_current(&authority).is_err());
+        assert!(
+            hosts
+                .completed_pairing_witness(&request, &authority, &id)
+                .is_err()
+        );
+        Ok(())
+    });
+    fixture.processor.shutdown().unwrap();
+}
+
+fn replace_observed_route(hosts: &HostBridge, context: &Value, hello: &Value) -> HostRouteOwner {
+    let (address, host) = host_response_fixture(hello.clone(), context.clone());
+    let client = HostRpcClient::paired(
+        EndpointRecord {
+            schema_version: 1,
+            contract_version: "0.2.0".into(),
+            address,
+            path: "/rpc".into(),
+            coordinator_epoch: "epoch-fixture-01".into(),
+            credential_ref: "MMMM.coordinator.peer-fixture".into(),
+        },
+        SecretToken::generate().unwrap(),
+    )
+    .unwrap();
+    let result = hosts.attach_owned_with_deadline(
+        client,
+        PrincipalId::new(context["principalRef"].as_str().unwrap()).unwrap(),
+        context.clone(),
+        hello.clone(),
+        Duration::from_secs(60),
+        Instant::now() + Duration::from_secs(5),
+    );
+    host.join().unwrap().unwrap();
+    result.unwrap()
+}
+
+#[test]
+fn completed_pairing_never_follows_an_identical_context_to_a_new_route() {
+    let mut fixture = observed_pairing_fixture("pair-replaced-provenance");
+    finish_observed_pairing(&mut fixture, true).unwrap();
+    let policy = fixture.processor.current_session_policy().unwrap();
+    let hosts = fixture.processor.hosts.clone();
+    let authority = fixture.authority.clone();
+    let context = fixture.context.clone();
+    let hello = fixture.hello.clone();
+    pairing_request_probe(fixture.store, policy, move |request| {
+        let id = ContextId::new(context["contextId"].as_str().unwrap()).unwrap();
+        let witness = hosts.completed_pairing_witness(&request, &authority, &id)?;
+        let replacement = replace_observed_route(&hosts, &context, &hello);
+        assert_eq!(
+            witness.check_current(&authority).unwrap_err().code,
+            "SESSION_ROUTE_CHANGED"
+        );
+        assert_eq!(
+            hosts
+                .completed_pairing_witness(&request, &authority, &id)
+                .unwrap_err()
+                .code,
+            "SOURCE_UNAVAILABLE"
+        );
+        hosts.detach_owned(&replacement)?;
+        Ok(())
+    });
+    fixture.processor.shutdown().unwrap();
+}
+
+#[test]
+fn completed_delivery_route_mismatch_rolls_back_only_original_generation() {
+    let mut fixture = observed_pairing_fixture("pair-original-route-provenance");
+    let hosts = fixture.processor.hosts.clone();
+    let replacement = replace_observed_route(&hosts, &fixture.context, &fixture.hello);
+    assert_eq!(
+        finish_observed_pairing(&mut fixture, true),
+        Err(ManagementError::WrongReply)
+    );
+    let id = ContextId::new(fixture.context["contextId"].as_str().unwrap()).unwrap();
+    assert!(hosts.contains_route_for_test(&id).unwrap());
+    assert!(fixture.processor.active.is_empty());
+    assert!(fixture.processor.pending.is_empty());
+    let retained = fixture
+        .processor
+        .rejected_completions
+        .get(fixture.witness.id())
+        .unwrap();
+    assert!(retained._observation.completion.delivered());
+    assert!(matches!(
+        retained._rollback,
+        RollbackObservation::Completed { .. }
+    ));
+    assert_eq!(
+        retained._publication_failure.as_ref().unwrap().code,
+        "SESSION_ROUTE_CHANGED"
+    );
+    assert!(retained._first_rollback_failure.is_none());
+    hosts.detach_owned(&replacement).unwrap();
+    fixture.processor.shutdown().unwrap();
+}
+
+#[test]
+fn completed_pairing_witness_obeys_original_current_request_cancellation() {
+    let mut fixture = observed_pairing_fixture("pair-request-cancel-provenance");
+    finish_observed_pairing(&mut fixture, true).unwrap();
+    let policy = fixture.processor.current_session_policy().unwrap();
+    let hosts = fixture.processor.hosts.clone();
+    let authority = fixture.authority.clone();
+    let id = ContextId::new(fixture.context["contextId"].as_str().unwrap()).unwrap();
+    pairing_request_probe(fixture.store, policy, move |request| {
+        let witness = hosts.completed_pairing_witness(&request, &authority, &id)?;
+        request
+            .budget()
+            .cancellation()
+            .store(true, Ordering::Release);
+        assert_eq!(
+            witness.check_current(&authority).unwrap_err().code,
+            "CANCELLED"
+        );
+        assert_eq!(
+            hosts
+                .completed_pairing_witness(&request, &authority, &id)
+                .unwrap_err()
+                .code,
+            "CANCELLED"
+        );
+        Ok(())
+    });
+    fixture.processor.shutdown().unwrap();
+}
+
+#[test]
+fn rejected_completion_keeps_original_receipt_after_successful_rollback() {
+    let mut fixture = observed_pairing_fixture("pair-rejected-provenance");
+    finish_observed_pairing(&mut fixture, false).unwrap();
+    assert!(fixture.processor.pending.is_empty());
+    assert!(fixture.processor.active.is_empty());
+    let retained = fixture
+        .processor
+        .rejected_completions
+        .get(fixture.witness.id())
+        .unwrap();
+    assert!(!retained._observation.completion.delivered());
+    assert_eq!(
+        retained._observation.offer_digest(),
+        fixture.witness.offer_digest()
+    );
+    assert!(matches!(
+        retained._rollback,
+        RollbackObservation::Completed {
+            prior_failure: None
+        }
+    ));
+    let retained_bytes = fixture.processor.rejected_encoded_bytes;
+    assert!(retained_bytes > 0 && retained_bytes <= MAX_REJECTED_ENCODED_BYTES);
+    fixture.processor.cleanup_expired().unwrap();
+    fixture.processor.shutdown().unwrap();
+    assert_eq!(fixture.processor.rejected_completions.len(), 1);
+    assert_eq!(fixture.processor.rejected_encoded_bytes, retained_bytes);
+}
+
+#[test]
+fn completion_retention_budget_keeps_rolled_back_pending_truth() {
+    let mut fixture = observed_pairing_fixture("pair-full-provenance");
+    // Exact aggregate boundary injection exercises overflow/capacity without
+    // manufacturing eight megabytes of unrelated offers or any source grant.
+    fixture.processor.rejected_encoded_bytes = MAX_REJECTED_ENCODED_BYTES;
+    assert_eq!(
+        finish_observed_pairing(&mut fixture, false),
+        Err(ManagementError::TransportUncertain)
+    );
+    let retained = fixture.processor.pending.get(fixture.witness.id()).unwrap();
+    let original = retained.completion.as_ref().unwrap().clone();
+    assert!(!original.delivered());
+    assert!(matches!(
+        retained.rollback_observation,
+        RollbackObservation::Completed { .. }
+    ));
+    assert!(fixture.processor.active.is_empty());
+    assert!(fixture.processor.rejected_completions.is_empty());
+    assert_eq!(
+        fixture.processor.shutdown(),
+        Err(ManagementError::TransportUncertain)
+    );
+    let retained = fixture.processor.pending.get(fixture.witness.id()).unwrap();
+    assert!(Arc::ptr_eq(
+        retained.completion.as_ref().unwrap(),
+        &original
+    ));
+    assert_eq!(
+        fixture.processor.rejected_encoded_bytes,
+        MAX_REJECTED_ENCODED_BYTES
+    );
 }
 
 #[test]

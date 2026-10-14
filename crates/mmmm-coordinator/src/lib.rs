@@ -20,6 +20,7 @@ pub mod lifecycle;
 pub mod local_setup;
 pub mod native_backend;
 pub mod native_entry;
+mod native_import_files;
 pub mod native_payload;
 pub mod native_project;
 pub mod native_read_targets;

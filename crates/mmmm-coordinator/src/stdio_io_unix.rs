@@ -190,13 +190,10 @@ pub(super) fn spawn_failure(error: std::io::Error) -> StdioError {
             _ => return StdioError::io("native_spawn", error),
         };
         let native = encoded & 65_535;
-        return StdioError {
-            code,
-            drained: false,
-            native_code: (native < SPAWN_NATIVE_UNKNOWN).then_some(native as i32),
-            native_code_unknown: native == SPAWN_NATIVE_UNKNOWN,
-            cleanup: None,
-        };
+        let mut failure = StdioError::new(code);
+        failure.native_code = (native < SPAWN_NATIVE_UNKNOWN).then_some(native as i32);
+        failure.native_code_unknown = native == SPAWN_NATIVE_UNKNOWN;
+        return failure;
     }
     StdioError::io("native_spawn", error)
 }
@@ -342,7 +339,13 @@ pub(super) struct Process {
     owner_deadline: Instant,
     reservation: Option<WorkerReservation>,
     #[cfg(target_os = "macos")]
-    identity: (u64, u64),
+    identity: Option<MacIdentity>,
+    #[cfg(target_os = "macos")]
+    identity_uncertain: bool,
+    #[cfg(target_os = "macos")]
+    resource_identity_uncertain: bool,
+    #[cfg(target_os = "macos")]
+    resources: ResourceTracker,
 }
 impl Process {
     pub(super) fn spawn(
@@ -421,23 +424,40 @@ impl Process {
                         std::io::Error::last_os_error(),
                     ));
                 }
+                #[cfg(target_os = "linux")]
                 let memory = libc::rlimit {
                     rlim_cur: 256 * 1024 * 1024,
                     rlim_max: 256 * 1024 * 1024,
                 };
+                #[cfg(target_os = "macos")]
+                let memory = mac_address_limit();
                 let core = libc::rlimit {
                     rlim_cur: 0,
                     rlim_max: 0,
                 };
                 if libc::setrlimit(libc::RLIMIT_AS, &memory) == -1 {
-                    // Darwin also rejects lowering AS below the forked image's
-                    // current VM usage. Preserve that actual admission failure;
-                    // do not remove the cap or mistake it for worker cleanup.
-                    // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_resource.c
                     return Err(spawn_stage_error(
                         SpawnStage::MemoryLimit,
                         std::io::Error::last_os_error(),
                     ));
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    let mut installed: libc::rlimit = std::mem::zeroed();
+                    if libc::getrlimit(libc::RLIMIT_AS, &mut installed) == -1 {
+                        return Err(spawn_stage_error(
+                            SpawnStage::MemoryLimit,
+                            std::io::Error::last_os_error(),
+                        ));
+                    }
+                    if installed.rlim_cur != memory.rlim_cur
+                        || installed.rlim_max != memory.rlim_max
+                    {
+                        return Err(encoded_spawn_error(
+                            SpawnStage::MemoryLimit,
+                            SPAWN_NATIVE_UNKNOWN,
+                        ));
+                    }
                 }
                 if libc::setrlimit(libc::RLIMIT_CORE, &core) == -1 {
                     return Err(spawn_stage_error(
@@ -465,6 +485,8 @@ impl Process {
         // child has exited and been reaped. No Process owner is issued here.
         // This is an admission rejection, not an activated worker drain proof.
         // https://doc.rust-lang.org/src/std/sys/process/unix/unix.rs.html#137-150
+        #[cfg(target_os = "macos")]
+        let spawn_native_millis = monotonic_millis()?;
         let child = command.spawn().map_err(spawn_failure)?;
         let pid = child.id() as i32;
         drop(read);
@@ -478,7 +500,13 @@ impl Process {
             owner_deadline,
             reservation: Some(reservation),
             #[cfg(target_os = "macos")]
-            identity: (0, 0),
+            identity: None,
+            #[cfg(target_os = "macos")]
+            identity_uncertain: true,
+            #[cfg(target_os = "macos")]
+            resource_identity_uncertain: false,
+            #[cfg(target_os = "macos")]
+            resources: ResourceTracker::new(spawn_native_millis),
         };
         #[cfg(target_os = "macos")]
         let mut process = process;
@@ -494,13 +522,22 @@ impl Process {
                 }
                 Err(error) => return Err(super::cleanup_failed_process(process, error)),
             };
-            if info.pid != pid as u32 || info.pgid != pid as u32 {
+            let identity = MacIdentity::from_info(&info);
+            if info.pid != pid as u32
+                || info.pgid != pid as u32
+                || info.uid != unsafe { libc::geteuid() }
+                || info.ruid != unsafe { libc::getuid() }
+            {
                 return Err(super::cleanup_failed_process(
                     process,
                     StdioError::new("native_identity"),
                 ));
             }
-            process.identity = (info.start_sec, info.start_usec);
+            process.identity = Some(identity);
+            process.identity_uncertain = false;
+            if let Err(error) = process.check_resources(startup_deadline, true) {
+                return Err(super::cleanup_failed_process(process, error));
+            }
         }
         if !matches!(same_file(&executable.file, &executable.path), Ok(true)) {
             return Err(super::cleanup_failed_process(
@@ -566,15 +603,59 @@ impl Process {
         }
         #[cfg(target_os = "macos")]
         {
-            Ok(mac_members(self.pid, self.identity, deadline)? == 0)
+            let identity = self
+                .identity
+                .ok_or_else(|| StdioError::new("native_resource_identity"))?;
+            verify_mac_identity(self.pid, identity, MacDeadline::Instant(deadline))?;
+            Ok(mac_members(self.pid, identity.birth(), deadline)? == 0)
         }
     }
+    #[cfg(not(target_os = "macos"))]
     pub(super) fn terminate(&mut self) -> Result<(), StdioError> {
+        self.terminate_before(self.owner_deadline)
+    }
+    pub(super) fn terminate_before(&mut self, deadline: Instant) -> Result<(), StdioError> {
+        #[cfg(target_os = "linux")]
+        let _ = deadline;
         if self.reaped {
             return Ok(());
         }
         if !self.reserved {
             return Err(StdioError::new("native_identity"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let result = self
+                .identity
+                .ok_or_else(|| StdioError::new("native_resource_identity"))
+                .and_then(|identity| {
+                    verify_mac_identity(self.pid, identity, MacDeadline::Instant(deadline))
+                });
+            if let Err(error) = result {
+                // Keep the unreaped Child and reservation. An unknown native
+                // identity is not permission to signal a numeric replacement.
+                if error.code != "deadline" {
+                    self.identity_uncertain = true;
+                }
+                return Err(error.with_resources(self.resource_evidence()));
+            }
+            self.identity_uncertain = false;
+            if self.resource_identity_uncertain {
+                // A later explicit finite cleanup may retry the actual fixed
+                // identity. Never permanently erase ownership on a timeout.
+                let observation = self.check_resources_before(deadline, true);
+                if self.identity_uncertain || self.resource_identity_uncertain {
+                    return Err(observation.err().unwrap_or_else(|| {
+                        StdioError::new("native_resource_identity")
+                            .with_resources(self.resource_evidence())
+                    }));
+                }
+                if let Err(error) = observation
+                    && error.code == "deadline"
+                {
+                    return Err(error);
+                }
+            }
         }
         if unsafe { libc::kill(-self.pid, libc::SIGKILL) } == -1
             && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
@@ -584,9 +665,27 @@ impl Process {
             Ok(())
         }
     }
+    #[cfg(not(target_os = "macos"))]
     pub(super) fn reap(&mut self) -> Result<Option<i32>, StdioError> {
+        self.reap_before(self.owner_deadline)
+    }
+    pub(super) fn reap_before(&mut self, deadline: Instant) -> Result<Option<i32>, StdioError> {
+        #[cfg(target_os = "linux")]
+        let _ = deadline;
         if self.exit_code()?.is_none() {
             return Err(StdioError::new("native_reap"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // A confirmed zombie is terminal identity evidence, not a zero
+            // resource sample. Resource failures remain cached during reap.
+            if Instant::now() < deadline {
+                let _ = self.check_resources_before(deadline, true);
+            }
+            if !self.reserved || self.identity_uncertain || self.resource_identity_uncertain {
+                return Err(StdioError::new("native_resource_identity")
+                    .with_resources(self.resource_evidence()));
+            }
         }
         let status = self
             .child
@@ -606,26 +705,36 @@ impl Process {
         if self.reaped {
             return Ok(());
         }
-        self.terminate()?;
+        #[cfg(target_os = "macos")]
+        if Instant::now() < deadline {
+            // A sampled threshold/query failure must not prevent the actual
+            // owner from cancelling. Only uncertain identity disables signal.
+            let _ = self.check_resources_before(deadline, true);
+        }
+        self.terminate_before(deadline)?;
         if Instant::now() >= deadline {
             return Err(StdioError::new("drain_uncertain"));
         }
         let mut empty = None;
         loop {
+            #[cfg(target_os = "macos")]
+            if Instant::now() < deadline {
+                let _ = self.check_resources_before(deadline, false);
+                if !self.reserved || self.identity_uncertain || self.resource_identity_uncertain {
+                    return Err(StdioError::new("native_resource_identity")
+                        .with_resources(self.resource_evidence()));
+                }
+            }
             if self.exit_code()?.is_some() && self.scope_empty(deadline)? {
                 if empty.is_some_and(|t: Instant| t.elapsed() >= Duration::from_millis(10)) {
                     if Instant::now() >= deadline {
                         return Err(StdioError::new("drain_uncertain"));
                     }
-                    self.reap()?;
+                    self.reap_before(deadline)?;
                     if Instant::now() >= deadline {
-                        return Err(StdioError {
-                            code: "drain_deadline",
-                            drained: true,
-                            native_code: None,
-                            native_code_unknown: false,
-                            cleanup: None,
-                        });
+                        let mut error = StdioError::new("drain_deadline");
+                        error.drained = true;
+                        return Err(error);
                     }
                     return Ok(());
                 }
@@ -656,6 +765,12 @@ impl Drop for Process {
                 reservation: self.reservation.take(),
                 #[cfg(target_os = "macos")]
                 identity: self.identity,
+                #[cfg(target_os = "macos")]
+                identity_uncertain: self.identity_uncertain,
+                #[cfg(target_os = "macos")]
+                resource_identity_uncertain: self.resource_identity_uncertain,
+                #[cfg(target_os = "macos")]
+                resources: self.resources.clone(),
             };
             self.reaped = true;
             super::retain_uncertain_process(retained);
@@ -732,6 +847,1025 @@ fn linux_members(group: i32, deadline: Instant) -> Result<usize, StdioError> {
     Ok(members)
 }
 
+// This is a separate Darwin policy. AS is a VM limit; RSS and physical
+// footprint are independently sampled thresholds and may overshoot between
+// observations. In particular, this does not claim the Linux AS guarantee.
+#[cfg(target_os = "macos")]
+const MAC_VM_LIMIT: u64 = 512 * 1024 * 1024 * 1024;
+#[cfg(target_os = "macos")]
+const MAC_PHYSICAL_THRESHOLD: u64 = 256 * 1024 * 1024;
+#[cfg(target_os = "macos")]
+const MAC_SAMPLE_TARGET_MILLIS: u64 = 100;
+#[cfg(target_os = "macos")]
+const MAC_MAX_GAP_MILLIS: u64 = 1000;
+#[cfg(target_os = "macos")]
+const MAC_SAMPLE_LIMIT: u64 = 1_000_000;
+#[cfg(target_os = "macos")]
+pub(super) const RESOURCE_ADMISSION_LENGTH: usize = 176;
+#[cfg(target_os = "macos")]
+const RESOURCE_ADMISSION_MAGIC: &[u8; 8] = b"MMMMRS01";
+// Zero means no completed resource sample yet. Every other value is the
+// actual elapsed nanoseconds from the shared worker/watchdog anchor, plus one.
+#[cfg(target_os = "macos")]
+static WORKER_RESOURCE_HEARTBEAT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_os = "macos")]
+fn elapsed_nanos(anchor: Instant) -> Result<u64, StdioError> {
+    Instant::now()
+        .checked_duration_since(anchor)
+        .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok())
+        .ok_or_else(|| StdioError::new("native_resource_budget"))
+}
+
+#[cfg(target_os = "macos")]
+fn publish_worker_resource_sample(anchor: Instant, completed: Instant) -> Result<(), StdioError> {
+    // Publishing can itself be scheduled late. Keep the actual successful
+    // sample's timestamp; a delayed store must never refresh stale evidence.
+    let encoded = completed
+        .checked_duration_since(anchor)
+        .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok())
+        .ok_or_else(|| StdioError::new("native_resource_budget"))?
+        .checked_add(1)
+        .ok_or_else(|| StdioError::new("native_resource_budget"))?;
+    WORKER_RESOURCE_HEARTBEAT.store(encoded, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// Called by the existing independent deadline watchdog: no native resource
+/// query, lock, retry or new worker. Scheduler/native-call delays still mean
+/// that this is delayed detection, not an exact one-second termination bound.
+#[cfg(target_os = "macos")]
+pub(super) fn check_worker_resource_gap(anchor: Instant) -> Result<(), StdioError> {
+    let encoded = WORKER_RESOURCE_HEARTBEAT.load(std::sync::atomic::Ordering::Acquire);
+    if encoded == 0 {
+        return Ok(());
+    }
+    let result = check_worker_gap_at(encoded, elapsed_nanos(anchor)?);
+    if result.is_err()
+        && WORKER_RESOURCE_HEARTBEAT.load(std::sync::atomic::Ordering::Acquire) != encoded
+    {
+        // The watchdog itself may have been descheduled after the first load
+        // while successful samples continued. Discard this stale decision;
+        // one bounded recheck creates neither a retry loop nor a fresh sample.
+        return Ok(());
+    }
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn check_worker_gap_at(encoded: u64, now: u64) -> Result<(), StdioError> {
+    if encoded == 0 {
+        return Ok(());
+    }
+    let last = encoded - 1;
+    let allowed = MAC_MAX_GAP_MILLIS
+        .checked_mul(1_000_000)
+        .ok_or_else(|| StdioError::new("native_resource_budget"))?;
+    let gap = now
+        .checked_sub(last)
+        .ok_or_else(|| StdioError::new("native_resource_watchdog_gap"))?;
+    if gap > allowed {
+        Err(StdioError::new("native_resource_watchdog_gap"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Actual public evidence contains no PID, path, inherited value or secret.
+/// Parent polls and child admission samples have different coverage. The
+/// child's later samples are enforced locally but are not transmitted here.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DarwinStdioResources(Box<DarwinStdioResourceFacts>);
+
+#[cfg(target_os = "macos")]
+impl std::ops::Deref for DarwinStdioResources {
+    type Target = DarwinStdioResourceFacts;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DarwinStdioResourceFacts {
+    pub policy: &'static str,
+    pub vm_limit_bytes: u64,
+    pub rss_threshold_bytes: u64,
+    pub footprint_threshold_bytes: u64,
+    pub worker_limit: u64,
+    pub target_sample_interval_millis: u64,
+    pub maximum_sample_gap_millis: u64,
+    pub sampling_may_overshoot: bool,
+    pub activation_memory_coverage_unknown: bool,
+    pub activation_interval_millis: Option<u64>,
+    pub parent_samples: u64,
+    pub parent_peak_vm_bytes: u64,
+    pub parent_peak_rss_bytes: u64,
+    pub parent_peak_footprint_bytes: u64,
+    pub parent_maximum_sample_gap_millis: u64,
+    pub parent_elapsed_millis: u64,
+    pub parent_sampling_is_poll_driven: bool,
+    pub parent_confirmed_zombie_observations: u64,
+    pub parent_exit_pending_observations: u64,
+    pub parent_last_exit_observation: Option<mmmm_native_process::darwin::NativeResourceError>,
+    pub parent_last_resource_failure: Option<&'static str>,
+    pub parent_last_resource_error: Option<mmmm_native_process::darwin::NativeResourceError>,
+    pub parent_terminal_identity_query_errno: Option<i32>,
+    pub child_admitted: bool,
+    pub child_as_soft_bytes: Option<u64>,
+    pub child_as_hard_bytes: Option<u64>,
+    pub child_admission_samples: Option<u64>,
+    pub child_admission_vm_bytes: Option<u64>,
+    pub child_admission_rss_bytes: Option<u64>,
+    pub child_admission_footprint_bytes: Option<u64>,
+    pub child_admission_peak_vm_bytes: Option<u64>,
+    pub child_admission_peak_rss_bytes: Option<u64>,
+    pub child_admission_peak_footprint_bytes: Option<u64>,
+    pub child_admission_maximum_sample_gap_millis: Option<u64>,
+    pub child_admission_elapsed_millis: Option<u64>,
+    pub child_samples_after_admission_unobserved: bool,
+    pub child_watchdog_gap_detection_may_be_delayed: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl DarwinStdioResources {
+    fn pending() -> Self {
+        Self(Box::new(DarwinStdioResourceFacts {
+            policy: "darwin-stdio-sampled-resources/1",
+            vm_limit_bytes: MAC_VM_LIMIT,
+            rss_threshold_bytes: MAC_PHYSICAL_THRESHOLD,
+            footprint_threshold_bytes: MAC_PHYSICAL_THRESHOLD,
+            worker_limit: 1,
+            target_sample_interval_millis: MAC_SAMPLE_TARGET_MILLIS,
+            maximum_sample_gap_millis: MAC_MAX_GAP_MILLIS,
+            sampling_may_overshoot: true,
+            activation_memory_coverage_unknown: true,
+            activation_interval_millis: None,
+            parent_samples: 0,
+            parent_peak_vm_bytes: 0,
+            parent_peak_rss_bytes: 0,
+            parent_peak_footprint_bytes: 0,
+            parent_maximum_sample_gap_millis: 0,
+            parent_elapsed_millis: 0,
+            parent_sampling_is_poll_driven: true,
+            parent_confirmed_zombie_observations: 0,
+            parent_exit_pending_observations: 0,
+            parent_last_exit_observation: None,
+            parent_last_resource_failure: None,
+            parent_last_resource_error: None,
+            parent_terminal_identity_query_errno: None,
+            child_admitted: false,
+            child_as_soft_bytes: None,
+            child_as_hard_bytes: None,
+            child_admission_samples: None,
+            child_admission_vm_bytes: None,
+            child_admission_rss_bytes: None,
+            child_admission_footprint_bytes: None,
+            child_admission_peak_vm_bytes: None,
+            child_admission_peak_rss_bytes: None,
+            child_admission_peak_footprint_bytes: None,
+            child_admission_maximum_sample_gap_millis: None,
+            child_admission_elapsed_millis: None,
+            child_samples_after_admission_unobserved: true,
+            child_watchdog_gap_detection_may_be_delayed: true,
+        }))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_address_limit() -> libc::rlimit {
+    libc::rlimit {
+        rlim_cur: MAC_VM_LIMIT,
+        rlim_max: MAC_VM_LIMIT,
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct MacIdentity {
+    start_sec: u64,
+    start_usec: u64,
+    uid: u32,
+    ruid: u32,
+    svuid: u32,
+}
+#[cfg(target_os = "macos")]
+impl MacIdentity {
+    fn from_info(info: &BsdInfo) -> Self {
+        Self {
+            start_sec: info.start_sec,
+            start_usec: info.start_usec,
+            uid: info.uid,
+            ruid: info.ruid,
+            svuid: info.svuid,
+        }
+    }
+    fn birth(self) -> (u64, u64) {
+        (self.start_sec, self.start_usec)
+    }
+    fn matches(self, pid: i32, info: &BsdInfo) -> bool {
+        info.pid == pid as u32
+            && info.pgid == pid as u32
+            && self.birth() == (info.start_sec, info.start_usec)
+            && self.uid == info.uid
+            && self.ruid == info.ruid
+            && self.svuid == info.svuid
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum MacDeadline {
+    Instant(Instant),
+    Native(u64),
+}
+#[cfg(target_os = "macos")]
+impl MacDeadline {
+    fn check(self) -> Result<(), StdioError> {
+        match self {
+            Self::Instant(deadline) => super::deadline_check(deadline),
+            Self::Native(deadline) => {
+                if monotonic_millis()? >= deadline {
+                    Err(StdioError::new("deadline"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+    fn instant(self) -> Result<Instant, StdioError> {
+        self.check()?;
+        match self {
+            Self::Instant(deadline) => Ok(deadline),
+            Self::Native(deadline) => {
+                // Anchor before reading the native clock. Scheduling between
+                // the clocks can shorten this derived bound, never extend it.
+                let anchor = Instant::now();
+                let remaining = deadline
+                    .checked_sub(monotonic_millis()?)
+                    .and_then(|value| value.checked_sub(MONOTONIC_MARGIN_MILLIS))
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| StdioError::new("deadline"))?;
+                anchor
+                    .checked_add(Duration::from_millis(remaining))
+                    .ok_or_else(|| StdioError::new("deadline"))
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct VerifiedMacIdentity {
+    status: u32,
+    terminal_query_errno: Option<i32>,
+    exit_pending: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn verify_mac_identity(
+    pid: i32,
+    identity: MacIdentity,
+    deadline: MacDeadline,
+) -> Result<VerifiedMacIdentity, StdioError> {
+    deadline.check()?;
+    let before = bsd_info(pid, true)
+        .map_err(resource_identity_query_error)?
+        .ok_or_else(|| StdioError::new("native_resource_identity"))?;
+    if !identity.matches(pid, &before) {
+        return Err(StdioError::new("native_resource_identity"));
+    }
+    if before.status == 5 {
+        return verify_mac_zombie(pid, identity, deadline, None);
+    }
+    deadline.check()?;
+    let session = unsafe { libc::getsid(pid) };
+    if session == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return verify_mac_zombie(pid, identity, deadline, Some(libc::ESRCH));
+        }
+        return Err(StdioError::io("native_resource_observation", error));
+    }
+    if session != pid {
+        return Err(StdioError::new("native_resource_identity"));
+    }
+    deadline.check()?;
+    let group = unsafe { libc::getpgid(pid) };
+    if group == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return verify_mac_zombie(pid, identity, deadline, Some(libc::ESRCH));
+        }
+        return Err(StdioError::io("native_resource_observation", error));
+    }
+    if group != pid {
+        return Err(StdioError::new("native_resource_identity"));
+    }
+    deadline.check()?;
+    let after = bsd_info(pid, true)
+        .map_err(resource_identity_query_error)?
+        .ok_or_else(|| StdioError::new("native_resource_identity"))?;
+    deadline.check()?;
+    if !identity.matches(pid, &after) {
+        return Err(StdioError::new("native_resource_identity"));
+    }
+    if after.status == 5 {
+        return verify_mac_zombie(pid, identity, deadline, None);
+    }
+    Ok(VerifiedMacIdentity {
+        status: after.status,
+        terminal_query_errno: None,
+        exit_pending: false,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn verify_mac_zombie(
+    pid: i32,
+    identity: MacIdentity,
+    deadline: MacDeadline,
+    terminal_query_errno: Option<i32>,
+) -> Result<VerifiedMacIdentity, StdioError> {
+    // XNU removes a zombie from proc_find(), so getsid/getpgid return ESRCH.
+    // This private producer already performed setsid() in this exact child.
+    // Keep it unreaped and require two actual matching BSD zombie identities;
+    // a missing or reused PID never becomes terminal evidence.
+    // https://github.com/apple-oss-distributions/xnu/blob/xnu-11417.140.69/bsd/kern/kern_prot.c
+    deadline.check()?;
+    let before = bsd_info(pid, true)
+        .map_err(resource_identity_query_error)?
+        .ok_or_else(|| StdioError::new("native_resource_identity"))?;
+    deadline.check()?;
+    let after = bsd_info(pid, true)
+        .map_err(resource_identity_query_error)?
+        .ok_or_else(|| StdioError::new("native_resource_identity"))?;
+    deadline.check()?;
+    if !identity.matches(pid, &before) || !identity.matches(pid, &after) {
+        return Err(StdioError::new("native_resource_identity"));
+    }
+    let terminal = before.status == 5 && after.status == 5;
+    if !terminal && (before.status == 5 || terminal_query_errno != Some(libc::ESRCH)) {
+        return Err(StdioError::new("native_resource_identity"));
+    }
+    Ok(VerifiedMacIdentity {
+        status: after.status,
+        terminal_query_errno,
+        // P_REF_DEAD precedes SZOMB in XNU. A fixed BSD identity can be
+        // exiting while normal PID lookup already returns ESRCH. Preserve
+        // that pending observation; neither resource zero nor drain success.
+        exit_pending: !terminal,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn resource_identity_query_error(mut error: StdioError) -> StdioError {
+    error.code = "native_resource_observation";
+    error
+}
+
+#[cfg(target_os = "macos")]
+enum MacResourceObservation {
+    Live(mmmm_native_process::darwin::MemoryObservation, Option<i32>),
+    Zombie(
+        Option<mmmm_native_process::darwin::NativeResourceError>,
+        Option<i32>,
+    ),
+    Pending {
+        sample: Option<mmmm_native_process::darwin::MemoryObservation>,
+        error: Option<mmmm_native_process::darwin::NativeResourceError>,
+        terminal_errno: Option<i32>,
+    },
+}
+
+#[cfg(target_os = "macos")]
+impl MacResourceObservation {
+    fn sample(&self) -> Option<mmmm_native_process::darwin::MemoryObservation> {
+        match self {
+            Self::Live(sample, _) => Some(*sample),
+            Self::Pending { sample, .. } => *sample,
+            Self::Zombie(..) => None,
+        }
+    }
+    fn terminal_errno(&self) -> Option<i32> {
+        match self {
+            Self::Live(_, number) | Self::Zombie(_, number) => *number,
+            Self::Pending { terminal_errno, .. } => *terminal_errno,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct MacResourceFailure {
+    error: StdioError,
+    identity_uncertain: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn observe_mac_resources(
+    pid: i32,
+    identity: MacIdentity,
+    deadline: MacDeadline,
+) -> Result<MacResourceObservation, MacResourceFailure> {
+    use mmmm_native_process::darwin::{NativeResourceFailure, observe_memory};
+    let mut identity_confirmed = false;
+    let result = (|| -> Result<MacResourceObservation, StdioError> {
+        let before = verify_mac_identity(pid, identity, deadline)?;
+        let members =
+            mac_members(pid, identity.birth(), deadline.instant()?).map_err(|error| match error
+                .code
+            {
+                "native_observe" => resource_identity_query_error(error),
+                _ => error,
+            })?;
+        deadline.check()?;
+        let observation = if before.status == 5 || before.exit_pending {
+            None
+        } else {
+            Some(observe_memory(pid))
+        };
+        let after = deadline
+            .check()
+            .and_then(|()| verify_mac_identity(pid, identity, deadline))
+            .map_err(|error| match &observation {
+                Some(Err(source)) => error.with_resource_source(*source),
+                _ => error,
+            })?;
+        identity_confirmed = true;
+        let terminal_errno = after.terminal_query_errno.or(before.terminal_query_errno);
+        if members > 1 || (before.status == 5 && members != 0) {
+            return Err(StdioError::new("native_resource_budget"));
+        }
+        if before.exit_pending || after.exit_pending {
+            let (sample, error) = match observation {
+                Some(Ok(sample)) => (Some(sample), None),
+                Some(Err(error)) => (None, Some(error)),
+                None => (None, None),
+            };
+            return Ok(MacResourceObservation::Pending {
+                sample,
+                error,
+                terminal_errno,
+            });
+        }
+        match observation {
+            Some(Ok(sample)) => Ok(MacResourceObservation::Live(sample, terminal_errno)),
+            Some(Err(error))
+                if error.failure == NativeResourceFailure::Exited && after.status == 5 =>
+            {
+                Ok(MacResourceObservation::Zombie(Some(error), terminal_errno))
+            }
+            Some(Err(error)) => {
+                Err(StdioError::new("native_resource_observation").with_resource_source(error))
+            }
+            None if after.status == 5 => Ok(MacResourceObservation::Zombie(None, terminal_errno)),
+            None => Err(StdioError::new("native_resource_identity")),
+        }
+    })();
+    result.map_err(|error| MacResourceFailure {
+        identity_uncertain: !identity_confirmed && error.code != "deadline",
+        error,
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct ResourceSamples {
+    first: Instant,
+    last: Instant,
+    first_native_millis: u64,
+    actual: mmmm_native_process::darwin::MemoryObservation,
+    peak_vm: u64,
+    peak_rss: u64,
+    peak_footprint: u64,
+    samples: u64,
+    maximum_gap: Duration,
+}
+#[cfg(target_os = "macos")]
+impl ResourceSamples {
+    fn first(actual: mmmm_native_process::darwin::MemoryObservation) -> Result<Self, StdioError> {
+        let first_native_millis = monotonic_millis()?;
+        let now = Instant::now();
+        Ok(Self {
+            first: now,
+            last: now,
+            first_native_millis,
+            actual,
+            peak_vm: actual.adjusted_vm,
+            peak_rss: actual.rss,
+            peak_footprint: actual.footprint,
+            samples: 1,
+            maximum_gap: Duration::ZERO,
+        })
+    }
+    fn check_gap(&self) -> Result<(), StdioError> {
+        if self.last.elapsed() > Duration::from_millis(MAC_MAX_GAP_MILLIS) {
+            Err(StdioError::new("native_resource_gap"))
+        } else {
+            Ok(())
+        }
+    }
+    fn push(
+        &mut self,
+        actual: mmmm_native_process::darwin::MemoryObservation,
+        enforce_gap: bool,
+    ) -> Result<(), StdioError> {
+        if self.actual.start_abstime != actual.start_abstime {
+            return Err(StdioError::new("native_resource_identity"));
+        }
+        let now = Instant::now();
+        let gap = now.duration_since(self.last);
+        self.maximum_gap = self.maximum_gap.max(gap);
+        self.last = now;
+        self.actual = actual;
+        self.peak_vm = self.peak_vm.max(actual.adjusted_vm);
+        self.peak_rss = self.peak_rss.max(actual.rss);
+        self.peak_footprint = self.peak_footprint.max(actual.footprint);
+        self.samples = self
+            .samples
+            .checked_add(1)
+            .filter(|samples| *samples <= MAC_SAMPLE_LIMIT)
+            .ok_or_else(|| StdioError::new("native_resource_budget"))?;
+        // Preserve the actual sample and peak before returning its failure.
+        // A poll-driven parent gap is evidence, not child sampler coverage.
+        check_memory_thresholds(actual)?;
+        if enforce_gap && gap > Duration::from_millis(MAC_MAX_GAP_MILLIS) {
+            return Err(StdioError::new("native_resource_gap"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(target_os = "macos")]
+fn check_memory_thresholds(
+    observation: mmmm_native_process::darwin::MemoryObservation,
+) -> Result<(), StdioError> {
+    if observation.start_abstime == 0
+        || observation.adjusted_vm > MAC_VM_LIMIT
+        || observation.rss > MAC_PHYSICAL_THRESHOLD
+        || observation.footprint > MAC_PHYSICAL_THRESHOLD
+    {
+        Err(StdioError::new("native_resource_budget"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct ResourceTracker {
+    spawn_native_millis: u64,
+    samples: Option<ResourceSamples>,
+    evidence: DarwinStdioResources,
+    state: ResourceState,
+    pending_error: Option<mmmm_native_process::darwin::NativeResourceError>,
+}
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum ResourceState {
+    Unobserved,
+    Live,
+    Pending,
+    Zombie,
+}
+#[cfg(target_os = "macos")]
+impl ResourceTracker {
+    fn new(spawn_native_millis: u64) -> Self {
+        Self {
+            spawn_native_millis,
+            samples: None,
+            evidence: DarwinStdioResources::pending(),
+            state: ResourceState::Unobserved,
+            pending_error: None,
+        }
+    }
+    fn evidence(&self) -> DarwinStdioResources {
+        let mut evidence = self.evidence.clone();
+        if let Some(samples) = &self.samples {
+            evidence.0.parent_samples = samples.samples;
+            evidence.0.parent_peak_vm_bytes = samples.peak_vm;
+            evidence.0.parent_peak_rss_bytes = samples.peak_rss;
+            evidence.0.parent_peak_footprint_bytes = samples.peak_footprint;
+            evidence.0.parent_maximum_sample_gap_millis = millis(samples.maximum_gap);
+            evidence.0.parent_elapsed_millis = millis(samples.last.duration_since(samples.first));
+        }
+        evidence
+    }
+    fn push(
+        &mut self,
+        actual: mmmm_native_process::darwin::MemoryObservation,
+    ) -> Result<(), StdioError> {
+        match &mut self.samples {
+            Some(samples) => samples.push(actual, false),
+            None => {
+                self.samples = Some(ResourceSamples::first(actual)?);
+                check_memory_thresholds(actual)
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Process {
+    pub(super) fn resource_evidence(&self) -> DarwinStdioResources {
+        self.resources.evidence()
+    }
+    pub(super) fn check_resources(
+        &mut self,
+        deadline: Instant,
+        force: bool,
+    ) -> Result<(), StdioError> {
+        let deadline = deadline.min(self.owner_deadline);
+        self.check_resources_before(deadline, force)?;
+        if matches!(
+            self.resources.state,
+            ResourceState::Pending | ResourceState::Zombie
+        ) {
+            super::deadline_check(deadline)?;
+            let exited = self.exit_code()?;
+            super::deadline_check(deadline)?;
+            let mut error = match exited {
+                Some(status) => super::worker_exit_error(status),
+                None => StdioError::new("native_resource_observation"),
+            };
+            if exited.is_none()
+                && let Some(source) = self.resources.pending_error
+            {
+                error = error.with_resource_source(source);
+            }
+            return Err(error.with_resources(self.resource_evidence()));
+        }
+        Ok(())
+    }
+    fn check_resources_before(&mut self, deadline: Instant, force: bool) -> Result<(), StdioError> {
+        let result = (|| {
+            super::deadline_check(deadline)?;
+            if !self.reserved || self.reaped {
+                return Err(StdioError::new("native_resource_identity"));
+            }
+            if !force
+                && self.resources.samples.as_ref().is_some_and(|sample| {
+                    sample.last.elapsed() < Duration::from_millis(MAC_SAMPLE_TARGET_MILLIS)
+                })
+            {
+                return Ok(());
+            }
+            let identity = self
+                .identity
+                .ok_or_else(|| StdioError::new("native_resource_identity"))?;
+            let observed =
+                match observe_mac_resources(self.pid, identity, MacDeadline::Instant(deadline)) {
+                    Ok(observed) => observed,
+                    Err(failure) => {
+                        self.identity_uncertain = failure.identity_uncertain;
+                        return Err(failure.error);
+                    }
+                };
+            let actual_sample = observed.sample();
+            if let Some(actual) = actual_sample
+                && self
+                    .resources
+                    .samples
+                    .as_ref()
+                    .is_some_and(|samples| samples.actual.start_abstime != actual.start_abstime)
+            {
+                self.resource_identity_uncertain = true;
+                return Err(StdioError::new("native_resource_identity"));
+            }
+            self.identity_uncertain = false;
+            if actual_sample.is_some() {
+                self.resource_identity_uncertain = false;
+            }
+            if let Some(number) = observed.terminal_errno() {
+                self.resources
+                    .evidence
+                    .0
+                    .parent_terminal_identity_query_errno = Some(number);
+            }
+            match observed {
+                MacResourceObservation::Live(actual, _) => {
+                    self.resources.state = ResourceState::Live;
+                    self.resources.pending_error = None;
+                    self.resources.push(actual)?;
+                }
+                MacResourceObservation::Zombie(error, _) => {
+                    self.resources.state = ResourceState::Zombie;
+                    self.resources.pending_error = error;
+                    self.resources
+                        .evidence
+                        .0
+                        .parent_confirmed_zombie_observations = self
+                        .resources
+                        .evidence
+                        .parent_confirmed_zombie_observations
+                        .saturating_add(1);
+                    if error.is_some() {
+                        self.resources.evidence.0.parent_last_exit_observation = error;
+                    }
+                }
+                MacResourceObservation::Pending { sample, error, .. } => {
+                    self.resources.state = ResourceState::Pending;
+                    self.resources.pending_error = error;
+                    self.resources.evidence.0.parent_exit_pending_observations = self
+                        .resources
+                        .evidence
+                        .parent_exit_pending_observations
+                        .saturating_add(1);
+                    if let Some(error) = error {
+                        self.resources.evidence.0.parent_last_resource_failure =
+                            Some("native_resource_observation");
+                        self.resources.evidence.0.parent_last_resource_error = Some(error);
+                    }
+                    if let Some(actual) = sample {
+                        self.resources.push(actual)?;
+                    }
+                }
+            }
+            super::deadline_check(deadline)
+        })();
+        result.map_err(|error| {
+            self.resources.evidence.0.parent_last_resource_failure = Some(error.code);
+            if error.resource_source.is_some() {
+                self.resources.evidence.0.parent_last_resource_error = error.resource_source;
+            }
+            if error.code == "native_resource_identity" || error.code == "native_identity" {
+                self.identity_uncertain = true;
+            }
+            error.with_resources(self.resource_evidence())
+        })
+    }
+    pub(super) fn admit_worker_resources(
+        &mut self,
+        receipt: &[u8],
+        deadline: Instant,
+    ) -> Result<(), StdioError> {
+        let result = (|| {
+            self.check_resources(deadline, true)?;
+            if receipt.len() != RESOURCE_ADMISSION_LENGTH
+                || &receipt[..8] != RESOURCE_ADMISSION_MAGIC
+                || self.resources.evidence.child_admitted
+            {
+                return Err(StdioError::new("native_resource_admission"));
+            }
+            let mut fields = [0u64; 21];
+            for (field, bytes) in fields.iter_mut().zip(receipt[8..].chunks_exact(8)) {
+                *field = u64::from_be_bytes(
+                    bytes
+                        .try_into()
+                        .map_err(|_| StdioError::new("native_resource_admission"))?,
+                );
+            }
+            let now = monotonic_millis()?;
+            let parent_start = self
+                .resources
+                .samples
+                .as_ref()
+                .map(|samples| samples.actual.start_abstime);
+            if fields[..10]
+                != [
+                    1,
+                    RESOURCE_ADMISSION_LENGTH as u64,
+                    MAC_VM_LIMIT,
+                    MAC_PHYSICAL_THRESHOLD,
+                    MAC_PHYSICAL_THRESHOLD,
+                    MAC_SAMPLE_TARGET_MILLIS,
+                    MAC_MAX_GAP_MILLIS,
+                    1,
+                    MAC_VM_LIMIT,
+                    MAC_VM_LIMIT,
+                ]
+                || parent_start != Some(fields[13])
+                || !(1..=MAC_SAMPLE_LIMIT).contains(&fields[14])
+                || fields[15] > MAC_MAX_GAP_MILLIS
+                || fields[15] > fields[16]
+                || fields[20] < self.resources.spawn_native_millis
+                || fields[20] > now
+                || fields[16] > now - fields[20]
+                || fields[10] > fields[17]
+                || fields[11] > fields[18]
+                || fields[12] > fields[19]
+                || fields[17] > MAC_VM_LIMIT
+                || fields[18] > MAC_PHYSICAL_THRESHOLD
+                || fields[19] > MAC_PHYSICAL_THRESHOLD
+            {
+                return Err(StdioError::new("native_resource_admission"));
+            }
+            self.check_resources(deadline, true)?;
+            if self
+                .resources
+                .samples
+                .as_ref()
+                .is_none_or(|samples| samples.actual.start_abstime != fields[13])
+            {
+                return Err(StdioError::new("native_resource_admission"));
+            }
+            let evidence = &mut *self.resources.evidence.0;
+            evidence.activation_interval_millis =
+                Some(fields[20] - self.resources.spawn_native_millis);
+            evidence.child_as_soft_bytes = Some(fields[8]);
+            evidence.child_as_hard_bytes = Some(fields[9]);
+            evidence.child_admission_vm_bytes = Some(fields[10]);
+            evidence.child_admission_rss_bytes = Some(fields[11]);
+            evidence.child_admission_footprint_bytes = Some(fields[12]);
+            evidence.child_admission_samples = Some(fields[14]);
+            evidence.child_admission_maximum_sample_gap_millis = Some(fields[15]);
+            evidence.child_admission_elapsed_millis = Some(fields[16]);
+            evidence.child_admission_peak_vm_bytes = Some(fields[17]);
+            evidence.child_admission_peak_rss_bytes = Some(fields[18]);
+            evidence.child_admission_peak_footprint_bytes = Some(fields[19]);
+            evidence.child_admitted = true;
+            Ok(())
+        })();
+        result.map_err(|error| {
+            if error.code == "native_resource_identity" {
+                self.identity_uncertain = true;
+            }
+            self.resources.evidence.0.parent_last_resource_failure = Some(error.code);
+            error.with_resources(self.resource_evidence())
+        })
+    }
+}
+
+/// The sampler never reaps, signals a numeric PID, or releases parent-owned
+/// process reservations. A failure exits this same worker; its independent
+/// original watchdog and the parent's original owner/drain remain in force.
+#[cfg(target_os = "macos")]
+pub(super) struct WorkerResources {
+    samples: std::sync::Arc<std::sync::Mutex<ResourceSamples>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    native_deadline: u64,
+    as_soft: u64,
+    as_hard: u64,
+    anchor: Instant,
+}
+#[cfg(target_os = "macos")]
+pub(super) fn worker_resources(
+    native_deadline: u64,
+    anchor: Instant,
+) -> Result<WorkerResources, StdioError> {
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    let deadline = MacDeadline::Native(native_deadline);
+    deadline.check()?;
+    let requested = mac_address_limit();
+    if unsafe { libc::setrlimit(libc::RLIMIT_AS, &requested) } == -1 {
+        return Err(StdioError::io(
+            "native_resource_budget",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let mut installed: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut installed) } == -1 {
+        return Err(StdioError::io(
+            "native_resource_admission",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    if installed.rlim_cur != requested.rlim_cur || installed.rlim_max != requested.rlim_max {
+        return Err(StdioError::new("native_resource_admission"));
+    }
+    deadline.check()?;
+    let pid = unsafe { libc::getpid() };
+    let info = bsd_info(pid, true)?.ok_or_else(|| StdioError::new("native_resource_identity"))?;
+    if info.uid != unsafe { libc::geteuid() } || info.ruid != unsafe { libc::getuid() } {
+        return Err(StdioError::new("native_resource_identity"));
+    }
+    let identity = MacIdentity::from_info(&info);
+    let MacResourceObservation::Live(initial, _) =
+        observe_mac_resources(pid, identity, deadline).map_err(|failure| failure.error)?
+    else {
+        return Err(StdioError::new("native_resource_identity"));
+    };
+    let initial_samples = ResourceSamples::first(initial)?;
+    let initial_completed = initial_samples.last;
+    let samples = Arc::new(Mutex::new(initial_samples));
+    check_memory_thresholds(initial)?;
+    deadline.check()?;
+    publish_worker_resource_sample(anchor, initial_completed)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_samples = Arc::clone(&samples);
+    let thread_stop = Arc::clone(&stop);
+    let thread = std::thread::Builder::new()
+        .name("mmmm-stdio-resources".into())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            use std::sync::atomic::Ordering;
+            let run = || -> Result<(), StdioError> {
+                while !thread_stop.load(Ordering::Acquire) {
+                    deadline.check()?;
+                    {
+                        let samples = thread_samples
+                            .lock()
+                            .map_err(|_| StdioError::new("native_resource_thread"))?;
+                        samples.check_gap()?;
+                    }
+                    let observation = observe_mac_resources(pid, identity, deadline)
+                        .map_err(|failure| failure.error)?;
+                    let completed = {
+                        let mut samples = thread_samples
+                            .lock()
+                            .map_err(|_| StdioError::new("native_resource_thread"))?;
+                        let MacResourceObservation::Live(observation, _) = observation else {
+                            return Err(StdioError::new("native_resource_identity"));
+                        };
+                        samples.push(observation, true)?;
+                        samples.last
+                    };
+                    deadline.check()?;
+                    publish_worker_resource_sample(anchor, completed)?;
+                    let remaining = native_deadline
+                        .checked_sub(monotonic_millis()?)
+                        .filter(|remaining| *remaining > 0)
+                        .ok_or_else(|| StdioError::new("deadline"))?;
+                    std::thread::park_timeout(Duration::from_millis(
+                        remaining.min(MAC_SAMPLE_TARGET_MILLIS),
+                    ));
+                }
+                Ok(())
+            };
+            if let Err(error) = run() {
+                // Fixed status encoding carries the closed stage. Later child
+                // native details are not transmitted by the admission receipt.
+                unsafe { libc::_exit(super::worker_failure_exit(&error)) };
+            }
+        })
+        .map_err(|_| StdioError::new("native_resource_thread"))?;
+    Ok(WorkerResources {
+        samples,
+        stop,
+        thread: Some(thread),
+        native_deadline,
+        as_soft: installed.rlim_cur,
+        as_hard: installed.rlim_max,
+        anchor,
+    })
+}
+
+#[cfg(target_os = "macos")]
+impl WorkerResources {
+    pub(super) fn admission_receipt(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, StdioError> {
+        MacDeadline::Native(self.native_deadline).check()?;
+        check_worker_resource_gap(self.anchor)?;
+        let samples = self
+            .samples
+            .lock()
+            .map_err(|_| StdioError::new("native_resource_thread"))?;
+        samples.check_gap()?;
+        let values = [
+            1,
+            RESOURCE_ADMISSION_LENGTH as u64,
+            MAC_VM_LIMIT,
+            MAC_PHYSICAL_THRESHOLD,
+            MAC_PHYSICAL_THRESHOLD,
+            MAC_SAMPLE_TARGET_MILLIS,
+            MAC_MAX_GAP_MILLIS,
+            1,
+            self.as_soft,
+            self.as_hard,
+            samples.actual.adjusted_vm,
+            samples.actual.rss,
+            samples.actual.footprint,
+            samples.actual.start_abstime,
+            samples.samples,
+            millis(samples.maximum_gap),
+            millis(samples.last.duration_since(samples.first)),
+            samples.peak_vm,
+            samples.peak_rss,
+            samples.peak_footprint,
+            samples.first_native_millis,
+        ];
+        let mut receipt = zeroize::Zeroizing::new(Vec::with_capacity(RESOURCE_ADMISSION_LENGTH));
+        receipt.extend_from_slice(RESOURCE_ADMISSION_MAGIC);
+        for value in values {
+            receipt.extend_from_slice(&value.to_be_bytes());
+        }
+        MacDeadline::Native(self.native_deadline).check()?;
+        Ok(receipt)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for WorkerResources {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+            // Otherwise this handle detaches without a new wait or deadline.
+            // worker_entry_exit ends the whole process, and only the actual
+            // outer process drain proves that all its threads have stopped.
+        }
+    }
+}
+
 // ABI from Apple's public proc_info.h; PROC_PIDTBSDINFO=3, SZOMB=5.
 #[cfg(target_os = "macos")]
 #[repr(C)]
@@ -772,19 +1906,27 @@ fn bsd_info(pid: i32, zombie: bool) -> Result<Option<BsdInfo>, StdioError> {
         ) -> i32;
     }
     let mut info: BsdInfo = unsafe { std::mem::zeroed() };
-    let bytes = unsafe {
-        proc_pidinfo(
+    let (bytes, number) = unsafe {
+        *libc::__error() = 0;
+        let bytes = proc_pidinfo(
             pid,
             3,
             u64::from(zombie),
             (&mut info as *mut BsdInfo).cast(),
             std::mem::size_of::<BsdInfo>() as i32,
-        )
+        );
+        (bytes, *libc::__error())
     };
-    if bytes == 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+    if bytes == 0 && number == libc::ESRCH {
         return Ok(None);
     }
     if bytes as usize != std::mem::size_of::<BsdInfo>() {
+        if bytes <= 0 {
+            return Err(StdioError::io(
+                "native_observe",
+                std::io::Error::from_raw_os_error(number),
+            ));
+        }
         return Err(StdioError::new("native_observe"));
     }
     Ok(Some(info))
@@ -885,4 +2027,128 @@ fn mac_members(group: i32, identity: (u64, u64), deadline: Instant) -> Result<us
         return Err(StdioError::new("native_identity"));
     }
     Ok(count)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod resource_policy_tests {
+    use super::*;
+    use mmmm_native_process::darwin::MemoryObservation;
+
+    fn sample() -> MemoryObservation {
+        MemoryObservation {
+            adjusted_vm: MAC_VM_LIMIT,
+            rss: MAC_PHYSICAL_THRESHOLD,
+            footprint: MAC_PHYSICAL_THRESHOLD,
+            start_abstime: 17,
+        }
+    }
+    fn samples(actual: MemoryObservation, elapsed: Duration) -> ResourceSamples {
+        let last = Instant::now().checked_sub(elapsed).unwrap();
+        ResourceSamples {
+            first: last,
+            last,
+            first_native_millis: 1,
+            actual,
+            peak_vm: actual.adjusted_vm,
+            peak_rss: actual.rss,
+            peak_footprint: actual.footprint,
+            samples: 1,
+            maximum_gap: Duration::ZERO,
+        }
+    }
+
+    // Existing native stdio fixtures exercise lifecycle, but do not distinguish
+    // Darwin VM, resident and footprint policy or failed-sample evidence.
+    // These small authored values require no libproc call or process fixture.
+    #[test]
+    fn darwin_vm_resident_and_footprint_limits_are_independent() {
+        let exact = sample();
+        assert!(check_memory_thresholds(exact).is_ok());
+        for invalid in [
+            MemoryObservation {
+                adjusted_vm: exact.adjusted_vm + 1,
+                ..exact
+            },
+            MemoryObservation {
+                rss: exact.rss + 1,
+                ..exact
+            },
+            MemoryObservation {
+                footprint: exact.footprint + 1,
+                ..exact
+            },
+            MemoryObservation {
+                start_abstime: 0,
+                ..exact
+            },
+        ] {
+            assert_eq!(
+                check_memory_thresholds(invalid).unwrap_err().code,
+                "native_resource_budget"
+            );
+        }
+    }
+
+    #[test]
+    fn darwin_failed_samples_preserve_peaks_and_reject_changed_identity() {
+        let exact = sample();
+        let mut changed = samples(exact, Duration::ZERO);
+        assert_eq!(
+            changed
+                .push(
+                    MemoryObservation {
+                        start_abstime: exact.start_abstime + 1,
+                        ..exact
+                    },
+                    true,
+                )
+                .unwrap_err()
+                .code,
+            "native_resource_identity"
+        );
+        assert_eq!(changed.samples, 1);
+        assert_eq!(changed.actual, exact);
+
+        let mut exceeded = samples(exact, Duration::ZERO);
+        assert_eq!(
+            exceeded
+                .push(
+                    MemoryObservation {
+                        footprint: exact.footprint + 1,
+                        ..exact
+                    },
+                    true,
+                )
+                .unwrap_err()
+                .code,
+            "native_resource_budget"
+        );
+        assert_eq!(exceeded.peak_footprint, exact.footprint + 1);
+        assert_eq!(exceeded.samples, 2);
+
+        let mut overdue = samples(exact, Duration::from_secs(2));
+        assert_eq!(
+            overdue.push(exact, true).unwrap_err().code,
+            "native_resource_gap"
+        );
+        assert!(overdue.maximum_gap > Duration::from_millis(MAC_MAX_GAP_MILLIS));
+        assert_eq!(overdue.samples, 2);
+
+        let mut poll_driven = samples(exact, Duration::from_secs(2));
+        assert!(poll_driven.push(exact, false).is_ok());
+        assert!(poll_driven.maximum_gap > Duration::from_millis(MAC_MAX_GAP_MILLIS));
+
+        // Pure heartbeat arithmetic does not mutate the live atomic or claim
+        // an exact scheduler/termination bound for this polling watchdog.
+        assert!(check_worker_gap_at(0, 0).is_ok());
+        assert!(check_worker_gap_at(2, 1_000_000_001).is_ok());
+        assert_eq!(
+            check_worker_gap_at(2, 1_000_000_002).unwrap_err().code,
+            "native_resource_watchdog_gap"
+        );
+        assert_eq!(
+            check_worker_gap_at(3, 1).unwrap_err().code,
+            "native_resource_watchdog_gap"
+        );
+    }
 }

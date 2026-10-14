@@ -30,11 +30,15 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 const SESSION_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const MAX_PENDING: usize = 8;
+const MAX_REJECTED_COMPLETIONS: usize = 8;
+const MAX_REJECTED_ENCODED_BYTES: usize = 8 * 1024 * 1024;
+const COMPLETION_METADATA_BYTES: usize = 1024;
 const NATIVE_SOURCE_ID: &str = "mmmm_host";
 const READ_PERMISSIONS: [&str; 3] = [
     "mmmm:world_read",
@@ -192,6 +196,7 @@ pub fn register_explicit_host_setup(
 }
 
 struct PendingBootstrap {
+    original_offer: Arc<PublicFrame>,
     witness: BootstrapWitness,
     budget: BootstrapBudget,
     principal: PrincipalId,
@@ -203,7 +208,102 @@ struct PendingBootstrap {
     token: Option<SecretToken>,
     route_owner: Option<HostRouteOwner>,
     complete_issued: bool,
+    completion: Option<Arc<CompletedBootstrap>>,
+    rollback_observation: RollbackObservation,
+    publication_failure: Option<Arc<mmmm_application::AppError>>,
+    first_rollback_failure: Option<Arc<mmmm_application::AppError>>,
+    retained_encoded_bytes: usize,
     lease_expires: Instant,
+}
+
+#[derive(Clone, Copy)]
+enum RollbackObservation {
+    NotAttempted,
+    Uncertain {
+        first_failure: ManagementError,
+    },
+    Completed {
+        prior_failure: Option<ManagementError>,
+    },
+}
+struct RejectedPairingCompletion {
+    // Retention only: these records are never looked up by a source witness.
+    // Explicit diagnostic/export policy owns their later lifecycle. The
+    // aggregate encoded-data budget is distinct from a process RSS guarantee.
+    _observation: Arc<CompletedPairingObservation>,
+    _rollback: RollbackObservation,
+    _publication_failure: Option<Arc<mmmm_application::AppError>>,
+    _first_rollback_failure: Option<Arc<mmmm_application::AppError>>,
+}
+
+/// A factual native delivery observation. Only `finish` constructs it from
+/// the original bounded offer and opaque ACK/EOF receipt. It grants no source
+/// rights, game mode, target readiness or permission. No Debug/serde surface
+/// exposes the original offer's local path, nonce or private pairing details.
+pub(crate) struct CompletedPairingObservation {
+    original_offer: Arc<PublicFrame>,
+    completion: Arc<CompletedBootstrap>,
+    native_owner: PrincipalId,
+    principal: PrincipalId,
+    project: ProjectId,
+    context: Value,
+    policy: Sha256Digest,
+    original_deadline: Instant,
+    lease_expires: Instant,
+}
+impl CompletedPairingObservation {
+    fn from_pending(
+        pending: &PendingBootstrap,
+        completion: Arc<CompletedBootstrap>,
+        native_owner: &PrincipalId,
+    ) -> Self {
+        Self {
+            original_offer: pending.original_offer.clone(),
+            completion,
+            native_owner: native_owner.clone(),
+            principal: pending.principal.clone(),
+            project: pending.project.clone(),
+            context: pending.context.clone(),
+            policy: pending.policy.clone(),
+            original_deadline: pending.budget.deadline(),
+            lease_expires: pending.lease_expires,
+        }
+    }
+    pub(crate) fn principal(&self) -> &PrincipalId {
+        &self.principal
+    }
+    pub(crate) fn project(&self) -> &ProjectId {
+        &self.project
+    }
+    pub(crate) fn context(&self) -> &Value {
+        &self.context
+    }
+    pub(crate) fn policy(&self) -> &Sha256Digest {
+        &self.policy
+    }
+    pub(crate) fn native_owner(&self) -> &PrincipalId {
+        &self.native_owner
+    }
+    pub(crate) fn completed_at(&self) -> Instant {
+        self.completion.completed_at()
+    }
+    pub(crate) fn original_deadline(&self) -> Instant {
+        self.original_deadline
+    }
+    pub(crate) fn lease_expires(&self) -> Instant {
+        self.lease_expires
+    }
+    pub(crate) fn offer_digest(&self) -> &Sha256Digest {
+        self.completion.witness().offer_digest()
+    }
+    pub(crate) fn original_offer(&self) -> &Value {
+        self.original_offer.value()
+    }
+    pub(crate) fn check_delivery(&self) -> bool {
+        self.completion.delivered()
+            && self.completed_at() < self.original_deadline
+            && Instant::now() < self.lease_expires
+    }
 }
 struct ActiveBootstrap {
     principal: PrincipalId,
@@ -240,6 +340,8 @@ pub struct HostBootstrapProcessor {
     pending: BTreeMap<RequestId, PendingBootstrap>,
     active: BTreeMap<ContextId, ActiveBootstrap>,
     workspace: BTreeMap<ContextId, OwnerWorkspace>,
+    rejected_completions: BTreeMap<RequestId, RejectedPairingCompletion>,
+    rejected_encoded_bytes: usize,
 }
 impl HostBootstrapProcessor {
     pub fn new(hosts: HostBridge, authority: LocalAuthority) -> Result<Self, ManagementError> {
@@ -250,6 +352,8 @@ impl HostBootstrapProcessor {
             pending: BTreeMap::new(),
             active: BTreeMap::new(),
             workspace: BTreeMap::new(),
+            rejected_completions: BTreeMap::new(),
+            rejected_encoded_bytes: 0,
         })
     }
     /// Trusted composition has independently verified this Project's current
@@ -443,6 +547,11 @@ impl HostBootstrapProcessor {
             return Err(ManagementError::Busy);
         }
         let (public, token, witness) = offer.into_parts();
+        let offer_bytes = public.encode()?.payload().len();
+        let retained_encoded_bytes = offer_bytes
+            .checked_add(COMPLETION_METADATA_BYTES)
+            .ok_or(ManagementError::FrameTooLarge)?;
+        let public = Arc::new(public);
         let value = public.value();
         if Path::new(text(value, "dataRoot")?) != store.data_root()
             || canonical_digest(value).map_err(|_| ManagementError::InvalidFrame)?
@@ -502,6 +611,7 @@ impl HostBootstrapProcessor {
             )
             .map_err(|_| ManagementError::Busy)?;
         let mut pending = PendingBootstrap {
+            original_offer: public.clone(),
             witness,
             budget: budget.clone(),
             principal,
@@ -513,10 +623,25 @@ impl HostBootstrapProcessor {
             token: Some(token),
             route_owner: None,
             complete_issued: false,
+            completion: None,
+            rollback_observation: RollbackObservation::NotAttempted,
+            publication_failure: None,
+            first_rollback_failure: None,
+            retained_encoded_bytes,
             lease_expires: now + SESSION_LIFETIME,
         };
         let prepared = (|| {
+            let value = pending.original_offer.value();
             pending.context = build_context(value, &pending, scope)?;
+            pending.retained_encoded_bytes = pending
+                .retained_encoded_bytes
+                .checked_add(
+                    mmmm_contracts::encode_json(&pending.context)
+                        .map_err(|_| ManagementError::FrameTooLarge)?
+                        .len(),
+                )
+                .filter(|bytes| *bytes <= MAX_REJECTED_ENCODED_BYTES)
+                .ok_or(ManagementError::FrameTooLarge)?;
             let actions = value["nativeActions"]
                 .as_array()
                 .ok_or(ManagementError::InvalidFrame)?
@@ -658,7 +783,7 @@ impl HostBootstrapProcessor {
     /// This receipt has no wire constructor. The native worker supplies true
     /// only after Complete write, terminal ACK and EOF/disconnect have drained.
     pub fn finish(&mut self, receipt: CompletedBootstrap) -> Result<(), ManagementError> {
-        let Some(pending) = self.pending.remove(receipt.witness().id()) else {
+        let Some(mut pending) = self.pending.remove(receipt.witness().id()) else {
             // A late failure after exact expiry cleanup cannot retire any new
             // context or grant. A duplicated receipt never activates a session.
             return Ok(());
@@ -666,6 +791,35 @@ impl HostBootstrapProcessor {
         if !same_witness(&pending.witness, receipt.witness()) {
             self.pending.insert(pending.witness.id().clone(), pending);
             return Err(ManagementError::WrongReply);
+        }
+        // Preserve the actual opaque delivery truth before attempting current
+        // grant/route publication. An uncertain rollback retains this same
+        // receipt; a retry cannot replace its observed timestamp or outcome.
+        if let Some(observed) = &pending.completion {
+            if observed.completed_at() != receipt.completed_at()
+                || observed.delivered() != receipt.delivered()
+            {
+                self.pending.insert(pending.witness.id().clone(), pending);
+                return Err(ManagementError::WrongReply);
+            }
+        } else {
+            pending.completion = Some(Arc::new(receipt));
+        }
+        let receipt = pending
+            .completion
+            .as_ref()
+            .ok_or(ManagementError::WrongReply)?;
+        if !matches!(
+            pending.rollback_observation,
+            RollbackObservation::NotAttempted
+        ) {
+            let delivered = receipt.delivered();
+            self.rollback_and_retain_completion(pending)?;
+            return if delivered {
+                Err(ManagementError::WrongReply)
+            } else {
+                Ok(())
+            };
         }
         if receipt.delivered()
             && pending.complete_issued
@@ -678,15 +832,31 @@ impl HostBootstrapProcessor {
             // The private native completion timestamp proves delivery occurred
             // before the original deadline. Main-loop scheduling delay does
             // not rewrite that observation into a timeout or a new deadline.
-            if self
-                .authority
-                .activate_staged_project(&pending.principal, &pending.project, &pending.policy)
-                .is_err()
-            {
-                if self.rollback(&pending).is_err() {
-                    self.pending.insert(pending.witness.id().clone(), pending);
-                    return Err(ManagementError::TransportUncertain);
-                }
+            let published = (|| {
+                self.authority.activate_staged_project(
+                    &pending.principal,
+                    &pending.project,
+                    &pending.policy,
+                )?;
+                let observation = Arc::new(CompletedPairingObservation::from_pending(
+                    &pending,
+                    receipt.clone(),
+                    &self.owner,
+                ));
+                self.hosts.record_completed_pairing(
+                    pending.route_owner.as_ref().ok_or_else(|| {
+                        mmmm_application::AppError::new(
+                            "STALE_CONTEXT",
+                            "Original native route is unavailable",
+                        )
+                    })?,
+                    observation,
+                    &self.authority,
+                )
+            })();
+            if let Err(cause) = published {
+                pending.publication_failure = Some(Arc::new(cause));
+                self.rollback_and_retain_completion(pending)?;
                 return Err(ManagementError::WrongReply);
             }
             self.active.insert(
@@ -702,11 +872,9 @@ impl HostBootstrapProcessor {
             );
             return Ok(());
         }
-        if self.rollback(&pending).is_err() {
-            self.pending.insert(pending.witness.id().clone(), pending);
-            return Err(ManagementError::TransportUncertain);
-        }
-        if receipt.delivered() {
+        let delivered = receipt.delivered();
+        self.rollback_and_retain_completion(pending)?;
+        if delivered {
             Err(ManagementError::WrongReply)
         } else {
             Ok(())
@@ -763,11 +931,8 @@ impl HostBootstrapProcessor {
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         for id in expired {
-            if let Some(pending) = self.pending.remove(&id)
-                && self.rollback(&pending).is_err()
-            {
-                self.pending.insert(id, pending);
-                return Err(ManagementError::TransportUncertain);
+            if let Some(pending) = self.pending.remove(&id) {
+                self.rollback_and_retain_completion(pending)?;
             }
         }
         Ok(())
@@ -781,9 +946,8 @@ impl HostBootstrapProcessor {
         let pending_ids = self.pending.keys().cloned().collect::<Vec<_>>();
         for id in pending_ids {
             if let Some(pending) = self.pending.remove(&id)
-                && self.rollback(&pending).is_err()
+                && self.rollback_and_retain_completion(pending).is_err()
             {
-                self.pending.insert(id, pending);
                 failed = true;
             }
         }
@@ -817,14 +981,78 @@ impl HostBootstrapProcessor {
     pub fn has_pending_completion(&self) -> bool {
         self.pending.values().any(|pending| pending.complete_issued)
     }
+    /// Exact rollback observations and native completion truth have distinct
+    /// lifetimes. Neither successful cleanup nor capacity pressure discards a
+    /// completed exchange. A full diagnostic budget keeps its pending record
+    /// and prevents reporting settled ownership while retention is unresolved.
+    fn rollback_and_retain_completion(
+        &mut self,
+        mut pending: PendingBootstrap,
+    ) -> Result<(), ManagementError> {
+        let prior_failure = match pending.rollback_observation {
+            RollbackObservation::Uncertain { first_failure } => Some(first_failure),
+            RollbackObservation::Completed { prior_failure } => prior_failure,
+            RollbackObservation::NotAttempted => None,
+        };
+        if !matches!(
+            pending.rollback_observation,
+            RollbackObservation::Completed { .. }
+        ) {
+            if let Err(cause) = self.rollback_with_cause(&pending) {
+                if pending.first_rollback_failure.is_none() {
+                    pending.first_rollback_failure = Some(Arc::new(cause));
+                }
+                pending.rollback_observation = RollbackObservation::Uncertain {
+                    first_failure: prior_failure.unwrap_or(ManagementError::TransportUncertain),
+                };
+                self.pending.insert(pending.witness.id().clone(), pending);
+                return Err(ManagementError::TransportUncertain);
+            }
+            pending.rollback_observation = RollbackObservation::Completed { prior_failure };
+        }
+        let Some(completion) = pending.completion.as_ref() else {
+            return Ok(());
+        };
+        let total = self
+            .rejected_encoded_bytes
+            .checked_add(pending.retained_encoded_bytes)
+            .filter(|bytes| *bytes <= MAX_REJECTED_ENCODED_BYTES);
+        if self.rejected_completions.len() >= MAX_REJECTED_COMPLETIONS
+            || total.is_none()
+            || self.rejected_completions.contains_key(pending.witness.id())
+        {
+            self.pending.insert(pending.witness.id().clone(), pending);
+            return Err(ManagementError::TransportUncertain);
+        }
+        let observation = Arc::new(CompletedPairingObservation::from_pending(
+            &pending,
+            completion.clone(),
+            &self.owner,
+        ));
+        self.rejected_encoded_bytes = total.ok_or(ManagementError::TransportUncertain)?;
+        self.rejected_completions.insert(
+            pending.witness.id().clone(),
+            RejectedPairingCompletion {
+                _observation: observation,
+                _rollback: pending.rollback_observation,
+                _publication_failure: pending.publication_failure,
+                _first_rollback_failure: pending.first_rollback_failure,
+            },
+        );
+        Ok(())
+    }
     fn rollback(&self, pending: &PendingBootstrap) -> Result<(), ManagementError> {
-        self.authority
-            .revoke_staged_project(&pending.principal, &pending.project, &pending.policy)
-            .map_err(|_| ManagementError::TransportUncertain)?;
+        self.rollback_with_cause(pending)
+            .map_err(|_| ManagementError::TransportUncertain)
+    }
+    fn rollback_with_cause(&self, pending: &PendingBootstrap) -> mmmm_application::AppResult<()> {
+        self.authority.revoke_staged_project(
+            &pending.principal,
+            &pending.project,
+            &pending.policy,
+        )?;
         if let Some(route_owner) = &pending.route_owner {
-            self.hosts
-                .detach_owned(route_owner)
-                .map_err(|_| ManagementError::TransportUncertain)?;
+            self.hosts.detach_owned(route_owner)?;
         }
         Ok(())
     }

@@ -478,7 +478,181 @@ fn raw_budget_is_checked_before_external_io() {
 }
 
 #[test]
+fn hello_authentication_requires_each_binding_from_the_fixed_frame() {
+    // 기존 계약 fixture에는 이 private 고정 길이 hello가 없으므로, 실제 비밀 대신
+    // 작성한 바이트로 magic, capability, image와 process binding을 각각 확인한다.
+    let capability = [b'K'; 32];
+    let digest = [b'Q'; 32];
+    let pid = 42u64;
+    let mut hello = [0; 80];
+    hello[..8].copy_from_slice(MAGIC);
+    hello[8..40].copy_from_slice(&capability);
+    hello[40..72].copy_from_slice(&digest);
+    hello[72..].copy_from_slice(&pid.to_be_bytes());
+    assert!(check_hello(&hello, &capability, &digest, pid).valid());
+
+    for (offset, rejected_binding) in [(0, 0), (8, 1), (40, 2), (79, 3)] {
+        let mut changed = hello;
+        changed[offset] ^= 1;
+        let checks = check_hello(&changed, &capability, &digest, pid);
+        assert!(!checks.valid());
+        let bindings = [
+            checks.magic,
+            checks.capability,
+            checks.image,
+            checks.process_identity,
+        ];
+        for (index, accepted) in bindings.into_iter().enumerate() {
+            assert_eq!(accepted, index != rejected_binding);
+        }
+    }
+}
+
+#[test]
+fn startup_observation_preserves_history_without_reusing_previous_hello_checks() {
+    let mut observation = StartupObservation::new();
+    assert_eq!(observation.phase.as_str(), "parent_image");
+    assert_eq!(observation.accepted_connections, 0);
+    assert_eq!(observation.hello_attempts, 0);
+    assert!(observation.last_checks.is_none());
+
+    observation.observe_connection();
+    observation.observe_hello_bytes(11);
+    observation.truncate_hello();
+    assert_eq!(observation.phase.as_str(), "hello_partial");
+    assert_eq!(observation.truncated_hellos, 1);
+    assert_eq!(observation.hello_bytes, 11);
+    assert_eq!(observation.max_hello_bytes, 11);
+
+    observation.observe_connection();
+    assert_eq!(observation.hello_bytes, 0);
+    assert!(observation.last_checks.is_none());
+    assert_eq!(observation.max_hello_bytes, 11);
+    observation.observe_hello_bytes(80);
+    observation.reject_hello(Some(HelloChecks {
+        magic: true,
+        capability: true,
+        image: false,
+        process_identity: true,
+    }));
+    assert_eq!(observation.phase.as_str(), "hello_rejected");
+    assert_eq!(observation.rejected_hellos, 1);
+    assert!(!observation.last_checks.as_ref().unwrap().image);
+
+    observation.observe_connection();
+    assert_eq!(observation.hello_bytes, 0);
+    assert!(observation.last_checks.is_none());
+    assert_eq!(observation.max_hello_bytes, 80);
+    observation.observe_hello_bytes(7);
+    observation.observe_hello_bytes(80);
+    observation.validate_hello(HelloChecks {
+        magic: true,
+        capability: true,
+        image: true,
+        process_identity: true,
+    });
+    assert_eq!(observation.phase.as_str(), "hello_validated");
+    assert!(observation.last_checks.as_ref().unwrap().valid());
+    assert_eq!(observation.accepted_connections, 3);
+    assert_eq!(observation.hello_attempts, 3);
+    assert_eq!(observation.hello_bytes, 80);
+    assert_eq!(observation.max_hello_bytes, 80);
+    assert_eq!(observation.rejected_hellos, 1);
+    assert_eq!(observation.truncated_hellos, 1);
+}
+
+#[test]
+fn attaching_startup_observation_preserves_primary_error_and_drain_evidence() {
+    for drained in [false, true] {
+        for (native_code, native_code_unknown) in [(None, false), (Some(22), false), (None, true)] {
+            let mut error = StdioError::new("startup_deadline");
+            error.drained = drained;
+            error.native_code = native_code;
+            error.native_code_unknown = native_code_unknown;
+            let mut observation = StartupObservation::new();
+            observation.phase = StartupPhase::NoConnection;
+            observation.parent_image_bytes = Some(4096);
+            observation.parent_image_elapsed_ms = 8;
+            observation.native_spawn_elapsed_ms = 7;
+            observation.auth_elapsed_ms = 4;
+            observation.elapsed_ms = 19;
+
+            let error = error.with_startup(observation);
+            assert_eq!(error.code, "startup_deadline");
+            assert_eq!(error.native_code, native_code);
+            assert_eq!(error.native_code_unknown, native_code_unknown);
+            assert_eq!(error.drained, drained);
+            assert!(error.cleanup.is_none());
+            let snapshot = error.startup.as_ref().unwrap();
+            assert_eq!(snapshot.phase.as_str(), "no_connection");
+            assert_eq!(snapshot.parent_image_bytes, Some(4096));
+            assert_eq!(snapshot.parent_image_elapsed_ms, 8);
+            assert_eq!(snapshot.native_spawn_elapsed_ms, 7);
+            assert_eq!(snapshot.auth_elapsed_ms, 4);
+            assert_eq!(snapshot.elapsed_ms, 19);
+        }
+    }
+
+    let cleanup = StdioCleanupFailure {
+        code: "drain_uncertain",
+        native_code: Some(5),
+        native_code_unknown: false,
+    };
+    let mut error = StdioError::new("startup_deadline");
+    error.cleanup = Some(cleanup.clone());
+    let error = error.with_startup(StartupObservation::new());
+    assert_eq!(error.code, "startup_deadline");
+    assert!(!error.drained);
+    assert_eq!(error.cleanup.as_ref(), Some(&cleanup));
+    assert!(error.startup.is_some());
+}
+
+#[test]
+fn startup_diagnostics_expose_closed_phases_without_hello_credentials() {
+    let capability = [b'K'; 32];
+    let digest = [b'Q'; 32];
+    let pid = 42u64;
+    let mut hello = [0; 80];
+    hello[..8].copy_from_slice(MAGIC);
+    hello[8..40].copy_from_slice(&capability);
+    hello[40..72].copy_from_slice(&digest);
+    hello[72..].copy_from_slice(&pid.to_be_bytes());
+    let private_values = [
+        String::from_utf8(capability.to_vec()).unwrap(),
+        String::from_utf8(digest.to_vec()).unwrap(),
+        format!("{capability:?}"),
+        format!("{digest:?}"),
+        format!("{hello:?}"),
+        "MMMMIO01".to_owned(),
+    ];
+
+    for (phase, expected) in [
+        (StartupPhase::ParentImage, "parent_image"),
+        (StartupPhase::NativeSpawn, "native_spawn"),
+        (StartupPhase::NoConnection, "no_connection"),
+        (StartupPhase::PartialHello, "hello_partial"),
+        (StartupPhase::RejectedHello, "hello_rejected"),
+        (StartupPhase::ValidatedHello, "hello_validated"),
+        (StartupPhase::ValidatedLate, "hello_validated_late"),
+    ] {
+        let mut observation = StartupObservation::new();
+        observation.validate_hello(check_hello(&hello, &capability, &digest, pid));
+        observation.phase = phase;
+        let error = StdioError::new("startup_deadline").with_startup(observation);
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert!(display.contains("startup_deadline"));
+        assert!(display.contains(expected));
+        for private in &private_values {
+            assert!(!display.contains(private));
+            assert!(!debug.contains(private));
+        }
+    }
+}
+
+#[test]
 fn worker_failure_status_preserves_stage_and_marks_native_overflow_unknown() {
+    assert!(std::mem::size_of::<StdioError>() <= 128);
     for native in [None, Some(5), Some(i32::MAX), Some(-1)] {
         let mut error = StdioError::new("bootstrap_peek");
         error.native_code = native;
@@ -501,6 +675,39 @@ fn worker_failure_status_preserves_stage_and_marks_native_overflow_unknown() {
             assert_eq!(decoded.native_code, None);
             assert_eq!(decoded.native_code_unknown, native.is_some());
         }
+    }
+    let unknown = worker_exit_error(worker_failure_exit(&StdioError::new("unlisted_stage")));
+    assert_eq!(unknown.code, "worker_unknown");
+    let watchdog = worker_exit_error(worker_failure_exit(&StdioError::new(
+        "native_resource_watchdog_gap",
+    )));
+    assert_eq!(watchdog.code, "native_resource_watchdog_gap");
+    assert!(!watchdog.native_code_unknown);
+    #[cfg(unix)]
+    {
+        let panic = worker_exit_error(101);
+        assert_eq!(panic.code, "worker_exit");
+        assert_eq!(panic.native_code, Some(101));
+        assert!(!panic.native_code_unknown);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use mmmm_native_process::darwin::{
+            NativeResourceError, NativeResourceFailure, NativeResourceStage,
+        };
+        let source = NativeResourceError {
+            stage: NativeResourceStage::TaskInfo,
+            failure: NativeResourceFailure::Unavailable,
+            native_result: 0,
+            native_errno: libc::EPERM,
+        };
+        let error = StdioError::new("native_resource_observation").with_resource_source(source);
+        let decoded = worker_exit_error(worker_failure_exit(&error));
+        assert_eq!(decoded.code, "native_resource_observation");
+        assert!(decoded.native_code_unknown);
+        assert!(decoded.native_code.is_none());
+        assert!(!decoded.drained);
+        assert_eq!(error.resource_source, Some(source));
     }
     let unexpected = worker_exit_error(3);
     assert_eq!(unexpected.code, "worker_exit");

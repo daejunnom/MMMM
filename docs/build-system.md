@@ -192,6 +192,17 @@ WSL의 파일 삭제와 가상 디스크의 물리 공간 반환은 다른 결�
 
 ## WSL과 독립 실행 환경
 
+WSL Ubuntu의 사용은 Windows에서 가능한 실행 경로를 먼저 시도했으나 SAC/WDAC
+차단으로 진행할 수 없는 경우로 한정한다. 원래 Windows 실행의 차단 오류와 시도한
+경로·결과를 외부 증거에 보존하고, 대체할 작업의 범위를 정한다. 무한 재시도,
+보호 기능 해제나 차단 우회는 Windows 경로의 시도에 포함하지 않는다.
+Windows에서 정상 실행할 수 있으면 그 경로를 사용한다. 일반 빌드 오류나 편의는
+Ubuntu 전환 근거가 아니다. Ubuntu 결과는 원래 Windows 실패와 별도로 기록하며
+Windows 검사·게임 인수 또는 배포 후보의 성공으로 바꾸지 않는다.
+
+전환 전에 현재 Git·worktree와 소유 경로, 적용 규약, OS·아키텍처, 생성물 루트와
+lease를 확인한다. 비밀 파일 접근 금지, 소유 범위, 유한한 시간·자원·출력,
+취소 후 자식 종료 확인과 제품 DB·CAS·복구 및 증거 자료 보존 규칙은 그대로 적용한다.
 WSL의 재생성 Linux cache는 Linux 출력 루트를 사용한다. 보존 자료는 실제 호스트의
 Windows 생성물 루트를 확인하고 변환해 내보낸다. 경로 확인 및 변환 실패는 오류로
 반환하며 임의 루트로 대체하지 않는다. OS별 바이너리와 cache는 공유하지 않는다.
@@ -365,22 +376,27 @@ owned member), 고정 file 역할(pid directory, stat, RSS rollup), open·rewind
 종료 증거로 승격하지 않으며, kernel의 실제 종료와 접근 실패를 구분할 후속 관측이
 필요하다.
 
-`definition-startup`은 Windows x64의 개발용 JNI/JVMTI fixture 관측 명령이다.
+`definition-startup`은 Windows x64, Linux x64와 macOS ARM64의 개발용
+JNI/JVMTI fixture 관측 명령이다.
 기존 고정 JDK archive·modules·명시적 native library와 실제 Java executable·observer
-DLL·JAR·build source manifest를 최대 32개, 합계 512 MiB로 선택한다. 현재 고정 JDK
-ZIP의 실제 141,167,264 bytes에 맞춰 archive role을 192 MiB로 제한한다. 선택한
-파일과 조상 디렉터리의 실제 핸들을 유지하고 같은 핸들의 size·identity·SHA를
-실행 전후 대조한다. secret 이름, named stream, link와 Windows 경로 정규화 alias는
-파일을 열기 전에 거절한다. 이 선택과 hash는 JDK 전체 image나 agent roster의
-source admission을 발급하지 않는다.
+library·JAR·build source manifest를 최대 32개, 합계 512 MiB로 선택한다. archive
+role은 192 MiB로 제한한다. Windows의 선택 파일과 조상 디렉터리는 실제 핸들을,
+Unix는 root부터 열린 directory FD와 그 상대 경로 관계를 유지하며 size·identity·SHA를
+실행 전후 대조한다. secret 이름과 플랫폼별 link·특수 파일·경로 alias를 거절한다.
+Unix의 관측은 다른 writer나 JVM의 pathname 재개방을 원자적으로 배제하지 않는다.
+이 선택과 hash는 JDK 전체 image나 agent roster의 source admission을 발급하지 않는다.
 
 준비·native 실행·같은 stdout 핸들 판독·입력 재검사·ABI2 decode와 hash는 원래
 60초 절대 기한을 공유한다. 남은 프로세스 시간이 1초 미만이면 올림하지 않고
 실행을 거절한다. 원래 native drain 15초와 bounded evidence export 5초를 별도로
 기록한다. 고정 fixture heap 256 MiB·metaspace 256 MiB·code cache 64 MiB,
 일반 Windows 2 GiB Job·process 32, raw ABI2 18 MiB·combined log 64 MiB를
-사용한다. Java injector 환경 네 개는 원래 값을 읽거나 출력하지 않고 빈 값으로
-override한다. 현재 구현은 Linux와 macOS의 이 개발용 startup 명령을 지원하지 않는다.
+사용한다. Windows의 Java injector 환경 네 개는 원래 값을 읽거나 출력하지 않고
+빈 값으로 override한다. Unix의 이 route는 환경 상속을 제거하고 owned scratch의
+`java.io.tmpdir`와 `UsePerfData` 비활성화를 고정한다. Linux는 D028의 고정 JVM
+VM/RSS 정책, Darwin은 관리 도구의 별도 VM/RSS/footprint 정책을 적용한다.
+실제 3개 OS 실행과 C header ABI의 근거는 구현 착수 조건의 해당 source SHA와
+run 기록에 연결하며, 별도 stdio worker 정책이나 게임 인수의 근거로 확대하지 않는다.
 JVM unified logging의 기본 warning·error 선택은 stderr로 다시 구성하여 원래
 bounded 진단에 보존한다. stdout은 단일 바이너리 프레임으로 엄격히 검사하며,
 추가 문자열을 찾거나 잘라낸 뒤 성공으로 처리하지 않는다.

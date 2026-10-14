@@ -20,6 +20,9 @@ use zeroize::Zeroize;
 #[cfg(windows)]
 #[path = "stdio_io_windows.rs"]
 mod native;
+
+#[cfg(target_os = "macos")]
+pub use native::DarwinStdioResources;
 #[cfg(unix)]
 #[path = "stdio_io_unix.rs"]
 mod native;
@@ -79,6 +82,13 @@ const WORKER_STAGES: &[&str] = &[
     "deadline",
     "native_clock",
     "worker_unknown",
+    "native_resource_budget",
+    "native_resource_observation",
+    "native_resource_identity",
+    "native_resource_gap",
+    "native_resource_admission",
+    "native_resource_thread",
+    "native_resource_watchdog_gap",
 ];
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Mode {
@@ -153,7 +163,12 @@ fn drain_deadline_check(deadline: Instant) -> Result<(), StdioError> {
 
 fn cleanup_failed_process(mut process: native::Process, mut error: StdioError) -> StdioError {
     let deadline = process.owner_deadline();
-    match process.drain_blocking(deadline) {
+    let result = process.drain_blocking(deadline);
+    #[cfg(target_os = "macos")]
+    {
+        error.resources = Some(process.resource_evidence());
+    }
+    match result {
         Ok(()) => error.drained = true,
         Err(drain) => {
             error.drained = drain.drained;
@@ -219,6 +234,154 @@ pub struct StdioError {
     pub native_code: Option<i32>,
     pub native_code_unknown: bool,
     pub cleanup: Option<StdioCleanupFailure>,
+    pub startup: Option<Box<StartupObservation>>,
+    #[cfg(target_os = "macos")]
+    pub resources: Option<DarwinStdioResources>,
+    #[cfg(target_os = "macos")]
+    pub resource_source: Option<mmmm_native_process::darwin::NativeResourceError>,
+}
+
+/// Closed diagnostics from the actual parent startup attempt. These facts are
+/// never an authority grant and retain no token, image digest, path or frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupPhase {
+    ParentImage,
+    NativeSpawn,
+    NoConnection,
+    PartialHello,
+    RejectedHello,
+    ValidatedHello,
+    ValidatedLate,
+}
+impl StartupPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ParentImage => "parent_image",
+            Self::NativeSpawn => "native_spawn",
+            Self::NoConnection => "no_connection",
+            Self::PartialHello => "hello_partial",
+            Self::RejectedHello => "hello_rejected",
+            Self::ValidatedHello => "hello_validated",
+            Self::ValidatedLate => "hello_validated_late",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HelloChecks {
+    magic: bool,
+    capability: bool,
+    image: bool,
+    process_identity: bool,
+}
+impl HelloChecks {
+    fn valid(self) -> bool {
+        self.magic && self.capability && self.image && self.process_identity
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartupObservation {
+    phase: StartupPhase,
+    parent_image_bytes: Option<u64>,
+    parent_image_elapsed_ms: u64,
+    native_spawn_elapsed_ms: u64,
+    auth_elapsed_ms: u64,
+    elapsed_ms: u64,
+    accepted_connections: u8,
+    hello_attempts: u8,
+    hello_bytes: u8,
+    max_hello_bytes: u8,
+    rejected_hellos: u8,
+    truncated_hellos: u8,
+    last_checks: Option<HelloChecks>,
+}
+impl StartupObservation {
+    fn new() -> Self {
+        Self {
+            phase: StartupPhase::ParentImage,
+            parent_image_bytes: None,
+            parent_image_elapsed_ms: 0,
+            native_spawn_elapsed_ms: 0,
+            auth_elapsed_ms: 0,
+            elapsed_ms: 0,
+            accepted_connections: 0,
+            hello_attempts: 0,
+            hello_bytes: 0,
+            max_hello_bytes: 0,
+            rejected_hellos: 0,
+            truncated_hellos: 0,
+            last_checks: None,
+        }
+    }
+    fn observe_connection(&mut self) {
+        self.accepted_connections = self.accepted_connections.saturating_add(1);
+        self.hello_attempts = self.hello_attempts.saturating_add(1);
+        self.hello_bytes = 0;
+        self.last_checks = None;
+        self.phase = StartupPhase::PartialHello;
+    }
+    fn observe_hello_bytes(&mut self, total: usize) {
+        // Only the fixed 80-byte local receive array supplies this count.
+        self.hello_bytes = total.min(80) as u8;
+        self.max_hello_bytes = self.max_hello_bytes.max(self.hello_bytes);
+    }
+    fn reject_hello(&mut self, checks: Option<HelloChecks>) {
+        self.rejected_hellos = self.rejected_hellos.saturating_add(1);
+        self.last_checks = checks;
+        self.phase = StartupPhase::RejectedHello;
+    }
+    fn truncate_hello(&mut self) {
+        self.truncated_hellos = self.truncated_hellos.saturating_add(1);
+        self.phase = StartupPhase::PartialHello;
+    }
+    fn validate_hello(&mut self, checks: HelloChecks) {
+        self.last_checks = Some(checks);
+        self.phase = StartupPhase::ValidatedHello;
+    }
+}
+impl std::fmt::Display for StartupObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "startup={} image_bytes={:?} image_ms={} spawn_ms={} auth_ms={} elapsed_ms={} accepts={} attempts={} hello_bytes={} max_hello_bytes={} rejected={} truncated={} checks={:?}",
+            self.phase.as_str(),
+            self.parent_image_bytes,
+            self.parent_image_elapsed_ms,
+            self.native_spawn_elapsed_ms,
+            self.auth_elapsed_ms,
+            self.elapsed_ms,
+            self.accepted_connections,
+            self.hello_attempts,
+            self.hello_bytes,
+            self.max_hello_bytes,
+            self.rejected_hellos,
+            self.truncated_hellos,
+            self.last_checks
+        )
+    }
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn check_hello(
+    hello: &[u8; 80],
+    capability: &[u8; 32],
+    digest: &[u8; 32],
+    pid: u64,
+) -> HelloChecks {
+    HelloChecks {
+        magic: hello[..8] == MAGIC[..],
+        capability: hello[8..40]
+            .iter()
+            .zip(capability)
+            .fold(0u8, |value, (actual, expected)| value | (actual ^ expected))
+            == 0,
+        image: hello[40..72] == digest[..],
+        process_identity: u64::from_be_bytes(
+            hello[72..80].try_into().expect("fixed hello identity"),
+        ) == pid,
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StdioCleanupFailure {
@@ -247,6 +410,11 @@ impl StdioError {
             native_code: None,
             native_code_unknown: false,
             cleanup: None,
+            startup: None,
+            #[cfg(target_os = "macos")]
+            resources: None,
+            #[cfg(target_os = "macos")]
+            resource_source: None,
         }
     }
     fn io(code: &'static str, error: io::Error) -> Self {
@@ -256,7 +424,29 @@ impl StdioError {
             native_code: error.raw_os_error(),
             native_code_unknown: false,
             cleanup: None,
+            startup: None,
+            #[cfg(target_os = "macos")]
+            resources: None,
+            #[cfg(target_os = "macos")]
+            resource_source: None,
         }
+    }
+    fn with_startup(mut self, observation: StartupObservation) -> Self {
+        self.startup = Some(Box::new(observation));
+        self
+    }
+    #[cfg(target_os = "macos")]
+    fn with_resources(mut self, resources: DarwinStdioResources) -> Self {
+        self.resources = Some(resources);
+        self
+    }
+    #[cfg(target_os = "macos")]
+    fn with_resource_source(
+        mut self,
+        source: mmmm_native_process::darwin::NativeResourceError,
+    ) -> Self {
+        self.resource_source = Some(source);
+        self
     }
 }
 impl std::fmt::Display for StdioError {
@@ -270,14 +460,22 @@ impl std::fmt::Display for StdioError {
         if let Some(cleanup) = &self.cleanup {
             write!(f, "; {cleanup}")?;
         }
+        if let Some(startup) = &self.startup {
+            write!(f, "; {startup}")?;
+        }
         Ok(())
     }
 }
 impl std::error::Error for StdioError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.cleanup
-            .as_ref()
-            .map(|error| error as &(dyn std::error::Error + 'static))
+        if let Some(error) = &self.cleanup {
+            return Some(error);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(error) = &self.resource_source {
+            return Some(error);
+        }
+        None
     }
 }
 
@@ -291,6 +489,7 @@ struct Executable {
     path: PathBuf,
     file: File,
     digest: [u8; 32],
+    byte_length: u64,
 }
 impl Executable {
     fn current(deadline: Instant) -> Result<Self, StdioError> {
@@ -333,6 +532,7 @@ impl Executable {
             path,
             file,
             digest: hasher.finalize().into(),
+            byte_length: bytes,
         })
     }
 }
@@ -428,7 +628,13 @@ impl NativeStdioPort {
         }
         let session_deadline = (started + limits.session).min(owner_deadline);
         let startup_deadline = (started + limits.startup).min(owner_deadline);
-        let executable = Executable::current(startup_deadline)?;
+        let mut startup = StartupObservation::new();
+        let image_started = Instant::now();
+        let image_result = Executable::current(startup_deadline);
+        startup.parent_image_elapsed_ms = elapsed_millis(image_started);
+        startup.elapsed_ms = elapsed_millis(started);
+        let executable = image_result.map_err(|error| error.with_startup(startup.clone()))?;
+        startup.parent_image_bytes = Some(executable.byte_length);
         let listener =
             TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|_| StdioError::new("channel"))?;
         listener
@@ -472,6 +678,8 @@ impl NativeStdioPort {
             packet.extend_from_slice(&value.to_be_bytes());
         }
         deadline_check(startup_deadline)?;
+        startup.phase = StartupPhase::NativeSpawn;
+        let spawn_started = Instant::now();
         let spawned = native::Process::spawn(
             &executable,
             address,
@@ -481,29 +689,39 @@ impl NativeStdioPort {
             startup_deadline,
             reservation,
         );
+        startup.native_spawn_elapsed_ms = elapsed_millis(spawn_started);
+        startup.elapsed_ms = elapsed_millis(started);
         packet.zeroize();
         let mut process = match spawned {
             Ok(p) => p,
             Err(e) => {
                 capability.zeroize();
-                return Err(e);
+                return Err(e.with_startup(startup));
             }
         };
+        startup.phase = StartupPhase::NoConnection;
+        let auth_started = Instant::now();
         let result = authenticate_worker(
             &listener,
             &mut process,
             &capability,
             &executable.digest,
             startup_deadline,
+            &mut startup,
         );
+        startup.auth_elapsed_ms = elapsed_millis(auth_started);
+        startup.elapsed_ms = elapsed_millis(started);
         capability.zeroize();
         let socket = match result {
             Ok(socket) => socket,
-            Err(error) => return Err(cleanup_failed_process(process, error)),
+            Err(error) => {
+                return Err(cleanup_failed_process(process, error.with_startup(startup)));
+            }
         };
         if let Err(error) = deadline_check(startup_deadline) {
+            startup.phase = StartupPhase::ValidatedLate;
             let _ = socket.shutdown(Shutdown::Both);
-            return Err(cleanup_failed_process(process, error));
+            return Err(cleanup_failed_process(process, error.with_startup(startup)));
         }
         Ok(Self {
             bridge: Mutex::new(Bridge {
@@ -759,6 +977,9 @@ impl NativeStdioPort {
             bridge.lines.clear();
             bridge.queued = 0;
             let _ = bridge.socket.shutdown(Shutdown::Both);
+            #[cfg(target_os = "macos")]
+            bridge.process_mut()?.terminate_before(deadline)?;
+            #[cfg(not(target_os = "macos"))]
             bridge.process_mut()?.terminate()?;
         }
         if Instant::now() >= deadline {
@@ -772,6 +993,9 @@ impl NativeStdioPort {
                     if Instant::now() >= deadline {
                         return Err(StdioError::new("drain_uncertain"));
                     }
+                    #[cfg(target_os = "macos")]
+                    let code = bridge.process_mut()?.reap_before(deadline)?;
+                    #[cfg(not(target_os = "macos"))]
                     let code = bridge.process_mut()?.reap()?;
                     let done = StdioDrain {
                         exit_code: code,
@@ -785,6 +1009,11 @@ impl NativeStdioPort {
                             native_code: None,
                             native_code_unknown: false,
                             cleanup: None,
+                            startup: None,
+                            #[cfg(target_os = "macos")]
+                            resources: Some(bridge.process_mut()?.resource_evidence()),
+                            #[cfg(target_os = "macos")]
+                            resource_source: None,
                         });
                     }
                     return Ok(Poll::Ready(done));
@@ -799,6 +1028,20 @@ impl NativeStdioPort {
             return Err(StdioError::new("drain_uncertain"));
         }
         Ok(Poll::Pending)
+    }
+
+    /// Cached actual samples only. Reading evidence does not perform native
+    /// I/O, create a sampling interval, or extend any supervision deadline.
+    #[cfg(target_os = "macos")]
+    pub fn resource_evidence(&self) -> Result<Option<DarwinStdioResources>, StdioError> {
+        let bridge = self
+            .bridge
+            .lock()
+            .map_err(|_| StdioError::new("poisoned"))?;
+        Ok(bridge
+            .process
+            .as_ref()
+            .map(native::Process::resource_evidence))
     }
 
     /// Explicit recovery of the same retained native identity with a newly
@@ -874,6 +1117,17 @@ impl Bridge {
         }
         if Instant::now() >= deadline || Instant::now() >= self.expires {
             return self.fail("deadline");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let resource_deadline = deadline.min(self.expires);
+            if let Err(error) = self
+                .process_mut()?
+                .check_resources(resource_deadline, false)
+            {
+                self.failure = Some(error.clone());
+                return Err(error);
+            }
         }
         if self.process_mut()?.exit_code()?.is_some() {
             return self.fail("worker_exit");
@@ -1049,6 +1303,7 @@ fn authenticate_worker(
     capability: &[u8; 32],
     digest: &[u8; 32],
     deadline: Instant,
+    observation: &mut StartupObservation,
 ) -> Result<TcpStream, StdioError> {
     let mut attempts = 0;
     loop {
@@ -1058,9 +1313,12 @@ fn authenticate_worker(
         if let Some(code) = process.exit_code()? {
             return Err(worker_exit_error(code));
         }
+        #[cfg(target_os = "macos")]
+        process.check_resources(deadline, false)?;
         match listener.accept() {
             Ok((mut socket, address)) if address.ip().is_loopback() => {
                 attempts += 1;
+                observation.observe_connection();
                 if attempts > 4 {
                     return Err(StdioError::new("channel_auth"));
                 }
@@ -1071,8 +1329,14 @@ fn authenticate_worker(
                 let mut n = 0;
                 while n < hello.len() && Instant::now() < deadline {
                     match socket.read(&mut hello[n..]) {
-                        Ok(0) => break,
-                        Ok(read) => n += read,
+                        Ok(0) => {
+                            observation.truncate_hello();
+                            break;
+                        }
+                        Ok(read) => {
+                            n += read;
+                            observation.observe_hello_bytes(n);
+                        }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(5))
                         }
@@ -1080,27 +1344,28 @@ fn authenticate_worker(
                         Err(_) => break,
                     }
                 }
-                let matches = n == hello.len()
-                    && hello[..8] == MAGIC[..]
-                    && hello[8..40]
-                        .iter()
-                        .zip(capability)
-                        .fold(0u8, |v, (a, b)| v | (a ^ b))
-                        == 0
-                    && hello[40..72] == digest[..]
-                    && u64::from_be_bytes(
-                        hello[72..80]
-                            .try_into()
-                            .map_err(|_| StdioError::new("channel_auth"))?,
-                    ) == process.id();
+                let checks = (n == hello.len())
+                    .then(|| check_hello(&hello, capability, digest, process.id()));
                 hello.zeroize();
-                if matches {
-                    deadline_check(deadline)?;
+                if let Some(checks) = checks.filter(|checks| checks.valid()) {
+                    observation.validate_hello(checks);
+                    if let Err(error) = deadline_check(deadline) {
+                        observation.phase = StartupPhase::ValidatedLate;
+                        return Err(error);
+                    }
                     socket
                         .set_nodelay(true)
                         .map_err(|_| StdioError::new("channel"))?;
-                    deadline_check(deadline)?;
+                    if let Err(error) = deadline_check(deadline) {
+                        observation.phase = StartupPhase::ValidatedLate;
+                        return Err(error);
+                    }
+                    #[cfg(target_os = "macos")]
+                    receive_resource_admission(&mut socket, process, deadline)?;
                     return Ok(socket);
+                }
+                if n == hello.len() {
+                    observation.reject_hello(checks);
                 }
             }
             Ok(_) => return Err(StdioError::new("channel_auth")),
@@ -1111,6 +1376,41 @@ fn authenticate_worker(
             Err(_) => return Err(StdioError::new("channel")),
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn receive_resource_admission(
+    socket: &mut TcpStream,
+    process: &mut native::Process,
+    deadline: Instant,
+) -> Result<(), StdioError> {
+    let mut bytes = zeroize::Zeroizing::new(vec![0u8; native::RESOURCE_ADMISSION_LENGTH]);
+    let mut received = 0;
+    while received < bytes.len() {
+        deadline_check(deadline)?;
+        process.check_resources(deadline, false)?;
+        if let Some(code) = process.exit_code()? {
+            return Err(worker_exit_error(code));
+        }
+        match socket.read(&mut bytes[received..]) {
+            Ok(0) => return Err(StdioError::new("native_resource_admission")),
+            Ok(count) => received += count,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(StdioError::io("native_resource_admission", error)),
+        }
+    }
+    deadline_check(deadline)?;
+    if let Some(code) = process.exit_code()? {
+        return Err(worker_exit_error(code));
+    }
+    process.admit_worker_resources(&bytes, deadline)?;
+    if let Some(code) = process.exit_code()? {
+        return Err(worker_exit_error(code));
+    }
+    deadline_check(deadline)
 }
 
 /// Hidden app entry. No secret is accepted in args: only loopback address and
@@ -1128,7 +1428,12 @@ fn worker_failure_exit(error: &StdioError) -> i32 {
     let stage = WORKER_STAGES
         .iter()
         .position(|s| *s == error.code)
-        .unwrap_or(WORKER_STAGES.len() - 1) as u32
+        .unwrap_or_else(|| {
+            WORKER_STAGES
+                .iter()
+                .position(|stage| *stage == "worker_unknown")
+                .expect("fixed unknown worker stage")
+        }) as u32
         + 1;
     #[cfg(windows)]
     {
@@ -1143,11 +1448,17 @@ fn worker_failure_exit(error: &StdioError) -> i32 {
     {
         // POSIX retains only eight status bits. Preserve the fixed stage and
         // explicitly mark native diagnostics unavailable rather than truncate.
-        (if error.native_code.is_some() || error.native_code_unknown {
-            128
+        let native_unavailable = error.native_code.is_some() || error.native_code_unknown;
+        #[cfg(target_os = "macos")]
+        let native_unavailable = native_unavailable || error.resource_source.is_some();
+        if native_unavailable {
+            (128 + stage) as i32
         } else {
-            64
-        } + stage) as i32
+            let status = 64 + stage;
+            // Rust panic exits with 101. Keep that unexpected runtime status
+            // distinct while preserving every earlier fixed stage number.
+            (status + u32::from(status >= 101)) as i32
+        }
     }
 }
 fn worker_exit_error(status: i32) -> StdioError {
@@ -1158,8 +1469,10 @@ fn worker_exit_error(status: i32) -> StdioError {
         None
     };
     #[cfg(unix)]
-    let encoded = if (65..=64 + WORKER_STAGES.len() as i32).contains(&status) {
+    let encoded = if (65..=100).contains(&status) {
         Some(((status - 64) as u32, 65_535u32))
+    } else if (102..=65 + WORKER_STAGES.len() as i32).contains(&status) {
+        Some(((status - 65) as u32, 65_535u32))
     } else if (129..=128 + WORKER_STAGES.len() as i32).contains(&status) {
         Some(((status - 128) as u32, 65_534u32))
     } else {
@@ -1244,12 +1557,21 @@ pub fn worker_entry(args: &[String]) -> Result<(), StdioError> {
                 if now >= native_deadline {
                     std::process::exit(124);
                 }
+                #[cfg(target_os = "macos")]
+                if let Err(error) = native::check_worker_resource_gap(anchor) {
+                    // A lock-free timestamp check cannot be held behind the
+                    // sampler's native query. Scheduling may still delay it;
+                    // the exit stage does not transmit the late gap's value.
+                    unsafe { libc::_exit(worker_failure_exit(&error)) };
+                }
                 std::thread::sleep(
                     Duration::from_millis(100).min(Duration::from_millis(native_deadline - now)),
                 );
             }
         })
         .map_err(|_| StdioError::new("worker_thread"))?;
+    #[cfg(target_os = "macos")]
+    let resources = native::worker_resources(native_deadline, anchor)?;
     let executable = Executable::current(expires)?;
     if packet[32..64] != executable.digest {
         packet.zeroize();
@@ -1275,6 +1597,14 @@ pub fn worker_entry(args: &[String]) -> Result<(), StdioError> {
     hello.zeroize();
     sent.map_err(|e| StdioError::io("worker_hello", e))?;
     deadline_check(expires)?;
+    #[cfg(target_os = "macos")]
+    {
+        let receipt = resources.admission_receipt()?;
+        socket
+            .write_all(&receipt)
+            .map_err(|error| StdioError::io("native_resource_admission", error))?;
+        deadline_check(expires)?;
+    }
     socket
         .set_write_timeout(None)
         .map_err(|e| StdioError::io("worker_hello", e))?;

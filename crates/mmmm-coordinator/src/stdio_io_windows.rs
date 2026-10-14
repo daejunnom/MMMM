@@ -607,6 +607,7 @@ impl Process {
                             native_code: None,
                             native_code_unknown: false,
                             cleanup: None,
+                            startup: None,
                         });
                     }
                     return Ok(());

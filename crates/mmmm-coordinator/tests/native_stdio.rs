@@ -142,6 +142,8 @@ impl Scenario {
             owner_deadline,
         )
         .unwrap_or_else(|error| {
+            #[cfg(target_os = "macos")]
+            eprintln!("native stdio resource startup failure: {:?}", error.resources);
             panic!(
                 "native fixture must start real hidden worker: {error}; drained={}; cleanup={:?}; elapsed_ms={}",
                 error.drained,
@@ -171,11 +173,45 @@ impl Scenario {
                         Poll::Ready(proof.clone()),
                         "drain must be idempotent"
                     );
+                    #[cfg(target_os = "macos")]
+                    self.assert_and_report_resources();
                     return proof;
                 }
                 Poll::Pending => std::thread::sleep(Duration::from_millis(5)),
             }
         }
+    }
+    #[cfg(target_os = "macos")]
+    fn assert_and_report_resources(&self) {
+        let evidence = self
+            .port
+            .resource_evidence()
+            .expect("cached native resource evidence must remain readable")
+            .expect("the native owner remains available after confirmed drain");
+        assert_eq!(evidence.policy, "darwin-stdio-sampled-resources/1");
+        assert_eq!(evidence.vm_limit_bytes, 512 * 1024 * 1024 * 1024);
+        assert_eq!(evidence.rss_threshold_bytes, 256 * 1024 * 1024);
+        assert_eq!(evidence.footprint_threshold_bytes, 256 * 1024 * 1024);
+        assert_eq!(evidence.worker_limit, 1);
+        assert_eq!(evidence.target_sample_interval_millis, 100);
+        assert_eq!(evidence.maximum_sample_gap_millis, 1000);
+        assert!(evidence.child_admitted);
+        assert!(evidence.parent_samples > 0);
+        assert_eq!(evidence.child_as_soft_bytes, Some(evidence.vm_limit_bytes));
+        assert_eq!(evidence.child_as_hard_bytes, Some(evidence.vm_limit_bytes));
+        assert!(
+            evidence
+                .child_admission_samples
+                .is_some_and(|count| count > 0)
+        );
+        assert!(evidence.activation_interval_millis.is_some());
+        assert!(evidence.sampling_may_overshoot);
+        assert!(evidence.activation_memory_coverage_unknown);
+        assert!(evidence.parent_sampling_is_poll_driven);
+        assert!(evidence.child_samples_after_admission_unobserved);
+        // These are actual cached admission/poll samples. Later worker-local
+        // samples and memory peaks between samples remain unobserved here.
+        eprintln!("native stdio resource evidence: {evidence:?}");
     }
 }
 fn read(

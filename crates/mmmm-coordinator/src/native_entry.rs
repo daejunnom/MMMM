@@ -9,7 +9,10 @@ use crate::{
     host_relay::{self, RelayError},
     lifecycle::{Coordinator, CoordinatorError},
     local_setup::{LocalHostSetup, LocalSetupError, register_local_host_setup},
-    native_source_ingress::{NativeSourceDocument, NativeSourceInput, NativeSourceKind},
+    native_import_files::{ImportReadBudget, InputRole, read_selected, validate_selection},
+    native_source_ingress::{
+        NativeRawSourceResource, NativeSourceDocument, NativeSourceInput, NativeSourceKind,
+    },
     production_factory::ProductionFactory,
     service::{RequestBudget, ServiceError},
     stdio_io::{NativeStdioPort, StdioError, StdioLimits},
@@ -26,6 +29,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub use crate::native_import_files::ImportFileError;
+
 const OUTPUT: Duration = Duration::from_secs(5);
 const DRAIN: Duration = Duration::from_secs(3);
 const POLL: Duration = Duration::from_millis(5);
@@ -41,6 +46,7 @@ pub enum EntryError {
     Arguments,
     SourceArguments,
     SourceRequest(ServiceError),
+    SourceFile(ImportFileError),
     Deadline,
     Daemon(DaemonError),
     Launch(DaemonLaunchError),
@@ -75,8 +81,9 @@ impl std::fmt::Display for EntryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Arguments => f.write_str("Native command arguments are invalid"),
-            Self::SourceArguments => f.write_str("Native source import requires 1..256 --document <prefab|instance|clip>:<JSON> values, each at most 8 MiB and at most 32 MiB combined; OS argv limits may be smaller"),
+            Self::SourceArguments => f.write_str("Native source import requires at least one document and at most 256 combined document/resource inputs: --document <kind>:<JSON>, --document-file <kind>:<absolute JSON path>, and adjacent --resource-descriptor-file/--resource-bytes-file paths; kinds are prefab|instance|clip and OS argv limits may be smaller"),
             Self::SourceRequest(error) => write!(f, "{}: Native source request could not continue", error.code),
+            Self::SourceFile(error) => error.fmt(f),
             Self::Deadline => f.write_str("Native command startup or delivery deadline reached"),
             Self::Daemon(error) => error.fmt(f),
             Self::Launch(error) => error.fmt(f),
@@ -102,6 +109,7 @@ impl std::error::Error for EntryError {
         match self {
             Self::Daemon(e) => Some(e),
             Self::SourceRequest(e) => Some(e),
+            Self::SourceFile(e) => Some(e),
             Self::Launch(e) => Some(e),
             Self::Setup(e) => Some(e),
             Self::Relay(e) => Some(e),
@@ -144,6 +152,8 @@ enum Command {
         project: ProjectId,
         expected_revision: Sha256Digest,
         documents: Vec<CommandDocument>,
+        document_files: Vec<CommandDocumentFile>,
+        raw_resources: Vec<CommandRawFiles>,
     },
     HostBridge,
     Owned(Vec<String>),
@@ -154,6 +164,27 @@ struct CommandDocument {
     // Prefix removal is the only transformation. Strict parse/domain checks
     // and projected/raw pin separation remain owned by the existing ingress.
     source: String,
+}
+
+struct CommandDocumentFile {
+    kind: NativeSourceKind,
+    path: PathBuf,
+}
+struct CommandRawFiles {
+    descriptor: PathBuf,
+    bytes: PathBuf,
+}
+struct LoadedDocument {
+    kind: NativeSourceKind,
+    bytes: Vec<u8>,
+}
+struct LoadedRawResource {
+    metadata: Vec<u8>,
+    bytes: Vec<u8>,
+}
+struct LoadedNativeInputs {
+    documents: Vec<LoadedDocument>,
+    resources: Vec<LoadedRawResource>,
 }
 
 /// Returns false only for a command owned by the ordinary CLI/MCP facade.
@@ -295,6 +326,8 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
             project,
             expected_revision,
             documents,
+            document_files,
+            raw_resources,
         } => {
             let deadline = started + SOURCE_IMPORT;
             let budget = RequestBudget::until(deadline, Arc::new(AtomicBool::new(false)))
@@ -312,11 +345,31 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
                 &budget,
             )
             .map_err(EntryError::Daemon)?;
-            let raw_documents = documents
+            // The original Store is already locked and its actual native owner
+            // and Project/head are verified before any selected source opens.
+            let loaded = load_native_inputs(
+                &prepared,
+                &project,
+                &expected_revision,
+                documents,
+                &document_files,
+                &raw_resources,
+                &budget,
+            )?;
+            let raw_documents = loaded
+                .documents
                 .iter()
                 .map(|document| NativeSourceDocument {
                     kind: document.kind,
-                    bytes: document.source.as_bytes(),
+                    bytes: &document.bytes,
+                })
+                .collect::<Vec<_>>();
+            let raw_resources = loaded
+                .resources
+                .iter()
+                .map(|resource| NativeRawSourceResource {
+                    metadata: &resource.metadata,
+                    bytes: &resource.bytes,
                 })
                 .collect::<Vec<_>>();
             let receipt = prepared
@@ -325,7 +378,7 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
                     expected_revision: &expected_revision,
                     documents: &raw_documents,
                     retained_resources: &[],
-                    raw_resources: &[],
+                    raw_resources: &raw_resources,
                 })
                 .map_err(EntryError::Daemon)?;
             deliver_sources(receipt, &budget, |value, deadline| {
@@ -368,27 +421,58 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
     }
     let mut options = std::collections::BTreeMap::new();
     let mut documents = Vec::new();
+    let mut document_files = Vec::new();
+    let mut raw_resources = Vec::new();
+    let mut pending_descriptor = None;
     let mut source_total = 0usize;
     for pair in args[1..].chunks(2) {
         if pair.len() != 2 {
             return Err(EntryError::Arguments);
         }
-        if command == "source-import" && pair[0] == "--document" {
-            let (kind, source) = pair[1].split_once(':').ok_or(EntryError::SourceArguments)?;
-            let kind = match kind {
-                "prefab" => NativeSourceKind::Prefab,
-                "instance" => NativeSourceKind::Instance,
-                "clip" => NativeSourceKind::Clip,
-                _ => return Err(EntryError::SourceArguments),
-            };
-            source_total = checked_source_total(documents.len(), source_total, source.len())?;
-            documents.push(CommandDocument {
-                kind,
-                source: source.to_owned(),
-            });
-        } else if options.insert(pair[0].as_str(), pair[1].as_str()).is_some() {
+        if command == "source-import" {
+            if let Some(descriptor) = pending_descriptor.take() {
+                if pair[0] != "--resource-bytes-file" {
+                    return Err(EntryError::SourceArguments);
+                }
+                let bytes = selected_path(&pair[1], InputRole::ResourceBytes)?;
+                raw_resources.push(CommandRawFiles { descriptor, bytes });
+                continue;
+            }
+            let count =
+                source_input_count(documents.len(), document_files.len(), raw_resources.len())?;
+            match pair[0].as_str() {
+                "--document" => {
+                    let (kind, source) = document_selector(&pair[1])?;
+                    source_total = checked_source_total(count, source_total, source.len())?;
+                    documents.push(CommandDocument {
+                        kind,
+                        source: source.to_owned(),
+                    });
+                    continue;
+                }
+                "--document-file" => {
+                    checked_source_count(count)?;
+                    let (kind, name) = document_selector(&pair[1])?;
+                    let path = selected_path(name, InputRole::Document)?;
+                    document_files.push(CommandDocumentFile { kind, path });
+                    continue;
+                }
+                "--resource-descriptor-file" => {
+                    checked_source_count(count)?;
+                    pending_descriptor =
+                        Some(selected_path(&pair[1], InputRole::ResourceDescriptor)?);
+                    continue;
+                }
+                "--resource-bytes-file" => return Err(EntryError::SourceArguments),
+                _ => (),
+            }
+        }
+        if options.insert(pair[0].as_str(), pair[1].as_str()).is_some() {
             return Err(EntryError::Arguments);
         }
+    }
+    if pending_descriptor.is_some() {
+        return Err(EntryError::SourceArguments);
     }
     let root = PathBuf::from(options.remove("--data-root").ok_or(EntryError::Arguments)?);
     if !root.is_absolute() {
@@ -462,7 +546,7 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
             }
         }
         "source-import" => {
-            if documents.is_empty() {
+            if documents.is_empty() && document_files.is_empty() {
                 return Err(EntryError::SourceArguments);
             }
             Command::SourceImport {
@@ -476,6 +560,8 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
                 )
                 .map_err(|_| EntryError::Arguments)?,
                 documents,
+                document_files,
+                raw_resources,
             }
         }
         _ => return Err(EntryError::Arguments),
@@ -486,8 +572,40 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
     Ok(Some(parsed))
 }
 
+fn document_selector(value: &str) -> Result<(NativeSourceKind, &str), EntryError> {
+    let (kind, source) = value.split_once(':').ok_or(EntryError::SourceArguments)?;
+    let kind = match kind {
+        "prefab" => NativeSourceKind::Prefab,
+        "instance" => NativeSourceKind::Instance,
+        "clip" => NativeSourceKind::Clip,
+        _ => return Err(EntryError::SourceArguments),
+    };
+    Ok((kind, source))
+}
+
+fn selected_path(value: &str, role: InputRole) -> Result<PathBuf, EntryError> {
+    let path = PathBuf::from(value);
+    validate_selection(&path, role).map_err(EntryError::SourceFile)?;
+    Ok(path)
+}
+
+fn checked_source_count(count: usize) -> Result<(), EntryError> {
+    if count >= MAX_SOURCE_DOCUMENTS {
+        return Err(EntryError::SourceArguments);
+    }
+    Ok(())
+}
+
+fn source_input_count(inline: usize, files: usize, resources: usize) -> Result<usize, EntryError> {
+    inline
+        .checked_add(files)
+        .and_then(|count| count.checked_add(resources))
+        .ok_or(EntryError::SourceArguments)
+}
+
 fn checked_source_total(count: usize, total: usize, length: usize) -> Result<usize, EntryError> {
-    if count >= MAX_SOURCE_DOCUMENTS || length == 0 || length > MAX_SOURCE_DOCUMENT {
+    checked_source_count(count)?;
+    if length == 0 || length > MAX_SOURCE_DOCUMENT {
         return Err(EntryError::SourceArguments);
     }
     let next = total
@@ -497,6 +615,85 @@ fn checked_source_total(count: usize, total: usize, length: usize) -> Result<usi
         return Err(EntryError::SourceArguments);
     }
     Ok(next)
+}
+
+fn load_native_inputs(
+    prepared: &PreparedDaemon,
+    project: &ProjectId,
+    expected_revision: &Sha256Digest,
+    documents: Vec<CommandDocument>,
+    document_files: &[CommandDocumentFile],
+    raw_resources: &[CommandRawFiles],
+    budget: &RequestBudget,
+) -> Result<LoadedNativeInputs, EntryError> {
+    budget.check().map_err(EntryError::SourceRequest)?;
+    let handles = prepared.handles();
+    let workspace = handles.workspace.as_ref().ok_or_else(|| {
+        EntryError::Daemon(DaemonError::Composition(ServiceError::new(
+            "WORKSPACE_UNAVAILABLE",
+            "Native source file import requires its verified workspace",
+        )))
+    })?;
+    if handles.configured_project.as_ref() != Some(project)
+        || &workspace.project_revision != expected_revision
+    {
+        return Err(EntryError::Daemon(DaemonError::Composition(
+            ServiceError::new(
+                "PLAN_STALE",
+                "Native source file import Project or expected revision differs from its workspace",
+            ),
+        )));
+    }
+    let initial_bytes = documents.iter().try_fold(0usize, |total, document| {
+        total
+            .checked_add(document.source.len())
+            .ok_or(EntryError::SourceArguments)
+    })?;
+    let mut totals = ImportReadBudget::new(initial_bytes).map_err(EntryError::SourceFile)?;
+    let mut loaded = LoadedNativeInputs {
+        documents: documents
+            .into_iter()
+            .map(|document| LoadedDocument {
+                kind: document.kind,
+                bytes: document.source.into_bytes(),
+            })
+            .collect(),
+        resources: Vec::new(),
+    };
+    for document in document_files {
+        loaded.documents.push(LoadedDocument {
+            kind: document.kind,
+            bytes: read_selected(
+                &document.path,
+                InputRole::Document,
+                &workspace.witness,
+                budget,
+                &mut totals,
+            )
+            .map_err(EntryError::SourceFile)?,
+        });
+    }
+    for resource in raw_resources {
+        let metadata = read_selected(
+            &resource.descriptor,
+            InputRole::ResourceDescriptor,
+            &workspace.witness,
+            budget,
+            &mut totals,
+        )
+        .map_err(EntryError::SourceFile)?;
+        let bytes = read_selected(
+            &resource.bytes,
+            InputRole::ResourceBytes,
+            &workspace.witness,
+            budget,
+            &mut totals,
+        )
+        .map_err(EntryError::SourceFile)?;
+        loaded.resources.push(LoadedRawResource { metadata, bytes });
+    }
+    budget.check().map_err(EntryError::SourceRequest)?;
+    Ok(loaded)
 }
 
 fn source_receipt_value(receipt: &NativeOwnedSourceCommitReceipt) -> Value {
@@ -828,6 +1025,19 @@ mod tests {
         fn open(&self) -> DurableStore {
             DurableStore::open(StoreConfig::new(self.0.clone())).unwrap()
         }
+        fn selection(&self, name: &str) -> PathBuf {
+            // The native file selector accepts ordinary drive paths. The test
+            // root retains its canonical spelling for ownership/cleanup only.
+            #[cfg(windows)]
+            let selected_root = {
+                let canonical = self.0.to_str().unwrap();
+                PathBuf::from(canonical.strip_prefix("\\\\?\\").unwrap_or(canonical))
+            };
+            #[cfg(not(windows))]
+            let selected_root = self.0.clone();
+            assert_eq!(fs::canonicalize(&selected_root).unwrap(), self.0);
+            selected_root.join(name)
+        }
         fn initialize(&self) -> ProjectBootstrapReceipt {
             crate::native_project::create_native_project(
                 &mut self.open(),
@@ -909,6 +1119,19 @@ mod tests {
         });
         prefab["revision"] = json!(projected_digest("Prefab", &prefab).unwrap());
         prefab
+    }
+    fn import_file_io_kind(error: &ImportFileError, kind: std::io::ErrorKind) -> bool {
+        let mut current: &(dyn std::error::Error + 'static) = error;
+        for _ in 0..8 {
+            if let Some(error) = current.downcast_ref::<std::io::Error>() {
+                return error.kind() == kind;
+            }
+            let Some(source) = current.source() else {
+                return false;
+            };
+            current = source;
+        }
+        false
     }
 
     #[test]
@@ -1227,6 +1450,240 @@ mod tests {
             root.open().project(&initialized.project_id).unwrap()["revision"],
             initialized.project_revision.as_str()
         );
+        assert!(!root.0.join("runtime").exists());
+    }
+
+    #[test]
+    fn selected_file_parser_preserves_drive_colons_and_requires_adjacent_raw_pairs() {
+        let document = PathBuf::from(root()).join("selected-prefab.json");
+        let descriptor = PathBuf::from(root()).join("resource-reference.json");
+        let bytes = PathBuf::from(root()).join("selected-content.bin");
+        let mut input = import_args();
+        input.extend([
+            "--document-file".into(),
+            format!("prefab:{}", document.display()),
+        ]);
+        input.extend([
+            "--resource-descriptor-file".into(),
+            descriptor.to_string_lossy().into_owned(),
+        ]);
+        input.extend([
+            "--resource-bytes-file".into(),
+            bytes.to_string_lossy().into_owned(),
+        ]);
+        let Some(Command::SourceImport {
+            documents,
+            document_files,
+            raw_resources,
+            ..
+        }) = parse(&input).unwrap()
+        else {
+            panic!("explicit file batch not selected");
+        };
+        assert!(documents.is_empty());
+        assert_eq!(document_files.len(), 1);
+        assert_eq!(document_files[0].kind, NativeSourceKind::Prefab);
+        assert_eq!(document_files[0].path, document);
+        assert_eq!(raw_resources.len(), 1);
+        assert_eq!(raw_resources[0].descriptor, descriptor);
+        assert_eq!(raw_resources[0].bytes, bytes);
+        // These are lexical paths and need not exist: the parser must not open,
+        // hash, create a Store or acquire a native owner to accept a selector.
+        for options in [
+            vec!["--resource-descriptor-file", descriptor.to_str().unwrap()],
+            vec!["--resource-bytes-file", bytes.to_str().unwrap()],
+            vec![
+                "--resource-descriptor-file",
+                descriptor.to_str().unwrap(),
+                "--document",
+                "prefab:{}",
+            ],
+            vec![
+                "--resource-descriptor-file",
+                descriptor.to_str().unwrap(),
+                "--resource-descriptor-file",
+                descriptor.to_str().unwrap(),
+            ],
+        ] {
+            let mut invalid = import_args();
+            invalid.extend(args(&options));
+            assert!(matches!(parse(&invalid), Err(EntryError::SourceArguments)));
+        }
+        let mut many = import_args();
+        for _ in 0..MAX_SOURCE_DOCUMENTS {
+            many.extend([
+                "--document-file".into(),
+                format!("prefab:{}", document.display()),
+            ]);
+        }
+        many.extend([
+            "--resource-descriptor-file".into(),
+            descriptor.to_string_lossy().into_owned(),
+        ]);
+        many.extend([
+            "--resource-bytes-file".into(),
+            bytes.to_string_lossy().into_owned(),
+        ]);
+        assert!(matches!(parse(&many), Err(EntryError::SourceArguments)));
+        let mut raw_only = import_args();
+        raw_only.extend([
+            "--resource-descriptor-file".into(),
+            descriptor.to_string_lossy().into_owned(),
+        ]);
+        raw_only.extend([
+            "--resource-bytes-file".into(),
+            bytes.to_string_lossy().into_owned(),
+        ]);
+        assert!(matches!(parse(&raw_only), Err(EntryError::SourceArguments)));
+    }
+
+    #[test]
+    fn selected_large_document_and_raw_content_share_the_actual_atomic_import() {
+        let root = ImportRoot::new();
+        let initialized = root.initialize();
+        let (budget, _) = import_budget();
+        let raw_bytes = (0..128 * 1024)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect::<Vec<_>>();
+        let descriptor = json!({"resourceId":"resource-file-entry","sha256":raw_digest(&raw_bytes),
+            "mediaType":"application/octet-stream","sizeBytes":raw_bytes.len()});
+        let descriptor_bytes = [
+            b" \n".as_slice(),
+            &encode_json(&descriptor).unwrap(),
+            b"\n ",
+        ]
+        .concat();
+        let mut prefab = import_prefab();
+        prefab["resources"] = json!([descriptor]);
+        prefab["revision"] = json!(projected_digest("Prefab", &prefab).unwrap());
+        let mut original = vec![b' '; 96 * 1024];
+        original.extend(encode_json(&prefab).unwrap());
+        original.push(b'\n');
+        assert!(original.len() > 64 * 1024);
+        let document_file = root.selection("large-prefab.json");
+        let descriptor_file = root.selection("resource-reference.json");
+        let content_file = root.selection("selected-content.bin");
+        fs::write(&document_file, &original).unwrap();
+        fs::write(&descriptor_file, &descriptor_bytes).unwrap();
+        fs::write(&content_file, &raw_bytes).unwrap();
+        let prepared = root.prepare(&initialized.project_id, &budget);
+        let loaded = load_native_inputs(
+            &prepared,
+            &initialized.project_id,
+            &initialized.project_revision,
+            Vec::new(),
+            &[CommandDocumentFile {
+                kind: NativeSourceKind::Prefab,
+                path: document_file.clone(),
+            }],
+            &[CommandRawFiles {
+                descriptor: descriptor_file.clone(),
+                bytes: content_file.clone(),
+            }],
+            &budget,
+        )
+        .unwrap();
+        assert_eq!(loaded.documents[0].bytes, original);
+        assert_eq!(loaded.resources[0].metadata, descriptor_bytes);
+        assert_eq!(loaded.resources[0].bytes, raw_bytes);
+        let documents = loaded
+            .documents
+            .iter()
+            .map(|document| NativeSourceDocument {
+                kind: document.kind,
+                bytes: &document.bytes,
+            })
+            .collect::<Vec<_>>();
+        let resources = loaded
+            .resources
+            .iter()
+            .map(|resource| NativeRawSourceResource {
+                metadata: &resource.metadata,
+                bytes: &resource.bytes,
+            })
+            .collect::<Vec<_>>();
+        let receipt = prepared
+            .import_native_sources(&NativeSourceInput {
+                project: &initialized.project_id,
+                expected_revision: &initialized.project_revision,
+                documents: &documents,
+                retained_resources: &[],
+                raw_resources: &resources,
+            })
+            .unwrap();
+        let stored = root.open();
+        assert_eq!(receipt.documents.len(), 1);
+        assert_eq!(receipt.resources.len(), 1);
+        assert_eq!(stored.read_blob(&receipt.documents[0].1).unwrap(), original);
+        assert_eq!(receipt.documents[0].1.digest, raw_digest(&original));
+        assert_eq!(
+            receipt.documents[0].0.revision.as_str(),
+            prefab["revision"].as_str().unwrap()
+        );
+        assert_eq!(
+            stored.read_blob(&receipt.resources[0].1).unwrap(),
+            raw_bytes
+        );
+        assert_eq!(receipt.resources[0].1.digest, raw_digest(&raw_bytes));
+        assert_eq!(
+            stored.project(&initialized.project_id).unwrap()["revision"],
+            receipt.project_revision.as_str()
+        );
+        assert_eq!(fs::read(document_file).unwrap(), original);
+        assert_eq!(fs::read(descriptor_file).unwrap(), descriptor_bytes);
+        assert_eq!(fs::read(content_file).unwrap(), raw_bytes);
+        assert!(!root.0.join("runtime").exists());
+    }
+
+    #[test]
+    fn a_later_selected_file_failure_does_not_publish_the_earlier_document() {
+        let root = ImportRoot::new();
+        let initialized = root.initialize();
+        let (budget, _) = import_budget();
+        let original = encode_json(&import_prefab()).unwrap();
+        let selected = root.selection("selected-prefab.json");
+        fs::write(&selected, &original).unwrap();
+        let before = root.open().project(&initialized.project_id).unwrap();
+        let prepared = root.prepare(&initialized.project_id, &budget);
+        let result = load_native_inputs(
+            &prepared,
+            &initialized.project_id,
+            &initialized.project_revision,
+            Vec::new(),
+            &[
+                CommandDocumentFile {
+                    kind: NativeSourceKind::Prefab,
+                    path: selected.clone(),
+                },
+                CommandDocumentFile {
+                    kind: NativeSourceKind::Clip,
+                    path: root.selection("missing-clip.json"),
+                },
+            ],
+            &[],
+            &budget,
+        );
+        assert!(matches!(result, Err(EntryError::SourceFile(ref error))
+            if import_file_io_kind(error, std::io::ErrorKind::NotFound)));
+        drop(prepared);
+        let stored = root.open();
+        assert_eq!(stored.project(&initialized.project_id).unwrap(), before);
+        assert_eq!(
+            stored
+                .project_revision(&initialized.project_id, &initialized.project_revision)
+                .unwrap(),
+            before
+        );
+        let unstaged_blob = mmmm_runtime::storage::BlobRef {
+            digest: raw_digest(&original),
+            byte_length: original.len() as u64,
+        };
+        assert!(
+            matches!(stored.read_blob(&unstaged_blob), Err(StorageError::Io(ref error))
+            if error.kind() == std::io::ErrorKind::NotFound)
+        );
+        assert_eq!(fs::read(selected).unwrap(), original);
+        assert!(!root.0.join("missing-clip.json").exists());
         assert!(!root.0.join("runtime").exists());
     }
 }
