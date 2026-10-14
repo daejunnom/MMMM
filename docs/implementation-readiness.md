@@ -661,6 +661,24 @@ stdout 0·Compiling 147건·Finished/test result 0건이므로 실제 테스트 
 성공 metadata다. Windows Rust job과 새 성공 archive 전체의 인수는 이 기록에서
 아직 확정하지 않았다. D051은 이 CI source에 포함되지 않는다.
 
+이 Linux 오류에는 D052의 좁은 분류를 추가했다. 원 PID directory FD를 확보한 뒤
+EnumeratedCandidate의 최초 Stat/Open에서 실제 raw ESRCH 3일 때만 후보를 건너뛴다.
+[공식 procfs 문서](https://docs.kernel.org/filesystems/proc.html#process-specific-subdirectories)는
+종료한 proc FD가 재사용된 숫자 PID의 새 process에 작용하지 않으며 ESRCH가 가능함을
+설명한다. [Linux v6.11 구현](https://raw.githubusercontent.com/torvalds/linux/v6.11/fs/proc/base.c)의
+PID directory permission도 task가 없으면 ESRCH다. 이는 허용한 경로의 근거이며 실제
+runner의 정확한 kernel branch나 후보 소유권을 복원한 관측은 아니다.
+
+그 None 자체는 identity·owned exit·RSS 0·empty·signal 권한을 만들지 않는다. 남은
+scan과 원 leader 재검증 뒤의 기존 Complete/Pending 및 drain을 유지한다. ENOENT,
+다른 errno와 raw errno 부재, leader/member·RSS·다른 operation은 원 typed 오류다.
+새 query·retry·sleep·기한·cadence·상한 변경 없이 독립 검토 finding 0을 확인했다.
+기존 두 순수 검사의 27개 role/file/operation 조합과 다른 errno 경계를 확장했으며
+새 fixture는 만들지 않았다. Windows 도구 lib 227 PASS·1 ignored·command 0/16,031 ms·
+명시 owned-tail 종료와 all-targets strict Clippy 0/2,793 ms·자연 종료를 확인했다.
+관련 drain·output·export·scratch 정리·lease 해제와 오류 0을 보존했다. 실제 Linux
+native 재검증 및 이 좁은 전이의 새 실행 관측은 별도다.
+
 ### 게임 실행 전의 launcher 및 보존 경로 준비
 
 Windows의 별도 help action에서 실제 `:fabric-host:runServer` task의 metadata만
@@ -747,6 +765,18 @@ command 0·932 ms·helper 524 ms·stderr 0·오류 0이며 원 파일을 덮거�
 정상 drain·출력·export·scratch 정리와 root/build lease 해제 뒤 자료를 보존했다.
 이 준비는 실제 mod 로드·ordinary origin 검사·observer 설치나 관리자 pairing을
 대신하지 않는다. EULA와 게임은 계속 미실행이다.
+
+실제 게임용 observer DLL을 Windows MSVC target으로 locked build했다. command
+0·4,251 ms·명시 owned-tail 종료이며 721,408 bytes·SHA
+`ceb8fcb92c467d0ae1aa1b85e4b0ab3e81f6550219073b9ebf4bf54e4c54a9b7`다. 별도 소유
+game root 재획득 실행에서 단일 새 copy를 CreateNew·flush·같은 handle digest로
+대조했다. observer JAR은 28,270 bytes·SHA
+`4b2ebdb935eb25c186c978330a992f2173ea4891b2514bc152b121bae7abdf73`이며 game cwd 기준
+ASCII 상대 이름 186자·상한 259 안임을 관측했다. JDK archive·modules·선택 JNI DLL의
+크기와 digest도 같은 준비에서 관측했으며 선택 source 합계는 302,743,443 bytes다.
+command 0·1,424 ms·helper 1,008 ms·stderr 0으로 copy와 자료를 보존하고 정상 drain·
+출력·export·scratch 및 root/build lease 해제를 확인했다. 이는 whole-JDK image·
+classpath·SourceAdmission·게임에서의 observer 설치 성공을 의미하지 않는다.
 
 실패한 실행의 원본 판정은 유지한다. native drain과 정확한 소유 기록을 확인하고
 로그를 별도로 내보내며 digest를 대조한 경우에만 해당 실행의 알려진 임시 파일을

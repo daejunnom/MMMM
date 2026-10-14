@@ -79,6 +79,8 @@
 
 | MMMM-D051 | Unix bootstrap의 Darwin 종료 진단은 이미 수행한 native 관측과 검증 도달 여부만 보존하고 strict 판정을 바꾸지 않는다. | TaskInfo·Rusage의 원 stage/result/errno를 BSD 재조회 전에 캡처하고, 성공한 Rusage에서만 start/exit timestamp 존재 bool을 남긴다. 이미 읽은 BSD status·INEXIT와 memory identity 검사의 수행·결과, 현재 scan의 기존 leader anchor 비교까지 실제 도달했는지를 닫힌 optional first/last/포화 count로 보존한다. 후속 BSD·identity 실패와 membership-only cleanup에서도 원 사실을 잃지 않으며 raw PID·UID·PGID·birth·token·경로는 직렬화하지 않는다. 검사를 앞당기거나 native query·retry·sleep을 추가하지 않고 원 오류 문자열·분류·정상 반환·signal·기한·cadence·자원 상한을 유지한다. 순수 AST 검사는 실제 정의를 mock으로 실행하며 실제 macOS 전이·과거 실패 원인 복원·게임 인수를 발급하지 않는다. |
 
+| MMMM-D052 | Linux의 고정 proc directory FD에서 소유 판정 전 열거 후보의 최초 stat open이 실제 ESRCH인 경우에만 사라진 후보로 건너뛴다. | EnumeratedCandidate·Stat·Open·raw errno 3의 교집합을 원 directory FD 확보 뒤 한 호출에만 적용한다. 최초 identity·group·pidfd나 owned exit witness를 발급하지 않으며 None 자체를 RSS 0·Complete·empty·Pending 또는 signal 권한으로 사용하지 않는다. 남은 scan과 원 leader 재검증 및 기존 Complete/Pending·drain 조건을 그대로 따른다. reserved leader·owned member·다른 파일과 operation·ENOENT·다른 errno·raw errno 부재는 원 typed 오류를 유지한다. 기존 열린 stat read의 ESRCH 경계와 proc FD가 재사용 PID로 재결합하지 않는 공식 의미에 근거하며 실제 CI runner의 kernel stack을 관측했다고 주장하지 않는다. 추가 native query·retry·sleep·기한·cadence·자원 상한 변경은 없다. |
+
 ## 구현 전에 확인할 항목
 
 - 원본 계약과 예제 패키지의 내용, 버전 및 digest.

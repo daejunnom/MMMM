@@ -610,6 +610,18 @@ impl MetadataOperation {
     }
 }
 
+fn initial_candidate_stat_open_disappeared(
+    process: ProcessRole,
+    file: MetadataRole,
+    operation: MetadataOperation,
+    error: &std::io::Error,
+) -> bool {
+    matches!(process, ProcessRole::EnumeratedCandidate)
+        && matches!(file, MetadataRole::Stat)
+        && matches!(operation, MetadataOperation::Open)
+        && error.raw_os_error() == Some(3)
+}
+
 fn metadata_io_error(
     process: ProcessRole,
     file: MetadataRole,
@@ -1226,7 +1238,30 @@ mod native {
             ));
         }
         let directory = unsafe { File::from_raw_fd(descriptor) };
-        let mut stat = open_file(&directory, MetadataRole::Stat, role)?;
+        let mut stat = match open_file_io(&directory, MetadataRole::Stat.file_name()?) {
+            Ok(stat) => stat,
+            Err(error)
+                if initial_candidate_stat_open_disappeared(
+                    role,
+                    MetadataRole::Stat,
+                    MetadataOperation::Open,
+                    &error,
+                ) =>
+            {
+                // This proc directory FD cannot retarget a reused numeric PID:
+                // https://docs.kernel.org/filesystems/proc.html#process-specific-subdirectories
+                // No initial identity or owned-process exit witness was obtained.
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(metadata_io_error(
+                    role,
+                    MetadataRole::Stat,
+                    MetadataOperation::Open,
+                    error,
+                ));
+            }
+        };
         let Some(initial) = read_stat(&mut stat, pid, role)? else {
             return Ok(None);
         };
@@ -1308,6 +1343,7 @@ mod native {
         }
     }
 
+    #[cfg(test)]
     fn open_file(
         directory: &File,
         file: MetadataRole,
@@ -2254,6 +2290,7 @@ pub(super) mod tests {
 
     #[test]
     fn metadata_failure_roles_stay_bounded_without_native_details() {
+        let mut disappeared_contexts = Vec::new();
         for process in [
             ProcessRole::ReservedLeader,
             ProcessRole::EnumeratedCandidate,
@@ -2269,6 +2306,45 @@ pub(super) mod tests {
                     MetadataOperation::Rewind,
                     MetadataOperation::Read,
                 ] {
+                    let esrch = std::io::Error::from_raw_os_error(3);
+                    if initial_candidate_stat_open_disappeared(process, file, operation, &esrch) {
+                        disappeared_contexts.push((
+                            process.label(),
+                            file.label(),
+                            operation.label(),
+                        ));
+                    } else {
+                        let error_kind = esrch.kind();
+                        let actual = metadata_io_error(process, file, operation, esrch);
+                        assert_eq!(actual.kind, "resource_observation");
+                        assert_eq!(
+                            actual.message,
+                            format!(
+                                "native process metadata failed; process_role={}; file_role={}; operation={}; error_kind={:?}; os_error=Some(3)",
+                                process.label(),
+                                file.label(),
+                                operation.label(),
+                                error_kind,
+                            )
+                        );
+                    }
+                    for code in [2, 4, 5, 13, 38] {
+                        assert!(!initial_candidate_stat_open_disappeared(
+                            process,
+                            file,
+                            operation,
+                            &std::io::Error::from_raw_os_error(code),
+                        ));
+                    }
+                    assert!(!initial_candidate_stat_open_disappeared(
+                        process,
+                        file,
+                        operation,
+                        &std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "untrusted native detail",
+                        ),
+                    ));
                     let actual = metadata_io_error(
                         process,
                         file,
@@ -2293,15 +2369,32 @@ pub(super) mod tests {
                 }
             }
         }
+        assert_eq!(
+            disappeared_contexts,
+            [("enumerated_candidate", "stat", "open")]
+        );
     }
 
     #[test]
     fn stat_open_absence_remains_an_error_with_its_exact_static_role_and_code() {
+        let absence = std::io::Error::from_raw_os_error(2);
+        assert!(!initial_candidate_stat_open_disappeared(
+            ProcessRole::EnumeratedCandidate,
+            MetadataRole::Stat,
+            MetadataOperation::Open,
+            &absence,
+        ));
+        assert!(!initial_candidate_stat_open_disappeared(
+            ProcessRole::EnumeratedCandidate,
+            MetadataRole::Stat,
+            MetadataOperation::Open,
+            &std::io::Error::new(std::io::ErrorKind::NotFound, "untrusted native detail"),
+        ));
         let actual = metadata_io_error(
             ProcessRole::EnumeratedCandidate,
             MetadataRole::Stat,
             MetadataOperation::Open,
-            std::io::Error::from_raw_os_error(2),
+            absence,
         );
         assert_eq!(actual.kind, "resource_observation");
         assert_eq!(
