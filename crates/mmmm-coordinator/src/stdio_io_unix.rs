@@ -144,6 +144,63 @@ pub(super) fn read_bootstrap(
     Ok(packet)
 }
 
+/// Fixed metadata carried by Command's existing CLOEXEC startup-error pipe.
+/// The pre-exec child uses only integer operations and an OS error value; it
+/// allocates no diagnostic string or additional pipe. The parent decodes this
+/// only after Command has returned an error, without claiming a worker drain.
+#[derive(Clone, Copy)]
+pub(super) enum SpawnStage {
+    Session = 1,
+    #[cfg(target_os = "linux")]
+    Descriptors = 2,
+    #[cfg(target_os = "linux")]
+    Bootstrap = 3,
+    MemoryLimit = 4,
+    CoreLimit = 5,
+    Exec = 6,
+}
+const SPAWN_STAGE_TAG: u32 = 0x4e00_0000;
+const SPAWN_NATIVE_NONE: u32 = 65_535;
+const SPAWN_NATIVE_UNKNOWN: u32 = 65_534;
+
+pub(super) fn spawn_stage_error(stage: SpawnStage, error: std::io::Error) -> std::io::Error {
+    let native = match error.raw_os_error() {
+        Some(code) if (0..=65_533).contains(&code) => code as u32,
+        None => SPAWN_NATIVE_NONE,
+        _ => SPAWN_NATIVE_UNKNOWN,
+    };
+    encoded_spawn_error(stage, native)
+}
+
+fn encoded_spawn_error(stage: SpawnStage, native: u32) -> std::io::Error {
+    std::io::Error::from_raw_os_error((SPAWN_STAGE_TAG | (stage as u32) << 16 | native) as i32)
+}
+
+pub(super) fn spawn_failure(error: std::io::Error) -> StdioError {
+    if let Some(encoded) = error.raw_os_error().map(|code| code as u32)
+        && encoded & 0xff00_0000 == SPAWN_STAGE_TAG
+    {
+        let code = match (encoded >> 16) & 255 {
+            1 => "native_spawn_session",
+            2 => "native_spawn_descriptors",
+            3 => "native_spawn_bootstrap",
+            4 => "native_spawn_memory_limit",
+            5 => "native_spawn_core_limit",
+            6 => "native_spawn_exec",
+            _ => return StdioError::io("native_spawn", error),
+        };
+        let native = encoded & 65_535;
+        return StdioError {
+            code,
+            drained: false,
+            native_code: (native < SPAWN_NATIVE_UNKNOWN).then_some(native as i32),
+            native_code_unknown: native == SPAWN_NATIVE_UNKNOWN,
+            cleanup: None,
+        };
+    }
+    StdioError::io("native_spawn", error)
+}
+
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
     // Public Darwin extension, available since macOS 10.7. The libc crate
@@ -250,11 +307,13 @@ impl MacExec {
         // Successful SETEXEC never returns. On failure, return the native
         // errno through Command's original CLOEXEC startup-error pipe, which
         // remains open until successful image activation actually closes it.
-        Err(std::io::Error::from_raw_os_error(if result == 0 {
-            libc::EIO
+        Err(if result <= 0 {
+            // SETEXEC success cannot return. Do not turn an unexpected return
+            // into a fabricated native EIO code or truncate a negative status.
+            encoded_spawn_error(SpawnStage::Exec, SPAWN_NATIVE_UNKNOWN)
         } else {
-            result
-        }))
+            spawn_stage_error(SpawnStage::Exec, std::io::Error::from_raw_os_error(result))
+        })
     }
 }
 
@@ -341,17 +400,26 @@ impl Process {
         unsafe {
             command.pre_exec(move || {
                 if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
+                    return Err(spawn_stage_error(
+                        SpawnStage::Session,
+                        std::io::Error::last_os_error(),
+                    ));
                 }
                 #[cfg(target_os = "linux")]
                 if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 4u32) == -1 {
                     // Linux 5.11+ CLOSE_RANGE_CLOEXEC is required, rather than
                     // silently inheriting descriptors or looping a huge limit.
-                    return Err(std::io::Error::last_os_error());
+                    return Err(spawn_stage_error(
+                        SpawnStage::Descriptors,
+                        std::io::Error::last_os_error(),
+                    ));
                 }
                 #[cfg(target_os = "linux")]
                 if libc::fcntl(boot, libc::F_SETFD, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
+                    return Err(spawn_stage_error(
+                        SpawnStage::Bootstrap,
+                        std::io::Error::last_os_error(),
+                    ));
                 }
                 let memory = libc::rlimit {
                     rlim_cur: 256 * 1024 * 1024,
@@ -361,10 +429,21 @@ impl Process {
                     rlim_cur: 0,
                     rlim_max: 0,
                 };
-                if libc::setrlimit(libc::RLIMIT_AS, &memory) == -1
-                    || libc::setrlimit(libc::RLIMIT_CORE, &core) == -1
-                {
-                    return Err(std::io::Error::last_os_error());
+                if libc::setrlimit(libc::RLIMIT_AS, &memory) == -1 {
+                    // Darwin also rejects lowering AS below the forked image's
+                    // current VM usage. Preserve that actual admission failure;
+                    // do not remove the cap or mistake it for worker cleanup.
+                    // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_resource.c
+                    return Err(spawn_stage_error(
+                        SpawnStage::MemoryLimit,
+                        std::io::Error::last_os_error(),
+                    ));
+                }
+                if libc::setrlimit(libc::RLIMIT_CORE, &core) == -1 {
+                    return Err(spawn_stage_error(
+                        SpawnStage::CoreLimit,
+                        std::io::Error::last_os_error(),
+                    ));
                 }
                 #[cfg(target_os = "linux")]
                 {
@@ -372,20 +451,25 @@ impl Process {
                     // between checksum and exec. No inherited environment is read.
                     let env = [std::ptr::null::<libc::c_char>()];
                     libc::fexecve(exec_fd, argv.as_ptr().cast(), env.as_ptr());
-                    Err(std::io::Error::last_os_error())
+                    Err(spawn_stage_error(
+                        SpawnStage::Exec,
+                        std::io::Error::last_os_error(),
+                    ))
                 }
                 #[cfg(target_os = "macos")]
                 mac_exec.exec()
             });
         }
         super::deadline_check(startup_deadline)?;
-        let child = command
-            .spawn()
-            .map_err(|error| StdioError::io("native_spawn", error))?;
+        // pre_exec errors return through std's startup pipe after its forked
+        // child has exited and been reaped. No Process owner is issued here.
+        // This is an admission rejection, not an activated worker drain proof.
+        // https://doc.rust-lang.org/src/std/sys/process/unix/unix.rs.html#137-150
+        let child = command.spawn().map_err(spawn_failure)?;
         let pid = child.id() as i32;
         drop(read);
         drop(write);
-        let mut process = Self {
+        let process = Self {
             child: Some(child),
             pid,
             reaped: false,
@@ -396,6 +480,8 @@ impl Process {
             #[cfg(target_os = "macos")]
             identity: (0, 0),
         };
+        #[cfg(target_os = "macos")]
+        let mut process = process;
         #[cfg(target_os = "macos")]
         {
             let info = match bsd_info(pid, true) {
@@ -556,24 +642,23 @@ impl Process {
 }
 impl Drop for Process {
     fn drop(&mut self) {
-        if !self.reaped {
-            if let Err(error) = self.drain_blocking(self.owner_deadline) {
-                if !error.drained {
-                    let retained = Self {
-                        child: self.child.take(),
-                        pid: self.pid,
-                        reaped: false,
-                        reserved: self.reserved,
-                        reaped_code: self.reaped_code,
-                        owner_deadline: self.owner_deadline,
-                        reservation: self.reservation.take(),
-                        #[cfg(target_os = "macos")]
-                        identity: self.identity,
-                    };
-                    self.reaped = true;
-                    super::retain_uncertain_process(retained);
-                }
-            }
+        if !self.reaped
+            && let Err(error) = self.drain_blocking(self.owner_deadline)
+            && !error.drained
+        {
+            let retained = Self {
+                child: self.child.take(),
+                pid: self.pid,
+                reaped: false,
+                reserved: self.reserved,
+                reaped_code: self.reaped_code,
+                owner_deadline: self.owner_deadline,
+                reservation: self.reservation.take(),
+                #[cfg(target_os = "macos")]
+                identity: self.identity,
+            };
+            self.reaped = true;
+            super::retain_uncertain_process(retained);
         }
     }
 }

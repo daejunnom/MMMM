@@ -130,7 +130,8 @@ impl Scenario {
         Self::start_output(raw, StdioOutput::Stdout)
     }
     fn start_output(raw: bool, sink: StdioOutput) -> Self {
-        let owner_deadline = Instant::now() + Duration::from_secs(15);
+        let started = Instant::now();
+        let owner_deadline = started + Duration::from_secs(15);
         let (port, input, output) = redirect::spawn(
             StdioLimits {
                 session: Duration::from_secs(15),
@@ -140,7 +141,14 @@ impl Scenario {
             sink,
             owner_deadline,
         )
-        .expect("native fixture must start real hidden worker");
+        .unwrap_or_else(|error| {
+            panic!(
+                "native fixture must start real hidden worker: {error}; drained={}; cleanup={:?}; elapsed_ms={}",
+                error.drained,
+                error.cleanup,
+                started.elapsed().as_millis()
+            )
+        });
         Self {
             port,
             input: Some(input),

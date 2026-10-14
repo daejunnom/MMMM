@@ -58,7 +58,6 @@ const DEFINITION_RESERVATION: usize = 26 * 1024 * 1024;
 const MAX_FORWARDER_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_FORWARDER_TEXT_BYTES: usize = 4096;
 const MAX_FORWARDER_REFERENCES: usize = 256;
-const STARTUP_OPTIONS: &[u8] = b"jdk25-windows-x64-msvc-controlled-startup-v1";
 const CLASS_LOADER_SIGNATURE: &[u8] = b"Ljava/lang/ClassLoader;";
 const DESC_1: &[u8] = b"(Ljava/lang/ClassLoader;Ljava/lang/String;[BIILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;\0";
 const DESC_2: &[u8] = b"(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/nio/ByteBuffer;IILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;\0";
@@ -510,13 +509,13 @@ unsafe fn actual_name(env: *mut JNIEnv, class: jclass) -> Result<Vec<u8>> {
 
 pub(crate) fn on_load(vm: *mut JavaVM, options: *mut c_char) -> jint {
     let result = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
-        if !ffi::ABI_SUPPORTED {
+        let Some(abi) = ffi::STARTUP_ABI else {
             return Err(ProducerError::StateUnavailable);
-        }
+        };
         // This exact startup option is a configuration marker, never source or
         // runtime authority. Arbitrary prefixes and late enablement are rejected.
         let option = unsafe { ffi::c_string(options, 128)? };
-        if option != STARTUP_OPTIONS {
+        if !abi.accepts_options(&option) {
             return Err(ProducerError::StateUnavailable);
         }
         if STATE.set(Mutex::new(State::new())).is_err()

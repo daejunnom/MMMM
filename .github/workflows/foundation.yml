@@ -33,19 +33,24 @@ jobs:
         include:
           - runner: windows-2025
             target: windows-x64
+            rust_target: x86_64-pc-windows-msvc
             os: Windows
             arch: X64
           - runner: ubuntu-24.04
             target: linux-x64
+            rust_target: x86_64-unknown-linux-gnu
             os: Linux
             arch: X64
           - runner: macos-15
             target: macos-arm64
+            rust_target: aarch64-apple-darwin
             os: Darwin
             arch: Arm64
     defaults:
       run:
         shell: pwsh
+    env:
+      MMMM_RUST_TARGET: ${{ matrix.rust_target }}
     steps:
       - name: Checkout source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -72,6 +77,13 @@ jobs:
           $actualOS = if ($IsWindows) { 'Windows' } elseif ($IsMacOS) { 'Darwin' } elseif ($IsLinux) { 'Linux' } else { 'unsupported' }
           $actualArch = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
           if ($actualOS -cne $env:EXPECTED_OS -or $actualArch -cne $env:EXPECTED_ARCH) { throw 'Runner OS or architecture differs from the matrix target.' }
+          $expectedRustTarget = switch ($actualOS) {
+            'Windows' { 'x86_64-pc-windows-msvc' }
+            'Linux' { 'x86_64-unknown-linux-gnu' }
+            'Darwin' { 'aarch64-apple-darwin' }
+            default { throw 'Unsupported native Rust target.' }
+          }
+          if ($env:MMMM_RUST_TARGET -cne $expectedRustTarget) { throw 'Rust target differs from the actual runner profile.' }
           $outputRoot = Join-Path $env:RUNNER_TEMP 'MMMM'
           $evidenceRoot = Join-Path $outputRoot 'evidence/foundation'
           [System.IO.Directory]::CreateDirectory($evidenceRoot) | Out-Null
@@ -95,7 +107,7 @@ jobs:
             run_id = $env:GITHUB_RUN_ID; run_attempt = $env:GITHUB_RUN_ATTEMPT;
             target = $env:MATRIX_TARGET; os = $actualOS; arch = $actualArch;
             runner_image = $env:ImageOS; runner_image_version = $env:ImageVersion;
-            rust_toolchain = '1.96.0'; build_jobs = 2; test_threads = 2;
+            rust_toolchain = '1.96.0'; rust_target = $env:MMMM_RUST_TARGET; build_jobs = 2; test_threads = 2;
             command_timeout_seconds = 1200; artifact_retention_days = 14
           }
           $record | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $evidenceRoot 'ci-context.json') -Encoding utf8NoBOM
@@ -167,14 +179,14 @@ jobs:
         timeout-minutes: 22
         run: |
           $ErrorActionPreference = 'Stop'
-          & $env:MMMM_XTASK run --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root (Join-Path $env:MMMM_EVIDENCE_ROOT 'test') --purpose ci-checks --timeout-seconds 1200 --owned-tail-policy terminate-build -- $env:MMMM_CARGO test --workspace --locked -- --test-threads=2
+          & $env:MMMM_XTASK run --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root (Join-Path $env:MMMM_EVIDENCE_ROOT 'test') --purpose ci-checks --timeout-seconds 1200 --owned-tail-policy terminate-build -- $env:MMMM_CARGO test --workspace --target $env:MMMM_RUST_TARGET --locked -- --test-threads=2
           if ($LASTEXITCODE -ne 0) { throw 'Rust workspace tests failed.' }
 
       - name: Check Rust lints
         timeout-minutes: 22
         run: |
           $ErrorActionPreference = 'Stop'
-          & $env:MMMM_XTASK run --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root (Join-Path $env:MMMM_EVIDENCE_ROOT 'clippy') --purpose ci-checks --timeout-seconds 1200 --owned-tail-policy terminate-build -- $env:MMMM_CARGO clippy --workspace --all-targets --locked -- -D warnings
+          & $env:MMMM_XTASK run --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root (Join-Path $env:MMMM_EVIDENCE_ROOT 'clippy') --purpose ci-checks --timeout-seconds 1200 --owned-tail-policy terminate-build -- $env:MMMM_CARGO clippy --workspace --all-targets --target $env:MMMM_RUST_TARGET --locked -- -D warnings
           if ($LASTEXITCODE -ne 0) { throw 'Rust workspace lint check failed.' }
 
       - name: Export foundation evidence

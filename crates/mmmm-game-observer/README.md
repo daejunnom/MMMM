@@ -62,10 +62,15 @@ payload 예약을 같은 64 MiB 예산 안에서 확인하고, 실제 보존량�
 있다면 참조를 성급하게 해제하지 않고 VM 파괴까지 유지한다. 모든 종료
 경로가 즉시 모든 강참조를 해제한다고 보고하지 않는다.
 
-현재 FFI는 little-endian Windows x64 MSVC와 지정한 JDK 25 ABI만 대상으로
-한다. Linux, macOS와 다른 Windows ABI는 지원하지 않는다. 단일 JVMTI
-버전 번호는 VM vendor/build, JDK source pin이나 closed agent roster를
-증명하지 않는다.
+현재 FFI는 little-endian Windows x64 MSVC, Linux x64 GNU와 macOS ARM64
+Darwin의 지정한 JDK 25 ABI 구성을 선택한다. Cargo build target 이름과 각
+ABI layout 조건을 함께 검사한다. 다른 이름·musl·arm64e·32비트와 big-endian은
+거절한다. build script의 TARGET 이름만으로 같은 이름의 custom JSON target을
+배제하지 못하므로 소유 빌드와 CI가 정확한 builtin triple을 명시적으로 선택하고
+그 실행·compiler·source 근거를 보존해야 한다. 단일 JVMTI 버전 번호 또는 이
+구성 검사는 VM vendor/build, JDK source pin이나 closed agent roster를 증명하지 않는다.
+현재 실제 native startup 성공은 Windows의 고정 입력 실행뿐이며, Linux·macOS의
+C header ABI witness·native startup 및 관리 런처 연결은 미완료다.
 
 ## Java 시작 경계
 
@@ -127,7 +132,8 @@ CalibrationRun은 기존 Application 계획·승인·원장의 원본 Invocation
 
 `Cargo.toml`은 기존 workspace의 package metadata와 lints를 사용하고
 `cdylib`과 `rlib`, library test를 구성한다. 이 관측기는 표준 라이브러리만
-사용하며 새 dependency나 build script를 추가하지 않는다.
+사용하며 외부 dependency를 추가하지 않는다. 작은 std-only build script는 실제
+Cargo target 이름을 닫힌 compile 설정으로 전달하며 생성 header나 source를 만들지 않는다.
 `jvm/definition-observer/build.gradle`은 실제 `DefinitionObserverAgent`를
 `Premain-Class`로 지정한다. redefine, retransform과 native-method-prefix
 capability manifest는 false다. `Main-Class`, attach용 `Agent-Class`나
@@ -142,9 +148,12 @@ Cargo workspace의 `crates/mmmm-game-observer`와 JVM settings의
 성공과 별개다. 현재 source의 변경 입력과 각 실행의 source 입력을 비교해
 결과를 재사용해야 한다.
 
-등록 후 실제 관리 검사 대상은 `cargo test --locked -p mmmm-game-observer
---lib`의 41개 작성된 테스트와 `cargo clippy --locked -p mmmm-game-observer
---all-targets -- -D warnings`, DLL library build다. Java는 기존 외부 출력
+등록 후 실제 관리 검사 대상은 정확한 내장 target을 지정한
+`cargo test --locked -p mmmm-game-observer --lib --target <target>`의 48개
+테스트와 같은 target의 `cargo clippy --locked -p mmmm-game-observer
+--all-targets --target <target> -- -D warnings`, native library build다.
+Windows `x86_64-pc-windows-msvc`에서 48개와 strict Clippy 및 library build의
+성공을 확인했다. Linux·macOS의 새 ABI 선택 코드 실행은 별도다. Java는 기존 외부 출력
 경로와 Java 25 toolchain, `-Xlint:all -Werror`, 기존 JUnit platform을 그대로
 사용해 `:definition-observer:test`의 22개 작성된 테스트와
 `:definition-observer:jar`를 실행한다. 실행·skip·cache hit와 XML의 실제
@@ -236,10 +245,16 @@ CalibrationRun 연결은 각각 별도 단계다. G0부터 G4는 저장소 전�
 현재 개발용 Windows x64 실행에서는 고정 JDK `25.0.4.1+1`과 선택한 observer
 DLL·JAR를 같은 실행 전후 digest에 묶고 actual JNI/JVMTI startup을 확인했다.
 ordinary·SAM 없는 hidden 정의·좁은 hidden forwarder의 단일 ABI2 프레임
-5,886 bytes를 엄격하게 검증했으며 raw SHA-256은
+5,886 bytes를 엄격하게 검증했다. 첫 성공의 raw SHA-256은
 `4e43bb003805482f138083fae1cec959d8ef1d22d2e35a2cad43ce8dad2c04dc`다.
+세 target의 ABI 선택 코드를 추가하고 정확한 Windows 내장 target으로 빌드한
+DLL로 재실행한 여섯 번째 startup도 같은 5,886 bytes의 strict decode를 통과했다.
+DLL SHA-256은 `61633704d8daed7eceac0bdfced96111a804c6caa8e7c197e6d5a8361c62c4f5`,
+23개 선택 source를 기록한 manifest SHA-256은
+`a3ecf7138d7244d5c2af5fc7a574412307de30ff0e702260f2cfe21ae51a3e59`,
+새 raw SHA-256은 `7935d96d9f16eb18d1da402df28a44b48993684cd7e4c79edf7102b9653d7c10`다.
 원래 input 거절·premain 실패·stdout 경고의 FRAME 거절과 각각의 원시 결과는
-저장소 밖에 보존했다. Java 경계 검사 22개 및 Rust 순수 검사 41개의 성공과 이
+저장소 밖에 보존했다. Java 경계 검사 22개 및 Rust 순수 검사 48개의 성공과 이
 실제 startup 성공을 구분한다. Linux·macOS startup, 실제 게임 정의·source
 admission·초기화 정책·전체 SAM 참조 closure와 write profile 인수는 미완료다.
 

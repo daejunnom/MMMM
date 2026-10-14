@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 MMMM contributors
-//! JDK 25 GA JNI/JVMTI ABI subset, restricted to Windows x64 MSVC.
+//! JDK 25 JNI/JVMTI ABI subset with three explicit 64-bit little-endian targets.
 //!
 //! Source declarations are independently expressed, not a bundled generated header.
 //! Functional ABI facts are referenced; no upstream implementation or generated
-//! header is copied. jni.h and Windows jni_md.h carry GPLv2 + Classpath exception;
+//! header is copied. jni.h and platform jni_md.h carry GPLv2 + Classpath exception;
 //! jvmti.xml and jvmtiH.xsl source headers carry GPLv2 (generated jvmti.h's
 //! template uses GPL_CP_Header). Those upstream files are not bundled here.
 //! Primary definitions:
 //! https://github.com/openjdk/jdk/blob/jdk-25-ga/src/java.base/share/native/include/jni.h
 //! https://github.com/openjdk/jdk/blob/jdk-25-ga/src/java.base/windows/native/include/jni_md.h
+//! https://github.com/openjdk/jdk/blob/jdk-25-ga/src/java.base/unix/native/include/jni_md.h
 //! https://github.com/openjdk/jdk/blob/jdk-25-ga/src/hotspot/share/prims/jvmti.xml
+//! https://github.com/adoptium/jdk25u/blob/jdk-25.0.4.1%2B1/src/java.base/share/native/include/jni.h
 //! https://docs.oracle.com/en/java/javase/25/docs/specs/jni/functions.html
 //! https://docs.oracle.com/en/java/javase/25/docs/specs/jvmti.html#FunctionTable
 //!
@@ -46,12 +48,108 @@ pub(crate) struct JvmtiEnv {
     pub(crate) functions: *const *const c_void,
 }
 
-pub(crate) const ABI_SUPPORTED: bool = cfg!(all(
+/// A compile-target calling convention, never a VM source or target-policy grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StartupAbi {
+    WindowsX64Msvc,
+    LinuxX64Gnu,
+    MacOsArm64Darwin,
+}
+impl StartupAbi {
+    pub(crate) const fn startup_options(self) -> &'static [u8] {
+        match self {
+            Self::WindowsX64Msvc => b"jdk25-windows-x64-msvc-controlled-startup-v1",
+            Self::LinuxX64Gnu => b"jdk25-linux-x64-gnu-controlled-startup-v1",
+            Self::MacOsArm64Darwin => b"jdk25-macos-arm64-darwin-controlled-startup-v1",
+        }
+    }
+
+    pub(crate) fn accepts_options(self, options: &[u8]) -> bool {
+        options == self.startup_options()
+    }
+}
+
+// These layout properties are necessary but not an exact target identity.
+// arm64e-apple-darwin shares Darwin ARM64's ordinary Rust cfg tuple. The Cargo
+// target captured by the owned build script must independently match below.
+const COMPILED_LAYOUT_ABI: Option<StartupAbi> = if cfg!(all(
     target_os = "windows",
+    target_vendor = "pc",
     target_arch = "x86_64",
     target_env = "msvc",
+    target_abi = "",
+    target_pointer_width = "64",
     target_endian = "little"
-));
+)) {
+    Some(StartupAbi::WindowsX64Msvc)
+} else if cfg!(all(
+    target_os = "linux",
+    target_vendor = "unknown",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_abi = "",
+    target_pointer_width = "64",
+    target_endian = "little"
+)) {
+    Some(StartupAbi::LinuxX64Gnu)
+} else if cfg!(all(
+    target_os = "macos",
+    target_vendor = "apple",
+    target_arch = "aarch64",
+    target_env = "",
+    target_abi = "",
+    target_pointer_width = "64",
+    target_endian = "little"
+)) {
+    Some(StartupAbi::MacOsArm64Darwin)
+} else {
+    None
+};
+
+const fn target_name_is(target: &str, expected: &str) -> bool {
+    let target = target.as_bytes();
+    let expected = expected.as_bytes();
+    if target.len() != expected.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < target.len() {
+        if target[index] != expected[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+const fn select_startup_abi(
+    target: Option<&str>,
+    layout: Option<StartupAbi>,
+) -> Option<StartupAbi> {
+    let Some(target) = target else {
+        return None;
+    };
+    match layout {
+        Some(StartupAbi::WindowsX64Msvc) if target_name_is(target, "x86_64-pc-windows-msvc") => {
+            Some(StartupAbi::WindowsX64Msvc)
+        }
+        Some(StartupAbi::LinuxX64Gnu) if target_name_is(target, "x86_64-unknown-linux-gnu") => {
+            Some(StartupAbi::LinuxX64Gnu)
+        }
+        Some(StartupAbi::MacOsArm64Darwin) if target_name_is(target, "aarch64-apple-darwin") => {
+            Some(StartupAbi::MacOsArm64Darwin)
+        }
+        _ => None,
+    }
+}
+
+// This build context permits table use only. VM build/source pins, startup
+// ordering, capability acquisition and current generations remain separate.
+pub(crate) const STARTUP_ABI: Option<StartupAbi> = select_startup_abi(
+    option_env!("MMMM_OBSERVER_BUILD_TARGET"),
+    COMPILED_LAYOUT_ABI,
+);
+pub(crate) const ABI_SUPPORTED: bool = STARTUP_ABI.is_some();
 pub(crate) const JVMTI_VERSION_25: jint = 0x3019_0000;
 pub(crate) const JNI_VERSION_24: jint = 0x0018_0000;
 pub(crate) const JNI_OK: jint = 0;
@@ -75,13 +173,17 @@ pub(crate) enum FfiError {
 }
 pub(crate) type Result<T> = std::result::Result<T, FfiError>;
 
-/// MSVC packs unsigned-int bit fields least-significant first into non-straddling
-/// 32-bit allocation units. 45 one-bit fields + three reserved bits + five
-/// unsigned 16-bit fields give four uint32 units, alignment 4, size 16.
-/// This representation is deliberately unavailable on any other ABI.
+/// The admitted MSVC x64, SysV x64 and Darwin ARM64 ABIs place these unsigned-int
+/// fields low-bit first in 32-bit allocation units. 45 one-bit fields + three
+/// reserved bits + five unsigned 16-bit fields end at bit 128 without straddling
+/// an allocation unit: four uint32 units, alignment 4, size 16. This is a layout
+/// declaration; each actual JDK/compiler pair still needs its native ABI check.
 /// https://learn.microsoft.com/en-us/cpp/c-language/storage-of-bit-fields
 /// https://learn.microsoft.com/en-us/cpp/c-language/c-bit-fields
 /// https://learn.microsoft.com/en-us/cpp/build/x64-software-conventions
+/// https://gitlab.com/x86-psABIs/x86-64-ABI/-/raw/master/x86-64-ABI/low-level-sys-info.tex
+/// https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms
+/// https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst#bit-fields-no-larger-than-their-container
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Capabilities {
@@ -104,6 +206,7 @@ impl Capabilities {
     }
 }
 const _: [(); 16] = [(); std::mem::size_of::<Capabilities>()];
+const _: [(); 4] = [(); std::mem::align_of::<Capabilities>()];
 
 /// jvmtiEventCallbacks includes reserved events 50 through 88: 39 pointer slots.
 #[repr(C)]
@@ -123,6 +226,25 @@ pub(crate) struct NativeMethod {
     pub(crate) signature: *mut c_char,
     pub(crate) function: *mut c_void,
 }
+
+// Validate Rust's chosen layout only for the closed ABI set. These assertions
+// neither read the selected VM's headers nor establish native execution.
+const _: () = {
+    if ABI_SUPPORTED {
+        assert!(std::mem::size_of::<*const c_void>() == 8);
+        assert!(std::mem::align_of::<*const c_void>() == 8);
+        assert!(std::mem::size_of::<JNIEnv>() == 8);
+        assert!(std::mem::size_of::<JavaVM>() == 8);
+        assert!(std::mem::size_of::<JvmtiEnv>() == 8);
+        assert!(std::mem::size_of::<EventCallbacks>() == 312);
+        assert!(std::mem::align_of::<EventCallbacks>() == 8);
+        assert!(std::mem::size_of::<NativeMethod>() == 24);
+        assert!(std::mem::align_of::<NativeMethod>() == 8);
+        assert!(std::mem::offset_of!(NativeMethod, name) == 0);
+        assert!(std::mem::offset_of!(NativeMethod, signature) == 8);
+        assert!(std::mem::offset_of!(NativeMethod, function) == 16);
+    }
+};
 
 pub(crate) type DefineClass1 = unsafe extern "C" fn(
     *mut JNIEnv,
@@ -811,5 +933,163 @@ pub(crate) unsafe fn byte_array(env: *mut JNIEnv, bytes: &[u8]) -> Result<jbyteA
         Err(FfiError::PendingException)
     } else {
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ABI_SUPPORTED, Capabilities, EventCallbacks, JNIEnv, JavaVM, JvmtiEnv, NativeMethod,
+        STARTUP_ABI, StartupAbi, jboolean, jbyte, jint, select_startup_abi,
+    };
+    use std::ffi::c_void;
+    use std::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn required_capabilities_match_the_jdk25_declared_field_ordinals() {
+        assert_eq!(
+            Capabilities::required().words,
+            [0x4400_0008, 0x0000_0428, 0, 0]
+        );
+        assert_eq!(size_of::<Capabilities>(), 16);
+        assert_eq!(align_of::<Capabilities>(), 4);
+    }
+
+    #[test]
+    fn every_required_capability_is_necessary_even_with_all_other_bits_set() {
+        let requested = Capabilities::required();
+        assert!(requested.contains(&requested));
+        assert!(!Capabilities::default().contains(&requested));
+        for ordinal in [3, 26, 30, 35, 37, 42] {
+            let mut observed = Capabilities {
+                words: [u32::MAX; 4],
+            };
+            assert!(observed.contains(&requested));
+            observed.words[ordinal / 32] &= !(1 << (ordinal % 32));
+            assert!(!observed.contains(&requested), "required ordinal {ordinal}");
+        }
+    }
+
+    #[test]
+    fn supported_rust_table_layout_matches_the_declared_64bit_subset() {
+        // Rust layout evidence only. This does not stand in for the selected
+        // native JDK header/compiler witness or an actual callback invocation.
+        assert_eq!(size_of::<jint>(), 4);
+        assert_eq!(size_of::<jboolean>(), 1);
+        assert_eq!(size_of::<jbyte>(), 1);
+        if ABI_SUPPORTED {
+            assert_eq!(size_of::<*const c_void>(), 8);
+            assert_eq!(align_of::<*const c_void>(), 8);
+            assert_eq!(size_of::<JNIEnv>(), 8);
+            assert_eq!(size_of::<JavaVM>(), 8);
+            assert_eq!(size_of::<JvmtiEnv>(), 8);
+            assert_eq!(size_of::<EventCallbacks>(), 312);
+            assert_eq!(align_of::<EventCallbacks>(), 8);
+            assert_eq!(size_of::<NativeMethod>(), 24);
+            assert_eq!(align_of::<NativeMethod>(), 8);
+            assert_eq!(offset_of!(NativeMethod, name), 0);
+            assert_eq!(offset_of!(NativeMethod, signature), 8);
+            assert_eq!(offset_of!(NativeMethod, function), 16);
+        }
+    }
+
+    #[test]
+    fn each_startup_marker_is_exact_bounded_and_target_specific() {
+        let markers: [(StartupAbi, &[u8]); 3] = [
+            (
+                StartupAbi::WindowsX64Msvc,
+                b"jdk25-windows-x64-msvc-controlled-startup-v1",
+            ),
+            (
+                StartupAbi::LinuxX64Gnu,
+                b"jdk25-linux-x64-gnu-controlled-startup-v1",
+            ),
+            (
+                StartupAbi::MacOsArm64Darwin,
+                b"jdk25-macos-arm64-darwin-controlled-startup-v1",
+            ),
+        ];
+        for (abi, marker) in markers {
+            assert_eq!(abi.startup_options(), marker);
+            assert!(abi.accepts_options(marker));
+            assert!(marker.is_ascii());
+            assert!(marker.len() <= 128);
+            assert!(!marker.contains(&0));
+            for (other, other_marker) in markers {
+                assert_eq!(abi.accepts_options(other_marker), abi == other);
+            }
+        }
+    }
+
+    #[test]
+    fn partial_extended_and_malformed_startup_options_are_rejected() {
+        for abi in [
+            StartupAbi::WindowsX64Msvc,
+            StartupAbi::LinuxX64Gnu,
+            StartupAbi::MacOsArm64Darwin,
+        ] {
+            let marker = abi.startup_options();
+            assert!(!abi.accepts_options(&[]));
+            assert!(!abi.accepts_options(&marker[..marker.len() - 1]));
+            for extra in [b'x', b'\0', 0xff] {
+                let mut extended = marker.to_vec();
+                extended.push(extra);
+                assert!(!abi.accepts_options(&extended));
+            }
+            let mut prefixed = vec![b'x'];
+            prefixed.extend_from_slice(marker);
+            assert!(!abi.accepts_options(&prefixed));
+        }
+    }
+
+    #[test]
+    fn an_exact_target_requires_its_matching_layout_and_build_identity() {
+        let targets = [
+            ("x86_64-pc-windows-msvc", StartupAbi::WindowsX64Msvc),
+            ("x86_64-unknown-linux-gnu", StartupAbi::LinuxX64Gnu),
+            ("aarch64-apple-darwin", StartupAbi::MacOsArm64Darwin),
+        ];
+        for (target, expected) in targets {
+            assert_eq!(
+                select_startup_abi(Some(target), Some(expected)),
+                Some(expected)
+            );
+            assert_eq!(select_startup_abi(Some(target), None), None);
+            for (_, other_layout) in targets {
+                if other_layout != expected {
+                    assert_eq!(select_startup_abi(Some(target), Some(other_layout)), None);
+                }
+            }
+        }
+        assert_eq!(ABI_SUPPORTED, STARTUP_ABI.is_some());
+    }
+
+    #[test]
+    fn similar_or_missing_target_identities_never_admit_a_matching_layout() {
+        for layout in [
+            StartupAbi::WindowsX64Msvc,
+            StartupAbi::LinuxX64Gnu,
+            StartupAbi::MacOsArm64Darwin,
+        ] {
+            assert_eq!(select_startup_abi(None, Some(layout)), None);
+            for rejected in [
+                "unsupported",
+                "",
+                "x86_64-pc-windows-gnu",
+                "arm64ec-pc-windows-msvc",
+                "i686-pc-windows-msvc",
+                "x86_64-unknown-linux-musl",
+                "x86_64-unknown-linux-gnux32",
+                "aarch64-unknown-linux-gnu",
+                "s390x-unknown-linux-gnu",
+                "x86_64-apple-darwin",
+                "arm64e-apple-darwin",
+                "arm64_32-apple-watchos",
+                "aarch64-apple-darwin-extra",
+                "targets/custom.json",
+            ] {
+                assert_eq!(select_startup_abi(Some(rejected), Some(layout)), None);
+            }
+        }
     }
 }

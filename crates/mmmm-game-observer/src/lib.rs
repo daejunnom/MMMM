@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 MMMM contributors
-//! Source-only JDK 25 Windows x64 MSVC definition producer.
+//! Bounded JDK 25 startup definition producer with explicit target ABI selection.
+//!
+//! The table subset admits Windows x64 MSVC, Linux x64 GNU and macOS ARM64
+//! Darwin, each 64-bit and little-endian. Compile-target selection does not
+//! replace the actual JDK/compiler ABI check or native startup verification.
 //!
 //! Crate registration, compilation and tests do not grant a target profile.
 //! A launcher must independently admit a closed startup agent roster,
@@ -27,8 +31,9 @@ use std::ffi::{c_char, c_void};
 ///
 /// # Safety
 /// `vm` and the NUL-terminated startup `options` must be the live VM-provided
-/// Agent_OnLoad arguments. Only the pinned JDK 25 Windows x64 MSVC table ABI is
-/// supported. The caller must invoke this at VM startup, never emulate attach.
+/// Agent_OnLoad arguments. The VM must use the pinned JDK 25 table ABI for the
+/// compiled Windows x64 MSVC, Linux x64 GNU or macOS ARM64 Darwin target.
+/// The caller must invoke this at VM startup, never emulate attach.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Agent_OnLoad(
     vm: *mut c_void,
@@ -73,7 +78,8 @@ pub extern "C" fn Java_io_github_daejunnom_mmmm_observer_DefinitionObserverBridg
 /// # Safety
 /// `env` must be the calling attached thread's live JNI environment. `actual`
 /// must be null or a valid local/global jclass in that VM and its current frame.
-/// The environment must use the pinned JDK 25 Windows x64 MSVC JNI table ABI.
+/// The environment must use the pinned JDK 25 JNI table ABI for this compiled
+/// target, and references must belong to that same VM and attached thread.
 pub unsafe extern "C" fn Java_io_github_daejunnom_mmmm_observer_DefinitionObserverBridge_nativeEvidence(
     env: *mut c_void,
     _bridge: *mut c_void,
@@ -88,7 +94,8 @@ pub unsafe extern "C" fn Java_io_github_daejunnom_mmmm_observer_DefinitionObserv
 /// # Safety
 /// `env` must be the calling attached thread's live JNI environment. `actual`
 /// must be null or a valid local/global jclass in that VM and its current frame.
-/// The environment must use the pinned JDK 25 Windows x64 MSVC JNI table ABI.
+/// The environment must use the pinned JDK 25 JNI table ABI for this compiled
+/// target, and references must belong to that same VM and attached thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_io_github_daejunnom_mmmm_observer_DefinitionObserverBridge_nativeHiddenForwarder(
     env: *mut c_void,

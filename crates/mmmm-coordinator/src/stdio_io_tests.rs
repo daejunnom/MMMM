@@ -271,7 +271,7 @@ fn output_sequence_and_budget_fail_before_external_write() {
     }
 }
 #[test]
-fn actual_native_startup_failure_is_finite_and_drains_worker() {
+fn actual_native_startup_rejection_preserves_admission_or_verified_drain() {
     // The Rust test executable deliberately has no hidden app entry. Its actual
     // child fails instead of completing the capability handshake. This protects
     // native startup failure cleanup; app integration separately exercises a
@@ -281,6 +281,19 @@ fn actual_native_startup_failure_is_finite_and_drains_worker() {
         Ok(_) => panic!("test helper unexpectedly understood hidden app entry"),
         Err(error) => error,
     };
+    #[cfg(target_os = "macos")]
+    if error.code == "native_spawn_memory_limit" && error.native_code == Some(libc::EINVAL) {
+        // Darwin can reject lowering RLIMIT_AS below the forked test image's
+        // current VM usage. This exact pre-exec admission failure is reported
+        // after Command has reaped that child, without issuing a Process owner.
+        // It is not a successful native-worker or drain acceptance result.
+        assert!(!error.drained);
+        assert!(!error.native_code_unknown);
+        assert!(error.cleanup.is_none());
+        assert!(!OWNERSHIP_UNCERTAIN.load(Ordering::Acquire));
+        assert!(started.elapsed() < Duration::from_secs(12));
+        return;
+    }
     assert!(
         matches!(error.code, "worker_exit" | "startup_deadline"),
         "unexpected native startup rejection: {error}; drained={}",
@@ -291,6 +304,55 @@ fn actual_native_startup_failure_is_finite_and_drains_worker() {
         "native failure must preserve a verified drain result"
     );
     assert!(started.elapsed() < Duration::from_secs(12));
+}
+
+#[cfg(unix)]
+#[test]
+fn pre_exec_failure_metadata_preserves_exact_stage_and_native_code_without_drain() {
+    use native::SpawnStage;
+    let stages = [
+        (SpawnStage::Session, "native_spawn_session"),
+        #[cfg(target_os = "linux")]
+        (SpawnStage::Descriptors, "native_spawn_descriptors"),
+        #[cfg(target_os = "linux")]
+        (SpawnStage::Bootstrap, "native_spawn_bootstrap"),
+        (SpawnStage::MemoryLimit, "native_spawn_memory_limit"),
+        (SpawnStage::CoreLimit, "native_spawn_core_limit"),
+        (SpawnStage::Exec, "native_spawn_exec"),
+    ];
+    for (stage, expected) in stages {
+        let error = native::spawn_failure(native::spawn_stage_error(
+            stage,
+            std::io::Error::from_raw_os_error(libc::EINVAL),
+        ));
+        assert_eq!(error.code, expected);
+        assert_eq!(error.native_code, Some(libc::EINVAL));
+        assert!(!error.native_code_unknown);
+        assert!(!error.drained);
+        assert!(error.cleanup.is_none());
+    }
+    for code in [-1, 65_534, i32::MAX] {
+        let error = native::spawn_failure(native::spawn_stage_error(
+            SpawnStage::Exec,
+            std::io::Error::from_raw_os_error(code),
+        ));
+        assert_eq!(error.code, "native_spawn_exec");
+        assert_eq!(error.native_code, None);
+        assert!(error.native_code_unknown);
+        assert!(!error.drained);
+    }
+    let absent = native::spawn_failure(native::spawn_stage_error(
+        SpawnStage::Exec,
+        std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+    ));
+    assert_eq!(absent.native_code, None);
+    assert!(!absent.native_code_unknown);
+    for code in [libc::EINVAL, 0x4e00_0016, 0x4e07_0016] {
+        let ordinary = native::spawn_failure(std::io::Error::from_raw_os_error(code));
+        assert_eq!(ordinary.code, "native_spawn");
+        assert_eq!(ordinary.native_code, Some(code));
+        assert!(!ordinary.drained);
+    }
 }
 #[test]
 fn hidden_worker_rejects_nonloopback_and_non_numeric_bootstrap() {
