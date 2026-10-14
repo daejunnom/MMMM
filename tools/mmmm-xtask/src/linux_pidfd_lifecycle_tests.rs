@@ -210,10 +210,10 @@ impl Fixture {
             }
             self.update_status()?;
             self.read_output()?;
-            if self.output_eof {
-                if let Some(status) = self.status {
-                    return Ok(status);
-                }
+            if self.output_eof
+                && let Some(status) = self.status
+            {
+                return Ok(status);
             }
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -252,10 +252,10 @@ impl Drop for Fixture {
         }
         // Only this still-owned Child may be killed. There is no numeric PID
         // fallback after identity uncertainty or after a successful wait.
-        if self.status.is_none() {
-            if let Err(error) = self.child.kill() {
-                eprintln!("{}", io_failure("cleanup_kill", error));
-            }
+        if self.status.is_none()
+            && let Err(error) = self.child.kill()
+        {
+            eprintln!("{}", io_failure("cleanup_kill", error));
         }
         if let Err(error) = self.wait_exit() {
             eprintln!("{error}; cleanup_incomplete=true");

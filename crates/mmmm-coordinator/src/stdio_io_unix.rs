@@ -158,6 +158,16 @@ pub(super) enum SpawnStage {
     MemoryLimit = 4,
     CoreLimit = 5,
     Exec = 6,
+    #[cfg(target_os = "macos")]
+    StdinDescriptor = 7,
+    #[cfg(target_os = "macos")]
+    StdoutDescriptor = 8,
+    #[cfg(target_os = "macos")]
+    StderrDescriptor = 9,
+    #[cfg(target_os = "macos")]
+    BootstrapDescriptor = 10,
+    #[cfg(target_os = "macos")]
+    BootstrapType = 11,
 }
 const SPAWN_STAGE_TAG: u32 = 0x4e00_0000;
 const SPAWN_NATIVE_NONE: u32 = 65_535;
@@ -187,6 +197,16 @@ pub(super) fn spawn_failure(error: std::io::Error) -> StdioError {
             4 => "native_spawn_memory_limit",
             5 => "native_spawn_core_limit",
             6 => "native_spawn_exec",
+            #[cfg(target_os = "macos")]
+            7 => "native_spawn_stdin_descriptor",
+            #[cfg(target_os = "macos")]
+            8 => "native_spawn_stdout_descriptor",
+            #[cfg(target_os = "macos")]
+            9 => "native_spawn_stderr_descriptor",
+            #[cfg(target_os = "macos")]
+            10 => "native_spawn_bootstrap_descriptor",
+            #[cfg(target_os = "macos")]
+            11 => "native_spawn_bootstrap_type",
             _ => return StdioError::io("native_spawn", error),
         };
         let native = encoded & 65_535;
@@ -220,6 +240,7 @@ struct MacExec {
     path: usize,
     argv: Vec<usize>,
     env: [usize; 1],
+    descriptors: [(SpawnStage, libc::c_int); 4],
 }
 // The opaque objects are exclusively constructed/destroyed in the parent.
 // Command's pre_exec closure only reads its forked copy; no native mutation or
@@ -254,6 +275,12 @@ impl MacExec {
             path,
             argv,
             env: [0],
+            descriptors: [
+                (SpawnStage::StdinDescriptor, libc::STDIN_FILENO),
+                (SpawnStage::StdoutDescriptor, libc::STDOUT_FILENO),
+                (SpawnStage::StderrDescriptor, libc::STDERR_FILENO),
+                (SpawnStage::BootstrapDescriptor, boot),
+            ],
         };
         fn check(result: i32) -> Result<(), StdioError> {
             if result == 0 {
@@ -275,18 +302,38 @@ impl MacExec {
         check(unsafe { libc::posix_spawn_file_actions_init(&mut plan.actions) })?;
         plan.actions_ready = true;
         check(unsafe { libc::posix_spawnattr_setflags(&mut plan.attr, flags) })?;
-        for fd in [
-            libc::STDIN_FILENO,
-            libc::STDOUT_FILENO,
-            libc::STDERR_FILENO,
-            boot,
-        ] {
+        for &(_, fd) in &plan.descriptors {
             check(unsafe { posix_spawn_file_actions_addinherit_np(&mut plan.actions, fd) })?;
         }
         Ok(plan)
     }
 
     fn exec(&self) -> std::io::Result<()> {
+        // Exactly the four roles prepared for inheritance are inspected here.
+        // There is no retry, allocation, flag mutation or descriptor fallback.
+        // A syscall error is captured before any other native call. The parent
+        // retains its original deadline; these five cooperative kernel calls
+        // provide no hard interruption bound for a delayed pre-exec syscall.
+        for &(stage, fd) in &self.descriptors {
+            if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+                let error = std::io::Error::last_os_error();
+                return Err(spawn_stage_error(stage, error));
+            }
+        }
+        let [_, _, _, (_, bootstrap)] = self.descriptors;
+        let mut info: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(bootstrap, &mut info) } == -1 {
+            let error = std::io::Error::last_os_error();
+            return Err(spawn_stage_error(SpawnStage::BootstrapType, error));
+        }
+        if info.st_mode & libc::S_IFMT != libc::S_IFIFO {
+            // A shape mismatch supplies no OS errno. Preserve known absence
+            // instead of inventing EBADF, EINVAL or an I/O failure number.
+            return Err(encoded_spawn_error(
+                SpawnStage::BootstrapType,
+                SPAWN_NATIVE_NONE,
+            ));
+        }
         // Apple's SETEXEC wrapper reads the prepared objects and submits one
         // native spawn syscall. This child path allocates, locks and drops no
         // Rust objects. CLOEXEC_DEFAULT acts on the actual exec descriptor

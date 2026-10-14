@@ -248,6 +248,41 @@ function Find-InstalledVisualStudio {
     return $selectedRoot
 }
 
+function Test-RecordFields($Record, [string[]]$Names) {
+    if ($Record -isnot [System.Collections.IDictionary]) { return $false }
+    foreach ($name in $Names) { if (-not $Record.Contains($name)) { return $false } }
+    return $true
+}
+
+function Test-NullableInt32($Value) {
+    return $null -eq $Value -or (($Value -is [int] -or $Value -is [long]) -and $Value -ge [int]::MinValue -and $Value -le [int]::MaxValue)
+}
+
+function Get-ProcessPayloadKind($Record) {
+    $outcomeFields = @('command_exit','command_signal','supervisor_errors','drained','termination_reason','elapsed_ms',
+        'stdout_bytes','stderr_bytes','output_complete','owned_tail_terminated','native_scope','resource_policy')
+    if ((Test-RecordFields $Record $outcomeFields) -and -not $Record.Contains('kind')) {
+        $numeric = $true
+        foreach ($name in @('elapsed_ms','stdout_bytes','stderr_bytes')) {
+            $value = $Record[$name]
+            if (($value -isnot [int] -and $value -isnot [long] -and $value -isnot [ulong]) -or $value -lt 0) { $numeric = $false }
+        }
+        if ((Test-NullableInt32 $Record.command_exit) -and (Test-NullableInt32 $Record.command_signal) -and
+            $Record.supervisor_errors -is [array] -and $Record.drained -is [bool] -and $Record.output_complete -is [bool] -and
+            $Record.owned_tail_terminated -is [bool] -and $Record.termination_reason -is [string] -and
+            $Record.termination_reason -cmatch '^[a-z][a-z0-9_]{0,95}$' -and $Record.native_scope -is [string] -and
+            $Record.native_scope -cmatch '^[a-z][a-z0-9_]{0,95}$' -and $Record.resource_policy -is [string] -and
+            $Record.resource_policy -cmatch '^[a-z][a-z0-9_./-]{0,95}$' -and $numeric) { return 'process_outcome' }
+    }
+    if ((Test-RecordFields $Record @('kind','native_os_code','process_error','storage_error','post_check_error')) -and
+        $Record.kind -is [string] -and $Record.kind -cmatch '^[A-Z][A-Z0-9_]{0,95}$' -and
+        (Test-NullableInt32 $Record.native_os_code)) { return 'startup_error' }
+    if ((Test-RecordFields $Record @('kind','message','drained')) -and $Record.kind -is [string] -and
+        $Record.kind -cmatch '^[A-Za-z][A-Za-z0-9_]{0,95}$' -and $Record.message -is [string] -and
+        $Record.drained -is [bool]) { return 'supervisor_error' }
+    return 'unrecognized'
+}
+
 function Get-ManagedRecords([string]$Root, [string]$Purpose) {
     $rootPath = Assert-Physical $Root $true
     # Enumerate only this invocation's dedicated evidence directories, never a
@@ -271,11 +306,40 @@ function Get-ManagedRecords([string]$Root, [string]$Purpose) {
         $owner.slot_id -cne $slotEntries[0].Name -or $owner.checkout_digest -cne $checkoutDigest -or
         $owner.os -cne $hostOS -or $owner.arch -cne $hostArch -or $owner.purpose -cne $Purpose -or
         $owner.token -cne $tokens[0].Name -or $owner.state -cne 'complete' -or $owner.completed_ms -eq $null) { throw 'OBSERVER_MANAGED_OWNER_MISMATCH' }
+    $payloadKind = Get-ProcessPayloadKind $process
+    $observation = $null; $observationSha = $null; $processStarted = $null; $candidatePresent = $null; $startupErrorKind = $null
+    if ($Purpose -ceq 'definition-startup') {
+        # Only this same owned observation records actual creation. A missing
+        # native outcome is not evidence that no process was created.
+        $observationPath = Join-Path $recordRoot 'definition-startup.json'
+        $observation = Read-Json $observationPath 262144
+        $observationSha = Get-Hash $observationPath 262144
+        if (-not (Test-RecordFields $observation @('schema','scope','status','process_started')) -or
+            $observation.schema -isnot [string] -or $observation.scope -isnot [string] -or $observation.status -isnot [string] -or
+            $observation.schema -cne 'mmmm-definition-startup-observation/1' -or $observation.scope -cne 'development_fixture' -or
+            $observation.status -cnotin @('observed','failed') -or
+            ($null -ne $observation.process_started -and $observation.process_started -isnot [bool])) { throw 'OBSERVER_DEFINITION_OBSERVATION_INVALID' }
+        $processStarted = $observation.process_started
+        if ($observation.status -ceq 'failed') {
+            if (-not (Test-RecordFields $observation @('error','raw_candidate_present')) -or
+                -not (Test-RecordFields $observation.error @('kind')) -or $observation.error.kind -isnot [string] -or
+                $observation.error.kind -cnotmatch '^[A-Z][A-Z0-9_]{0,95}$' -or
+                $observation.raw_candidate_present -isnot [bool]) { throw 'OBSERVER_DEFINITION_OBSERVATION_INVALID' }
+            $startupErrorKind = $observation.error.kind
+            $candidatePresent = $observation.raw_candidate_present
+        } elseif (-not (Test-RecordFields $observation @('raw_sha256')) -or $observation.raw_sha256 -isnot [string]) { throw 'OBSERVER_DEFINITION_OBSERVATION_INVALID' }
+    }
     return [pscustomobject]@{ root=$recordRoot; slot_id=$slotEntries[0].Name; token=$tokens[0].Name; owner_sha256=(Get-Hash $ownerPath 8192);
-        finish=$finish; process=$process; finalization=$finalization }
+        finish=$finish; process=$process; finalization=$finalization; process_payload_kind=$payloadKind;
+        observation=$observation; observation_sha256=$observationSha; process_started=$processStarted;
+        startup_error_kind=$startupErrorKind; raw_candidate_present=$candidatePresent }
 }
 
 function Assert-ManagedSuccess($Records, [bool]$AllowBuildTail = $false) {
+    # Error DTOs, unknown payloads and incomplete outcomes can be recorded, but
+    # never enter the native-success predicate or its full-outcome accesses.
+    if ($Records.process_payload_kind -cne 'process_outcome' -or
+        (Get-ProcessPayloadKind $Records.process) -cne 'process_outcome') { throw 'OBSERVER_MANAGED_PROCESS_OUTCOME_REQUIRED' }
     $nativeCompletion = ($Records.process.termination_reason -ceq 'completed' -and $Records.process.owned_tail_terminated -eq $false)
     if ($AllowBuildTail -and $Records.process.termination_reason -ceq 'completed_after_owned_tail_cleanup' -and
         $Records.process.owned_tail_terminated -eq $true) { $nativeCompletion = $true }
@@ -288,13 +352,23 @@ function Assert-ManagedSuccess($Records, [bool]$AllowBuildTail = $false) {
 }
 
 function Add-ManagedStep([string]$Name, [string]$RelativeRoot, [int]$Exit, $Records) {
+    $payloadKind = Get-ProcessPayloadKind $Records.process
+    $termination = $null; $tailTerminated = $null; $processExit = $null; $processSignal = $null; $processDrained = $null; $outputComplete = $null
+    if ($payloadKind -ceq 'process_outcome') {
+        $termination = $Records.process.termination_reason; $tailTerminated = $Records.process.owned_tail_terminated
+        $processExit = $Records.process.command_exit; $processSignal = $Records.process.command_signal
+        $processDrained = $Records.process.drained; $outputComplete = $Records.process.output_complete
+    }
     $stepRecords.Add([ordered]@{ name=$Name; evidence_root=$RelativeRoot; wrapper_exit=$Exit; slot_id=$Records.slot_id; token=$Records.token;
         owner_sha256=$Records.owner_sha256;
         process_sha256=(Get-Hash (Join-Path $Records.root 'process.json') 262144);
         finish_sha256=(Get-Hash (Join-Path $Records.root 'finish.json') 65536);
         finalization_sha256=(Get-Hash (Join-Path $Records.root 'finalization-input.json') 65536);
-        command_exit=$Records.finish.command_exit; termination_reason=$Records.process.termination_reason;
-        owned_tail_terminated=$Records.process.owned_tail_terminated; drained=$Records.finalization.drained;
+        process_payload_kind=$payloadKind; process_started=$Records.process_started;
+        startup_error_kind=$Records.startup_error_kind; observation_sha256=$Records.observation_sha256; raw_candidate_present=$Records.raw_candidate_present;
+        process_command_exit=$processExit; process_command_signal=$processSignal; process_drained=$processDrained; process_output_complete=$outputComplete;
+        command_exit=$Records.finish.command_exit; termination_reason=$termination;
+        owned_tail_terminated=$tailTerminated; drained=$Records.finalization.drained; finalization_drained=$Records.finalization.drained;
         evidence_exported=$Records.finalization.evidence_exported; lease_released=$Records.finish.lease_released })
 }
 
@@ -556,9 +630,9 @@ try {
     $startupExit = $LASTEXITCODE
     $startupRecords = Get-ManagedRecords $startupEvidence 'definition-startup'
     Add-ManagedStep 'definition_startup' 'definition-startup' $startupExit $startupRecords
-    if ($startupExit -ne 0) { throw 'OBSERVER_DEFINITION_STARTUP_FAILED' }
+    if ($startupExit -ne 0) { $result.definition_startup = 'failed'; throw 'OBSERVER_DEFINITION_STARTUP_FAILED' }
     Assert-ManagedSuccess $startupRecords
-    $observation = Read-Json (Join-Path $startupRecords.root 'definition-startup.json') 262144
+    $observation = $startupRecords.observation
     if ($observation.schema -cne 'mmmm-definition-startup-observation/1' -or $observation.scope -cne 'development_fixture' -or
         $observation.status -cne 'observed' -or $observation.process_started -ne $true -or $observation.raw_sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'OBSERVER_DEFINITION_OBSERVATION_INVALID' }
     if ((Get-Hash (Join-Path $startupRecords.root 'definition-startup.abi2.bin') 18874368) -cne $observation.raw_sha256 -or
@@ -569,6 +643,7 @@ try {
     $result.status = 'passed'; $phase = 'complete'
 } catch {
     $result.status = 'failed'; $result.failure = Failure-Shape $_.Exception
+    if ($phase -ceq 'definition_startup') { $result.definition_startup = 'failed' }
     if ($Action -ceq 'header') {
         # Setup failure precedes the ABI helper's own result. Preserve it as a
         # separate factual record instead of manufacturing a header witness.

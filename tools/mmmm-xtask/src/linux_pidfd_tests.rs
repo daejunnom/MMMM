@@ -94,6 +94,141 @@ fn poll_accepts_only_one_ready_descriptor_with_known_process_terminal_bits() {
 }
 
 #[test]
+fn poll_diagnostics_keep_terminal_not_ready_and_unknown_distinct() {
+    for terminal in [
+        POLL_IN,
+        POLL_IN | POLL_RDNORM,
+        POLL_IN | POLL_HUP,
+        POLL_IN | POLL_RDNORM | POLL_HUP,
+    ] {
+        let check = classify_poll_with_diagnostic(1, terminal, Some(3));
+        assert_eq!(check.observation, PollObservation::Terminal);
+        assert_eq!(check.diagnostic.phase, DiagnosticPhase::TerminalPoll);
+        assert_eq!(check.diagnostic.category, DiagnosticCategory::Terminal);
+        assert_eq!(check.diagnostic.native_errno, None);
+    }
+    let check = classify_poll_with_diagnostic(0, 0, None);
+    assert_eq!(check.observation, PollObservation::NotReady);
+    assert_eq!(check.diagnostic.category, DiagnosticCategory::NotReady);
+    assert_eq!(check.diagnostic.native_errno, None);
+
+    let interrupted = classify_poll_with_diagnostic(-1, 0, Some(4));
+    assert_eq!(interrupted.observation, PollObservation::Unknown);
+    assert_eq!(
+        interrupted.diagnostic.category,
+        DiagnosticCategory::NativeFailure
+    );
+    assert_eq!(interrupted.diagnostic.native_errno, Some(4));
+    for (result, events, expected) in [
+        (2, POLL_IN, DiagnosticCategory::UnexpectedPollResult),
+        (0, POLL_IN, DiagnosticCategory::UnexpectedPollResult),
+        (1, POLL_HUP, DiagnosticCategory::UnexpectedPollEvents),
+        (1, 0x0008, DiagnosticCategory::UnexpectedPollEvents),
+    ] {
+        let check = classify_poll_with_diagnostic(result, events, Some(3));
+        assert_eq!(check.observation, PollObservation::Unknown);
+        assert_eq!(check.diagnostic.category, expected);
+        assert_eq!(check.diagnostic.native_errno, None);
+    }
+}
+
+#[test]
+fn pidfd_suffix_preserves_the_original_error_and_first_secondary_observation() {
+    let mut error = metadata("original RSS error");
+    error.drained = false;
+    let diagnostic = Diagnostic::new(
+        DiagnosticPhase::PidfdOpen,
+        DiagnosticCategory::Unsupported,
+        Some(38),
+    );
+    let error = error
+        .with_linux_pidfd_diagnostic(diagnostic)
+        .with_linux_pidfd_diagnostic(Diagnostic::new(
+            DiagnosticPhase::TerminalPoll,
+            DiagnosticCategory::NotReady,
+            None,
+        ));
+    assert_eq!(error.kind, "resource_observation");
+    assert_eq!(error.message, "original RSS error");
+    assert!(!error.drained);
+    assert_eq!(
+        error.to_string(),
+        "resource_observation: original RSS error; pidfd_observation(phase=pidfd_open; category=unsupported; native_errno=Some(38))",
+    );
+    assert_eq!(
+        metadata("original RSS error").to_string(),
+        "resource_observation: original RSS error",
+    );
+}
+
+#[test]
+fn diagnostic_text_is_bounded_by_closed_phases_categories_and_numeric_errno() {
+    let phases = [
+        DiagnosticPhase::InputIdentity,
+        DiagnosticPhase::ProcRootFilesystem,
+        DiagnosticPhase::ProcRootMetadata,
+        DiagnosticPhase::ProcessDirectoryFilesystem,
+        DiagnosticPhase::ProcessDirectoryMetadata,
+        DiagnosticPhase::OriginalStatFilesystem,
+        DiagnosticPhase::OriginalStatMetadata,
+        DiagnosticPhase::PidfdOpen,
+        DiagnosticPhase::SelfLinkOpen,
+        DiagnosticPhase::SelfLinkFilesystem,
+        DiagnosticPhase::SelfLinkMetadata,
+        DiagnosticPhase::SelfLinkRead,
+        DiagnosticPhase::SelfLinkParse,
+        DiagnosticPhase::SelfDirectoryOpen,
+        DiagnosticPhase::SelfDirectoryFilesystem,
+        DiagnosticPhase::SelfDirectoryMetadata,
+        DiagnosticPhase::FdinfoDirectoryOpen,
+        DiagnosticPhase::FdinfoDirectoryFilesystem,
+        DiagnosticPhase::FdinfoDirectoryMetadata,
+        DiagnosticPhase::FdinfoOpen,
+        DiagnosticPhase::FdinfoFilesystem,
+        DiagnosticPhase::FdinfoMetadata,
+        DiagnosticPhase::FdinfoRead,
+        DiagnosticPhase::FdinfoParse,
+        DiagnosticPhase::FdinfoPidMatch,
+        DiagnosticPhase::TerminalIdentity,
+        DiagnosticPhase::TerminalPoll,
+    ];
+    let categories = [
+        DiagnosticCategory::Terminal,
+        DiagnosticCategory::NotReady,
+        DiagnosticCategory::Unsupported,
+        DiagnosticCategory::NativeFailure,
+        DiagnosticCategory::ProcfsMismatch,
+        DiagnosticCategory::MountMismatch,
+        DiagnosticCategory::FileTypeMismatch,
+        DiagnosticCategory::MissingMetadata,
+        DiagnosticCategory::InvalidSelfLink,
+        DiagnosticCategory::InvalidFdinfo,
+        DiagnosticCategory::NamespaceMismatch,
+        DiagnosticCategory::InvalidIdentity,
+        DiagnosticCategory::ReadByteBound,
+        DiagnosticCategory::ReadCallBound,
+        DiagnosticCategory::IdentityMismatch,
+        DiagnosticCategory::UnexpectedPollResult,
+        DiagnosticCategory::UnexpectedPollEvents,
+    ];
+    for phase in phases {
+        for category in categories {
+            for errno in [None, Some(i32::MIN), Some(i32::MAX)] {
+                let text = Diagnostic::new(phase, category, errno).to_string();
+                assert!(text.len() < 160);
+                assert!(text.is_ascii());
+                assert!(
+                    !text
+                        .bytes()
+                        .any(|byte| matches!(byte, b'/' | b'\\' | b'\n' | b'\r'))
+                );
+                assert!(text.starts_with("pidfd_observation(phase="));
+            }
+        }
+    }
+}
+
+#[test]
 fn terminal_witness_cannot_cross_any_full_identity_component() {
     let original = stat().identity;
     let witness = TerminalWitness { identity: original };

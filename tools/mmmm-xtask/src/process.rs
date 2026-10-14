@@ -302,6 +302,8 @@ pub struct ProcessError {
     pub message: String,
     /// False means native ownership could not establish a drained scope.
     pub drained: bool,
+    #[cfg(any(target_os = "linux", test))]
+    linux_pidfd_diagnostic: Option<linux_resources::PidfdDiagnostic>,
 }
 impl ProcessError {
     fn new(kind: &'static str, message: impl Into<String>) -> Self {
@@ -309,7 +311,18 @@ impl ProcessError {
             kind,
             message: message.into(),
             drained: true,
+            #[cfg(any(target_os = "linux", test))]
+            linux_pidfd_diagnostic: None,
         }
+    }
+    #[cfg(any(target_os = "linux", test))]
+    fn with_linux_pidfd_diagnostic(mut self, diagnostic: linux_resources::PidfdDiagnostic) -> Self {
+        // Keep the first secondary observation and the complete original
+        // native error, including its kind, message and drain fact.
+        if self.linux_pidfd_diagnostic.is_none() {
+            self.linux_pidfd_diagnostic = Some(diagnostic);
+        }
+        self
     }
     fn io(context: &str, error: std::io::Error) -> Self {
         Self::new("io", format!("{context}: {error}"))
@@ -317,7 +330,12 @@ impl ProcessError {
 }
 impl fmt::Display for ProcessError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.kind, self.message)
+        write!(f, "{}: {}", self.kind, self.message)?;
+        #[cfg(any(target_os = "linux", test))]
+        if let Some(diagnostic) = self.linux_pidfd_diagnostic {
+            write!(f, "; {diagnostic}")?;
+        }
+        Ok(())
     }
 }
 impl std::error::Error for ProcessError {}

@@ -4,11 +4,157 @@
 //! pidfd, verifies its positive Pid through the original procfs namespace, and
 //! rereads the original stat FD before accepting a single nonblocking poll.
 use super::Identity;
+use std::fmt;
 
 const FDINFO_BYTES: usize = 4096;
 const POLL_IN: i16 = 0x0001;
 const POLL_RDNORM: i16 = 0x0040;
 const POLL_HUP: i16 = 0x0010;
+
+/// Closed secondary observations. These carry no process, path, fdinfo or
+/// process-lifetime authority, and never replace an original metadata error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in super::super) struct Diagnostic {
+    phase: DiagnosticPhase,
+    category: DiagnosticCategory,
+    native_errno: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in super::super) enum DiagnosticPhase {
+    InputIdentity,
+    ProcRootFilesystem,
+    ProcRootMetadata,
+    ProcessDirectoryFilesystem,
+    ProcessDirectoryMetadata,
+    OriginalStatFilesystem,
+    OriginalStatMetadata,
+    PidfdOpen,
+    SelfLinkOpen,
+    SelfLinkFilesystem,
+    SelfLinkMetadata,
+    SelfLinkRead,
+    SelfLinkParse,
+    SelfDirectoryOpen,
+    SelfDirectoryFilesystem,
+    SelfDirectoryMetadata,
+    FdinfoDirectoryOpen,
+    FdinfoDirectoryFilesystem,
+    FdinfoDirectoryMetadata,
+    FdinfoOpen,
+    FdinfoFilesystem,
+    FdinfoMetadata,
+    FdinfoRead,
+    FdinfoParse,
+    FdinfoPidMatch,
+    TerminalIdentity,
+    TerminalPoll,
+}
+
+impl DiagnosticPhase {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::InputIdentity => "input_identity",
+            Self::ProcRootFilesystem => "proc_root_filesystem",
+            Self::ProcRootMetadata => "proc_root_metadata",
+            Self::ProcessDirectoryFilesystem => "process_directory_filesystem",
+            Self::ProcessDirectoryMetadata => "process_directory_metadata",
+            Self::OriginalStatFilesystem => "original_stat_filesystem",
+            Self::OriginalStatMetadata => "original_stat_metadata",
+            Self::PidfdOpen => "pidfd_open",
+            Self::SelfLinkOpen => "self_link_open",
+            Self::SelfLinkFilesystem => "self_link_filesystem",
+            Self::SelfLinkMetadata => "self_link_metadata",
+            Self::SelfLinkRead => "self_link_read",
+            Self::SelfLinkParse => "self_link_parse",
+            Self::SelfDirectoryOpen => "self_directory_open",
+            Self::SelfDirectoryFilesystem => "self_directory_filesystem",
+            Self::SelfDirectoryMetadata => "self_directory_metadata",
+            Self::FdinfoDirectoryOpen => "fdinfo_directory_open",
+            Self::FdinfoDirectoryFilesystem => "fdinfo_directory_filesystem",
+            Self::FdinfoDirectoryMetadata => "fdinfo_directory_metadata",
+            Self::FdinfoOpen => "fdinfo_open",
+            Self::FdinfoFilesystem => "fdinfo_filesystem",
+            Self::FdinfoMetadata => "fdinfo_metadata",
+            Self::FdinfoRead => "fdinfo_read",
+            Self::FdinfoParse => "fdinfo_parse",
+            Self::FdinfoPidMatch => "fdinfo_pid_match",
+            Self::TerminalIdentity => "terminal_identity",
+            Self::TerminalPoll => "terminal_poll",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in super::super) enum DiagnosticCategory {
+    Terminal,
+    NotReady,
+    Unsupported,
+    NativeFailure,
+    ProcfsMismatch,
+    MountMismatch,
+    FileTypeMismatch,
+    MissingMetadata,
+    InvalidSelfLink,
+    InvalidFdinfo,
+    NamespaceMismatch,
+    InvalidIdentity,
+    ReadByteBound,
+    ReadCallBound,
+    IdentityMismatch,
+    UnexpectedPollResult,
+    UnexpectedPollEvents,
+}
+
+impl DiagnosticCategory {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::NotReady => "not_ready",
+            Self::Unsupported => "unsupported",
+            Self::NativeFailure => "native_failure",
+            Self::ProcfsMismatch => "procfs_mismatch",
+            Self::MountMismatch => "mount_mismatch",
+            Self::FileTypeMismatch => "file_type_mismatch",
+            Self::MissingMetadata => "missing_metadata",
+            Self::InvalidSelfLink => "invalid_self_link",
+            Self::InvalidFdinfo => "invalid_fdinfo",
+            Self::NamespaceMismatch => "namespace_mismatch",
+            Self::InvalidIdentity => "invalid_identity",
+            Self::ReadByteBound => "read_byte_bound",
+            Self::ReadCallBound => "read_call_bound",
+            Self::IdentityMismatch => "identity_mismatch",
+            Self::UnexpectedPollResult => "unexpected_poll_result",
+            Self::UnexpectedPollEvents => "unexpected_poll_events",
+        }
+    }
+}
+
+impl Diagnostic {
+    pub(in super::super) const fn new(
+        phase: DiagnosticPhase,
+        category: DiagnosticCategory,
+        native_errno: Option<i32>,
+    ) -> Self {
+        Self {
+            phase,
+            category,
+            native_errno,
+        }
+    }
+}
+
+impl fmt::Display for Diagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "pidfd_observation(phase={}; category={}; native_errno={:?})",
+            self.phase.label(),
+            self.category.label(),
+            self.native_errno,
+        )
+    }
+}
 
 /// This type is neither serialized nor a signal/drain authority. Only the
 /// private native producer can construct one outside this module's tests.
@@ -39,6 +185,30 @@ fn classify_poll(result: i32, events: i16) -> PollObservation {
         PollObservation::Terminal
     } else {
         PollObservation::Unknown
+    }
+}
+
+struct PollCheck {
+    observation: PollObservation,
+    diagnostic: Diagnostic,
+}
+
+fn classify_poll_with_diagnostic(result: i32, events: i16, native_errno: Option<i32>) -> PollCheck {
+    let observation = classify_poll(result, events);
+    let category = match observation {
+        PollObservation::Terminal => DiagnosticCategory::Terminal,
+        PollObservation::NotReady => DiagnosticCategory::NotReady,
+        PollObservation::Unknown if result < 0 => DiagnosticCategory::NativeFailure,
+        PollObservation::Unknown if result != 1 => DiagnosticCategory::UnexpectedPollResult,
+        PollObservation::Unknown => DiagnosticCategory::UnexpectedPollEvents,
+    };
+    PollCheck {
+        observation,
+        diagnostic: Diagnostic::new(
+            DiagnosticPhase::TerminalPoll,
+            category,
+            if result < 0 { native_errno } else { None },
+        ),
     }
 }
 
@@ -76,11 +246,24 @@ fn fdinfo_pid(bytes: &[u8]) -> Option<i32> {
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum BindingUnavailable {
-    Unsupported,
-    DescriptorFailure,
-    ProcfsBoundary,
-    Namespace,
-    MetadataUnavailable,
+    Unsupported(Diagnostic),
+    DescriptorFailure(Diagnostic),
+    ProcfsBoundary(Diagnostic),
+    Namespace(Diagnostic),
+    MetadataUnavailable(Diagnostic),
+}
+
+#[cfg(target_os = "linux")]
+impl BindingUnavailable {
+    pub(super) fn diagnostic(self) -> Diagnostic {
+        match self {
+            Self::Unsupported(diagnostic)
+            | Self::DescriptorFailure(diagnostic)
+            | Self::ProcfsBoundary(diagnostic)
+            | Self::Namespace(diagnostic)
+            | Self::MetadataUnavailable(diagnostic) => diagnostic,
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -98,17 +281,40 @@ pub(super) struct BoundPidfd {
 }
 
 #[cfg(target_os = "linux")]
+pub(super) struct TerminalCheck {
+    pub(super) witness: Option<TerminalWitness>,
+    pub(super) diagnostic: Diagnostic,
+}
+
+#[cfg(target_os = "linux")]
 impl BoundPidfd {
-    pub(super) fn terminal_after(&self, after: Identity) -> Option<TerminalWitness> {
+    pub(super) fn check_terminal_after(&self, after: Identity) -> TerminalCheck {
         if self.identity != after {
-            return None;
+            return TerminalCheck {
+                witness: None,
+                diagnostic: Diagnostic::new(
+                    DiagnosticPhase::TerminalIdentity,
+                    DiagnosticCategory::IdentityMismatch,
+                    None,
+                ),
+            };
         }
-        match native::poll_once(&self.descriptor) {
+        let check = native::poll_once(&self.descriptor);
+        let witness = match check.observation {
             PollObservation::Terminal => Some(TerminalWitness {
                 identity: self.identity,
             }),
             PollObservation::NotReady | PollObservation::Unknown => None,
+        };
+        TerminalCheck {
+            witness,
+            diagnostic: check.diagnostic,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn terminal_after(&self, after: Identity) -> Option<TerminalWitness> {
+        self.check_terminal_after(after).witness
     }
 }
 
@@ -156,6 +362,41 @@ mod native {
         fdinfo: File,
     }
 
+    #[derive(Clone, Copy)]
+    enum NamespaceComponent {
+        SelfLink,
+        SelfDirectory,
+        FdinfoDirectory,
+        Fdinfo,
+    }
+
+    impl NamespaceComponent {
+        fn phases(self) -> (DiagnosticPhase, DiagnosticPhase, DiagnosticPhase) {
+            match self {
+                Self::SelfLink => (
+                    DiagnosticPhase::SelfLinkOpen,
+                    DiagnosticPhase::SelfLinkFilesystem,
+                    DiagnosticPhase::SelfLinkMetadata,
+                ),
+                Self::SelfDirectory => (
+                    DiagnosticPhase::SelfDirectoryOpen,
+                    DiagnosticPhase::SelfDirectoryFilesystem,
+                    DiagnosticPhase::SelfDirectoryMetadata,
+                ),
+                Self::FdinfoDirectory => (
+                    DiagnosticPhase::FdinfoDirectoryOpen,
+                    DiagnosticPhase::FdinfoDirectoryFilesystem,
+                    DiagnosticPhase::FdinfoDirectoryMetadata,
+                ),
+                Self::Fdinfo => (
+                    DiagnosticPhase::FdinfoOpen,
+                    DiagnosticPhase::FdinfoFilesystem,
+                    DiagnosticPhase::FdinfoMetadata,
+                ),
+            }
+        }
+    }
+
     pub(super) fn bind(
         root: &File,
         directory: &File,
@@ -192,23 +433,62 @@ mod native {
         identity: Identity,
     ) -> Result<(OwnedFd, NamespaceFiles), BindingUnavailable> {
         if identity.pid <= 0 {
-            return Err(BindingUnavailable::Namespace);
+            return Err(BindingUnavailable::Namespace(Diagnostic::new(
+                DiagnosticPhase::InputIdentity,
+                DiagnosticCategory::InvalidIdentity,
+                None,
+            )));
         }
-        let root_mount = proc_mount(root, libc::S_IFDIR)?;
-        if proc_mount(directory, libc::S_IFDIR)? != root_mount
-            || proc_mount(original_stat, libc::S_IFREG)? != root_mount
+        let root_mount = proc_mount(
+            root,
+            libc::S_IFDIR,
+            DiagnosticPhase::ProcRootFilesystem,
+            DiagnosticPhase::ProcRootMetadata,
+        )?;
+        if proc_mount(
+            directory,
+            libc::S_IFDIR,
+            DiagnosticPhase::ProcessDirectoryFilesystem,
+            DiagnosticPhase::ProcessDirectoryMetadata,
+        )? != root_mount
         {
-            return Err(BindingUnavailable::ProcfsBoundary);
+            return Err(BindingUnavailable::ProcfsBoundary(Diagnostic::new(
+                DiagnosticPhase::ProcessDirectoryMetadata,
+                DiagnosticCategory::MountMismatch,
+                None,
+            )));
+        }
+        if proc_mount(
+            original_stat,
+            libc::S_IFREG,
+            DiagnosticPhase::OriginalStatFilesystem,
+            DiagnosticPhase::OriginalStatMetadata,
+        )? != root_mount
+        {
+            return Err(BindingUnavailable::ProcfsBoundary(Diagnostic::new(
+                DiagnosticPhase::OriginalStatMetadata,
+                DiagnosticCategory::MountMismatch,
+                None,
+            )));
         }
         // flags=0 binds a whole thread group. PIDFD_THREAD is deliberately
         // unavailable here; a single thread's exit cannot settle an RSS error.
         let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.pid, 0u32) };
         if descriptor < 0 {
             let error = std::io::Error::last_os_error();
+            let diagnostic = Diagnostic::new(
+                DiagnosticPhase::PidfdOpen,
+                if unsupported(&error) {
+                    DiagnosticCategory::Unsupported
+                } else {
+                    DiagnosticCategory::NativeFailure
+                },
+                error.raw_os_error(),
+            );
             return Err(if unsupported(&error) {
-                BindingUnavailable::Unsupported
+                BindingUnavailable::Unsupported(diagnostic)
             } else {
-                BindingUnavailable::DescriptorFailure
+                BindingUnavailable::DescriptorFailure(diagnostic)
             });
         }
         // Successful Linux FD syscalls return an int. Owning it immediately
@@ -216,8 +496,22 @@ mod native {
         let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor as libc::c_int) };
         let mut files = own_fdinfo(root, root_mount, &descriptor)?;
         let bytes = read_fdinfo(&mut files.fdinfo)?;
-        if fdinfo_pid(&bytes) != Some(identity.pid) {
-            return Err(BindingUnavailable::Namespace);
+        match fdinfo_pid(&bytes) {
+            Some(actual) if actual == identity.pid => {}
+            Some(_) => {
+                return Err(BindingUnavailable::Namespace(Diagnostic::new(
+                    DiagnosticPhase::FdinfoPidMatch,
+                    DiagnosticCategory::NamespaceMismatch,
+                    None,
+                )));
+            }
+            None => {
+                return Err(BindingUnavailable::Namespace(Diagnostic::new(
+                    DiagnosticPhase::FdinfoParse,
+                    DiagnosticCategory::InvalidFdinfo,
+                    None,
+                )));
+            }
         }
         Ok((descriptor, files))
     }
@@ -236,6 +530,7 @@ mod native {
             libc::O_PATH | libc::O_NOFOLLOW,
             libc::S_IFLNK,
             root_mount,
+            NamespaceComponent::SelfLink,
         )?;
         let mut target = [0u8; SELF_BYTES];
         let length = unsafe {
@@ -248,19 +543,43 @@ mod native {
             )
         };
         if length <= 0 || length as usize >= target.len() {
-            return Err(BindingUnavailable::MetadataUnavailable);
+            let native_errno = if length < 0 {
+                std::io::Error::last_os_error().raw_os_error()
+            } else {
+                None
+            };
+            return Err(BindingUnavailable::MetadataUnavailable(Diagnostic::new(
+                DiagnosticPhase::SelfLinkRead,
+                if length < 0 {
+                    DiagnosticCategory::NativeFailure
+                } else {
+                    DiagnosticCategory::InvalidSelfLink
+                },
+                native_errno,
+            )));
         }
         // Kernel proc/self reports the caller TGID in this procfs namespace.
-        let self_pid = canonical_positive_pid(&target[..length as usize])
-            .ok_or(BindingUnavailable::Namespace)?;
-        let self_name =
-            CString::new(self_pid.to_string()).map_err(|_| BindingUnavailable::Namespace)?;
+        let self_pid = canonical_positive_pid(&target[..length as usize]).ok_or(
+            BindingUnavailable::Namespace(Diagnostic::new(
+                DiagnosticPhase::SelfLinkParse,
+                DiagnosticCategory::InvalidSelfLink,
+                None,
+            )),
+        )?;
+        let self_name = CString::new(self_pid.to_string()).map_err(|_| {
+            BindingUnavailable::Namespace(Diagnostic::new(
+                DiagnosticPhase::SelfLinkParse,
+                DiagnosticCategory::InvalidSelfLink,
+                None,
+            ))
+        })?;
         let self_directory = open_component(
             root,
             &self_name,
             libc::O_RDONLY | libc::O_DIRECTORY,
             libc::S_IFDIR,
             root_mount,
+            NamespaceComponent::SelfDirectory,
         )?;
         let fdinfo_directory = open_component(
             &self_directory,
@@ -268,15 +587,22 @@ mod native {
             libc::O_RDONLY | libc::O_DIRECTORY,
             libc::S_IFDIR,
             root_mount,
+            NamespaceComponent::FdinfoDirectory,
         )?;
-        let fd_name = CString::new(descriptor.as_raw_fd().to_string())
-            .map_err(|_| BindingUnavailable::DescriptorFailure)?;
+        let fd_name = CString::new(descriptor.as_raw_fd().to_string()).map_err(|_| {
+            BindingUnavailable::DescriptorFailure(Diagnostic::new(
+                DiagnosticPhase::FdinfoOpen,
+                DiagnosticCategory::InvalidIdentity,
+                None,
+            ))
+        })?;
         let fdinfo = open_component(
             &fdinfo_directory,
             &fd_name,
             libc::O_RDONLY,
             libc::S_IFREG,
             root_mount,
+            NamespaceComponent::Fdinfo,
         )?;
         Ok(NamespaceFiles {
             _self_link: self_link,
@@ -292,7 +618,9 @@ mod native {
         flags: libc::c_int,
         kind: libc::mode_t,
         root_mount: u64,
+        component: NamespaceComponent,
     ) -> Result<File, BindingUnavailable> {
+        let (open_phase, filesystem_phase, metadata_phase) = component.phases();
         let how = OpenHow {
             flags: (flags | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
             mode: 0,
@@ -313,27 +641,57 @@ mod native {
         if descriptor < 0 {
             let error = std::io::Error::last_os_error();
             return Err(if unsupported(&error) {
-                BindingUnavailable::Unsupported
+                BindingUnavailable::Unsupported(Diagnostic::new(
+                    open_phase,
+                    DiagnosticCategory::Unsupported,
+                    error.raw_os_error(),
+                ))
             } else if matches!(error.raw_os_error(), Some(libc::EXDEV) | Some(libc::ELOOP)) {
-                BindingUnavailable::ProcfsBoundary
+                BindingUnavailable::ProcfsBoundary(Diagnostic::new(
+                    open_phase,
+                    DiagnosticCategory::ProcfsMismatch,
+                    error.raw_os_error(),
+                ))
             } else {
-                BindingUnavailable::MetadataUnavailable
+                BindingUnavailable::MetadataUnavailable(Diagnostic::new(
+                    open_phase,
+                    DiagnosticCategory::NativeFailure,
+                    error.raw_os_error(),
+                ))
             });
         }
         let file = unsafe { File::from_raw_fd(descriptor as libc::c_int) };
-        if proc_mount(&file, kind)? != root_mount {
-            return Err(BindingUnavailable::ProcfsBoundary);
+        if proc_mount(&file, kind, filesystem_phase, metadata_phase)? != root_mount {
+            return Err(BindingUnavailable::ProcfsBoundary(Diagnostic::new(
+                metadata_phase,
+                DiagnosticCategory::MountMismatch,
+                None,
+            )));
         }
         Ok(file)
     }
 
-    fn proc_mount(file: &File, kind: libc::mode_t) -> Result<u64, BindingUnavailable> {
+    fn proc_mount(
+        file: &File,
+        kind: libc::mode_t,
+        filesystem_phase: DiagnosticPhase,
+        metadata_phase: DiagnosticPhase,
+    ) -> Result<u64, BindingUnavailable> {
         let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstatfs(file.as_raw_fd(), &mut filesystem) } != 0 {
-            return Err(BindingUnavailable::MetadataUnavailable);
+            let error = std::io::Error::last_os_error();
+            return Err(BindingUnavailable::MetadataUnavailable(Diagnostic::new(
+                filesystem_phase,
+                DiagnosticCategory::NativeFailure,
+                error.raw_os_error(),
+            )));
         }
         if filesystem.f_type != PROC_MAGIC {
-            return Err(BindingUnavailable::ProcfsBoundary);
+            return Err(BindingUnavailable::ProcfsBoundary(Diagnostic::new(
+                filesystem_phase,
+                DiagnosticCategory::ProcfsMismatch,
+                None,
+            )));
         }
         let mut attributes: libc::statx = unsafe { std::mem::zeroed() };
         let result = unsafe {
@@ -347,21 +705,43 @@ mod native {
             )
         };
         if result != 0 {
-            return Err(if unsupported(&std::io::Error::last_os_error()) {
-                BindingUnavailable::Unsupported
+            let error = std::io::Error::last_os_error();
+            return Err(if unsupported(&error) {
+                BindingUnavailable::Unsupported(Diagnostic::new(
+                    metadata_phase,
+                    DiagnosticCategory::Unsupported,
+                    error.raw_os_error(),
+                ))
             } else {
-                BindingUnavailable::MetadataUnavailable
+                BindingUnavailable::MetadataUnavailable(Diagnostic::new(
+                    metadata_phase,
+                    DiagnosticCategory::NativeFailure,
+                    error.raw_os_error(),
+                ))
             });
         }
         if attributes.stx_mask & (libc::STATX_MNT_ID | libc::STATX_TYPE)
             != (libc::STATX_MNT_ID | libc::STATX_TYPE)
         {
-            return Err(BindingUnavailable::Unsupported);
+            return Err(BindingUnavailable::Unsupported(Diagnostic::new(
+                metadata_phase,
+                DiagnosticCategory::MissingMetadata,
+                None,
+            )));
         }
-        if libc::mode_t::from(attributes.stx_mode) & libc::S_IFMT != kind
-            || attributes.stx_mnt_id == 0
-        {
-            return Err(BindingUnavailable::ProcfsBoundary);
+        if libc::mode_t::from(attributes.stx_mode) & libc::S_IFMT != kind {
+            return Err(BindingUnavailable::ProcfsBoundary(Diagnostic::new(
+                metadata_phase,
+                DiagnosticCategory::FileTypeMismatch,
+                None,
+            )));
+        }
+        if attributes.stx_mnt_id == 0 {
+            return Err(BindingUnavailable::ProcfsBoundary(Diagnostic::new(
+                metadata_phase,
+                DiagnosticCategory::MissingMetadata,
+                None,
+            )));
         }
         Ok(attributes.stx_mnt_id)
     }
@@ -376,14 +756,28 @@ mod native {
                 Ok(read) => {
                     bytes.extend_from_slice(&buffer[..read]);
                     if bytes.len() > FDINFO_BYTES {
-                        return Err(BindingUnavailable::MetadataUnavailable);
+                        return Err(BindingUnavailable::MetadataUnavailable(Diagnostic::new(
+                            DiagnosticPhase::FdinfoRead,
+                            DiagnosticCategory::ReadByteBound,
+                            None,
+                        )));
                     }
                 }
                 // No new retry clock or EINTR retry authority for the witness.
-                Err(_) => return Err(BindingUnavailable::MetadataUnavailable),
+                Err(error) => {
+                    return Err(BindingUnavailable::MetadataUnavailable(Diagnostic::new(
+                        DiagnosticPhase::FdinfoRead,
+                        DiagnosticCategory::NativeFailure,
+                        error.raw_os_error(),
+                    )));
+                }
             }
         }
-        Err(BindingUnavailable::MetadataUnavailable)
+        Err(BindingUnavailable::MetadataUnavailable(Diagnostic::new(
+            DiagnosticPhase::FdinfoRead,
+            DiagnosticCategory::ReadCallBound,
+            None,
+        )))
     }
 
     fn unsupported(error: &std::io::Error) -> bool {
@@ -393,7 +787,7 @@ mod native {
         )
     }
 
-    pub(super) fn poll_once(descriptor: &OwnedFd) -> PollObservation {
+    pub(super) fn poll_once(descriptor: &OwnedFd) -> PollCheck {
         let mut descriptor = libc::pollfd {
             fd: descriptor.as_raw_fd(),
             events: libc::POLLIN,
@@ -402,7 +796,12 @@ mod native {
         // Linux v6.8 pidfd_poll reports readable only once the whole group
         // exits. One syscall with timeout=0; no wait, signal, retry, or reap.
         let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
-        classify_poll(result, descriptor.revents)
+        let native_errno = if result < 0 {
+            std::io::Error::last_os_error().raw_os_error()
+        } else {
+            None
+        };
+        classify_poll_with_diagnostic(result, descriptor.revents, native_errno)
     }
 }
 

@@ -436,7 +436,7 @@ fn host_response_fixture(
     listener.set_nonblocking(true).unwrap();
     let task = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(6);
-        for payload in [hello, context] {
+        for (payload_index, payload) in [hello, context].into_iter().enumerate() {
             let mut stream = loop {
                 if Instant::now() >= deadline {
                     return Err("bounded host fixture accept expired");
@@ -458,10 +458,20 @@ fn host_response_fixture(
                 .map_err(|_| "fixture write timeout")?;
             let mut header = zeroize::Zeroizing::new(Vec::new());
             loop {
-                let mut byte = [0_u8; 1];
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or("bounded host fixture header deadline expired")?;
                 stream
-                    .read_exact(&mut byte)
-                    .map_err(|_| "host fixture header read")?;
+                    .set_read_timeout(Some(remaining))
+                    .map_err(|_| "fixture header timeout configuration")?;
+                let mut byte = [0_u8; 1];
+                stream.read_exact(&mut byte).map_err(|cause| {
+                    eprintln!(
+                        "host_fixture_failure payload_index={payload_index}; stage=header; kind={:?}; native_errno={:?}; received_bytes={}; deadline_reached={}",
+                        cause.kind(), cause.raw_os_error(), header.len(), Instant::now() >= deadline,
+                    );
+                    "host fixture header read"
+                })?;
                 header.push(byte[0]);
                 if header.len() > 16 * 1024 {
                     return Err("host fixture header limit");
@@ -546,7 +556,16 @@ fn actual_host_responses_then_terminal_receipt_activate_exact_session() {
         &budget,
         Instant::now() + Duration::from_secs(5),
     );
-    host.join().unwrap().unwrap();
+    let fixture_result = host.join();
+    if reply.is_err() || !matches!(&fixture_result, Ok(Ok(()))) {
+        eprintln!(
+            "host_fixture_caller stage=installed; result={:?}",
+            reply
+                .as_ref()
+                .map(|frame| frame.as_ref().map(PublicFrame::kind)),
+        );
+    }
+    fixture_result.unwrap().unwrap();
     let complete = reply.unwrap().unwrap();
     assert_eq!(complete.kind(), ManagementKind::Complete);
     assert!(processor.has_pending_completion());
@@ -689,7 +708,16 @@ fn observed_pairing_with_store(
         &budget,
         Instant::now() + Duration::from_secs(5),
     );
-    host.join().unwrap().unwrap();
+    let fixture_result = host.join();
+    if installed_result.is_err() || !matches!(&fixture_result, Ok(Ok(()))) {
+        eprintln!(
+            "host_fixture_caller stage=installed; result={:?}",
+            installed_result
+                .as_ref()
+                .map(|frame| frame.as_ref().map(PublicFrame::kind)),
+        );
+    }
+    fixture_result.unwrap().unwrap();
     assert_eq!(
         installed_result.unwrap().unwrap().kind(),
         ManagementKind::Complete
@@ -1137,6 +1165,79 @@ fn completion_retention_budget_keeps_rolled_back_pending_truth() {
         fixture.processor.rejected_encoded_bytes,
         MAX_REJECTED_ENCODED_BYTES
     );
+}
+
+#[test]
+fn current_pairing_owner_reads_only_explicit_same_host_policy() {
+    for explicit in [false, true] {
+        let mut fixture = native_owned_pairing_fixture(if explicit {
+            "pair-owner-explicit-read-policy"
+        } else {
+            "pair-owner-missing-read-policy"
+        });
+        let selected = HostReadPolicy::new(["survival".to_owned()], true).unwrap();
+        let retained = if explicit {
+            let rpc = OwnerSetupRpcContext::for_store(&fixture.store, None).unwrap();
+            let project = ProjectId::new(fixture.context["projectId"].as_str().unwrap()).unwrap();
+            let mut approval = OwnerSetupAuthority::for_read(&rpc);
+            let setup = host_setup(
+                &fixture.store,
+                &rpc,
+                &mut approval,
+                &project,
+                &artifact(),
+                None,
+            )
+            .unwrap();
+            let request = HostSetupRegistration {
+                project_id: project,
+                host_artifact_digest: artifact(),
+                approved_scope: setup.approved_scope,
+            };
+            // Reuse this fixture's existing private file-verification seam.
+            // Kernel owner, native Project registration, actual SQLite policy
+            // and current entered-request consumer are real. This is not a
+            // game/JAR execution or a source-rights acceptance fixture.
+            approval.registration = Some(request.clone());
+            approval.selected_read_policy = Some(selected.clone());
+            Some(
+                register_host_setup_with_read_policy(
+                    &mut fixture.store,
+                    &rpc,
+                    &mut approval,
+                    &request,
+                    &selected,
+                )
+                .unwrap()
+                .1,
+            )
+        } else {
+            None
+        };
+        finish_observed_pairing(&mut fixture, true).unwrap();
+        let hosts = fixture.processor.hosts.clone();
+        let authority = fixture.authority.clone();
+        let id = ContextId::new(fixture.context["contextId"].as_str().unwrap()).unwrap();
+        let policy = fixture.processor.current_session_policy().unwrap();
+        pairing_request_probe(fixture.store, policy, move |store, request| {
+            let pairing = hosts.completed_pairing_witness(&request, &authority, &id)?;
+            let result = pairing
+                .with_current_native_owner(store, &authority, |owner| owner.read_host_policy());
+            if let Some(retained) = &retained {
+                let actual = result?;
+                assert_eq!(&actual, retained);
+                assert_eq!(actual.policy(), &selected);
+                assert!(actual.policy().native_observation_user_local_only());
+                assert!(!actual.policy().shape_modes().contains("creative"));
+                assert_eq!(actual.principal(), pairing.native_owner());
+                assert_ne!(actual.principal(), pairing.principal());
+            } else {
+                assert_eq!(result.unwrap_err().code, "SOURCE_UNAVAILABLE");
+            }
+            Ok(())
+        });
+        fixture.processor.shutdown().unwrap();
+    }
 }
 
 #[test]

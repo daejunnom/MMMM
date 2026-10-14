@@ -295,3 +295,281 @@ fn registration_revocation_and_cancellation_roll_back_before_any_approval() {
     assert!(register_host_setup(&mut store, &rpc, &mut authority, &request(&missing)).is_err());
     assert!(register_host_setup(&mut store, &rpc, &mut authority, &setup).is_ok());
 }
+
+// The old Authority deliberately keeps both new default-deny methods. These
+// fixtures add policy-specific decisions instead of widening old setup tests.
+struct PolicyAuthority {
+    base: Authority,
+    selected: HostReadPolicy,
+    policy_calls: usize,
+    revoke_policy_at: Option<usize>,
+    deny_policy_read: bool,
+}
+impl PolicyAuthority {
+    fn new(selected: HostReadPolicy) -> Self {
+        Self {
+            base: Authority::default(),
+            selected,
+            policy_calls: 0,
+            revoke_policy_at: None,
+            deny_policy_read: false,
+        }
+    }
+}
+impl HostSetupAuthority for PolicyAuthority {
+    fn authorize_registration(
+        &mut self,
+        store: &DurableStore,
+        owner: &PrincipalId,
+        request: &HostSetupRegistration,
+    ) -> StorageResult<()> {
+        self.base.authorize_registration(store, owner, request)
+    }
+    fn authorize_read(
+        &mut self,
+        store: &DurableStore,
+        owner: &PrincipalId,
+        record: &HostSetupRecord,
+    ) -> StorageResult<()> {
+        self.base.authorize_read(store, owner, record)
+    }
+    fn authorize_read_policy_registration(
+        &mut self,
+        _: &DurableStore,
+        _: &PrincipalId,
+        _: &HostSetupRegistration,
+        policy: &HostReadPolicy,
+    ) -> StorageResult<()> {
+        self.policy_calls += 1;
+        if policy != &self.selected
+            || self
+                .revoke_policy_at
+                .is_some_and(|at| self.policy_calls >= at)
+        {
+            return Err(StorageError::Conflict("Test explicit read policy revoked"));
+        }
+        Ok(())
+    }
+    fn authorize_read_policy_read(
+        &mut self,
+        _: &DurableStore,
+        _: &PrincipalId,
+        _: &HostSetupRecord,
+        _: &HostReadPolicyRecord,
+    ) -> StorageResult<()> {
+        if self.deny_policy_read {
+            return Err(StorageError::Conflict("Test policy read revoked"));
+        }
+        Ok(())
+    }
+}
+fn read_policy() -> HostReadPolicy {
+    HostReadPolicy::new(["survival".to_owned(), "adventure".to_owned()], true).unwrap()
+}
+
+#[test]
+fn legacy_setup_never_infers_or_creates_a_read_policy() {
+    let root = Root::new();
+    let mut store = root.open();
+    let project = project(&mut store);
+    let rpc = Rpc::new();
+    let request = request(&project);
+    let mut old = Authority::default();
+    register_host_setup(&mut store, &rpc, &mut old, &request).unwrap();
+    assert!(matches!(
+        host_read_policy(
+            &store,
+            &rpc,
+            &mut old,
+            &project,
+            &request.host_artifact_digest,
+            &request.approved_scope
+        ),
+        Err(StorageError::NotFound(_))
+    ));
+    assert!(
+        register_host_setup_with_read_policy(&mut store, &rpc, &mut old, &request, &read_policy())
+            .is_err()
+    );
+    let exists: i64 = store
+        .connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='approved_host_read_policies')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(exists, 0);
+}
+
+#[test]
+fn explicit_companion_binds_the_legacy_scope_and_survives_restart_immutably() {
+    let root = Root::new();
+    let mut store = root.open();
+    let project = project(&mut store);
+    let rpc = Rpc::new();
+    let request = request(&project);
+    let old = register_host_setup(&mut store, &rpc, &mut Authority::default(), &request).unwrap();
+    let policy = read_policy();
+    let mut authority = PolicyAuthority::new(policy.clone());
+    let receipt =
+        register_host_setup_with_read_policy(&mut store, &rpc, &mut authority, &request, &policy)
+            .unwrap();
+    assert_eq!(receipt.0, old);
+    assert_eq!(
+        register_host_setup_with_read_policy(&mut store, &rpc, &mut authority, &request, &policy)
+            .unwrap(),
+        receipt
+    );
+    let changed = HostReadPolicy::new(["creative".to_owned()], false).unwrap();
+    authority.selected = changed.clone();
+    assert!(matches!(
+        register_host_setup_with_read_policy(&mut store, &rpc, &mut authority, &request, &changed),
+        Err(StorageError::Conflict(
+            "Immutable approved host read policy"
+        ))
+    ));
+    drop(store);
+    let store = root.open();
+    assert_eq!(
+        host_read_policy(
+            &store,
+            &rpc,
+            &mut authority,
+            &project,
+            &request.host_artifact_digest,
+            &request.approved_scope
+        )
+        .unwrap(),
+        receipt.1
+    );
+    // Setup-only authority cannot read a policy merely because it reads setup.
+    assert!(
+        host_read_policy(
+            &store,
+            &rpc,
+            &mut Authority::default(),
+            &project,
+            &request.host_artifact_digest,
+            &request.approved_scope
+        )
+        .is_err()
+    );
+    let mut offered = request.approved_scope.clone();
+    offered
+        .object_ids
+        .push(ObjectId::new("outside-policy-scope").unwrap());
+    assert!(
+        host_read_policy(
+            &store,
+            &rpc,
+            &mut authority,
+            &project,
+            &request.host_artifact_digest,
+            &offered
+        )
+        .is_err()
+    );
+    authority.deny_policy_read = true;
+    assert!(
+        host_read_policy(
+            &store,
+            &rpc,
+            &mut authority,
+            &project,
+            &request.host_artifact_digest,
+            &request.approved_scope
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn policy_revocation_or_cancellation_rolls_back_both_rows_in_one_transaction() {
+    for cancelled in [false, true] {
+        let root = Root::new();
+        let mut store = root.open();
+        let project = project(&mut store);
+        let request = request(&project);
+        let policy = read_policy();
+        let rpc = Rpc {
+            cancel_after: cancelled.then_some(3),
+            ..Rpc::new()
+        };
+        let mut authority = PolicyAuthority::new(policy.clone());
+        authority.revoke_policy_at = (!cancelled).then_some(2);
+        assert!(
+            register_host_setup_with_read_policy(
+                &mut store,
+                &rpc,
+                &mut authority,
+                &request,
+                &policy
+            )
+            .is_err()
+        );
+        // DDL is transactional too: neither table was published by this call.
+        let count: i64 = store.connection.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('approved_host_setups','approved_host_read_policies')", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
+}
+
+#[test]
+fn corrupted_policy_identity_scope_and_digest_are_never_adopted() {
+    let root = Root::new();
+    let mut store = root.open();
+    let project = project(&mut store);
+    let request = request(&project);
+    let policy = read_policy();
+    let rpc = Rpc::new();
+    let mut authority = PolicyAuthority::new(policy.clone());
+    let (_, retained) =
+        register_host_setup_with_read_policy(&mut store, &rpc, &mut authority, &request, &policy)
+            .unwrap();
+    for field in [
+        "principal",
+        "projectId",
+        "hostArtifactDigest",
+        "approvedScopeDigest",
+        "policyDigest",
+    ] {
+        let mut changed = serde_json::to_value(&retained).unwrap();
+        changed[field] = if field.ends_with("Digest") {
+            json!("b".repeat(64))
+        } else {
+            json!("different-valid-id")
+        };
+        store
+            .connection
+            .execute(
+                "UPDATE approved_host_read_policies SET record_json=?1",
+                [changed.to_string()],
+            )
+            .unwrap();
+        assert!(matches!(
+            host_read_policy(
+                &store,
+                &rpc,
+                &mut authority,
+                &project,
+                &request.host_artifact_digest,
+                &request.approved_scope
+            ),
+            Err(StorageError::Corrupt(_))
+        ));
+    }
+}
+
+#[test]
+fn policy_modes_and_observation_opt_in_are_separate_and_closed() {
+    for name in ["", "Survival", "all", "unknown"] {
+        assert!(HostReadPolicy::new([name.to_owned()], true).is_err());
+    }
+    assert!(HostReadPolicy::new(["survival".to_owned(), "survival".to_owned()], true).is_err());
+    let observation = HostReadPolicy::new([], true).unwrap();
+    assert!(observation.shape_modes().is_empty());
+    assert!(observation.native_observation_user_local_only());
+    let shape = HostReadPolicy::new(["survival".to_owned()], false).unwrap();
+    assert!(!shape.native_observation_user_local_only());
+    assert_eq!(shape.shape_modes().len(), 1);
+}

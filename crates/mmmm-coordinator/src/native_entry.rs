@@ -6,9 +6,13 @@ use crate::{
     CoordinatorClient,
     daemon::{DaemonError, PreparedDaemon},
     daemon_launch::{self, DaemonLaunchError, NativeDaemonLocator},
+    host_read_policy::selected_host_read_policy,
     host_relay::{self, RelayError},
     lifecycle::{Coordinator, CoordinatorError},
-    local_setup::{LocalHostSetup, LocalSetupError, register_local_host_setup},
+    local_setup::{
+        LocalHostSetup, LocalReadPolicySetupError, LocalSetupError, register_local_host_setup,
+        register_local_host_setup_with_read_policy,
+    },
     native_import_files::{ImportReadBudget, InputRole, read_selected, validate_selection},
     native_source_ingress::{
         NativeRawSourceResource, NativeSourceDocument, NativeSourceInput, NativeSourceKind,
@@ -18,9 +22,14 @@ use crate::{
     stdio_io::{NativeStdioPort, StdioError, StdioLimits},
 };
 use mmmm_contracts::{
-    JsonLimits, ProjectId, Sha256Digest, TargetProfileId, encode_json, parse_json_with_limits,
+    ContextId, JsonLimits, ProjectId, Sha256Digest, TargetProfileId, encode_json,
+    parse_json_with_limits,
 };
-use mmmm_runtime::storage::{StoreConfig, native_owned_sources::NativeOwnedSourceCommitReceipt};
+use mmmm_runtime::storage::{
+    StoreConfig,
+    host_setup::{HostReadPolicy, HostReadPolicyRecord},
+    native_owned_sources::NativeOwnedSourceCommitReceipt,
+};
 use serde_json::{Value, json};
 use std::{
     path::PathBuf,
@@ -44,6 +53,7 @@ const MAX_SOURCE_DOCUMENTS: usize = 256;
 #[derive(Debug)]
 pub enum EntryError {
     Arguments,
+    HostReadPolicyArguments,
     SourceArguments,
     SourceRequest(ServiceError),
     SourceFile(ImportFileError),
@@ -51,6 +61,7 @@ pub enum EntryError {
     Daemon(DaemonError),
     Launch(DaemonLaunchError),
     Setup(LocalSetupError),
+    ReadPolicySetup(LocalReadPolicySetupError),
     Relay(RelayError),
     Client(crate::client::ClientError),
     Peer(crate::peer::PeerError),
@@ -72,6 +83,10 @@ pub enum EntryError {
         receipt: Box<NativeOwnedSourceCommitReceipt>,
         delivery: Box<EntryError>,
     },
+    HostReadPolicyCommitted {
+        record: Box<HostReadPolicyRecord>,
+        delivery: Box<EntryError>,
+    },
     Shutdown {
         primary: Option<Box<EntryError>>,
         cleanup: CoordinatorError,
@@ -81,6 +96,7 @@ impl std::fmt::Display for EntryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Arguments => f.write_str("Native command arguments are invalid"),
+            Self::HostReadPolicyArguments => f.write_str("Host setup read policy requires unique --shape-mode survival|creative|adventure|spectator selections and optional --native-observation user_local_only; absent selections grant no corresponding source access"),
             Self::SourceArguments => f.write_str("Native source import requires at least one document and at most 256 combined document/resource inputs: --document <kind>:<JSON>, --document-file <kind>:<absolute JSON path>, and adjacent --resource-descriptor-file/--resource-bytes-file paths; kinds are prefab|instance|clip and OS argv limits may be smaller"),
             Self::SourceRequest(error) => write!(f, "{}: Native source request could not continue", error.code),
             Self::SourceFile(error) => error.fmt(f),
@@ -88,6 +104,7 @@ impl std::fmt::Display for EntryError {
             Self::Daemon(error) => error.fmt(f),
             Self::Launch(error) => error.fmt(f),
             Self::Setup(error) => error.fmt(f),
+            Self::ReadPolicySetup(error) => error.fmt(f),
             Self::Relay(error) => error.fmt(f),
             Self::Client(_) => f.write_str("Selected Project could not be inspected through the authenticated Coordinator"),
             Self::Peer(_) => f.write_str("The exact selected Coordinator generation could not be authenticated"),
@@ -100,6 +117,9 @@ impl std::fmt::Display for EntryError {
             Self::SourcesCommitted { receipt, delivery } => write!(f,
                 "Project {} advanced from {} to {} with committed sources retained; result delivery failed: {delivery}",
                 receipt.project_id, receipt.base_revision, receipt.project_revision),
+            Self::HostReadPolicyCommitted { record, delivery } => write!(f,
+                "Host read policy {} for Project {} was committed and retained; result delivery failed: {delivery}",
+                record.policy_digest(), record.project_id()),
             Self::Shutdown { .. } => f.write_str("Coordinator shutdown is unresolved; durable data and discovery requiring cleanup are retained"),
         }
     }
@@ -112,6 +132,7 @@ impl std::error::Error for EntryError {
             Self::SourceFile(e) => Some(e),
             Self::Launch(e) => Some(e),
             Self::Setup(e) => Some(e),
+            Self::ReadPolicySetup(e) => Some(e),
             Self::Relay(e) => Some(e),
             Self::Client(e) => Some(e),
             Self::Peer(e) => Some(e),
@@ -119,6 +140,7 @@ impl std::error::Error for EntryError {
             Self::OutputDrain { primary, .. } => Some(primary.as_ref()),
             Self::Initialized { delivery, .. } => Some(delivery.as_ref()),
             Self::SourcesCommitted { delivery, .. } => Some(delivery.as_ref()),
+            Self::HostReadPolicyCommitted { delivery, .. } => Some(delivery.as_ref()),
             Self::Shutdown { cleanup, .. } => Some(cleanup),
             _ => None,
         }
@@ -146,6 +168,7 @@ enum Command {
         jar: PathBuf,
         destination: PathBuf,
         scope: Value,
+        read_policy: Option<HostReadPolicy>,
     },
     SourceImport {
         root: PathBuf,
@@ -257,10 +280,26 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
                 PreparedDaemon::open(StoreConfig::new(root), Some(project.clone()), &mut factory)
                     .map_err(EntryError::Daemon)?;
             check(deadline)?;
+            // Return the installed workspace locator only after listener startup
+            // succeeds. A caller cannot supply or reuse a different context ID.
+            let workspace_context = prepared
+                .handles()
+                .workspace
+                .as_ref()
+                .and_then(|workspace| workspace.context.get("contextId"))
+                .and_then(Value::as_str)
+                .and_then(|id| ContextId::new(id).ok())
+                .ok_or_else(|| {
+                    EntryError::Daemon(DaemonError::Composition(ServiceError::new(
+                        "WORKSPACE_UNAVAILABLE",
+                        "The installed native workspace has no valid context locator",
+                    )))
+                })?;
             let mut coordinator = prepared.start().map_err(EntryError::Daemon)?;
             let primary = match output(
                 &json!({"kind":"coordinator_started","projectId":project,
-                "address":coordinator.endpoint().address,"coordinatorEpoch":coordinator.endpoint().coordinator_epoch}),
+                "address":coordinator.endpoint().address,"coordinatorEpoch":coordinator.endpoint().coordinator_epoch,
+                "workspaceContextId":workspace_context}),
                 deadline,
             ) {
                 Ok(()) => coordinator
@@ -300,26 +339,38 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
             jar,
             destination,
             scope,
+            read_policy,
         } => {
             let executable = std::env::current_exe().map_err(|_| EntryError::Arguments)?;
-            let setup = register_local_host_setup(
-                StoreConfig::new(root),
-                LocalHostSetup {
-                    executable: &executable,
-                    installed_host_jar: &jar,
-                    destination: &destination,
-                    project,
-                    scope,
-                },
-            )
-            .map_err(EntryError::Setup)?;
-            // Confirmation contains public pins only. Capability issuance is
-            // still the actual game admin's private host pairing transition.
-            output(
-                &json!({"kind":"host_setup_registered","projectId":setup.project_id,
-                "executableSha256":setup.executable_sha256,"hostArtifactDigest":setup.host_artifact_digest}),
-                Instant::now() + OUTPUT,
-            )?;
+            let request = LocalHostSetup {
+                executable: &executable,
+                installed_host_jar: &jar,
+                destination: &destination,
+                project,
+                scope,
+            };
+            if let Some(policy) = read_policy {
+                let deadline = started + Duration::from_secs(15);
+                let (setup, record) = register_local_host_setup_with_read_policy(
+                    StoreConfig::new(root),
+                    request,
+                    &policy,
+                    deadline,
+                )
+                .map_err(EntryError::ReadPolicySetup)?;
+                let confirmation = json!({"kind":"host_setup_registered","projectId":setup.project_id,
+                    "executableSha256":setup.executable_sha256,"hostArtifactDigest":setup.host_artifact_digest,
+                    "readPolicyDigest":record.policy_digest()});
+                deliver_host_read_policy(record, || output(&confirmation, deadline))?;
+            } else {
+                let setup = register_local_host_setup(StoreConfig::new(root), request)
+                    .map_err(EntryError::Setup)?;
+                output(
+                    &json!({"kind":"host_setup_registered","projectId":setup.project_id,
+                    "executableSha256":setup.executable_sha256,"hostArtifactDigest":setup.host_artifact_digest}),
+                    Instant::now() + OUTPUT,
+                )?;
+            }
         }
         Command::SourceImport {
             root,
@@ -425,9 +476,17 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
     let mut raw_resources = Vec::new();
     let mut pending_descriptor = None;
     let mut source_total = 0usize;
+    let mut shape_modes = Vec::new();
     for pair in args[1..].chunks(2) {
         if pair.len() != 2 {
             return Err(EntryError::Arguments);
+        }
+        if command == "host-setup" && pair[0] == "--shape-mode" {
+            if shape_modes.len() >= 4 || pair[1].len() > 16 || shape_modes.contains(&pair[1]) {
+                return Err(EntryError::HostReadPolicyArguments);
+            }
+            shape_modes.push(pair[1].clone());
+            continue;
         }
         if command == "source-import" {
             if let Some(descriptor) = pending_descriptor.take() {
@@ -517,6 +576,18 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
             }
         }
         "host-setup" => {
+            let observation = options.remove("--native-observation");
+            if observation.is_some_and(|value| value != "user_local_only") {
+                return Err(EntryError::HostReadPolicyArguments);
+            }
+            let read_policy = if shape_modes.is_empty() && observation.is_none() {
+                None
+            } else {
+                Some(
+                    selected_host_read_policy(&shape_modes, observation.is_some())
+                        .map_err(|_| EntryError::HostReadPolicyArguments)?,
+                )
+            };
             let project = ProjectId::new(options.remove("--project").ok_or(EntryError::Arguments)?)
                 .map_err(|_| EntryError::Arguments)?;
             let jar = PathBuf::from(options.remove("--host-jar").ok_or(EntryError::Arguments)?);
@@ -543,6 +614,7 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
                 jar,
                 destination,
                 scope,
+                read_policy,
             }
         }
         "source-import" => {
@@ -570,6 +642,16 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
         return Err(EntryError::Arguments);
     }
     Ok(Some(parsed))
+}
+
+fn deliver_host_read_policy(
+    record: HostReadPolicyRecord,
+    deliver: impl FnOnce() -> Result<(), EntryError>,
+) -> Result<(), EntryError> {
+    deliver().map_err(|delivery| EntryError::HostReadPolicyCommitted {
+        record: Box::new(record),
+        delivery: Box::new(delivery),
+    })
 }
 
 fn document_selector(value: &str) -> Result<(NativeSourceKind, &str), EntryError> {
@@ -894,6 +976,97 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn host_setup_policy_flags_are_explicit_closed_and_leave_old_commands_unchanged() {
+        let base = || {
+            args(&[
+                "host-setup",
+                "--data-root",
+                root(),
+                "--project",
+                "project-test",
+                "--host-jar",
+                &PathBuf::from(root()).join("selected.jar").to_string_lossy(),
+                "--output",
+                &PathBuf::from(root())
+                    .join("mmmm-host.json")
+                    .to_string_lossy(),
+                "--scope-json",
+                "{}",
+            ])
+        };
+        assert!(matches!(
+            parse(&base()),
+            Ok(Some(Command::Setup {
+                read_policy: None,
+                ..
+            }))
+        ));
+        let mut selected = base();
+        selected.extend(args(&[
+            "--shape-mode",
+            "survival",
+            "--shape-mode",
+            "adventure",
+        ]));
+        let Some(Command::Setup {
+            read_policy: Some(shape),
+            ..
+        }) = parse(&selected).unwrap()
+        else {
+            panic!("Explicit modes must retain a selected policy");
+        };
+        assert_eq!(
+            shape
+                .shape_modes()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["adventure", "survival"]
+        );
+        assert!(!shape.native_observation_user_local_only());
+        selected.extend(args(&["--native-observation", "user_local_only"]));
+        let Some(Command::Setup {
+            read_policy: Some(both),
+            ..
+        }) = parse(&selected).unwrap()
+        else {
+            panic!("Explicit observation opt-in must remain independent");
+        };
+        assert!(both.native_observation_user_local_only());
+        let mut observation = base();
+        observation.extend(args(&["--native-observation", "user_local_only"]));
+        let Some(Command::Setup {
+            read_policy: Some(observation),
+            ..
+        }) = parse(&observation).unwrap()
+        else {
+            panic!("Observation-only policy must parse");
+        };
+        assert!(observation.shape_modes().is_empty());
+        for extra in [
+            vec!["--shape-mode", "all"],
+            vec!["--shape-mode", "Survival"],
+            vec!["--shape-mode", "survival", "--shape-mode", "survival"],
+            vec!["--native-observation", "deny"],
+            vec!["--native-observation", "owned"],
+            vec![
+                "--native-observation",
+                "user_local_only",
+                "--native-observation",
+                "user_local_only",
+            ],
+        ] {
+            let mut invalid = base();
+            invalid.extend(args(&extra));
+            assert!(parse(&invalid).is_err());
+        }
+        let mut other_command =
+            args(&["start", "--data-root", root(), "--project", "project-test"]);
+        other_command.extend(args(&["--shape-mode", "survival"]));
+        assert!(parse(&other_command).is_err());
     }
     #[test]
     fn committed_locator_survives_failed_delivery_and_expired_startup_is_rejected() {

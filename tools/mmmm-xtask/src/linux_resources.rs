@@ -8,6 +8,7 @@ use super::ProcessError;
 
 #[path = "linux_pidfd.rs"]
 mod pidfd;
+pub(super) use pidfd::Diagnostic as PidfdDiagnostic;
 
 const STAT_BYTES: usize = 8192;
 const ROLLUP_BYTES: usize = 32 * 1024;
@@ -610,6 +611,7 @@ mod native {
         // Only an already identified member can bind a process-lifetime FD.
         // Binding is optional: unsupported syscalls or uncertain namespace /
         // mount metadata never turn a later RSS error into a successful sample.
+        let mut pidfd_diagnostic = None;
         let bound = if include_rss {
             match pidfd::bind(
                 root,
@@ -622,7 +624,7 @@ mod native {
                 pidfd::Binding::Unavailable(reason) => {
                     // Keep the closed reason distinct inside the producer;
                     // it is not a replacement for the actual RSS failure.
-                    let _ = reason;
+                    pidfd_diagnostic = Some(reason.diagnostic());
                     None
                 }
                 pidfd::Binding::OriginalGone => return unavailable_member(is_leader),
@@ -644,7 +646,9 @@ mod native {
         // losing the leader reservation cannot be repaired with a pidfd.
         let terminal = match (&memory, after, bound.as_ref()) {
             (Some(Err(_)), Some(after), Some(bound)) if !after.definitely_exited() => {
-                bound.terminal_after(after.identity)
+                let check = bound.check_terminal_after(after.identity);
+                pidfd_diagnostic = Some(check.diagnostic);
+                check.witness
             }
             _ => None,
         };
@@ -653,11 +657,16 @@ mod native {
         // Successful RSS stays an observed fact even when this process exits
         // immediately afterwards. Its live count may drop; its measured RSS
         // and VM must not disappear from the resource budget evidence.
-        if let Some(terminal) = terminal.as_ref() {
+        let failed_rss = memory.as_ref().is_some_and(Result::is_err);
+        let settled = if let Some(terminal) = terminal.as_ref() {
             settle_member_with_terminal(before, after, memory, is_leader, Some(terminal))
         } else {
             settle_member(before, after, memory, is_leader)
-        }
+        };
+        settled.map_err(|error| match (failed_rss, pidfd_diagnostic) {
+            (true, Some(diagnostic)) => error.with_linux_pidfd_diagnostic(diagnostic),
+            _ => error,
+        })
     }
 
     fn unavailable_member(is_leader: bool) -> Result<Option<MemberSample>, ProcessError> {

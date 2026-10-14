@@ -1324,3 +1324,145 @@ fn unix_role_names_are_exact_and_do_not_reinterpret_windows_or_versioned_librari
         assert!(!platform.role_name(DefinitionSourceRole::ObserverLibrary, "observer.so.1"));
     }
 }
+
+#[test]
+fn startup_diagnostics_separate_active_complete_and_unentered_phases() {
+    use std::time::{Duration, Instant};
+    let origin = Instant::now();
+    let mut progress = StartupProgress::new(origin);
+    progress.complete_at(origin + Duration::from_millis(5));
+    progress.begin_at(
+        StartupPhase::AcquireInput,
+        origin + Duration::from_millis(5),
+    );
+    progress.input_at(
+        DefinitionSourceRole::JdkArchive,
+        0,
+        origin + Duration::from_millis(7),
+    );
+    progress.pin_completed();
+    let facts = progress.snapshot(origin + Duration::from_millis(12));
+    assert_eq!(facts.total_elapsed_ms, 12);
+    assert_eq!(facts.phase_elapsed_ms, 7);
+    assert_eq!(facts.input_elapsed_ms, Some(5));
+    assert_eq!(facts.role, Some(DefinitionSourceRole::JdkArchive));
+    assert_eq!(facts.input_ordinal, Some(1));
+    assert_eq!(facts.acquired_pins, Some(1));
+    assert_eq!(facts.pre_spawn_rechecked_pins, Some(0));
+    assert_eq!(facts.post_spawn_rechecked_pins, Some(0));
+    assert!(!facts.elapsed_saturated);
+    assert!(!facts.pin_counter_out_of_range);
+    assert_eq!(facts.phases.len(), 13);
+    let initial = &facts.phases[StartupPhase::InitialMeasure.index()];
+    assert_eq!(initial.elapsed_ms, Some(5));
+    assert!(initial.completed);
+    let active = &facts.phases[StartupPhase::AcquireInput.index()];
+    assert_eq!(active.elapsed_ms, Some(7));
+    assert!(!active.completed);
+    let encoded = serde_json::to_value(&facts).unwrap();
+    assert_eq!(encoded["phase"], "acquire_input");
+    for phase in [
+        StartupPhase::NativeProcess,
+        StartupPhase::DecodeFrame,
+        StartupPhase::Complete,
+    ] {
+        let unentered = &facts.phases[phase.index()];
+        assert_eq!(unentered.elapsed_ms, None);
+        assert!(!unentered.completed);
+        assert!(encoded["phases"][phase.index()]["elapsed_ms"].is_null());
+        assert_eq!(encoded["phases"][phase.index()]["completed"], false);
+    }
+}
+
+#[test]
+fn startup_diagnostics_check_counter_range_and_report_elapsed_saturation_separately() {
+    use std::time::{Duration, Instant};
+    let origin = Instant::now();
+    let mut progress = StartupProgress::new(origin);
+    progress.begin_at(StartupPhase::AcquireInput, origin);
+    for ordinal in 0..MAX_INPUTS {
+        progress.input_at(DefinitionSourceRole::JdkLibrary, ordinal, origin);
+        progress.pin_completed();
+    }
+    let bounded = progress.snapshot(origin);
+    assert_eq!(bounded.acquired_pins, Some(32));
+    assert_eq!(bounded.input_ordinal, Some(32));
+    assert!(!bounded.pin_counter_out_of_range);
+    progress.input_at(DefinitionSourceRole::JdkLibrary, MAX_INPUTS, origin);
+    progress.pin_completed();
+    let unknown = progress.snapshot(origin);
+    assert_eq!(unknown.acquired_pins, None);
+    assert_eq!(unknown.input_ordinal, None);
+    assert!(unknown.pin_counter_out_of_range);
+    assert!(!unknown.elapsed_saturated);
+    assert_eq!(unknown.pre_spawn_rechecked_pins, Some(0));
+    let mut saturated = false;
+    assert_eq!(
+        StartupProgress::milliseconds(Duration::from_millis(u64::MAX), &mut saturated),
+        u64::MAX
+    );
+    assert!(!saturated);
+    assert_eq!(
+        StartupProgress::milliseconds(Duration::from_secs(u64::MAX), &mut saturated),
+        u64::MAX
+    );
+    assert!(saturated);
+}
+
+#[test]
+fn startup_diagnostics_keep_first_error_snapshot_when_post_check_fails() {
+    use std::time::{Duration, Instant};
+    let origin = Instant::now();
+    let mut progress = StartupProgress::new(origin);
+    let early = DefinitionStartupError::new("INPUT_PATH");
+    assert!(early.diagnostics().is_none());
+    assert!(early.post_check_diagnostics().is_none());
+    progress.begin_at(StartupPhase::NativeProcess, origin);
+    let mut first = progress.annotate_at(
+        DefinitionStartupError::new("PROCESS_INCOMPLETE"),
+        origin + Duration::from_millis(3),
+    );
+    let original = serde_json::to_value(first.diagnostics()).unwrap();
+    progress.begin_at(
+        StartupPhase::PostSpawnRecheck,
+        origin + Duration::from_millis(4),
+    );
+    progress.input_at(
+        DefinitionSourceRole::JdkModules,
+        4,
+        origin + Duration::from_millis(5),
+    );
+    progress.pin_completed();
+    first.post_check_error = Some(Box::new(progress.annotate_at(
+        DefinitionStartupError::new("DEADLINE"),
+        origin + Duration::from_millis(8),
+    )));
+    first.set_post_check_diagnostics(progress.snapshot(origin + Duration::from_millis(8)));
+    let first = progress.annotate_at(first, origin + Duration::from_millis(9));
+    assert_eq!(first.kind(), "PROCESS_INCOMPLETE");
+    assert_eq!(serde_json::to_value(first.diagnostics()).unwrap(), original);
+    let primary = first.diagnostics().unwrap();
+    assert_eq!(primary.phase, StartupPhase::NativeProcess);
+    assert_eq!(primary.total_elapsed_ms, 3);
+    assert_eq!(primary.post_spawn_rechecked_pins, Some(0));
+    assert_eq!(
+        primary.phases[StartupPhase::PostSpawnRecheck.index()].elapsed_ms,
+        None
+    );
+    assert!(!primary.phases[StartupPhase::NativeProcess.index()].completed);
+    let secondary = first.post_check_error().unwrap();
+    assert_eq!(secondary.kind(), "DEADLINE");
+    let failed_check = secondary.diagnostics().unwrap();
+    assert_eq!(failed_check.phase, StartupPhase::PostSpawnRecheck);
+    assert_eq!(failed_check.role, Some(DefinitionSourceRole::JdkModules));
+    assert_eq!(failed_check.input_ordinal, Some(5));
+    assert_eq!(failed_check.total_elapsed_ms, 8);
+    assert_eq!(failed_check.phase_elapsed_ms, 4);
+    assert_eq!(failed_check.input_elapsed_ms, Some(3));
+    assert_eq!(failed_check.post_spawn_rechecked_pins, Some(1));
+    assert!(!failed_check.phases[StartupPhase::PostSpawnRecheck.index()].completed);
+    assert_eq!(
+        serde_json::to_value(first.post_check_diagnostics()).unwrap(),
+        serde_json::to_value(secondary.diagnostics()).unwrap()
+    );
+}

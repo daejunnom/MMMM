@@ -21,8 +21,9 @@ use mmmm_contracts::{
 use mmmm_runtime::storage::{
     DurableStore, StorageError, StorageResult, WriteScope,
     host_setup::{
-        HostSetupAuthority, HostSetupRecord, HostSetupRegistration, HostSetupRpcContext,
-        host_setup, register_host_setup,
+        HostReadPolicy, HostReadPolicyRecord, HostSetupAuthority, HostSetupRecord,
+        HostSetupRegistration, HostSetupRpcContext, host_setup, register_host_setup,
+        register_host_setup_with_read_policy,
     },
 };
 use serde_json::{Value, json};
@@ -56,15 +57,22 @@ pub struct OwnerSetupRpcContext {
 }
 impl OwnerSetupRpcContext {
     fn for_store(store: &DurableStore, budget: Option<&BootstrapBudget>) -> StorageResult<Self> {
-        let owner = local_owner_principal().map_err(|_| owner_error())?;
         let deadline = budget
             .map(BootstrapBudget::deadline)
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(10));
+        Self::capture(store, deadline, budget.cloned())
+    }
+    fn capture(
+        store: &DurableStore,
+        deadline: Instant,
+        budget: Option<BootstrapBudget>,
+    ) -> StorageResult<Self> {
+        let owner = local_owner_principal().map_err(|_| owner_error())?;
         let context = Self {
             owner,
             data_root: store.data_root().to_path_buf(),
             deadline,
-            budget: budget.cloned(),
+            budget,
         };
         context.check()?;
         Ok(context)
@@ -102,6 +110,7 @@ struct OwnerSetupAuthority {
     owner: PrincipalId,
     data_root: PathBuf,
     registration: Option<HostSetupRegistration>,
+    selected_read_policy: Option<HostReadPolicy>,
 }
 impl OwnerSetupAuthority {
     fn for_read(rpc: &OwnerSetupRpcContext) -> Self {
@@ -109,6 +118,7 @@ impl OwnerSetupAuthority {
             owner: rpc.owner.clone(),
             data_root: rpc.data_root.clone(),
             registration: None,
+            selected_read_policy: None,
         }
     }
     fn check_current(
@@ -159,6 +169,26 @@ impl HostSetupAuthority for OwnerSetupAuthority {
         }
         Ok(())
     }
+    fn authorize_read_policy_registration(
+        &mut self,
+        store: &DurableStore,
+        principal: &PrincipalId,
+        request: &HostSetupRegistration,
+        policy: &HostReadPolicy,
+    ) -> StorageResult<()> {
+        self.authorize_registration(store, principal, request)?;
+        if self.selected_read_policy.as_ref() != Some(policy)
+            || mmmm_runtime::storage::bootstrap::registered_native_project_owner(
+                store,
+                &request.project_id,
+            )? != *principal
+        {
+            return Err(owner_error());
+        }
+        self.check_current(store, principal, &request.project_id)
+    }
+    // The setup writer never serves policy reads to a paired request. That
+    // consumer supplies its actual current owner/route/request adapter instead.
 }
 
 /// Explicitly invoked local CLI setup computes actual ordinary executable/JAR
@@ -193,6 +223,51 @@ pub fn register_explicit_host_setup(
     authority.registration = Some(registration.clone());
     register_host_setup(store, &rpc, &mut authority, &registration)?;
     Ok(setup)
+}
+
+/// Explicit native selection only. Its original caller deadline survives file
+/// verification, registration and every transaction checkpoint. The returned
+/// policy is a confirmed durable receipt, not an observation/source capability.
+pub(crate) fn register_explicit_host_setup_with_read_policy(
+    store: &mut DurableStore,
+    executable: &Path,
+    installed_host_jar: &Path,
+    project: ProjectId,
+    scope: Value,
+    policy: &HostReadPolicy,
+    deadline: Instant,
+) -> StorageResult<(PublicHostSetup, HostReadPolicyRecord)> {
+    let rpc = OwnerSetupRpcContext::capture(store, deadline, None)?;
+    rpc.check_store(store)?;
+    if mmmm_runtime::storage::bootstrap::registered_native_project_owner(store, &project)?
+        != rpc.owner
+    {
+        return Err(owner_error());
+    }
+    store.project(&project)?;
+    let setup = PublicHostSetup::create(
+        executable,
+        installed_host_jar,
+        store.data_root(),
+        project,
+        scope,
+    )
+    .map_err(|_| StorageError::InvalidInput("Explicit host setup verification failed".into()))?;
+    rpc.check_store(store)?;
+    let request = HostSetupRegistration {
+        project_id: setup.project_id.clone(),
+        host_artifact_digest: setup.host_artifact_digest.clone(),
+        approved_scope: serde_json::from_value(setup.scope.clone())
+            .map_err(|_| StorageError::InvalidInput("Host setup scope is invalid".into()))?,
+    };
+    let mut authority = OwnerSetupAuthority::for_read(&rpc);
+    authority.registration = Some(request.clone());
+    authority.selected_read_policy = Some(policy.clone());
+    let (_, retained) =
+        register_host_setup_with_read_policy(store, &rpc, &mut authority, &request, policy)?;
+    // Do not discard this receipt by performing a fallible post-commit check.
+    // The local wrapper retains it around all remaining owner/output checks.
+    Ok((setup, retained))
 }
 
 struct PendingBootstrap {

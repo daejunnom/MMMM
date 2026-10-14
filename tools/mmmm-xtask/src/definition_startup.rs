@@ -116,6 +116,229 @@ impl SourcePins {
     }
 }
 
+/// Closed developer-observation checkpoints, never input names or authority.
+/// A phase includes its existing boundary checks; entering decode/hash does
+/// not itself claim that the body ran or that the boundary completed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupPhase {
+    InitialMeasure,
+    SelectInputs,
+    AcquireInput,
+    PreSpawnRecheck,
+    PreSpawnMeasure,
+    PrepareProcess,
+    NativeProcess,
+    ReadCapture,
+    PostSpawnRecheck,
+    PostSpawnMeasure,
+    DecodeFrame,
+    HashFrame,
+    Complete,
+}
+const STARTUP_PHASES: [StartupPhase; 13] = [
+    StartupPhase::InitialMeasure,
+    StartupPhase::SelectInputs,
+    StartupPhase::AcquireInput,
+    StartupPhase::PreSpawnRecheck,
+    StartupPhase::PreSpawnMeasure,
+    StartupPhase::PrepareProcess,
+    StartupPhase::NativeProcess,
+    StartupPhase::ReadCapture,
+    StartupPhase::PostSpawnRecheck,
+    StartupPhase::PostSpawnMeasure,
+    StartupPhase::DecodeFrame,
+    StartupPhase::HashFrame,
+    StartupPhase::Complete,
+];
+impl StartupPhase {
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StartupPhaseElapsed {
+    phase: StartupPhase,
+    // None means this phase was not entered. A failing or still active phase
+    // has an elapsed observation but never completed=true.
+    elapsed_ms: Option<u64>,
+    completed: bool,
+}
+
+/// Fixed-size path-free facts. Millisecond conversion explicitly saturates;
+/// counters instead become unknown on a checked range violation, never 32 by
+/// clamping. Neither condition changes the original execution/error policy.
+#[derive(Clone, Debug, Serialize)]
+pub struct StartupDiagnostics {
+    schema: &'static str,
+    phase: StartupPhase,
+    role: Option<DefinitionSourceRole>,
+    input_ordinal: Option<u8>,
+    total_elapsed_ms: u64,
+    phase_elapsed_ms: u64,
+    input_elapsed_ms: Option<u64>,
+    elapsed_saturated: bool,
+    acquired_pins: Option<u8>,
+    pre_spawn_rechecked_pins: Option<u8>,
+    post_spawn_rechecked_pins: Option<u8>,
+    pin_counter_out_of_range: bool,
+    phases: [StartupPhaseElapsed; 13],
+}
+#[derive(Debug)]
+struct StartupErrorDiagnostics {
+    primary: StartupDiagnostics,
+    post_check: Option<StartupDiagnostics>,
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
+struct StartupProgress {
+    origin: std::time::Instant,
+    phase_started: std::time::Instant,
+    input_started: Option<std::time::Instant>,
+    facts: StartupDiagnostics,
+}
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
+impl StartupProgress {
+    fn new(origin: std::time::Instant) -> Self {
+        let mut phases = std::array::from_fn(|index| StartupPhaseElapsed {
+            phase: STARTUP_PHASES[index],
+            elapsed_ms: None,
+            completed: false,
+        });
+        phases[StartupPhase::InitialMeasure.index()].elapsed_ms = Some(0);
+        Self {
+            origin,
+            phase_started: origin,
+            input_started: None,
+            facts: StartupDiagnostics {
+                schema: "mmmm-definition-startup-diagnostics/1",
+                phase: StartupPhase::InitialMeasure,
+                role: None,
+                input_ordinal: None,
+                total_elapsed_ms: 0,
+                phase_elapsed_ms: 0,
+                input_elapsed_ms: None,
+                elapsed_saturated: false,
+                acquired_pins: Some(0),
+                pre_spawn_rechecked_pins: Some(0),
+                post_spawn_rechecked_pins: Some(0),
+                pin_counter_out_of_range: false,
+                phases,
+            },
+        }
+    }
+    fn milliseconds(value: std::time::Duration, saturated: &mut bool) -> u64 {
+        match u64::try_from(value.as_millis()) {
+            Ok(value) => value,
+            Err(_) => {
+                *saturated = true;
+                u64::MAX
+            }
+        }
+    }
+    fn begin(&mut self, phase: StartupPhase) {
+        self.begin_at(phase, std::time::Instant::now());
+    }
+    fn begin_at(&mut self, phase: StartupPhase, now: std::time::Instant) {
+        let previous = &mut self.facts.phases[self.facts.phase.index()];
+        if !previous.completed {
+            previous.elapsed_ms = Some(Self::milliseconds(
+                now.saturating_duration_since(self.phase_started),
+                &mut self.facts.elapsed_saturated,
+            ));
+        }
+        self.facts.phase = phase;
+        self.facts.role = None;
+        self.facts.input_ordinal = None;
+        self.input_started = None;
+        self.phase_started = now;
+        self.facts.phases[phase.index()].elapsed_ms = Some(0);
+        self.facts.phases[phase.index()].completed = false;
+    }
+    fn complete(&mut self) {
+        self.complete_at(std::time::Instant::now());
+    }
+    fn complete_at(&mut self, now: std::time::Instant) {
+        let elapsed = Self::milliseconds(
+            now.saturating_duration_since(self.phase_started),
+            &mut self.facts.elapsed_saturated,
+        );
+        let phase = &mut self.facts.phases[self.facts.phase.index()];
+        phase.elapsed_ms = Some(elapsed);
+        phase.completed = true;
+    }
+    fn input(&mut self, role: DefinitionSourceRole, zero_based_ordinal: usize) {
+        self.input_at(role, zero_based_ordinal, std::time::Instant::now());
+    }
+    fn input_at(
+        &mut self,
+        role: DefinitionSourceRole,
+        zero_based_ordinal: usize,
+        now: std::time::Instant,
+    ) {
+        self.facts.role = Some(role);
+        self.facts.input_ordinal = zero_based_ordinal
+            .checked_add(1)
+            .filter(|value| *value <= MAX_INPUTS)
+            .and_then(|value| u8::try_from(value).ok());
+        self.facts.pin_counter_out_of_range |= self.facts.input_ordinal.is_none();
+        self.input_started = Some(now);
+    }
+    fn pin_completed(&mut self) {
+        let counter = match self.facts.phase {
+            StartupPhase::AcquireInput => &mut self.facts.acquired_pins,
+            StartupPhase::PreSpawnRecheck => &mut self.facts.pre_spawn_rechecked_pins,
+            StartupPhase::PostSpawnRecheck => &mut self.facts.post_spawn_rechecked_pins,
+            _ => return,
+        };
+        *counter = (*counter)
+            .and_then(|value| value.checked_add(1))
+            .filter(|value| usize::from(*value) <= MAX_INPUTS);
+        self.facts.pin_counter_out_of_range |= counter.is_none();
+    }
+    fn snapshot(&self, now: std::time::Instant) -> StartupDiagnostics {
+        let mut facts = self.facts.clone();
+        facts.total_elapsed_ms = Self::milliseconds(
+            now.saturating_duration_since(self.origin),
+            &mut facts.elapsed_saturated,
+        );
+        let current = &mut facts.phases[facts.phase.index()];
+        if !current.completed {
+            current.elapsed_ms = Some(Self::milliseconds(
+                now.saturating_duration_since(self.phase_started),
+                &mut facts.elapsed_saturated,
+            ));
+        }
+        facts.phase_elapsed_ms = current.elapsed_ms.unwrap_or(0);
+        facts.input_elapsed_ms = self.input_started.map(|started| {
+            Self::milliseconds(
+                now.saturating_duration_since(started),
+                &mut facts.elapsed_saturated,
+            )
+        });
+        facts
+    }
+    fn annotate(&self, error: DefinitionStartupError) -> DefinitionStartupError {
+        self.annotate_at(error, std::time::Instant::now())
+    }
+    fn annotate_at(
+        &self,
+        mut error: DefinitionStartupError,
+        now: std::time::Instant,
+    ) -> DefinitionStartupError {
+        // A primary error keeps its first snapshot even when a later cleanup
+        // check has a different active phase, role, counter or elapsed time.
+        if error.diagnostics.is_none() {
+            error.diagnostics = Some(Box::new(StartupErrorDiagnostics {
+                primary: self.snapshot(now),
+                post_check: None,
+            }));
+        }
+        error
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct FixtureDefinitionSummary {
     class_identity: String,
@@ -145,6 +368,7 @@ pub struct DefinitionStartupRun {
     raw_abi2: Vec<u8>,
     raw_sha256: String,
     summary: DefinitionFixtureSummary,
+    diagnostics: StartupDiagnostics,
 }
 impl DefinitionStartupRun {
     pub fn outcome(&self) -> &process::ProcessOutcome {
@@ -165,6 +389,9 @@ impl DefinitionStartupRun {
     pub fn summary(&self) -> &DefinitionFixtureSummary {
         &self.summary
     }
+    pub fn diagnostics(&self) -> &StartupDiagnostics {
+        &self.diagnostics
+    }
     pub fn into_outcome(self) -> process::ProcessOutcome {
         self.outcome
     }
@@ -181,6 +408,7 @@ pub struct DefinitionStartupError {
     source_pins: Option<SourcePins>,
     raw_candidate: Option<Vec<u8>>,
     post_check_error: Option<Box<DefinitionStartupError>>,
+    diagnostics: Option<Box<StartupErrorDiagnostics>>,
 }
 impl DefinitionStartupError {
     fn new(kind: &'static str) -> Self {
@@ -197,6 +425,7 @@ impl DefinitionStartupError {
             source_pins: None,
             raw_candidate: None,
             post_check_error: None,
+            diagnostics: None,
         }
     }
     pub fn kind(&self) -> &'static str {
@@ -225,6 +454,19 @@ impl DefinitionStartupError {
     }
     pub fn post_check_error(&self) -> Option<&DefinitionStartupError> {
         self.post_check_error.as_deref()
+    }
+    pub fn diagnostics(&self) -> Option<&StartupDiagnostics> {
+        self.diagnostics.as_ref().map(|facts| &facts.primary)
+    }
+    pub fn post_check_diagnostics(&self) -> Option<&StartupDiagnostics> {
+        self.diagnostics
+            .as_ref()
+            .and_then(|facts| facts.post_check.as_ref())
+    }
+    fn set_post_check_diagnostics(&mut self, observed: StartupDiagnostics) {
+        if let Some(facts) = self.diagnostics.as_mut() {
+            facts.post_check = Some(observed);
+        }
     }
     pub fn into_outcome(self) -> Option<process::ProcessOutcome> {
         self.outcome.map(|outcome| *outcome)
@@ -571,14 +813,17 @@ use std::time::{Duration, Instant};
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 struct Deadline<'a> {
     cancellation: &'a AtomicBool,
+    started: Instant,
     deadline: Instant,
 }
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 impl<'a> Deadline<'a> {
     fn new(cancellation: &'a AtomicBool) -> Self {
+        let started = Instant::now();
         Self {
             cancellation,
-            deadline: Instant::now() + Duration::from_secs(60),
+            started,
+            deadline: started + Duration::from_secs(60),
         }
     }
     fn check(&self) -> Result<(), DefinitionStartupError> {
@@ -647,11 +892,20 @@ fn post_check<P: StartupInputPin>(
     pins: &mut [P],
     build: &storage::ManagedBuild,
     check: &Deadline<'_>,
+    progress: &mut StartupProgress,
 ) -> Result<(), DefinitionStartupError> {
-    for pin in pins {
-        pin.recheck(build, check)?;
+    progress.begin(StartupPhase::PostSpawnRecheck);
+    for (ordinal, pin) in pins.iter_mut().enumerate() {
+        progress.input(pin.report().role, ordinal);
+        pin.recheck(build, check)
+            .map_err(|error| progress.annotate(error))?;
+        progress.pin_completed();
     }
-    measure(build, check)
+    progress.complete();
+    progress.begin(StartupPhase::PostSpawnMeasure);
+    measure(build, check).map_err(|error| progress.annotate(error))?;
+    progress.complete();
+    Ok(())
 }
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn run_with_pins<P: StartupInputPin>(
@@ -660,12 +914,18 @@ fn run_with_pins<P: StartupInputPin>(
     cancellation: &AtomicBool,
 ) -> Result<DefinitionStartupRun, DefinitionStartupError> {
     let check = Deadline::new(cancellation);
-    measure(build, &check)?;
-    let selected = selected_inputs(selection)?;
+    let mut progress = StartupProgress::new(check.started);
+    measure(build, &check).map_err(|error| progress.annotate(error))?;
+    progress.complete();
+    progress.begin(StartupPhase::SelectInputs);
+    let selected = selected_inputs(selection).map_err(|error| progress.annotate(error))?;
+    progress.complete();
     let mut context = P::Context::default();
     let mut pins: Vec<P> = Vec::new();
     let mut total = 0_u64;
-    for (role, path) in selected {
+    progress.begin(StartupPhase::AcquireInput);
+    for (ordinal, (role, path)) in selected.into_iter().enumerate() {
+        progress.input(role, ordinal);
         let pin = P::acquire(
             &mut context,
             role,
@@ -673,28 +933,39 @@ fn run_with_pins<P: StartupInputPin>(
             build,
             &check,
             MAX_INPUT_BYTES - total,
-        )?;
+        )
+        .map_err(|error| progress.annotate(error))?;
         if pins
             .iter()
             .any(|other| other.source_identity() == pin.source_identity())
         {
-            return Err(DefinitionStartupError::new("INPUT_DUPLICATE"));
+            return Err(progress.annotate(DefinitionStartupError::new("INPUT_DUPLICATE")));
         }
         total = total
             .checked_add(pin.report().size)
-            .ok_or_else(|| DefinitionStartupError::new("INPUT_SIZE"))?;
+            .ok_or_else(|| progress.annotate(DefinitionStartupError::new("INPUT_SIZE")))?;
         if total > MAX_INPUT_BYTES {
-            return Err(DefinitionStartupError::new("INPUT_SIZE"));
+            return Err(progress.annotate(DefinitionStartupError::new("INPUT_SIZE")));
         }
         pins.push(pin);
+        progress.pin_completed();
     }
+    progress.complete();
     let source_pins = SourcePins {
         files: pins.iter().map(|pin| pin.report().clone()).collect(),
     };
-    for pin in &mut pins {
-        pin.recheck(build, &check)?;
+    progress.begin(StartupPhase::PreSpawnRecheck);
+    for (ordinal, pin) in pins.iter_mut().enumerate() {
+        progress.input(pin.report().role, ordinal);
+        pin.recheck(build, &check)
+            .map_err(|error| progress.annotate(error))?;
+        progress.pin_completed();
     }
-    measure(build, &check)?;
+    progress.complete();
+    progress.begin(StartupPhase::PreSpawnMeasure);
+    measure(build, &check).map_err(|error| progress.annotate(error))?;
+    progress.complete();
+    progress.begin(StartupPhase::PrepareProcess);
     let mut spec = process::ProcessSpec::new(
         selection.java_exe.clone(),
         build.paths().scratch.clone(),
@@ -704,7 +975,7 @@ fn run_with_pins<P: StartupInputPin>(
     spec.args = fixed_java_args(
         &selection.observer_dll,
         &selection.observer_jar,
-        StartupPlatform::current()?,
+        StartupPlatform::current().map_err(|error| progress.annotate(error))?,
     );
     spec.env = fixed_environment(build.environment());
     #[cfg(unix)]
@@ -714,14 +985,17 @@ fn run_with_pins<P: StartupInputPin>(
         // reading their values; explicit managed paths/Java overrides remain.
         spec.inherit_environment = false;
     }
-    check.check()?;
+    check.check().map_err(|error| progress.annotate(error))?;
     spec.timeout =
-        remaining_process_budget(check.deadline.saturating_duration_since(Instant::now()))?;
+        remaining_process_budget(check.deadline.saturating_duration_since(Instant::now()))
+            .map_err(|error| progress.annotate(error))?;
     spec.absolute_deadline = Some(check.deadline);
     spec.drain_timeout = Duration::from_secs(15);
     spec.max_log_bytes = 64 * MIB;
     spec.tail_policy = process::TailPolicy::Reject;
     spec.resource_policy = process::ResourcePolicy::for_definition_startup();
+    progress.complete();
+    progress.begin(StartupPhase::NativeProcess);
     let mut capture =
         match process::supervise_with_progress_captured(&spec, cancellation, |progress| {
             check.check().map_err(|error| error.to_string())?;
@@ -745,7 +1019,11 @@ fn run_with_pins<P: StartupInputPin>(
                 error.process_started = None;
                 error.process_error = Some(Box::new(original));
                 error.source_pins = Some(source_pins);
-                error.post_check_error = post_check(&mut pins, build, &check).err().map(Box::new);
+                error = progress.annotate(error);
+                error.post_check_error = post_check(&mut pins, build, &check, &mut progress)
+                    .err()
+                    .map(Box::new);
+                error.set_post_check_diagnostics(progress.snapshot(Instant::now()));
                 return Err(error);
             }
         };
@@ -760,9 +1038,15 @@ fn run_with_pins<P: StartupInputPin>(
         || outcome.owned_tail_terminated
     {
         let mut error = DefinitionStartupError::new("PROCESS_INCOMPLETE");
-        error.post_check_error = post_check(&mut pins, build, &check).err().map(Box::new);
+        error = progress.annotate(error);
+        error.post_check_error = post_check(&mut pins, build, &check, &mut progress)
+            .err()
+            .map(Box::new);
+        error.set_post_check_diagnostics(progress.snapshot(Instant::now()));
         return Err(attach(error, capture, source_pins, None));
     }
+    progress.complete();
+    progress.begin(StartupPhase::ReadCapture);
     let mut capture_ownership_error = None;
     let raw = match capture.read_stdout(MAX_FRAME_BYTES, || {
         check.check().map_err(|error| error.to_string())?;
@@ -777,34 +1061,81 @@ fn run_with_pins<P: StartupInputPin>(
             let mut error = DefinitionStartupError::new("CAPTURE");
             error.process_error = Some(Box::new(original));
             error.storage_error = capture_ownership_error.map(Box::new);
-            error.post_check_error = post_check(&mut pins, build, &check).err().map(Box::new);
+            error = progress.annotate(error);
+            error.post_check_error = post_check(&mut pins, build, &check, &mut progress)
+                .err()
+                .map(Box::new);
+            error.set_post_check_diagnostics(progress.snapshot(Instant::now()));
             return Err(attach(error, capture, source_pins, None));
         }
     };
-    for pin in &mut pins {
+    progress.complete();
+    progress.begin(StartupPhase::PostSpawnRecheck);
+    for (ordinal, pin) in pins.iter_mut().enumerate() {
+        progress.input(pin.report().role, ordinal);
         if let Err(error) = pin.recheck(build, &check) {
-            return Err(attach(error, capture, source_pins, Some(raw)));
+            return Err(attach(
+                progress.annotate(error),
+                capture,
+                source_pins,
+                Some(raw),
+            ));
         }
+        progress.pin_completed();
     }
+    progress.complete();
+    progress.begin(StartupPhase::PostSpawnMeasure);
     if let Err(error) = measure(build, &check) {
-        return Err(attach(error, capture, source_pins, Some(raw)));
+        return Err(attach(
+            progress.annotate(error),
+            capture,
+            source_pins,
+            Some(raw),
+        ));
     }
+    progress.complete();
+    progress.begin(StartupPhase::DecodeFrame);
     if let Err(error) = check.check() {
-        return Err(attach(error, capture, source_pins, Some(raw)));
+        return Err(attach(
+            progress.annotate(error),
+            capture,
+            source_pins,
+            Some(raw),
+        ));
     }
     let summary = match decode_abi2(&raw) {
         Ok(summary) => summary,
         Err(error) => {
-            return Err(attach(error, capture, source_pins, Some(raw)));
+            return Err(attach(
+                progress.annotate(error),
+                capture,
+                source_pins,
+                Some(raw),
+            ));
         }
     };
     if let Err(error) = check.check() {
-        return Err(attach(error, capture, source_pins, Some(raw)));
+        return Err(attach(
+            progress.annotate(error),
+            capture,
+            source_pins,
+            Some(raw),
+        ));
     }
+    progress.complete();
+    progress.begin(StartupPhase::HashFrame);
     let raw_sha256 = format!("{:x}", Sha256::digest(&raw));
     if let Err(error) = check.check() {
-        return Err(attach(error, capture, source_pins, Some(raw)));
+        return Err(attach(
+            progress.annotate(error),
+            capture,
+            source_pins,
+            Some(raw),
+        ));
     }
+    progress.complete();
+    progress.begin(StartupPhase::Complete);
+    progress.complete();
     // Converting releases the original stdout handle. Input and ancestor
     // handles remain held until this function returns, before root cleanup.
     Ok(DefinitionStartupRun {
@@ -814,6 +1145,7 @@ fn run_with_pins<P: StartupInputPin>(
         raw_abi2: raw,
         raw_sha256,
         summary,
+        diagnostics: progress.snapshot(Instant::now()),
     })
 }
 

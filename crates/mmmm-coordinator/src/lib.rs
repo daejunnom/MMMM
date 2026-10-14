@@ -14,6 +14,7 @@ pub mod endpoint;
 pub mod feature_sources;
 pub mod features;
 pub mod host;
+mod host_read_policy;
 pub mod host_relay;
 pub mod http;
 pub mod lifecycle;

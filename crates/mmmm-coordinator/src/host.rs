@@ -249,6 +249,25 @@ pub(crate) struct CurrentCompletedPairingOwner<'a> {
     owner: NativeOwnerWitness,
 }
 impl CurrentCompletedPairingOwner<'_> {
+    /// Returns factual local approval under this exact short request borrow.
+    /// A later source issuer must recheck it with current source permissions.
+    #[allow(
+        dead_code,
+        reason = "The actual source-registration consumer is composed after this policy reader"
+    )]
+    pub(crate) fn read_host_policy(
+        &self,
+    ) -> AppResult<mmmm_runtime::storage::host_setup::HostReadPolicyRecord> {
+        self.check_current()?;
+        let record = crate::host_read_policy::read_current_host_policy(
+            self.store,
+            &self.owner,
+            self.pairing,
+            self.authority,
+        )?;
+        self.check_current()?;
+        Ok(record)
+    }
     pub(crate) fn check_current(&self) -> AppResult<()> {
         self.pairing.check_current(self.authority)?;
         if Path::new(text(self.pairing.observation.original_offer(), "dataRoot")?)

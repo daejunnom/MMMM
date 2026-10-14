@@ -311,25 +311,69 @@ fn actual_native_startup_rejection_preserves_admission_or_verified_drain() {
 fn pre_exec_failure_metadata_preserves_exact_stage_and_native_code_without_drain() {
     use native::SpawnStage;
     let stages = [
-        (SpawnStage::Session, "native_spawn_session"),
+        (SpawnStage::Session, 1, "native_spawn_session"),
         #[cfg(target_os = "linux")]
-        (SpawnStage::Descriptors, "native_spawn_descriptors"),
+        (SpawnStage::Descriptors, 2, "native_spawn_descriptors"),
         #[cfg(target_os = "linux")]
-        (SpawnStage::Bootstrap, "native_spawn_bootstrap"),
-        (SpawnStage::MemoryLimit, "native_spawn_memory_limit"),
-        (SpawnStage::CoreLimit, "native_spawn_core_limit"),
-        (SpawnStage::Exec, "native_spawn_exec"),
+        (SpawnStage::Bootstrap, 3, "native_spawn_bootstrap"),
+        (SpawnStage::MemoryLimit, 4, "native_spawn_memory_limit"),
+        (SpawnStage::CoreLimit, 5, "native_spawn_core_limit"),
+        (SpawnStage::Exec, 6, "native_spawn_exec"),
+        #[cfg(target_os = "macos")]
+        (
+            SpawnStage::StdinDescriptor,
+            7,
+            "native_spawn_stdin_descriptor",
+        ),
+        #[cfg(target_os = "macos")]
+        (
+            SpawnStage::StdoutDescriptor,
+            8,
+            "native_spawn_stdout_descriptor",
+        ),
+        #[cfg(target_os = "macos")]
+        (
+            SpawnStage::StderrDescriptor,
+            9,
+            "native_spawn_stderr_descriptor",
+        ),
+        #[cfg(target_os = "macos")]
+        (
+            SpawnStage::BootstrapDescriptor,
+            10,
+            "native_spawn_bootstrap_descriptor",
+        ),
+        #[cfg(target_os = "macos")]
+        (SpawnStage::BootstrapType, 11, "native_spawn_bootstrap_type"),
     ];
-    for (stage, expected) in stages {
-        let error = native::spawn_failure(native::spawn_stage_error(
-            stage,
-            std::io::Error::from_raw_os_error(libc::EINVAL),
-        ));
+    for (stage, number, expected) in stages {
+        let encoded =
+            native::spawn_stage_error(stage, std::io::Error::from_raw_os_error(libc::EINVAL));
+        assert_eq!((encoded.raw_os_error().unwrap() as u32 >> 16) & 255, number);
+        let error = native::spawn_failure(encoded);
         assert_eq!(error.code, expected);
         assert_eq!(error.native_code, Some(libc::EINVAL));
         assert!(!error.native_code_unknown);
         assert!(!error.drained);
         assert!(error.cleanup.is_none());
+        let unknown = native::spawn_failure(native::spawn_stage_error(
+            stage,
+            std::io::Error::from_raw_os_error(i32::MAX),
+        ));
+        assert_eq!(unknown.code, expected);
+        assert!(unknown.native_code.is_none());
+        assert!(unknown.native_code_unknown);
+        assert!(!unknown.drained);
+        assert!(unknown.cleanup.is_none());
+        let absent = native::spawn_failure(native::spawn_stage_error(
+            stage,
+            std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+        ));
+        assert_eq!(absent.code, expected);
+        assert!(absent.native_code.is_none());
+        assert!(!absent.native_code_unknown);
+        assert!(!absent.drained);
+        assert!(absent.cleanup.is_none());
     }
     for code in [-1, 65_534, i32::MAX] {
         let error = native::spawn_failure(native::spawn_stage_error(
@@ -341,13 +385,7 @@ fn pre_exec_failure_metadata_preserves_exact_stage_and_native_code_without_drain
         assert!(error.native_code_unknown);
         assert!(!error.drained);
     }
-    let absent = native::spawn_failure(native::spawn_stage_error(
-        SpawnStage::Exec,
-        std::io::Error::from(std::io::ErrorKind::BrokenPipe),
-    ));
-    assert_eq!(absent.native_code, None);
-    assert!(!absent.native_code_unknown);
-    for code in [libc::EINVAL, 0x4e00_0016, 0x4e07_0016] {
+    for code in [libc::EINVAL, 0x4e00_0016, 0x4eff_0016] {
         let ordinary = native::spawn_failure(std::io::Error::from_raw_os_error(code));
         assert_eq!(ordinary.code, "native_spawn");
         assert_eq!(ordinary.native_code, Some(code));

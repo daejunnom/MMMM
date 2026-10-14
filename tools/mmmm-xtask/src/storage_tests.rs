@@ -375,15 +375,33 @@ fn checkout_and_evidence_overlap_is_rejected_before_creation() {
 }
 
 #[test]
-fn secret_named_tree_entry_is_not_opened_or_removed() {
+fn secret_named_selected_tree_is_rejected_before_metadata_or_removal() {
     let fixture = Fixture::new("names");
     let build = fixture.acquire();
     let scratch = build.paths().scratch.clone();
-    // A directory exercises name rejection without creating a secret file.
-    fs::create_dir(scratch.join(".env.test")).unwrap();
-    assert_eq!(error_kind(build.measure()), "secret_path");
-    assert_eq!(error_kind(build.finish(outcome(0))), "secret_path");
-    assert!(scratch.join(".env.test").is_dir());
+    // This is a lexical selector only. Creating a rejected directory inside a
+    // supervised scratch tree races the outer observer and can strand its lease.
+    // No protected file or directory is created, probed, opened or removed.
+    let selected = scratch.join(".env.test");
+    let mut metadata_reached = false;
+    assert_eq!(
+        error_kind(tree_bytes_observed(&selected, &scratch, &[], |_| {
+            metadata_reached = true;
+        })),
+        "secret_path"
+    );
+    assert!(!metadata_reached);
+    assert_eq!(
+        error_kind(remove_tree(
+            &selected,
+            &scratch,
+            &build.paths().slot.join("owner.json"),
+            &[],
+            &|| panic!("secret selector must be rejected before lease or filesystem access"),
+        )),
+        "secret_path"
+    );
+    build.finish(outcome(0)).unwrap();
 }
 
 #[test]

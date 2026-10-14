@@ -12,7 +12,9 @@ const USAGE: &str = "Usage:\n\
   mmmm init --data-root <absolute root> --name <name> --target-profile <profile>\n\
   mmmm start --data-root <absolute root> --project <projectId>\n\
   mmmm daemon --data-root <absolute root> --project <projectId> [--lifetime-seconds <1..1800>]\n\
-  mmmm host-setup --data-root <absolute root> --project <projectId> --host-jar <absolute jar> --output <absolute config> --scope-json <json>\n\
+  mmmm host-setup --data-root <absolute root> --project <projectId> --host-jar <absolute jar> --output <absolute config> --scope-json <json> [--shape-mode survival|creative|adventure|spectator ...] [--native-observation user_local_only]\n\
+    Shape modes are explicit unique selections. Native observations need their own opt-in; absent policy flags leave the corresponding sources unavailable. The same protected Store retains immutable policy; mmmm-host.json contains public locators only.\n\
+    A changed policy for the same native owner/Project/host artifact is refused. An existing public config is preserved; a policy committed before config/output failure remains retained and is reported by digest.\n\
   mmmm source-import --data-root <absolute root> --project <projectId> --expected-revision <sha256> --document <prefab|instance|clip>:<JSON> [--document <kind>:<JSON> ...]\n\
     Inputs may instead use repeated --document-file <kind>:<absolute JSON path> and adjacent --resource-descriptor-file <absolute JSON path> --resource-bytes-file <absolute content path> pairs.\n\
     Source import is a cold native management command: at least one document, <=256 combined document/resource inputs, each document <=8 MiB, descriptors <=16 KiB, documents+descriptors <=32 MiB, raw content <=128 MiB total; actual OS argv limits may be smaller.\n\
@@ -94,6 +96,13 @@ impl fmt::Display for PublicEntryError<'_> {
                 receipt.project_id,
                 receipt.base_revision,
                 receipt.project_revision,
+                PublicEntryError(delivery)
+            ),
+            EntryError::HostReadPolicyCommitted { record, delivery } => write!(
+                f,
+                "Host read policy {} for Project {} was committed and retained; result delivery failed: {}",
+                record.policy_digest(),
+                record.project_id(),
                 PublicEntryError(delivery)
             ),
             // EntryError's other diagnostics contain fixed text, public pins,

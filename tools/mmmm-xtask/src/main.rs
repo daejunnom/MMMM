@@ -341,6 +341,7 @@ fn run_definition_startup(
                 "status": "observed",
                 "process_started": started,
                 "source_pins": observed.source_pins(),
+                "diagnostics": observed.diagnostics(),
                 "raw_sha256": observed.raw_sha256(),
                 "summary": observed.summary(),
             }),
@@ -356,6 +357,7 @@ fn run_definition_startup(
                     "status": "failed",
                     "process_started": started,
                     "source_pins": error.source_pins(),
+                    "diagnostics": error.diagnostics(),
                     "error": definition_startup_error_json(error),
                     "raw_candidate_present": error.raw_candidate().is_some(),
                 }),
@@ -432,10 +434,10 @@ fn run_definition_startup(
     // Public stdout contains the observation scope, path-free pins and summary.
     let public_observation = match &result {
         Ok(value) => {
-            serde_json::json!({"source_pins": value.source_pins(), "raw_sha256": value.raw_sha256(), "summary": value.summary()})
+            serde_json::json!({"source_pins": value.source_pins(), "raw_sha256": value.raw_sha256(), "summary": value.summary(), "diagnostics": value.diagnostics()})
         }
         Err(value) => {
-            serde_json::json!({"source_pins": value.source_pins(), "error_kind": value.kind(), "native_os_code": value.native_os_code()})
+            serde_json::json!({"source_pins": value.source_pins(), "error_kind": value.kind(), "native_os_code": value.native_os_code(), "diagnostics": value.diagnostics()})
         }
     };
     println!(
@@ -461,6 +463,8 @@ fn definition_startup_error_json(
         "process_error": error.process_error().map(|value| serde_json::json!({"kind":value.kind,"message":value.message,"drained":value.drained})),
         "storage_error": error.storage_error().map(|value| serde_json::json!({"kind":value.kind,"message":value.message})),
         "post_check_error": error.post_check_error().map(definition_startup_error_json),
+        "diagnostics": error.diagnostics(),
+        "post_check_diagnostics": error.post_check_diagnostics(),
     })
 }
 
