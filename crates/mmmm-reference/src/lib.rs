@@ -4,6 +4,7 @@
 
 pub mod capture;
 pub mod catalog;
+pub mod input_archive;
 pub mod query;
 pub mod shape;
 pub mod snapshot;

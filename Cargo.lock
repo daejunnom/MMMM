@@ -801,11 +801,15 @@ dependencies = [
 name = "mmmm-reference"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
+ "flate2",
  "hmac",
  "mmmm-contracts",
  "serde",
  "serde_json",
  "sha2",
+ "unicode-normalization",
+ "zip",
 ]
 
 [[package]]

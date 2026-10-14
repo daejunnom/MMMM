@@ -59,6 +59,8 @@
 
 | MMMM-D041 | FN23은 owning Catalog의 실제 완료 snapshot과 현재 요청의 읽기 권한을 소비하고, 공통 최종 검사를 통과한 결과의 geometry receipt만 게시한다. | FN23/FN31의 좁은 snapshot 소비 권한은 catalog source 발행·capture 권한이 아니다. native 소비는 기존 publication의 checkpoint만 사용하고 `ensure`로 새 source를 만들지 않는다. 같은 요청·budget/cancel·session·side·완료 pairing·현재 route·Project/Policy·source-use/CAS·D032 shape mode를 검사하며 초기 및 마지막 hello 전후의 durable 검증에는 host I/O를 중첩하지 않는다. host 실패와 후검사 실패가 겹치면 typed 원인을 함께 보존한다. geometry는 private pending에 두고 공통 current/budget/output schema 성공 뒤 owning pin과 마지막 host I/O 후 durable 검사를 다시 통과해야 게시한다. 실패는 현재 pending만 폐기하며 기존 발행을 지우지 않는다. FN31의 현재 Project/context 양쪽에 별도로 승인된 정확 resource grant는 기존 immutable owner/version·metadata·전체 CAS·전후 권한 검사로 읽고 shape receipt를 재발급하지 않는다. 미확정 artifact·pack·host identity를 빈 값이나 known으로 승격하지 않으며 실제 known geometry와 게임 인수는 별도다. |
 
+| MMMM-D042 | ZIP/JAR input inventory는 실제 입력 bytes의 bounded 순수 관측이며 runtime pack·loaded definition·권한과 분리한다. | reference producer는 파일·네트워크를 열거나 extract하지 않는다. 초기 상한은 input/member 각각 64 MiB, decoded 합계 256 MiB, 65,535 entries, ratio 1,000, metadata 16 MiB, 이름 1,024 bytes이며 caller는 낮출 수만 있다. library의 directory 할당 전 EOCD·count·offset·size·전체 이름·local header·descriptor·물리 coverage를 검사한다. secret selector와 alias는 같은 portable fold로 판단하고 보호 대상은 container/member hash 전에 거절한다. classic Stored/Deflate와 명시적인 0-byte Stored directory만 지원하며 ZIP64·암호화·특수 member·alias·비정상 경로와 불일치는 닫힌 오류다. actual stream end·consumed input·decoded size·CRC·SHA를 확인하고 partial inventory를 성공으로 반환하지 않는다. 원 cancellation/deadline을 유지하며 원인과 정적 공개 오류를 분리한다. 입력 inventory 완료가 effective pack mapping·SourceAdmission·게임 호환성이나 재배포 승인은 아니다. 실제 게임 입력·속도·현재 Store 권한에 결합한 consumer는 별도 검증하며 실패 후 자동 한도 확대·재시도는 하지 않는다. |
+
 ## 구현 전에 확인할 항목
 
 - 원본 계약과 예제 패키지의 내용, 버전 및 digest.
