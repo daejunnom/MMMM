@@ -329,6 +329,46 @@ unknown fallback으로 삼키지 않는다. 기존 비검사 호출은 같은 �
 0·29,169 ms·자연 종료·drain·완전한 출력·export·scratch 정리·lease 해제·오류 0이며
 실제 게임 관측이나 다른 OS의 이 새 소스 실행은 별도 검증이다.
 
+### 실제 게임 입력의 archive 관측
+
+로컬의 실제 Minecraft merged JAR 관측은 처음에
+`INPUT_ARCHIVE_METADATA_LIMIT`으로 거절됐다. 입력은 39,515,741 bytes·34,225 entries,
+중앙 directory 4,789,080 bytes였다. 긴 공통 경로의 모든 full prefix를 literal과
+folded 문자열로 반복 소유하던 이름 자료구조를 parent node ID·folded component의
+공유 구조로 바꿨다. Literal component는 이미 charge한 immutable 중앙 bytes를
+빌리고 실제 key/value 크기·소유 folded bytes·노드당 보수적 overhead와 초기 slab을
+checked 합산한다. 이는 metadata admission 계산이며 실제 allocator 사용량이나
+RSS 측정을 대신하지 않는다. 기존 16 MiB 상한·공개 API·alias/secret 검사·전체 이름
+및 물리 header preflight를 유지했다. 기존 작은 alias fixture는 긴 공통 prefix를
+대표하지 못하므로 64개 실제 member의 공유 경로 검사 하나를 추가하여 caller의
+64 KiB metadata budget 성공과 40 KiB 거절을 함께 확인했다.
+
+독립 소스 리뷰 뒤 Reference 55개 검사가 command 0·12,959 ms·명시 owned-tail
+정리로 통과했고, all-targets strict Clippy는 0·1,722 ms·자연 종료다. 새 library를
+실제로 빌드한 뒤 외부 probe의 새 실행 파일에 연결하여 같은 게임 입력을 재검증했다.
+입력 SHA `9c5cc8208b06eda6f8f625524af77526dad347c0ce00aa416fc80ba73fb977be`,
+member 34,225개·directory 1,349개·decoded 76,423,852 bytes·complete true이며
+producer 내부 2,543 ms와 전체 command 4,103 ms를 구분한다. 같은 관측 classpath의
+Fabric resource-loader v1 JAR도 입력 135,272 bytes·SHA
+`2d2fb907728c895640c1261ff3dd115b5087913d88d1ba1d9f3a8a4cfd1ca87e`,
+member 135개·directory 20개·decoded 265,624 bytes·complete true를 기록했다.
+내부 10 ms·전체 command 166 ms다. 모두 기본 producer 한도와 probe의 원래 10초
+기한 안이며 성능 인수나 다른 입력의 전체 호환성으로 확대하지 않는다.
+
+이 두 입력은 실제 Gradle project task 안에서 얻은 classpath의 경로·종류·길이
+hint에서 선택했다. 앞선 Windows fileKey 부재와 projectsEvaluated에서의 exclusive
+lock 오류는 원 실패로 보존했다. 성공한 metadata task의 124개 경로 hint는 내용
+hash·불변 file identity·사용 허가를 발급하지 않는다. 선택한 두 JAR만 별도로 실제
+전체 inventory를 검사하고, Windows 읽기 handle의 write/delete 공유를 닫은 동안
+producer digest와 held handle digest를 대조했다. 같은 두 handle을 유지한 실제
+`javap` 관측에서는 정해진 4개 API 선언과 추가 7개 pack 구현의 선언·bytecode를
+읽었고 실행 전후 container digest가 일치했다. 두 command는 0·1,121/1,882 ms·자연
+종료다. class filename·선언 관측과 실제 loaded Class·활성 pack/root mapping·
+effective pack fingerprint·SourceAdmission을 구분하며 게임 코드를 실행한 관측으로
+기록하지 않는다. 모든 관련 실행의 drain·출력·export·scratch 정리·lease 해제와
+supervisor/cleanup 오류 0을 확인했다. 원본 JAR·probe·raw logs는 Git에 넣지 않았으며
+실패한 이전 binary와 원 증거도 별도 보존했다.
+
 실패한 실행의 원본 판정은 유지한다. native drain과 정확한 소유 기록을 확인하고
 로그를 별도로 내보내며 digest를 대조한 경우에만 해당 실행의 알려진 임시 파일을
 정리했다. 원래 자동 export 실패와 수동 보존 성공을 같은 결과로 기록하지 않는다.

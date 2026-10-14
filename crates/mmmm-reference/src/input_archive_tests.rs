@@ -212,6 +212,47 @@ fn duplicate_case_unicode_and_ancestor_aliases_never_collapse() {
 }
 
 #[test]
+fn long_shared_components_fit_a_lower_caller_metadata_budget() {
+    // The small alias/header fixtures do not represent many members sharing a
+    // long directory path. Repeating eight 32-byte components exposes retained
+    // full-prefix copies while this real inventory still has tiny payloads.
+    let prefix = ["shared_component0123456789abcdef"; 8].join("/");
+    let names: Vec<_> = (0..64)
+        .map(|index| format!("{prefix}/entry{index:03}.bin"))
+        .collect();
+    let data: Vec<(&str, &[u8])> = names
+        .iter()
+        .map(|name| (name.as_str(), &b"x"[..]))
+        .collect();
+    let bytes = zip(&data, false);
+    let observed = run(
+        &bytes,
+        InputArchiveLimits {
+            metadata_bytes: 64 * 1024,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(observed.complete());
+    assert_eq!(observed.members().len(), names.len());
+    assert_eq!(observed.decoded_bytes(), names.len() as u64);
+    assert_eq!(observed.input_sha256(), &raw_digest(&bytes));
+    assert_eq!(observed.members()[63].name(), names[63]);
+    assert_eq!(
+        run(
+            &bytes,
+            InputArchiveLimits {
+                metadata_bytes: 40 * 1024,
+                ..Default::default()
+            }
+        )
+        .unwrap_err()
+        .code(),
+        "INPUT_ARCHIVE_METADATA_LIMIT"
+    );
+}
+
+#[test]
 fn declarations_are_bounded_before_library_directory_allocation() {
     let original = zip(&[("a", b"x")], false);
     let mut count = original.clone();

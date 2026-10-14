@@ -292,19 +292,23 @@ fn secret(component: &str) -> bool {
                 .iter()
                 .any(|part| folded.contains(part)))
 }
-struct NameNode {
-    literal: String,
+struct NameNode<'a> {
+    // The immutable central-directory bytes are already charged in full. Keep
+    // only this literal component's slice, never another owned path prefix.
+    literal: &'a str,
+    id: u32,
     file: bool,
     explicit: bool,
 }
 #[derive(Default)]
-struct Names {
-    nodes: BTreeMap<String, NameNode>,
+struct Names<'a> {
+    nodes: BTreeMap<(u32, Box<str>), NameNode<'a>>,
+    next_id: u32,
 }
-impl Names {
+impl<'a> Names<'a> {
     fn insert(
         &mut self,
-        name: &str,
+        name: &'a str,
         kind: InputArchiveMemberKind,
         metadata: &mut usize,
         limits: InputArchiveLimits,
@@ -366,40 +370,69 @@ impl Names {
                 return Err(failure("INPUT_ARCHIVE_NAME_ALIAS"));
             }
         }
-        for end in logical
-            .match_indices('/')
-            .map(|(at, _)| at)
-            .chain(std::iter::once(logical.len()))
-        {
-            let literal = &logical[..end];
-            let leaf = end == logical.len();
+        // Zero names the root and is never allocated. A component can only be
+        // reached through the exact parent whose literal and kind also matched.
+        let mut parent = 0_u32;
+        let mut components = logical.split('/').peekable();
+        while let Some(component) = components.next() {
+            let leaf = components.peek().is_none();
             let file = leaf && kind == InputArchiveMemberKind::File;
-            let folded = portable_fold(literal);
-            if let Some(node) = self.nodes.get_mut(&folded) {
-                if node.literal != literal || node.file != file || (leaf && node.explicit) {
+            let key = (parent, portable_fold(component).into_boxed_str());
+            if let Some(node) = self.nodes.get_mut(&key) {
+                if node.literal != component || node.file != file || (leaf && node.explicit) {
                     return Err(failure("INPUT_ARCHIVE_NAME_ALIAS"));
                 }
                 if leaf {
                     node.explicit = true;
                 }
+                parent = node.id;
             } else {
+                let max_nodes = limits
+                    .entries
+                    .checked_mul(64)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| failure("INPUT_ARCHIVE_OVERFLOW"))?;
+                let id = self
+                    .next_id
+                    .checked_add(1)
+                    .filter(|id| *id <= max_nodes)
+                    .ok_or_else(|| failure("INPUT_ARCHIVE_OVERFLOW"))?;
+                let entry_bytes = std::mem::size_of::<((u32, Box<str>), NameNode<'a>)>();
+                // BTreeMap's allocation layout is private. Charge the actual
+                // key/value size plus 16 words per entry for partially occupied
+                // tree nodes, edges and allocator bookkeeping (including the
+                // folded-string allocation). Also reserve a full initial slab,
+                // so a sparse first tree is not charged as one packed entry.
+                let overhead = std::mem::size_of::<usize>()
+                    .checked_mul(16)
+                    .ok_or_else(|| failure("INPUT_ARCHIVE_OVERFLOW"))?;
+                if self.nodes.is_empty() {
+                    let initial = entry_bytes
+                        .checked_mul(16)
+                        .and_then(|n| n.checked_add(overhead))
+                        .and_then(|n| n.checked_add(std::mem::size_of::<Self>()))
+                        .ok_or_else(|| failure("INPUT_ARCHIVE_OVERFLOW"))?;
+                    charge(metadata, initial, limits)?;
+                }
                 charge(
                     metadata,
-                    literal
-                        .len()
-                        .checked_add(folded.len())
-                        .and_then(|n| n.checked_add(96))
+                    entry_bytes
+                        .checked_add(overhead)
+                        .and_then(|n| n.checked_add(key.1.len()))
                         .ok_or_else(|| failure("INPUT_ARCHIVE_OVERFLOW"))?,
                     limits,
                 )?;
                 self.nodes.insert(
-                    folded,
+                    key,
                     NameNode {
-                        literal: literal.to_owned(),
+                        literal: component,
+                        id,
                         file,
                         explicit: leaf,
                     },
                 );
+                self.next_id = id;
+                parent = id;
             }
         }
         Ok(())
