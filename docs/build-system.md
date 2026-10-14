@@ -264,6 +264,14 @@ CI는 source의 `Cargo.lock`을 요구하고 routine 최초 컴파일에도 lock
 `-UpdateLock` 또는 Unix의 `--update-lock`을 명시적으로 선택할 수 있다.
 이 선택은 lock 갱신을 허용하며, CI가 자동으로 재시도하거나 선택하지 않는다.
 
+개발·검사 빌드의 `sha2`는 package별 `opt-level=3`으로 컴파일한다. 전체 실행 파일과
+선택 입력의 SHA-256, 원래 request 기한·입력 한도·전후 pin 검사는 유지한다.
+이는 Linux startup에서 관측한 부모 image hash 비용에 대응하는 명시적 build 입력이며,
+child 지연 원인 확정이나 실제 Unix 성공을 뜻하지 않는다. 의존성 버전과 알고리즘,
+release profile 및 나머지 crate의 debug·overflow 검사를 바꾸지 않는다.
+설정은 [Cargo profile override](https://doc.rust-lang.org/cargo/reference/profiles.html#overrides)를
+따르며 실제 native 실행과 digest 검사를 별도로 확인한다.
+
 최초 Cargo 실행은 Windows의 `tools/bootstrap/bootstrap.ps1` 또는 Unix의
 `tools/bootstrap/bootstrap-unix.py`가 맡는다. Unix launcher의 Python 코드는
 첫 Rust 도구를 만들기 위한 build infrastructure에만 사용한다. 제품 계약 처리,

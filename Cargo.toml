@@ -43,3 +43,12 @@ debug = 1
 
 [profile.test]
 debug = 1
+
+# Full input/image SHA remains inside each original finite request budget.
+# Keep the existing algorithm and pin checks while optimizing its compression
+# implementation in development and test builds as well as release builds.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.test.package.sha2]
+opt-level = 3

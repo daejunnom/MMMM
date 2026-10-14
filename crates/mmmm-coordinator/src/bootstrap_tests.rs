@@ -98,7 +98,7 @@ fn artifact() -> Sha256Digest {
 fn approve_fixture(store: &mut DurableStore, scope: Value) {
     let rpc = OwnerSetupRpcContext::for_store(store, None).unwrap();
     let request = HostSetupRegistration {
-        project_id: ProjectId::new("project-fixture").unwrap(),
+        project_id: ProjectId::new(scope["projectId"].as_str().unwrap()).unwrap(),
         host_artifact_digest: artifact(),
         approved_scope: serde_json::from_value(scope).unwrap(),
     };
@@ -109,6 +109,7 @@ fn approve_fixture(store: &mut DurableStore, scope: Value) {
     register_host_setup(store, &rpc, &mut authority, &request).unwrap();
 }
 fn offer(root: &Root, nonce: &str, scope: Value) -> HostOffer {
+    let project = scope["projectId"].clone();
     let mut hello = parse_json(include_bytes!("../../../examples/host-hello.json")).unwrap();
     hello["loader"]["id"] = json!("fabric");
     let mut action = parse_json(include_bytes!("../../../examples/provider-supported.json"))
@@ -121,7 +122,7 @@ fn offer(root: &Root, nonce: &str, scope: Value) -> HostOffer {
         "playerId":"player-fixture", "playerContext":{
             "dimension":"minecraft:overworld", "executorHandle":"actual-player-handle",
             "origin":[1,2,3], "rotationDegrees":[10,20], "anchor":"feet"},
-        "dataRoot":root.0, "projectId":"project-fixture", "scope":scope,
+        "dataRoot":root.0, "projectId":project, "scope":scope,
         "nativeActions":[action],
     }))
     .unwrap();
@@ -636,9 +637,33 @@ fn observed_pairing_fixture(nonce: &str) -> ObservedPairingFixture {
     let root = Root::new();
     let mut store = root.open();
     project(&mut store);
-    approve_fixture(&mut store, finite_scope());
+    observed_pairing_with_store(nonce, root, store, finite_scope())
+}
+fn native_owned_pairing_fixture(nonce: &str) -> ObservedPairingFixture {
+    let root = Root::new();
+    let mut store = root.open();
+    let created = crate::native_project::create_native_project(
+        &mut store,
+        "Current native pairing owner fixture",
+        &mmmm_contracts::TargetProfileId::new("target-unverified").unwrap(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    let mut scope = finite_scope();
+    scope["projectId"] = json!(created.project_id);
+    scope["resourceIds"] = json!([created.policy_resource["resourceId"]]);
+    scope["objectIds"] = json!([]);
+    observed_pairing_with_store(nonce, root, store, scope)
+}
+fn observed_pairing_with_store(
+    nonce: &str,
+    root: Root,
+    mut store: DurableStore,
+    scope: Value,
+) -> ObservedPairingFixture {
+    approve_fixture(&mut store, scope.clone());
     let (mut processor, authority) = processor();
-    let offer = offer(&root, nonce, finite_scope());
+    let offer = offer(&root, nonce, scope);
     let witness = offer.witness().clone();
     let hello = offer.public().value()["hostHello"].clone();
     let budget = BootstrapBudget::new();
@@ -784,8 +809,10 @@ impl mmmm_application::Clock for NoPairingApplicationCalls {
         0
     }
 }
-type PairingProbeCall =
-    dyn FnMut(crate::service::RequestContextWitness) -> mmmm_application::AppResult<()>;
+type PairingProbeCall = dyn FnMut(
+    &DurableStore,
+    crate::service::RequestContextWitness,
+) -> mmmm_application::AppResult<()>;
 struct PairingProbeExtension {
     request: crate::service::RequestContextSlot,
     inspect: Box<PairingProbeCall>,
@@ -799,7 +826,7 @@ impl crate::service::ServiceExtension for PairingProbeExtension {
     ) -> Result<Value, crate::service::ServiceError> {
         context.check(method)?;
         let request = self.request.current_witness(method)?;
-        (self.inspect)(request).map_err(|cause| {
+        (self.inspect)(context.store, request).map_err(|cause| {
             crate::service::ServiceError::caused_by(cause.code, cause.message, cause)
         })?;
         Ok(json!({}))
@@ -808,7 +835,10 @@ impl crate::service::ServiceExtension for PairingProbeExtension {
 fn pairing_request_probe(
     store: DurableStore,
     policy: SessionPolicy,
-    inspect: impl FnMut(crate::service::RequestContextWitness) -> mmmm_application::AppResult<()>
+    inspect: impl FnMut(
+        &DurableStore,
+        crate::service::RequestContextWitness,
+    ) -> mmmm_application::AppResult<()>
     + 'static,
 ) {
     use crate::service::{
@@ -875,7 +905,7 @@ fn completed_pairing_uses_current_request_without_restarting_native_budget() {
     let capture = held.clone();
     let policy = fixture.processor.current_session_policy().unwrap();
     let digest = fixture.witness.offer_digest().clone();
-    pairing_request_probe(fixture.store, policy, move |request| {
+    pairing_request_probe(fixture.store, policy, move |_, request| {
         let witness = hosts.completed_pairing_witness(&request, &authority, &id)?;
         assert_eq!(witness.completed_at(), completed_at);
         assert_eq!(witness.original_deadline(), original_deadline);
@@ -909,7 +939,7 @@ fn completed_pairing_witness_rechecks_active_policy() {
     let hosts = fixture.processor.hosts.clone();
     let authority = fixture.authority.clone();
     let context = fixture.context.clone();
-    pairing_request_probe(fixture.store, policy, move |request| {
+    pairing_request_probe(fixture.store, policy, move |_, request| {
         let id = ContextId::new(context["contextId"].as_str().unwrap()).unwrap();
         let witness = hosts.completed_pairing_witness(&request, &authority, &id)?;
         let project = witness.project().clone();
@@ -962,7 +992,7 @@ fn completed_pairing_never_follows_an_identical_context_to_a_new_route() {
     let authority = fixture.authority.clone();
     let context = fixture.context.clone();
     let hello = fixture.hello.clone();
-    pairing_request_probe(fixture.store, policy, move |request| {
+    pairing_request_probe(fixture.store, policy, move |_, request| {
         let id = ContextId::new(context["contextId"].as_str().unwrap()).unwrap();
         let witness = hosts.completed_pairing_witness(&request, &authority, &id)?;
         let replacement = replace_observed_route(&hosts, &context, &hello);
@@ -1023,7 +1053,7 @@ fn completed_pairing_witness_obeys_original_current_request_cancellation() {
     let hosts = fixture.processor.hosts.clone();
     let authority = fixture.authority.clone();
     let id = ContextId::new(fixture.context["contextId"].as_str().unwrap()).unwrap();
-    pairing_request_probe(fixture.store, policy, move |request| {
+    pairing_request_probe(fixture.store, policy, move |_, request| {
         let witness = hosts.completed_pairing_witness(&request, &authority, &id)?;
         request
             .budget()
@@ -1107,6 +1137,313 @@ fn completion_retention_budget_keeps_rolled_back_pending_truth() {
         fixture.processor.rejected_encoded_bytes,
         MAX_REJECTED_ENCODED_BYTES
     );
+}
+
+#[test]
+fn current_pairing_owner_uses_real_native_project_and_current_request_lifetime() {
+    let mut fixture = native_owned_pairing_fixture("pair-current-owner");
+    finish_observed_pairing(&mut fixture, true).unwrap();
+    // This old bootstrap budget must not become the new owner's call budget.
+    fixture.budget.cancel();
+    let hosts = fixture.processor.hosts.clone();
+    let authority = fixture.authority.clone();
+    let context = fixture.context.clone();
+    let root = fixture._root.0.clone();
+    let held = Rc::new(RefCell::new(None));
+    let capture = held.clone();
+    let policy = fixture.processor.current_session_policy().unwrap();
+    pairing_request_probe(fixture.store, policy, move |store, request| {
+        let id = ContextId::new(context["contextId"].as_str().unwrap()).unwrap();
+        let pairing = hosts.completed_pairing_witness(&request, &authority, &id)?;
+        let value = pairing.with_current_native_owner(store, &authority, |owner| {
+            owner.check_current()?;
+            Ok(17_u8)
+        })?;
+        assert_eq!(value, 17);
+        *capture.borrow_mut() = Some(pairing);
+        Ok(())
+    });
+    // Reopening happens only after the actual service dropped its Store. The
+    // old entered request must reject before trying to capture another owner.
+    let reopened = DurableStore::open_existing(StoreConfig::new(root)).unwrap();
+    let result = held.borrow().as_ref().unwrap().with_current_native_owner(
+        &reopened,
+        &fixture.authority,
+        |_| -> mmmm_application::AppResult<()> {
+            panic!("A retired request cannot enter a new owner callback")
+        },
+    );
+    assert_eq!(result.unwrap_err().code, "PERMISSION_REQUIRED");
+    drop(reopened);
+    fixture.processor.shutdown().unwrap();
+}
+
+#[test]
+fn current_pairing_owner_rejects_another_held_store_before_callback() {
+    let mut fixture = native_owned_pairing_fixture("pair-owner-wrong-store");
+    finish_observed_pairing(&mut fixture, true).unwrap();
+    let another_root = Root::new();
+    let another_store = another_root.open();
+    let hosts = fixture.processor.hosts.clone();
+    let authority = fixture.authority.clone();
+    let id = ContextId::new(fixture.context["contextId"].as_str().unwrap()).unwrap();
+    let policy = fixture.processor.current_session_policy().unwrap();
+    pairing_request_probe(fixture.store, policy, move |_, request| {
+        let pairing = hosts.completed_pairing_witness(&request, &authority, &id)?;
+        let result = pairing.with_current_native_owner(
+            &another_store,
+            &authority,
+            |_| -> mmmm_application::AppResult<()> {
+                panic!("Another Store cannot enter owner callback")
+            },
+        );
+        assert_eq!(result.unwrap_err().code, "PERMISSION_REQUIRED");
+        Ok(())
+    });
+    fixture.processor.shutdown().unwrap();
+}
+
+#[test]
+fn current_pairing_owner_requires_actual_native_project_owner_registration() {
+    use std::error::Error;
+    // The existing original-example fixture intentionally has no native owner
+    // registration. A saved canonical Project alone cannot pass this guard.
+    let mut fixture = observed_pairing_fixture("pair-owner-not-registered");
+    finish_observed_pairing(&mut fixture, true).unwrap();
+    let hosts = fixture.processor.hosts.clone();
+    let authority = fixture.authority.clone();
+    let id = ContextId::new(fixture.context["contextId"].as_str().unwrap()).unwrap();
+    let policy = fixture.processor.current_session_policy().unwrap();
+    pairing_request_probe(fixture.store, policy, move |store, request| {
+        let pairing = hosts.completed_pairing_witness(&request, &authority, &id)?;
+        let error = pairing
+            .with_current_native_owner(store, &authority, |_| -> mmmm_application::AppResult<()> {
+                panic!("Missing native registration cannot enter callback")
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "PERMISSION_REQUIRED");
+        assert!(matches!(
+            error.source().unwrap().downcast_ref::<StorageError>(),
+            Some(StorageError::NotFound(_))
+        ));
+        Ok(())
+    });
+    fixture.processor.shutdown().unwrap();
+}
+
+// Adversarial metadata registration is negative input only. This permit is
+// never used by native_owned_pairing_fixture or any successful owner test;
+// no read, Apply, source-rights or game-mode grant is constructed here.
+struct ForeignOwnerMetadataFixture {
+    current: crate::workspace_bootstrap::NativeOwnerWitness,
+    project: Value,
+    policy: Value,
+}
+impl mmmm_runtime::storage::bootstrap::NativeOwnerCreatePermit for ForeignOwnerMetadataFixture {
+    fn check(&self, store: &DurableStore) -> StorageResult<()> {
+        self.current.check_store(store)
+    }
+    fn authorize_create(
+        &mut self,
+        store: &DurableStore,
+        request: &mmmm_runtime::storage::bootstrap::ProjectBootstrapRequest<'_>,
+    ) -> StorageResult<PrincipalId> {
+        self.current.check_store(store)?;
+        if request.project != &self.project || request.policy != &self.policy {
+            return Err(StorageError::Conflict(
+                "Foreign-owner negative fixture document changed",
+            ));
+        }
+        Ok(PrincipalId::new("different-native-owner-metadata").unwrap())
+    }
+}
+#[test]
+fn current_pairing_owner_rejects_an_existing_registration_for_another_owner() {
+    let root = Root::new();
+    let mut store = root.open();
+    let mut project = parse_json(include_bytes!("../../../examples/project.json")).unwrap();
+    project["projectId"] = json!("project-owner-mismatch");
+    project["prefabIds"] = json!([]);
+    project["instanceIds"] = json!([]);
+    project["ownedResources"] = json!([]);
+    project["policyResourceId"] = json!("policy-owner-mismatch");
+    project["resourceIds"] = json!(["policy-owner-mismatch"]);
+    project["revision"] = json!(projected_digest("Project", &project).unwrap());
+    let policy_document = parse_json(include_bytes!("../../../examples/policy.json")).unwrap();
+    let mut permit = ForeignOwnerMetadataFixture {
+        current: crate::workspace_bootstrap::NativeOwnerWitness::capture(
+            &store,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap(),
+        project: project.clone(),
+        policy: policy_document.clone(),
+    };
+    let created = mmmm_runtime::storage::bootstrap::create_project(
+        &mut store,
+        &mut permit,
+        &mmmm_runtime::storage::bootstrap::ProjectBootstrapRequest {
+            project: &project,
+            policy: &policy_document,
+        },
+    )
+    .unwrap();
+    let registered = mmmm_runtime::storage::bootstrap::registered_native_project_owner(
+        &store,
+        &created.project_id,
+    )
+    .unwrap();
+    assert_ne!(registered, local_owner_principal().unwrap());
+    let mut scope = finite_scope();
+    scope["projectId"] = json!(created.project_id);
+    scope["resourceIds"] = json!([created.policy_resource["resourceId"]]);
+    scope["objectIds"] = json!([]);
+    let mut fixture =
+        observed_pairing_with_store("pair-owner-registration-mismatch", root, store, scope);
+    finish_observed_pairing(&mut fixture, true).unwrap();
+    let hosts = fixture.processor.hosts.clone();
+    let authority = fixture.authority.clone();
+    let id = ContextId::new(fixture.context["contextId"].as_str().unwrap()).unwrap();
+    let policy = fixture.processor.current_session_policy().unwrap();
+    pairing_request_probe(fixture.store, policy, move |store, request| {
+        let pairing = hosts.completed_pairing_witness(&request, &authority, &id)?;
+        let error = pairing
+            .with_current_native_owner(store, &authority, |_| -> mmmm_application::AppResult<()> {
+                panic!("Foreign registered owner cannot enter callback")
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "PERMISSION_REQUIRED");
+        Ok(())
+    });
+    fixture.processor.shutdown().unwrap();
+}
+
+#[test]
+fn current_pairing_owner_rejects_route_replacement_after_callback() {
+    let mut fixture = native_owned_pairing_fixture("pair-owner-route-replaced");
+    finish_observed_pairing(&mut fixture, true).unwrap();
+    let hosts = fixture.processor.hosts.clone();
+    let authority = fixture.authority.clone();
+    let context = fixture.context.clone();
+    let hello = fixture.hello.clone();
+    let policy = fixture.processor.current_session_policy().unwrap();
+    pairing_request_probe(fixture.store, policy, move |store, request| {
+        let id = ContextId::new(context["contextId"].as_str().unwrap()).unwrap();
+        let pairing = hosts.completed_pairing_witness(&request, &authority, &id)?;
+        let mut replacement = None;
+        let result = pairing.with_current_native_owner(store, &authority, |owner| {
+            owner.check_current()?;
+            replacement = Some(replace_observed_route(&hosts, &context, &hello));
+            Ok(19_u8)
+        });
+        assert_eq!(result.unwrap_err().code, "SESSION_ROUTE_CHANGED");
+        hosts.detach_owned(replacement.as_ref().unwrap())?;
+        Ok(())
+    });
+    fixture.processor.shutdown().unwrap();
+}
+
+#[test]
+fn current_pairing_owner_rejects_callback_result_after_current_cancellation() {
+    let mut fixture = native_owned_pairing_fixture("pair-owner-callback-cancelled");
+    finish_observed_pairing(&mut fixture, true).unwrap();
+    let hosts = fixture.processor.hosts.clone();
+    let authority = fixture.authority.clone();
+    let id = ContextId::new(fixture.context["contextId"].as_str().unwrap()).unwrap();
+    let policy = fixture.processor.current_session_policy().unwrap();
+    pairing_request_probe(fixture.store, policy, move |store, request| {
+        let pairing = hosts.completed_pairing_witness(&request, &authority, &id)?;
+        let result = pairing.with_current_native_owner(store, &authority, |owner| {
+            owner.check_current()?;
+            request
+                .budget()
+                .cancellation()
+                .store(true, Ordering::Release);
+            Ok(23_u8)
+        });
+        assert_eq!(result.unwrap_err().code, "CANCELLED");
+        Ok(())
+    });
+    fixture.processor.shutdown().unwrap();
+}
+
+#[test]
+fn current_pairing_owner_keeps_first_callback_error_and_final_cancel_cause() {
+    use std::error::Error;
+    let mut fixture = native_owned_pairing_fixture("pair-owner-two-failures");
+    finish_observed_pairing(&mut fixture, true).unwrap();
+    let hosts = fixture.processor.hosts.clone();
+    let authority = fixture.authority.clone();
+    let id = ContextId::new(fixture.context["contextId"].as_str().unwrap()).unwrap();
+    let policy = fixture.processor.current_session_policy().unwrap();
+    pairing_request_probe(fixture.store, policy, move |store, request| {
+        let pairing = hosts.completed_pairing_witness(&request, &authority, &id)?;
+        let error = pairing
+            .with_current_native_owner(store, &authority, |_| -> mmmm_application::AppResult<()> {
+                request
+                    .budget()
+                    .cancellation()
+                    .store(true, Ordering::Release);
+                Err(mmmm_application::AppError::storage(
+                    "CALLBACK_SOURCE_UNAVAILABLE",
+                    StorageError::NotFound("Actual callback source fixture"),
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "CALLBACK_SOURCE_UNAVAILABLE");
+        let both = error
+            .source()
+            .unwrap()
+            .downcast_ref::<crate::host::NativePairingOwnerFailure>()
+            .unwrap();
+        assert_eq!(both.primary.code, "CALLBACK_SOURCE_UNAVAILABLE");
+        assert!(matches!(
+            both.primary
+                .source()
+                .unwrap()
+                .downcast_ref::<StorageError>(),
+            Some(StorageError::NotFound(_))
+        ));
+        assert_eq!(both.checkpoint.code, "CANCELLED");
+        assert_eq!(
+            both.checkpoint
+                .source()
+                .unwrap()
+                .downcast_ref::<crate::service::ServiceError>()
+                .unwrap()
+                .code,
+            "CANCELLED"
+        );
+        assert!(!format!("{error:?}").contains("Actual callback source fixture"));
+        Ok(())
+    });
+    fixture.processor.shutdown().unwrap();
+}
+
+#[test]
+fn current_pairing_owner_rejects_callback_result_after_policy_revocation() {
+    let mut fixture = native_owned_pairing_fixture("pair-owner-callback-policy-revoked");
+    finish_observed_pairing(&mut fixture, true).unwrap();
+    let hosts = fixture.processor.hosts.clone();
+    let authority = fixture.authority.clone();
+    let context = fixture.context.clone();
+    let policy = fixture.processor.current_session_policy().unwrap();
+    pairing_request_probe(fixture.store, policy, move |store, request| {
+        let id = ContextId::new(context["contextId"].as_str().unwrap()).unwrap();
+        let pairing = hosts.completed_pairing_witness(&request, &authority, &id)?;
+        let result = pairing.with_current_native_owner(store, &authority, |owner| {
+            owner.check_current()?;
+            authority.revoke_staged_project(
+                pairing.principal(),
+                pairing.project(),
+                &Sha256Digest::new(context["policyRevision"].as_str().unwrap()).unwrap(),
+            )?;
+            Ok(29_u8)
+        });
+        assert_eq!(result.unwrap_err().code, "PERMISSION_REQUIRED");
+        Ok(())
+    });
+    fixture.processor.shutdown().unwrap();
 }
 
 #[test]

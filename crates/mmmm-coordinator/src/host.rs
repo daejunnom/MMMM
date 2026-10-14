@@ -4,9 +4,10 @@
 
 use crate::{
     authority::LocalAuthority,
-    bootstrap::CompletedPairingObservation,
+    bootstrap::{CompletedPairingObservation, NativeWorkspacePermit},
     client::{ClientError, HostClientReply, HostRpcClient},
     service::RequestContextWitness,
+    workspace_bootstrap::NativeOwnerWitness,
 };
 use mmmm_application::{AppError, AppResult, ProviderPort};
 use mmmm_contracts::{
@@ -17,7 +18,7 @@ use mmmm_runtime::storage::DurableStore;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -236,6 +237,74 @@ pub struct CompletedPairingWitness {
     generation: [u8; 16],
     observation: Arc<CompletedPairingObservation>,
 }
+/// Request-scoped owner/provenance check over one already opened and locked
+/// Store borrow. No raw NativeOwnerWitness, Clone, serde or authority constructor
+/// is exposed. Source rights, game modes and target readiness remain separate.
+/// Same-store checking reuses the held Store's existing opening guarantees;
+/// it does not refresh live filesystem ACL or lock-file namespace identity.
+pub(crate) struct CurrentCompletedPairingOwner<'a> {
+    pairing: &'a CompletedPairingWitness,
+    store: &'a DurableStore,
+    authority: &'a LocalAuthority,
+    owner: NativeOwnerWitness,
+}
+impl CurrentCompletedPairingOwner<'_> {
+    pub(crate) fn check_current(&self) -> AppResult<()> {
+        self.pairing.check_current(self.authority)?;
+        if Path::new(text(self.pairing.observation.original_offer(), "dataRoot")?)
+            != self.store.data_root()
+            || self.owner.principal() != self.pairing.native_owner()
+        {
+            return Err(error(
+                "PERMISSION_REQUIRED",
+                "Current native owner or held Store differs from completed pairing",
+            ));
+        }
+        self.owner
+            .check_store(self.store)
+            .map_err(|cause| self.pairing.native_owner_failure(cause))?;
+        let registered = self
+            .owner
+            .check_project(self.store, self.pairing.project())
+            .map_err(|cause| self.pairing.native_owner_failure(cause))?;
+        if &registered != self.pairing.native_owner() {
+            return Err(error(
+                "PERMISSION_REQUIRED",
+                "Registered native Project owner differs from completed pairing",
+            ));
+        }
+        // NativeOwnerWitness itself has no cancellation/session generation.
+        // The exact entered request is therefore checked after every metadata
+        // pass and again around the callback, without resetting its deadline.
+        self.pairing.check_current(self.authority)
+    }
+}
+/// Both immutable errors survive when native/DB/callback failure and a current
+/// request checkpoint fail together. No request, owner witness, Store or body is kept
+/// in this diagnostic snapshot, so it can cross the local error boundary.
+pub(crate) struct NativePairingOwnerFailure {
+    pub(crate) primary: AppError,
+    pub(crate) checkpoint: AppError,
+}
+impl std::fmt::Debug for NativePairingOwnerFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativePairingOwnerFailure")
+            .field("primary_code", &self.primary.code)
+            .field("checkpoint_code", &self.checkpoint.code)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for NativePairingOwnerFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Native pairing owner work and current request checks both failed")
+    }
+}
+impl std::error::Error for NativePairingOwnerFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
+    }
+}
 impl std::fmt::Debug for CompletedPairingWitness {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -244,6 +313,73 @@ impl std::fmt::Debug for CompletedPairingWitness {
     }
 }
 impl CompletedPairingWitness {
+    /// Observe only the already entered request after a native/DB failure.
+    /// This adds no kernel/Store I/O or new deadline and never replaces the
+    /// first native cause with a later cancellation/deadline observation.
+    fn native_owner_failure(&self, cause: mmmm_runtime::storage::StorageError) -> AppError {
+        let primary = AppError::storage("PERMISSION_REQUIRED", cause);
+        match self.request.check_local() {
+            Ok(()) => primary,
+            Err(cause) => {
+                let checkpoint = AppError::caused_by(cause.code, cause.message, cause);
+                AppError::caused_by(
+                    primary.code,
+                    primary.message,
+                    NativePairingOwnerFailure {
+                        primary,
+                        checkpoint,
+                    },
+                )
+            }
+        }
+    }
+    /// Capture current kernel ownership under this entered request's original
+    /// deadline, then check exact original root, completion owner, registered
+    /// native Project owner, route and policy around a bounded local callback.
+    /// This never renews setup authority or opens another Store. The callback
+    /// receives a non-clonable borrow guard and cannot retain the raw owner
+    /// permit as a longer-lived source/permission capability.
+    #[allow(
+        dead_code,
+        reason = "The explicit source-rights consumer is composed separately from this owner/provenance slice"
+    )]
+    pub(crate) fn with_current_native_owner<T>(
+        &self,
+        store: &DurableStore,
+        authority: &LocalAuthority,
+        inspect: impl FnOnce(&CurrentCompletedPairingOwner<'_>) -> AppResult<T>,
+    ) -> AppResult<T> {
+        self.check_current(authority)?;
+        if Path::new(text(self.observation.original_offer(), "dataRoot")?) != store.data_root() {
+            return Err(error(
+                "PERMISSION_REQUIRED",
+                "Completed native pairing belongs to another held Store",
+            ));
+        }
+        let owner = NativeOwnerWitness::capture(store, self.request.budget().deadline())
+            .map_err(|cause| self.native_owner_failure(cause))?;
+        let current = CurrentCompletedPairingOwner {
+            pairing: self,
+            store,
+            authority,
+            owner,
+        };
+        current.check_current()?;
+        let output = inspect(&current);
+        let checked = current.check_current();
+        match (output, checked) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Err(cause), Ok(())) | (Ok(_), Err(cause)) => Err(cause),
+            (Err(callback), Err(postcheck)) => Err(AppError::caused_by(
+                callback.code,
+                callback.message,
+                NativePairingOwnerFailure {
+                    primary: callback,
+                    checkpoint: postcheck,
+                },
+            )),
+        }
+    }
     pub fn check_current(&self, authority: &LocalAuthority) -> AppResult<()> {
         self.request
             .check_local()
