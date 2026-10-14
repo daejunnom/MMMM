@@ -688,14 +688,17 @@ impl Process {
                 .and_then(|identity| {
                     verify_mac_identity(self.pid, identity, MacDeadline::Instant(deadline))
                 });
-            if let Err(error) = result {
-                // Keep the unreaped Child and reservation. An unknown native
-                // identity is not permission to signal a numeric replacement.
-                if error.code != "deadline" {
-                    self.identity_uncertain = true;
+            let verified = match result {
+                Ok(verified) => verified,
+                Err(error) => {
+                    // Keep the unreaped Child and reservation. An unknown native
+                    // identity is not permission to signal a numeric replacement.
+                    if error.code != "deadline" {
+                        self.identity_uncertain = true;
+                    }
+                    return Err(error.with_resources(self.resource_evidence()));
                 }
-                return Err(error.with_resources(self.resource_evidence()));
-            }
+            };
             self.identity_uncertain = false;
             if self.resource_identity_uncertain {
                 // A later explicit finite cleanup may retry the actual fixed
@@ -712,6 +715,24 @@ impl Process {
                 {
                     return Err(error);
                 }
+            }
+            let terminal_scope_empty = mac_terminal_scope_is_empty(&verified, || {
+                super::deadline_check(deadline)?;
+                let exited = self.exit_code()?;
+                super::deadline_check(deadline)?;
+                let empty = if exited.is_some() {
+                    self.scope_empty(deadline)?
+                } else {
+                    false
+                };
+                super::deadline_check(deadline)?;
+                Ok((exited, empty))
+            })
+            .map_err(|error| error.with_resources(self.resource_evidence()))?;
+            if terminal_scope_empty {
+                // Suppress only this unnecessary signal. Ownership, the two
+                // later stable drain observations and the final reap remain.
+                return Ok(());
             }
         }
         if unsafe { libc::kill(-self.pid, libc::SIGKILL) } == -1 {
@@ -1178,6 +1199,20 @@ struct VerifiedMacIdentity {
     status: u32,
     terminal_query_errno: Option<i32>,
     exit_pending: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn mac_terminal_scope_is_empty(
+    verified: &VerifiedMacIdentity,
+    observe: impl FnOnce() -> Result<(Option<i32>, bool), StdioError>,
+) -> Result<bool, StdioError> {
+    if verified.status != 5 || verified.exit_pending {
+        return Ok(false);
+    }
+    let (exited, empty) = observe()?;
+    // A confirmed same-identity zombie alone cannot account for descendants.
+    // Both facts must come from fresh observations under the original bound.
+    Ok(exited.is_some() && empty)
 }
 
 #[cfg(target_os = "macos")]
@@ -2111,6 +2146,59 @@ mod resource_policy_tests {
             peak_footprint: actual.footprint,
             samples: 1,
             maximum_gap: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn darwin_terminal_signal_preflight_requires_fresh_exit_and_empty_scope() {
+        let verified = VerifiedMacIdentity {
+            status: 5,
+            terminal_query_errno: None,
+            exit_pending: false,
+        };
+        for (exited, empty, expected) in [
+            (Some(0), true, true),
+            (Some(101), true, true),
+            (Some(-9), true, true),
+            (None, true, false),
+            (Some(101), false, false),
+            (None, false, false),
+        ] {
+            let mut observations = 0;
+            let actual = mac_terminal_scope_is_empty(&verified, || {
+                observations += 1;
+                Ok((exited, empty))
+            })
+            .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(observations, 1);
+        }
+        for (status, exit_pending) in [(0, false), (2, false), (2, true), (5, true)] {
+            let unconfirmed = VerifiedMacIdentity {
+                status,
+                terminal_query_errno: Some(libc::ESRCH),
+                exit_pending,
+            };
+            assert!(
+                !mac_terminal_scope_is_empty(&unconfirmed, || {
+                    panic!("live, unknown or pending identity cannot skip a signal")
+                })
+                .unwrap()
+            );
+        }
+        for error in [
+            StdioError::new("deadline"),
+            StdioError::new("native_observe"),
+            StdioError::new("native_resource_identity"),
+            StdioError::io(
+                "native_resource_observation",
+                std::io::Error::from_raw_os_error(libc::EPERM),
+            ),
+        ] {
+            assert_eq!(
+                mac_terminal_scope_is_empty(&verified, || Err(error.clone())).unwrap_err(),
+                error
+            );
         }
     }
 

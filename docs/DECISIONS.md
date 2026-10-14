@@ -65,6 +65,8 @@
 
 | MMMM-D044 | 승인된 selected input의 archive 사실은 현재 native catalog 발행과 같은 보호 Store에서 읽고 immutable CAS에 나누어 보존한다. | `catalog.capture`만 실제 완료 pairing·현재 owner/route·Project/Policy·D032·D035 선택 및 전체 CAS를 전후 검사하여 생산한다. 명시 publisher와 FN23/FN31 소비자는 새 inventory를 만들지 않는다. 입력별 raw bytes/member 목록은 한 입력의 생애에만 두고 registry는 exact 발행 receipt와 작은 provenance/manifest 참조·summary만 보유한다. member page는 256 KiB·1,024 entries, 요청 합계는 input 64 MiB·decoded 256 MiB·65,535 entries·encoded 16 MiB이며 기존 JSON 및 registry 1 MiB 제한을 유지한다. parser에 제공한 allowance를 선예약하고 성공 때 실제 사용량만 환급한다. 선택별 실제 rejection manifest 비용을 작업 전에 예약하여 긴 canonical 선택도 기록 공간을 잃지 않게 한다. 형식·지원·합계 초과는 정확한 rejected 사실로 남기고 취소·기한·읽기·ACL 실패는 원 typed 오류로 보존하며 실패한 호출의 새 완료 cache를 게시하지 않는다. 원 source의 독립 FN31 grant, runtime pack mapping·loaded definition·SourceAdmission 및 게임 권한을 이 사실에서 발급하지 않는다. |
 
+| MMMM-D045 | Darwin stdio cleanup은 동일한 미회수 zombie와 실제 빈 scope를 새로 확인한 경우에만 신호를 생략하며 기존 drain 판정을 계속 따른다. | CI36에서 실제 group SIGKILL의 EPERM을 관측했지만 errno 자체를 성공이나 종료 증명으로 사용하지 않는다. 기존 reserved·고정 identity·resource identity 검사를 통과한 fresh SZOMB·non-pending leader에 한해 원 cleanup deadline 안의 WNOWAIT exit 확인과 기존 scope 전체의 실제 empty 관측을 요구한다. 그 한 번의 신호만 생략하며 두 번 안정 관측과 reap이 끝나야 drain을 발급한다. 미확인 exit·nonempty는 기존 signal 경로, 관측·identity·기한 오류는 원 typed 오류와 자원 사실로 보존한다. Child·reservation·기한·자원 상한·EPERM/ESRCH 처리와 기존 sleep은 유지한다. 이번 CI에는 pre-signal empty 관측이 없으므로 정책 채택을 원 실패의 해결로 표시하지 않으며 실제 macOS 실행을 별도로 확인한다. |
+
 ## 구현 전에 확인할 항목
 
 - 원본 계약과 예제 패키지의 내용, 버전 및 digest.
