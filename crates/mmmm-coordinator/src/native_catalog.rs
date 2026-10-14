@@ -59,7 +59,7 @@ struct CurrentNativeCatalogCheckpoint {
 impl NativeCatalogCheckpoint for CurrentNativeCatalogCheckpoint {
     fn check(&self, store: &DurableStore) -> AppResult<()> {
         let result = (|| {
-            check_request(&self.request, &self.principal, &self.context, &self.budget)?;
+            check_read_request(&self.request, &self.principal, &self.context, &self.budget)?;
             self.pairing
                 .with_current_native_owner(store, &self.authority, |owner| {
                     let current = owner.read_host_policy()?;
@@ -148,7 +148,7 @@ impl NativeCatalogAdmission<'_> {
         };
         let result = (|| {
             let request = self.request.occupied_witness().map_err(service_error)?;
-            check_request(&request, principal, context, budget)?;
+            check_read_request(&request, principal, context, budget)?;
             let id = ContextId::new(text(context, "contextId")?).map_err(|_| denied())?;
             let pairing = Rc::new(self.hosts.completed_pairing_witness(
                 &request,
@@ -450,7 +450,7 @@ impl NativeSourceUseRead {
 }
 impl ProjectSourceRpcContext for NativeSourceUseRead {
     fn check(&self) -> StorageResult<()> {
-        check_request(&self.request, &self.principal, &self.context, &self.budget)
+        check_read_request(&self.request, &self.principal, &self.context, &self.budget)
             .map_err(|cause| self.reject(cause))?;
         self.owner.check()?;
         self.rpc.check()
@@ -578,7 +578,7 @@ fn read_source_uses(
     // read. Reader callbacks below recheck the same native owner/Store and game
     // ACL, without recursively reopening the D032 reader for each metadata pin.
     let boundary = || {
-        check_request(request, principal, context, budget)?;
+        check_read_request(request, principal, context, budget)?;
         if pairing.context() != context {
             return Err(denied());
         }
@@ -637,7 +637,7 @@ fn read_source_uses(
         {
             return Err(denied());
         }
-        check_request(request, principal, context, budget)?;
+        check_read_request(request, principal, context, budget)?;
         Ok(selected)
     })();
     combine(output, boundary())
@@ -704,10 +704,31 @@ fn check_request(
     context: &Value,
     budget: &RequestBudget,
 ) -> AppResult<()> {
-    request.check_local().map_err(service_error)?;
     if !matches!(
         request.method(),
         "catalog.capture" | "catalog.search" | "catalog.describe"
+    ) {
+        return Err(denied());
+    }
+    check_read_request(request, principal, context, budget)
+}
+
+/// 원 publication만 소비하는 FN23/FN31도 같은 실제 요청·source-use 검사를 쓴다.
+/// 발행자는 위 catalog-only check_request를 계속 사용한다.
+fn check_read_request(
+    request: &RequestContextWitness,
+    principal: &AuthenticatedPrincipal,
+    context: &Value,
+    budget: &RequestBudget,
+) -> AppResult<()> {
+    request.check_local().map_err(service_error)?;
+    if !matches!(
+        request.method(),
+        "catalog.capture"
+            | "catalog.search"
+            | "catalog.describe"
+            | "world.shape_query"
+            | "artifact.read"
     ) || !request.authenticated().same_session(principal)
         || !principal.is_current()
         || !principal.permits(request.method())

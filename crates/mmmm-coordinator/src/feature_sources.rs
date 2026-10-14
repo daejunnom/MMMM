@@ -58,6 +58,9 @@ use std::{
     rc::Rc,
 };
 
+#[path = "feature_shapes.rs"]
+mod shape_source;
+
 const MAX_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CODEC_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_REGISTRATIONS: usize = 4096;
@@ -554,6 +557,7 @@ struct ProductRecord {
     resource: ResourceRef,
     producer: Sha256Digest,
     origin: FeatureOrigin,
+    shape: Option<shape_source::ShapeGeometryReceipt>,
     weight: usize,
 }
 #[derive(Default)]
@@ -591,12 +595,14 @@ struct FeatureOrigin {
 pub struct LocalFeatureSources {
     composition: FeatureSourceComposition,
     origin: FeatureOrigin,
+    pending_shape: Option<shape_source::ShapeGeometryReceipt>,
 }
 impl LocalFeatureSources {
     pub fn new(composition: FeatureSourceComposition) -> Self {
         Self {
             composition,
             origin: FeatureOrigin::default(),
+            pending_shape: None,
         }
     }
     /// FN31 and canonical feature reads share this exact issuance registry.
@@ -698,6 +704,38 @@ impl LocalFeatureSources {
             return Err(service(conflict()));
         }
         Ok((principal, source, project))
+    }
+
+    fn shape_admission(
+        &self,
+        access: &FeatureAccess,
+        store: &DurableStore,
+        budget: &RequestBudget,
+    ) -> Result<shape_source::ShapeReadAdmission, ServiceError> {
+        let (principal, _) = self.current(access, budget)?;
+        let context = access
+            .context
+            .as_ref()
+            .ok_or_else(|| service(unavailable()))?;
+        let catalog = self
+            .composition
+            .catalog
+            .as_ref()
+            .ok_or_else(|| service(unavailable()))?;
+        let snapshot_access =
+            catalog.shape_snapshot_access(&self.composition.request, access, budget)?;
+        let native = crate::native_catalog::NativeCatalogAdmission {
+            request: &self.composition.request,
+            authority: &self.composition.authority,
+            hosts: &self.composition.hosts,
+            sources: catalog,
+        }
+        .checkpoint(&principal, context, store, budget)
+        .map_err(shape_source::service_error)?;
+        Ok(shape_source::ShapeReadAdmission::new(
+            snapshot_access,
+            native,
+        ))
     }
     /// Called by trusted native/file ingress only after bytes were placed in
     /// registered Project CAS. This does not fabricate a completed BakeArtifact.
@@ -912,6 +950,7 @@ impl FeatureSources for LocalFeatureSources {
             return Err(service(forbidden()));
         }
         self.origin = FeatureOrigin::default();
+        self.pending_shape = None;
         let local = self.local(actual.clone(), actual_budget).map_err(service)?;
         let id = input
             .get("contextId")
@@ -942,8 +981,9 @@ impl FeatureSources for LocalFeatureSources {
             .authority
             .policy_revision(actual.principal(), project.project_id())
             .map_err(service)?;
-        let read_principal = if method.starts_with("catalog.") {
-            if let Some(context) = context.as_ref()
+        let read_principal = if method.starts_with("catalog.") || method == "world.shape_query" {
+            if method.starts_with("catalog.")
+                && let Some(context) = context.as_ref()
                 && context["environment"]["kind"] == "game"
             {
                 crate::native_catalog::NativeCatalogAdmission {
@@ -1031,6 +1071,116 @@ impl FeatureSources for LocalFeatureSources {
         environment
             .inventory(principal.principal(), context)
             .map_err(service)
+    }
+    fn shape_query_with_catalog(
+        &mut self,
+        access: &FeatureAccess,
+        input: &Value,
+        catalog: &mmmm_reference::Catalog,
+        store: &mut DurableStore,
+        budget: &RequestBudget,
+    ) -> Result<Value, ServiceError> {
+        let ports =
+            shape_source::ShapeReadPorts::features(self).map_err(shape_source::service_error)?;
+        let admission = self.shape_admission(access, store, budget)?;
+        let output = shape_source::query_current_shape(
+            ports, access, input, catalog, store, budget, admission,
+        )
+        .map_err(shape_source::service_error)?;
+        budget.check()?;
+        self.pending_shape = output.geometry;
+        Ok(output.result)
+    }
+    fn shape_finished(
+        &mut self,
+        access: &FeatureAccess,
+        result: &Result<Value, ServiceError>,
+        catalog: &mmmm_reference::Catalog,
+        store: &mut DurableStore,
+        budget: &RequestBudget,
+    ) -> Result<(), ServiceError> {
+        // 실패·취소 때 새 I/O 없이 이 호출의 미발행 자료만 폐기한다.
+        let pending = self.pending_shape.take();
+        let Ok(output) = result else {
+            return Ok(());
+        };
+        if let Some(receipt) = pending {
+            if output.get("geometryRef")
+                != Some(&serde_json::to_value(receipt.resource()).map_err(|_| service(invalid()))?)
+            {
+                return Err(service(invalid()));
+            }
+            let (principal, _, project) =
+                self.source(access, PlanningStore::read(store), budget)?;
+            let context = access
+                .context
+                .as_ref()
+                .ok_or_else(|| service(unavailable()))?;
+            let resource = receipt.resource().clone();
+            let weight = record_cost(context, &receipt.snapshot().snapshot, &[&resource])
+                .map_err(service)?;
+            let binding =
+                SourceBinding::capture(&principal, &project, context, &self.composition.authority)
+                    .map_err(service)?;
+            let admission = self.shape_admission(access, store, budget)?;
+            let id: SnapshotId =
+                serde_json::from_value(receipt.snapshot().snapshot["snapshotId"].clone())
+                    .map_err(|_| service(invalid()))?;
+            let pin = catalog
+                .snapshot_pin(&id, &access.read_principal, admission.snapshot_access())
+                .map_err(|_| service(forbidden()))?;
+            if pin.revision != receipt.snapshot().revision {
+                return Err(service(forbidden()));
+            }
+            let ports = shape_source::ShapeReadPorts::features(self)
+                .map_err(shape_source::service_error)?;
+            // 마지막 실제 host I/O 및 그 후 source/CAS/D032 확인은 발행 전에 끝난다.
+            receipt
+                .authorize_publication(ports, access, store, budget, admission)
+                .map_err(shape_source::service_error)?;
+            let mut products = self
+                .composition
+                .products
+                .try_borrow_mut()
+                .map_err(|_| service(busy()))?;
+            let key = (project.project_id().clone(), resource.resource_id.clone());
+            if products.records.len() >= 128 && !products.records.contains_key(&key) {
+                return Err(service(limit()));
+            }
+            if products
+                .records
+                .get(&key)
+                .is_some_and(|old| !same_resource(&old.resource, &resource))
+            {
+                return Err(service(conflict()));
+            }
+            let previous = products.records.get(&key).map_or(0, |old| old.weight);
+            let bytes = products
+                .bytes
+                .checked_sub(previous)
+                .and_then(|bytes| bytes.checked_add(weight))
+                .ok_or_else(|| service(limit()))?;
+            if bytes > MAX_REGISTRY_BYTES {
+                return Err(service(limit()));
+            }
+            self.composition
+                .request
+                .current_witness("world.shape_query")?
+                .check_local()?;
+            products.records.insert(
+                key,
+                ProductRecord {
+                    binding,
+                    resource,
+                    producer: raw_digest(include_bytes!("features.rs")),
+                    origin: FeatureOrigin::default(),
+                    shape: Some(receipt),
+                    weight,
+                },
+            );
+            products.bytes = bytes;
+        }
+        Ok(())
     }
     fn math_inputs(
         &mut self,
@@ -1417,6 +1567,11 @@ impl LocalFeatureResources<'_> {
         }
         let record = record.clone();
         drop(records);
+        // Shape geometry는 원 snapshot/source와 현재 FN31 요청을 검사하는
+        // 아래 FeatureArtifactAuthority 전용 경로에서만 소비한다.
+        if record.shape.is_some() {
+            return Err(forbidden());
+        }
         let mut document_remaining = 32 * 1024 * 1024;
         let rpc = ProductRpc {
             access: self.source.access().clone(),
@@ -1708,6 +1863,7 @@ impl FeatureResourcePort for LocalFeatureResources<'_> {
                 resource: pin,
                 producer: raw_digest(include_bytes!("features.rs")),
                 origin: self.origin.clone(),
+                shape: None,
                 weight,
             };
             self.budget
@@ -1954,6 +2110,73 @@ impl ResourceAuthority for FeatureArtifactAuthority {
             budget: budget.clone(),
             origin: FeatureOrigin::default(),
         };
+        // 명시적인 현재 raw resource ACL은 파생 receipt의 존재·현재성과 별개다.
+        // ArtifactReader가 원 owner/version/metadata/CAS와 전후 ACL을 검사하며,
+        // 이 경로는 receipt를 복원하거나 배포 권한을 발급하지 않는다.
+        let scope = self
+            .authority
+            .project_scope(principal, project.project_id())
+            .map_err(artifact_app)?;
+        if scope["resourceIds"]
+            .as_array()
+            .is_some_and(|ids| ids.contains(&resource["resourceId"]))
+            && context["scope"]["resourceIds"]
+                .as_array()
+                .is_some_and(|ids| ids.contains(&resource["resourceId"]))
+        {
+            return issued.fresh(id.as_str()).map_err(artifact_app);
+        }
+        let geometry = self
+            .products
+            .try_borrow()
+            .map_err(|_| ArtifactError::new("SOURCE_BUSY", "Issued product registry is busy"))?
+            .records
+            .get(&(project.project_id().clone(), pin.resource_id.clone()))
+            .cloned()
+            .filter(|record| record.shape.is_some());
+        if let Some(record) = geometry {
+            if !same_resource(&record.resource, &pin)
+                || record.producer != raw_digest(include_bytes!("features.rs"))
+                || !record
+                    .binding
+                    .matches(&authenticated, &project, &context, &self.authority)
+                    .map_err(artifact_app)?
+            {
+                return Err(ArtifactError::forbidden());
+            }
+            let catalog = self.catalog.as_ref().ok_or_else(ArtifactError::forbidden)?;
+            let access = FeatureAccess {
+                read_principal: catalog
+                    .read_principal(&authenticated, id)
+                    .map_err(artifact_app)?,
+                context: Some(context.clone()),
+                project: Some(project.project().clone()),
+                granted_permissions: BTreeSet::new(),
+            };
+            let snapshot_access = catalog
+                .shape_snapshot_access(&self.request, &access, &budget)
+                .map_err(|error| ArtifactError::new(error.code, error.message))?;
+            let native = crate::native_catalog::NativeCatalogAdmission {
+                request: &self.request,
+                authority: &self.authority,
+                hosts: &self.hosts,
+                sources: catalog,
+            }
+            .checkpoint(&authenticated, &context, store, &budget)
+            .map_err(artifact_app)?;
+            let receipt = record.shape.as_ref().ok_or_else(ArtifactError::forbidden)?;
+            receipt
+                .authorize_read(
+                    shape_source::ShapeReadPorts::artifacts(self).map_err(artifact_app)?,
+                    &access,
+                    &pin,
+                    store,
+                    &budget,
+                    shape_source::ShapeReadAdmission::new(snapshot_access, native),
+                )
+                .map_err(artifact_app)?;
+            return Ok(());
+        }
         if issued.product(&pin).map_err(artifact_app)?.is_some() {
             issued.fresh(id.as_str()).map_err(artifact_app)?;
             return Ok(());
@@ -1974,23 +2197,7 @@ impl ResourceAuthority for FeatureArtifactAuthority {
             issued.fresh(id.as_str()).map_err(artifact_app)?;
             return Ok(());
         }
-        // Explicit current native resource grants also authorize an immutable
-        // historical FN31 binding. The ArtifactReader owns version selection,
-        // exact metadata and full-byte verification; this ACL cannot rebind it.
-        let scope = self
-            .authority
-            .project_scope(principal, project.project_id())
-            .map_err(artifact_app)?;
-        if !scope["resourceIds"]
-            .as_array()
-            .is_some_and(|ids| ids.contains(&resource["resourceId"]))
-            || !context["scope"]["resourceIds"]
-                .as_array()
-                .is_some_and(|ids| ids.contains(&resource["resourceId"]))
-        {
-            return Err(ArtifactError::forbidden());
-        }
-        issued.fresh(id.as_str()).map_err(artifact_app)
+        Err(ArtifactError::forbidden())
     }
 }
 

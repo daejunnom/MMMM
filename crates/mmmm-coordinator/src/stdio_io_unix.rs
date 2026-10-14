@@ -714,13 +714,13 @@ impl Process {
                 }
             }
         }
-        if unsafe { libc::kill(-self.pid, libc::SIGKILL) } == -1
-            && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-        {
-            Err(StdioError::new("native_terminate"))
-        } else {
-            Ok(())
+        if unsafe { libc::kill(-self.pid, libc::SIGKILL) } == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(StdioError::io("native_terminate", error));
+            }
         }
+        Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     pub(super) fn reap(&mut self) -> Result<Option<i32>, StdioError> {

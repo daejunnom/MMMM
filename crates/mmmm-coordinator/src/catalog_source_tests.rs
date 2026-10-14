@@ -261,7 +261,7 @@ fn capture(
 ) -> Result<Value, CatalogError> {
     let call = fixture.call();
     let principal = call.read_principal.clone();
-    let access = CatalogAccess(call.clone(), true);
+    let access = CatalogAccess(call.clone(), true, None);
     let shared = PlanningStore::write(store);
     let backend = BorrowedCatalogBackend {
         store: shared.clone(),
@@ -322,7 +322,7 @@ fn actual_project_source_raw_bytes_and_snapshot_manifest_survive_store_restart()
     assert_eq!(snapshot["sources"][0]["sha256"], raw_digest(raw).as_str());
     assert!(snapshot["artifactSha256"].is_null());
     let call = fixture.call();
-    let read=catalog.describe(&json!({"snapshotId":snapshot["snapshotId"],"contextId":fixture.context["contextId"],"kind":"minecraft:model","resourceId":"example:offset"}),&call.read_principal.clone(),&CatalogAccess(call,false)).unwrap();
+    let read=catalog.describe(&json!({"snapshotId":snapshot["snapshotId"],"contextId":fixture.context["contextId"],"kind":"minecraft:model","resourceId":"example:offset"}),&call.read_principal.clone(),&CatalogAccess(call,false,None)).unwrap();
     assert_eq!(read["value"], parse_json(raw).unwrap());
     assert_eq!(read["unit"], "unitless");
     let sid = SnapshotId::new(snapshot["snapshotId"].as_str().unwrap()).unwrap();
@@ -452,7 +452,7 @@ fn current_scope_and_source_revocation_apply_to_catalog_cache_reads() {
     )
     .unwrap();
     let call = fixture.call();
-    let access = CatalogAccess(call.clone(), false);
+    let access = CatalogAccess(call.clone(), false, None);
     access
         .authorize_snapshot(&call.read_principal, &snapshot)
         .unwrap();
@@ -940,7 +940,7 @@ fn generated_binary_resource_requires_completed_capture_and_current_exact_source
     assert_ne!(receipt.resource["resourceId"], "binary-input");
     assert_eq!(read_blob(&store, &receipt.resource), raw);
     let call = fixture.call();
-    let described=catalog.describe(&json!({"snapshotId":id,"contextId":fixture.context["contextId"],"kind":"minecraft:texture","resourceId":"example:raw_texture"}),&call.read_principal.clone(),&CatalogAccess(call,false)).unwrap();
+    let described=catalog.describe(&json!({"snapshotId":id,"contextId":fixture.context["contextId"],"kind":"minecraft:texture","resourceId":"example:raw_texture"}),&call.read_principal.clone(),&CatalogAccess(call,false,None)).unwrap();
     assert_eq!(described["value"], receipt.resource);
     let authorized = fixture
         .sources
@@ -1068,7 +1068,7 @@ fn cancellation_after_actual_retention_can_finalize_only_the_inserted_historical
         .capture(
             &request,
             &principal,
-            &CatalogAccess(call.clone(), true),
+            &CatalogAccess(call.clone(), true, None),
             &mut port,
             &control,
         )
@@ -1082,7 +1082,7 @@ fn cancellation_after_actual_retention_can_finalize_only_the_inserted_historical
             .snapshot_pin(
                 &id,
                 &call.read_principal,
-                &CatalogAccess(call.clone(), true)
+                &CatalogAccess(call.clone(), true, None)
             )
             .is_ok()
     );
@@ -1197,7 +1197,7 @@ fn failed_catalog_insertion_keeps_raw_evidence_pending_without_artifact_or_excha
         catalog.snapshot_pin(
             &id,
             &call.read_principal,
-            &CatalogAccess(call.clone(), true)
+            &CatalogAccess(call.clone(), true, None)
         ),
         Err(CatalogError::SnapshotNotFound)
     ));

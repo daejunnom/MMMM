@@ -57,6 +57,8 @@
 
 | MMMM-D040 | Linux stat 실패 진단은 이미 수행한 관측의 닫힌 비교값과 실제 pidfd 단계만 보존하며 종료 권한을 추가하지 않는다. | 원 identity의 PID·start ticks·group·session 각각의 일치 여부, before/after state·thread 수와 after group/session의 detached sentinel 여부를 기록한다. 원 식별자·경로·comm·stat 원문은 보관하지 않는다. count-only와 RSS 선택, 실제 binding의 미시도·성공·부재·종료·실패와 실제 terminal poll을 구분하고 수행하지 않은 pidfd 관측을 추정하지 않는다. 기존 stat 갱신으로 먼저 얻은 pidfd 사실을 잃지 않으며 최초 진단과 원 오류·drain 판정을 유지한다. 진단 payload는 오류 안에 boxed optional로 보관한다. sentinel이나 dead state를 identity 불일치의 예외·성공 표본·empty·drain으로 사용하지 않고 native 호출·재시도·기한·자원 한도·Linux gap 정책은 바꾸지 않는다. 실제 Linux CI에서 변경 필드를 확인한 뒤 판정 변경의 필요성을 별도로 검토한다. |
 
+| MMMM-D041 | FN23은 owning Catalog의 실제 완료 snapshot과 현재 요청의 읽기 권한을 소비하고, 공통 최종 검사를 통과한 결과의 geometry receipt만 게시한다. | FN23/FN31의 좁은 snapshot 소비 권한은 catalog source 발행·capture 권한이 아니다. native 소비는 기존 publication의 checkpoint만 사용하고 `ensure`로 새 source를 만들지 않는다. 같은 요청·budget/cancel·session·side·완료 pairing·현재 route·Project/Policy·source-use/CAS·D032 shape mode를 검사하며 초기 및 마지막 hello 전후의 durable 검증에는 host I/O를 중첩하지 않는다. host 실패와 후검사 실패가 겹치면 typed 원인을 함께 보존한다. geometry는 private pending에 두고 공통 current/budget/output schema 성공 뒤 owning pin과 마지막 host I/O 후 durable 검사를 다시 통과해야 게시한다. 실패는 현재 pending만 폐기하며 기존 발행을 지우지 않는다. FN31의 현재 Project/context 양쪽에 별도로 승인된 정확 resource grant는 기존 immutable owner/version·metadata·전체 CAS·전후 권한 검사로 읽고 shape receipt를 재발급하지 않는다. 미확정 artifact·pack·host identity를 빈 값이나 known으로 승격하지 않으며 실제 known geometry와 게임 인수는 별도다. |
+
 ## 구현 전에 확인할 항목
 
 - 원본 계약과 예제 패키지의 내용, 버전 및 digest.

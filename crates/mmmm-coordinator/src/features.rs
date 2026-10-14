@@ -229,6 +229,48 @@ pub trait FeatureSources {
         Err(unavailable())
     }
 
+    /// Owning Catalog 전달은 private 연결이다. 기본 구현도 같은 ShapeService를
+    /// 사용하며 production source는 실제 snapshot과 geometry 발행을 함께 검사한다.
+    fn shape_query_with_catalog(
+        &mut self,
+        access: &FeatureAccess,
+        input: &Value,
+        _catalog: &Catalog,
+        store: &mut DurableStore,
+        budget: &RequestBudget,
+    ) -> Result<Value, ServiceError> {
+        let source = self.shape(access, input, store, budget)?;
+        let deadline = wire_deadline(budget)?;
+        let control = ShapeControl {
+            cancellation: budget.cancellation(),
+            deadline: budget.deadline(),
+            deadline_at: &deadline,
+        };
+        ShapeService::new(ForwardShape(source.port), ShapeLimits::default())
+            .map_err(shape_error)?
+            .query(
+                input,
+                &access.read_principal,
+                source.authority.as_ref(),
+                &control,
+            )
+            .map(|read| read.result)
+            .map_err(shape_error)
+    }
+
+    /// 실제 공통 출력/current/budget 검사 결과 뒤에만 호출한다. 실패 결과는
+    /// 현재 호출의 private pending만 폐기하며 이전 발행을 철회하지 않는다.
+    fn shape_finished(
+        &mut self,
+        _access: &FeatureAccess,
+        _result: &Result<Value, ServiceError>,
+        _catalog: &Catalog,
+        _store: &mut DurableStore,
+        _budget: &RequestBudget,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
     /// In addition to ResourcePort.authorize_selection, verify selected DTOs
     /// against actual authored historical Project pins, dataSnapshotId against
     /// the accessible immutable catalog, and optional physics against its exact
@@ -462,29 +504,13 @@ impl FeatureExtension {
                 context.check(method)?;
                 Ok(snapshot)
             }
-            "world.shape_query" => {
-                let source = self
-                    .sources
-                    .shape(access, input, context.store, context.budget)?;
-                let deadline = wire_deadline(context.budget)?;
-                let control = ShapeControl {
-                    cancellation: context.budget.cancellation(),
-                    deadline: context.budget.deadline(),
-                    deadline_at: &deadline,
-                };
-                let mut shape =
-                    ShapeService::new(ForwardShape(source.port), ShapeLimits::default())
-                        .map_err(shape_error)?;
-                shape
-                    .query(
-                        input,
-                        &access.read_principal,
-                        source.authority.as_ref(),
-                        &control,
-                    )
-                    .map(|read| read.result)
-                    .map_err(shape_error)
-            }
+            "world.shape_query" => self.sources.shape_query_with_catalog(
+                access,
+                input,
+                &self.catalog,
+                context.store,
+                context.budget,
+            ),
             "exchange.prepare" => self.prepare_bundle(input, access, context),
             "exchange.inspect" => {
                 let mut resources =
@@ -862,16 +888,28 @@ impl ServiceExtension for FeatureExtension {
             context.budget,
         )?;
         check_access(context.principal, input, &access, context.budget)?;
-        let output = self.dispatch(method, input, &access, context)?;
-        context.check(method)?;
-        check_value(&output, context.budget)?;
-        validator.validate(&function.output, &output).map_err(|_| {
-            ServiceError::new(
-                "SCHEMA_INVALID",
-                "Feature output does not match the canonical function contract",
-            )
-        })?;
-        Ok(output)
+        let result = (|| {
+            let output = self.dispatch(method, input, &access, context)?;
+            context.check(method)?;
+            check_value(&output, context.budget)?;
+            validator.validate(&function.output, &output).map_err(|_| {
+                ServiceError::new(
+                    "SCHEMA_INVALID",
+                    "Feature output does not match the canonical function contract",
+                )
+            })?;
+            Ok(output)
+        })();
+        if method == "world.shape_query" {
+            self.sources.shape_finished(
+                &access,
+                &result,
+                &self.catalog,
+                context.store,
+                context.budget,
+            )?;
+        }
+        result
     }
 }
 
@@ -1357,7 +1395,7 @@ fn bounded_clone(value: &Value, budget: &RequestBudget) -> Result<Value, Service
     budget.check()?;
     Ok(result)
 }
-fn wire_deadline(budget: &RequestBudget) -> Result<String, ServiceError> {
+pub(crate) fn wire_deadline(budget: &RequestBudget) -> Result<String, ServiceError> {
     let remaining = budget
         .remaining()
         .ok_or_else(|| ServiceError::new("TIME_BUDGET_EXCEEDED", "Request deadline reached"))?;
@@ -1465,6 +1503,9 @@ fn shape_error(error: mmmm_reference::ShapeError) -> ServiceError {
     let code = match error.code() {
         "CANCELLED" => "CANCELLED",
         "TIME_BUDGET_EXCEEDED" => "TIME_BUDGET_EXCEEDED",
+        "DEADLINE_EXCEEDED" => "DEADLINE_EXCEEDED",
+        "STALE_CONTEXT" => "STALE_CONTEXT",
+        "SIDE_MISMATCH" => "SIDE_MISMATCH",
         "PERMISSION_REQUIRED" => "PERMISSION_REQUIRED",
         "SOURCE_UNAVAILABLE" => "SOURCE_UNAVAILABLE",
         "TARGET_DRIFT" => "TARGET_DRIFT",

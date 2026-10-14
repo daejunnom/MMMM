@@ -683,10 +683,11 @@ fn attaching_startup_observation_preserves_primary_error_and_drain_evidence() {
         }
     }
 
+    let termination = StdioError::io("native_terminate", io::Error::from_raw_os_error(5));
     let cleanup = StdioCleanupFailure {
-        code: "drain_uncertain",
-        native_code: Some(5),
-        native_code_unknown: false,
+        code: termination.code,
+        native_code: termination.native_code,
+        native_code_unknown: termination.native_code_unknown,
     };
     let mut error = StdioError::new("startup_deadline");
     error.cleanup = Some(cleanup.clone());
@@ -695,6 +696,14 @@ fn attaching_startup_observation_preserves_primary_error_and_drain_evidence() {
     assert!(!error.drained);
     assert_eq!(error.cleanup.as_ref(), Some(&cleanup));
     assert!(error.startup.is_some());
+    assert_eq!(cleanup.code, "native_terminate");
+    assert_eq!(cleanup.native_code, Some(5));
+    assert!(!cleanup.native_code_unknown);
+    assert_eq!(
+        cleanup.to_string(),
+        "finite stdio cleanup: native_terminate (native 5)"
+    );
+    assert!(error.to_string().contains(&cleanup.to_string()));
 }
 
 #[test]

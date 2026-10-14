@@ -823,7 +823,7 @@ impl RegisteredCatalogSources {
             call: call.clone(),
         };
         Ok(CaptureInputs {
-            access: Box::new(CatalogAccess(call, true)),
+            access: Box::new(CatalogAccess(call, true, None)),
             source: Box::new(source),
         })
     }
@@ -859,7 +859,47 @@ impl RegisteredCatalogSources {
             native_checkpoint: None,
         };
         call.fresh().map_err(app_service)?;
-        Ok(Box::new(CatalogAccess(call, false)))
+        Ok(Box::new(CatalogAccess(call, false, None)))
+    }
+
+    /// 실제 FN23 또는 이미 발행된 geometry의 FN31 소비자 전용이다. 새 source,
+    /// snapshot 또는 capture receipt를 발행하지 않으며 occupied 요청을 고정한다.
+    pub(crate) fn shape_snapshot_access(
+        &self,
+        slot: &RequestContextSlot,
+        access: &FeatureAccess,
+        budget: &RequestBudget,
+    ) -> Result<Rc<dyn AccessControl>, ServiceError> {
+        let witness = slot.occupied_witness()?;
+        if !matches!(witness.method(), "world.shape_query" | "artifact.read")
+            || witness.budget().deadline() != budget.deadline()
+            || !std::ptr::eq(witness.budget().cancellation(), budget.cancellation())
+        {
+            return Err(service_forbidden());
+        }
+        let authenticated = witness.authenticated().clone();
+        let context = access.context.as_ref().ok_or_else(service_unavailable)?;
+        let id = context_id(context).map_err(app_service)?;
+        let installed = self.environment(&authenticated, &id).map_err(app_service)?;
+        let expected = self
+            .read_principal(&authenticated, &id)
+            .map_err(app_service)?;
+        if *context != installed.registration.context
+            || expected.principal_id != access.read_principal.principal_id
+            || expected.permission_scope_digest != access.read_principal.permission_scope_digest
+        {
+            return Err(service_forbidden());
+        }
+        let call = CatalogCall {
+            sources: self.clone(),
+            authenticated,
+            budget: budget.clone(),
+            installed,
+            read_principal: expected,
+            native_checkpoint: None,
+        };
+        call.fresh().map_err(app_service)?;
+        Ok(Rc::new(CatalogAccess(call, false, Some(witness))))
     }
 
     /// FN24 resolves its dataSnapshotId through this actual retained capture
@@ -988,7 +1028,7 @@ impl RegisteredCatalogSources {
             .snapshot_pin(
                 &id,
                 &call.read_principal,
-                &CatalogAccess(call.clone(), true),
+                &CatalogAccess(call.clone(), true, None),
             )
             .map_err(|_| forbidden())?;
         if pin.snapshot != *snapshot
@@ -1447,7 +1487,11 @@ impl CatalogCall {
     }
 }
 
-struct CatalogAccess(CatalogCall, bool);
+struct CatalogAccess(
+    CatalogCall,
+    bool,
+    Option<crate::service::RequestContextWitness>,
+);
 impl AccessControl for CatalogAccess {
     fn authorize_snapshot(
         &self,
@@ -1455,7 +1499,16 @@ impl AccessControl for CatalogAccess {
         snapshot: &Value,
     ) -> Result<(), CatalogError> {
         self.0.principal(principal)?;
-        if !(self.0.authenticated.permits("catalog.capture")
+        if let Some(witness) = &self.2 {
+            witness
+                .check_local()
+                .map_err(|_| CatalogError::PermissionRequired)?;
+            if !witness.authenticated().same_session(&self.0.authenticated)
+                || !matches!(witness.method(), "world.shape_query" | "artifact.read")
+            {
+                return Err(CatalogError::PermissionRequired);
+            }
+        } else if !(self.0.authenticated.permits("catalog.capture")
             || self.0.authenticated.permits("catalog.search")
             || self.0.authenticated.permits("catalog.describe"))
         {

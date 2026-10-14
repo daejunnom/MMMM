@@ -146,13 +146,54 @@ fn session(methods: &[&str]) -> (SessionAuthority, AuthenticatedPrincipal) {
 }
 type Rights = Rc<RefCell<BTreeMap<String, Redistribution>>>;
 type Staged = Rc<RefCell<Vec<Value>>>;
+#[derive(Default)]
+struct ShapeFinalizationFixture {
+    output: Option<Value>,
+    pending: bool,
+    published: usize,
+    cancel_after_dispatch: bool,
+}
 struct FixtureSources {
     allowed: Arc<AtomicBool>,
     rights: Rights,
     staged: Staged,
     delta_allowed: Rc<Cell<bool>>,
+    shape_finalization: Rc<RefCell<ShapeFinalizationFixture>>,
 }
 impl FeatureSources for FixtureSources {
+    // 실제 geometry 권한을 발급하지 않는 공통 facade 순서 관측용이다. 기존
+    // 예제에 없는 최종 schema/취소 실패 뒤 발행 여부만 같은 service에서 검사한다.
+    fn shape_query_with_catalog(
+        &mut self,
+        _: &FeatureAccess,
+        _: &Value,
+        _: &Catalog,
+        _: &mut DurableStore,
+        budget: &RequestBudget,
+    ) -> Result<Value, ServiceError> {
+        let mut state = self.shape_finalization.borrow_mut();
+        let output = state.output.clone().ok_or_else(unavailable)?;
+        state.pending = true;
+        if state.cancel_after_dispatch {
+            budget.cancellation().store(true, Ordering::Release);
+        }
+        Ok(output)
+    }
+    fn shape_finished(
+        &mut self,
+        _: &FeatureAccess,
+        result: &Result<Value, ServiceError>,
+        _: &Catalog,
+        _: &mut DurableStore,
+        _: &RequestBudget,
+    ) -> Result<(), ServiceError> {
+        let mut state = self.shape_finalization.borrow_mut();
+        if state.pending && result.is_ok() {
+            state.published += 1;
+        }
+        state.pending = false;
+        Ok(())
+    }
     fn access(
         &mut self,
         principal: &AuthenticatedPrincipal,
@@ -644,6 +685,7 @@ struct Fixture {
     rights: Rights,
     staged: Staged,
     delta_allowed: Rc<Cell<bool>>,
+    shape_finalization: Rc<RefCell<ShapeFinalizationFixture>>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -652,6 +694,7 @@ impl Fixture {
             rights: Rc::new(RefCell::new(BTreeMap::new())),
             staged: Rc::new(RefCell::new(vec![])),
             delta_allowed: Rc::new(Cell::new(false)),
+            shape_finalization: Rc::new(RefCell::new(ShapeFinalizationFixture::default())),
         }
     }
     fn sources(&self) -> Box<dyn FeatureSources> {
@@ -660,6 +703,7 @@ impl Fixture {
             rights: self.rights.clone(),
             staged: self.staged.clone(),
             delta_allowed: self.delta_allowed.clone(),
+            shape_finalization: self.shape_finalization.clone(),
         })
     }
     fn initialize(&self, root: &TestRoot) {
@@ -764,6 +808,46 @@ fn canonical_feature_registration_excludes_builtins_and_separate_artifact_owner(
             .code,
         "INVALID_REGISTRATION"
     );
+    // 같은 실제 SQLite/service fixture에서 성공한 이전 발행을 남긴 채,
+    // 이후의 공통 출력 schema 실패와 취소가 새 pending만 폐기하는지 확인한다.
+    let root = TestRoot::new();
+    fixture.initialize(&root);
+    let mut service = fixture.service(&root);
+    let (_sessions, principal) = session(&["world.shape_query"]);
+    let query = parse_json(include_bytes!("../../../examples/shape-query.json")).unwrap();
+    let valid = parse_json(include_bytes!(
+        "../../../examples/shape-result-unknown.json"
+    ))
+    .unwrap();
+    fixture.shape_finalization.borrow_mut().output = Some(valid.clone());
+    service
+        .call(&principal, "world.shape_query", &query, &budget())
+        .unwrap();
+    assert_eq!(fixture.shape_finalization.borrow().published, 1);
+    fixture.shape_finalization.borrow_mut().output = Some(json!({"status":"known"}));
+    assert_eq!(
+        service
+            .call(&principal, "world.shape_query", &query, &budget())
+            .unwrap_err()
+            .code,
+        "SCHEMA_INVALID"
+    );
+    assert_eq!(fixture.shape_finalization.borrow().published, 1);
+    assert!(!fixture.shape_finalization.borrow().pending);
+    {
+        let mut state = fixture.shape_finalization.borrow_mut();
+        state.output = Some(valid);
+        state.cancel_after_dispatch = true;
+    }
+    assert_eq!(
+        service
+            .call(&principal, "world.shape_query", &query, &budget())
+            .unwrap_err()
+            .code,
+        "CANCELLED"
+    );
+    assert_eq!(fixture.shape_finalization.borrow().published, 1);
+    assert!(!fixture.shape_finalization.borrow().pending);
 }
 
 #[test]

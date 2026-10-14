@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::{
+    artifacts::ArtifactExtension,
     auth::{SessionAuthority, SessionPolicy},
     bootstrap::HostBootstrapProcessor,
     catalog_source_use::{LocalCatalogSourceUseAction, manage_catalog_source_use},
@@ -137,6 +138,8 @@ struct PeerState {
     fail_sources: bool,
     fail_at_source: Option<usize>,
     corrupt_at_source: Option<(usize, PathBuf)>,
+    shape_probes: usize,
+    shape_queries: usize,
 }
 struct Peer {
     address: SocketAddr,
@@ -162,6 +165,8 @@ impl Peer {
             fail_sources: false,
             fail_at_source: None,
             corrupt_at_source: None,
+            shape_probes: 0,
+            shape_queries: 0,
         }));
         let source_reads = Arc::new(AtomicUsize::new(0));
         let catalog_observations = Arc::new(AtomicUsize::new(0));
@@ -203,7 +208,7 @@ impl Peer {
                 {
                     observations.fetch_add(1, Ordering::AcqRel);
                 }
-                let state = shared.lock().map_err(|_| "host fixture state")?;
+                let mut state = shared.lock().map_err(|_| "host fixture state")?;
                 let mut failure = false;
                 let payload = match body["method"].as_str() {
                     Some("hello") => state.hello.clone(),
@@ -230,6 +235,14 @@ impl Peer {
                             facts
                         }
                         Some("native_registry") => registry_payload(&state),
+                        Some("world.shape_probe") => {
+                            state.shape_probes += 1;
+                            return Err("uncaptured snapshot must not probe shape");
+                        }
+                        Some("world.shape_query") => {
+                            state.shape_queries += 1;
+                            return Err("uncaptured snapshot must not query geometry");
+                        }
                         _ => return Err("unexpected native inspection"),
                     },
                     _ => return Err("unexpected host request"),
@@ -444,12 +457,20 @@ struct Fixture {
 }
 impl Fixture {
     fn new(selected: Option<bool>, complete: bool) -> Self {
-        Self::build(selected, complete, None)
+        Self::build(selected, complete, None, false)
     }
     fn containers(grant: bool, approve: bool) -> Self {
-        Self::build(Some(true), true, Some((grant, approve)))
+        Self::build(Some(true), true, Some((grant, approve)), false)
     }
-    fn build(selected: Option<bool>, complete: bool, containers: Option<(bool, bool)>) -> Self {
+    fn shapes(containers: bool) -> Self {
+        Self::build(Some(true), true, containers.then_some((true, true)), true)
+    }
+    fn build(
+        selected: Option<bool>,
+        complete: bool,
+        containers: Option<(bool, bool)>,
+        shape_scope: bool,
+    ) -> Self {
         let root = Root::new();
         let initialized = {
             let mut store = DurableStore::open(root.config()).unwrap();
@@ -473,7 +494,9 @@ impl Fixture {
         } else {
             vec![]
         };
-        let scope = json!({"projectId":project,"resourceIds":resources,"objectIds":[],"regions":[],"externalTargetIds":[]});
+        let scope = json!({"projectId":project,"resourceIds":resources,"objectIds":[],
+            "regions":if shape_scope { json!([{"contextId":"shape-scope-template","worldId":"world-fixture-01",
+                "dimension":"minecraft:overworld","min":[-16,0,-16],"maxExclusive":[16,128,16]}]) } else {json!([])},"externalTargetIds":[]});
         let request = LocalHostSetup {
             executable: &executable,
             installed_host_jar: &host_jar,
@@ -610,6 +633,12 @@ impl Fixture {
         let mut extensions = ExtensionRouter::default();
         extensions
             .register(
+                ["artifact.read"],
+                Box::new(ArtifactExtension::new(parts.artifacts, 32 * 1024 * 1024).unwrap()),
+            )
+            .unwrap();
+        extensions
+            .register(
                 FEATURE_METHODS.iter().copied(),
                 Box::new(FeatureExtension::new(parts.features, hosts).unwrap()),
             )
@@ -662,6 +691,13 @@ impl Fixture {
             }),
             budget,
         )
+    }
+    fn shape(&mut self, snapshot: &Value, budget: &RequestBudget) -> Result<Value, ServiceError> {
+        let mut query = parse_json(include_bytes!("../../../examples/shape-query.json")).unwrap();
+        query["contextId"] = self.context["contextId"].clone();
+        query["snapshotId"] = snapshot["snapshotId"].clone();
+        self.service
+            .call(&self.principal, "world.shape_query", &query, budget)
     }
     fn state(&self) -> NativeCatalogAdmissionState {
         self.registries
@@ -724,6 +760,75 @@ impl Fixture {
         assert_eq!(after.generation(), before.generation() + 1);
         assert!(after.selections().is_empty());
         after
+    }
+}
+
+#[test]
+fn fn23_does_not_publish_a_missing_source_or_accept_a_guessed_snapshot() {
+    let mut fixture = Fixture::shapes(false);
+    let before = fixture.peer.catalog_observations.load(Ordering::Acquire);
+    let guessed = json!({"snapshotId":"snapshot-not-issued"});
+    assert!(fixture.shape(&guessed, &fixture.budget()).is_err());
+    assert!(matches!(
+        fixture.state(),
+        NativeCatalogAdmissionState::Missing
+    ));
+    assert_eq!(fixture.peer.source_reads.load(Ordering::Acquire), 0);
+    assert_eq!(
+        fixture.peer.catalog_observations.load(Ordering::Acquire),
+        before
+    );
+    let state = fixture.peer.state.lock().unwrap();
+    assert_eq!((state.shape_probes, state.shape_queries), (0, 0));
+}
+
+#[test]
+fn fn23_native_publication_with_unknown_identity_does_not_create_a_usable_snapshot() {
+    // 현재 producer가 game artifact 또는 ordered pack stack을 입증하지 못하면
+    // registry 선택만으로도 capture는 거절된다. offline snapshot을 game pin으로
+    // 바꾸지 않으며, mode/neighbor/probe 후 취소/마지막 hello 경계에는 도달하지 않는다.
+    for containers in [false, true] {
+        let mut fixture = Fixture::shapes(containers);
+        if containers {
+            fixture.observe_containers();
+        }
+        assert_eq!(
+            fixture.capture(&fixture.budget()).unwrap_err().code,
+            "SOURCE_UNAVAILABLE"
+        );
+        let publication = match fixture.state() {
+            NativeCatalogAdmissionState::Native(publication) => publication,
+            _ => {
+                panic!("actual native source publication must precede incomplete capture rejection")
+            }
+        };
+        let before = fixture.peer.catalog_observations.load(Ordering::Acquire);
+        // FN23 admission의 실제 local source-use checkpoint는 통과해야 한다.
+        // catalog-only 잔여 검사가 있으면 원 publication을 퇴역시켜 아래서 잡힌다.
+        assert_eq!(
+            fixture
+                .shape(
+                    &json!({"snapshotId":"snapshot-not-issued"}),
+                    &fixture.budget()
+                )
+                .unwrap_err()
+                .code,
+            "PERMISSION_REQUIRED"
+        );
+        assert_eq!(
+            fixture.peer.catalog_observations.load(Ordering::Acquire),
+            before
+        );
+        let after = match fixture.state() {
+            NativeCatalogAdmissionState::Native(publication) => publication,
+            _ => panic!(
+                "an uncaptured snapshot read must not issue or retire a still-current native publication"
+            ),
+        };
+        assert_eq!(publication.read_policy(), after.read_policy());
+        assert_eq!(publication.source_use(), after.source_use());
+        let state = fixture.peer.state.lock().unwrap();
+        assert_eq!((state.shape_probes, state.shape_queries), (0, 0));
     }
 }
 
@@ -972,15 +1077,73 @@ fn protected_selection_does_not_replace_the_actual_game_resource_scope() {
         fixture.state(),
         NativeCatalogAdmissionState::Missing
     ));
+    // 동일 FN31/SQLite 경로에서 registry가 busy여도 독립적인 실제 resource
+    // grant만 먼저 소비한다. 이 검사는 opaque shape receipt를 위조하지 않는다.
+    let request = |context: &Value| {
+        json!({"contextId":context["contextId"],
+        "resourceId":"catalog-game-container","offset":"0","limitBytes":65536})
+    };
+    let products = fixture.registries.products.clone();
+    let busy = products.borrow_mut();
+    let read_budget = fixture.budget();
+    assert_eq!(
+        fixture
+            .service
+            .call(
+                &fixture.principal,
+                "artifact.read",
+                &request(&fixture.context),
+                &read_budget
+            )
+            .unwrap_err()
+            .code,
+        "SOURCE_BUSY"
+    );
+    drop(busy);
+    let mut granted = Fixture::containers(true, true);
+    granted.observe_containers();
+    let granted_budget = granted.budget();
+    assert_eq!(
+        granted.capture(&granted_budget).unwrap_err().code,
+        "SOURCE_UNAVAILABLE"
+    );
+    assert!(matches!(
+        granted.state(),
+        NativeCatalogAdmissionState::Native(_)
+    ));
+    granted.withdraw_containers();
+    let products = granted.registries.products.clone();
+    let _busy = products.borrow_mut();
+    let read_budget = granted.budget();
+    let result = granted
+        .service
+        .call(
+            &granted.principal,
+            "artifact.read",
+            &request(&granted.context),
+            &read_budget,
+        )
+        .unwrap();
+    assert_eq!(result["resource"]["resourceId"], "catalog-game-container");
+    assert_eq!(
+        result["resource"]["sha256"],
+        raw_digest(&container_bytes(false)).as_str()
+    );
+    assert_eq!(
+        result["resource"]["sizeBytes"],
+        container_bytes(false).len()
+    );
+    assert!(!result["data"].as_str().unwrap().is_empty());
 }
 
 #[test]
 fn protected_whole_containers_share_the_native_publisher_but_leave_both_pack_stacks_unknown() {
     let mut fixture = Fixture::containers(true, true);
     fixture.observe_containers();
-    let budget = fixture.budget();
+    // 아래 capture/source_refs/capture는 독립 호출이다. 같은 10초 한도를
+    // 호출마다 취득하며 원 요청 안의 취소·deadline 검사는 변경하지 않는다.
     assert_eq!(
-        fixture.capture(&budget).unwrap_err().code,
+        fixture.capture(&fixture.budget()).unwrap_err().code,
         "SOURCE_UNAVAILABLE"
     );
     let NativeCatalogAdmissionState::Native(original) = fixture.state() else {
@@ -990,7 +1153,7 @@ fn protected_whole_containers_share_the_native_publisher_but_leave_both_pack_sta
     let sources = fixture
         .registries
         .catalog
-        .source_refs(&fixture.principal, &id, &budget)
+        .source_refs(&fixture.principal, &id, &fixture.budget())
         .unwrap();
     assert_eq!(sources.len(), 3);
     for is_mod in [false, true] {
@@ -1004,7 +1167,7 @@ fn protected_whole_containers_share_the_native_publisher_but_leave_both_pack_sta
         assert_eq!(matching[0]["rights"], "user_local_only");
     }
     assert_eq!(
-        fixture.capture(&budget).unwrap_err().code,
+        fixture.capture(&fixture.budget()).unwrap_err().code,
         "SOURCE_UNAVAILABLE"
     );
     let NativeCatalogAdmissionState::Native(current) = fixture.state() else {
@@ -1260,15 +1423,16 @@ fn describe_rechecks_existing_native_issuance_but_cannot_issue_a_missing_source(
 #[test]
 fn publisher_conflict_and_exact_retirement_preserve_other_registration_owners() {
     let mut fixture = Fixture::new(Some(true), true);
-    let budget = fixture.budget();
+    // 각 capture/register는 독립 호출이며 기존 10초 budget을 새로 취득한다.
     assert_eq!(
-        fixture.capture(&budget).unwrap_err().code,
+        fixture.capture(&fixture.budget()).unwrap_err().code,
         "SOURCE_UNAVAILABLE"
     );
     let NativeCatalogAdmissionState::Native(old) = fixture.state() else {
         panic!("native publisher required");
     };
     let explicit = explicit_native_registration(&fixture.context);
+    let budget = fixture.budget();
     assert_eq!(
         fixture
             .registries
@@ -1290,7 +1454,7 @@ fn publisher_conflict_and_exact_retirement_preserve_other_registration_owners() 
         .revoke(&fixture.principal, &id)
         .unwrap();
     assert_eq!(
-        fixture.capture(&budget).unwrap_err().code,
+        fixture.capture(&fixture.budget()).unwrap_err().code,
         "SOURCE_UNAVAILABLE"
     );
     fixture
@@ -1307,6 +1471,7 @@ fn publisher_conflict_and_exact_retirement_preserve_other_registration_owners() 
         .catalog
         .revoke(&fixture.principal, &id)
         .unwrap();
+    let budget = fixture.budget();
     fixture
         .registries
         .catalog
