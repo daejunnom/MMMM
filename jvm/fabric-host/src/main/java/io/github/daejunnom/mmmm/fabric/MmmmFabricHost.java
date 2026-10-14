@@ -562,7 +562,7 @@ public final class MmmmFabricHost implements ModInitializer {
                 } else if ("undo_role".equals(kind)) {
                     HostDispatcher.exactFields(payload, Set.of("kind", "bindingId", "actionId"));
                     long fromTick = Integer.toUnsignedLong(server.getTickCount());
-                    ObjectNode actualFacts = NativeSourceFacts.observe(server, Long.toString(registryGeneration), environment());
+                    ObjectNode actualFacts = collectSourceFacts(paired, context, control, result, required);
                     String hostArtifact = artifactDigest(container("mmmm_host"));
                     result.complete(runtime.undoRole(HostDispatcher.string(payload, "bindingId"), HostDispatcher.string(payload, "actionId"),
                             registration -> NativeUndoInspection.role(registration, context, actualFacts, hostArtifact,
@@ -613,9 +613,9 @@ public final class MmmmFabricHost implements ModInitializer {
                     registry.set("environment", environment()); result.complete(registry);
                 } else if ("runtime_sources".equals(kind)) {
                     HostDispatcher.exactFields(payload, Set.of("kind"));
-                    result.complete(NativeSourceFacts.observe(server, Long.toString(registryGeneration), environment()));
+                    result.complete(collectSourceFacts(paired, context, control, result, required));
                 } else if ("target_admission".equals(kind)) {
-                    ObjectNode facts = NativeSourceFacts.observe(server, Long.toString(registryGeneration), environment());
+                    ObjectNode facts = collectSourceFacts(paired, context, control, result, required);
                     result.complete(new NativeTargetAdmission(contracts).inspect(server, player(paired), context, facts,
                             artifactDigest(container("mmmm_host")), Long.toString(registryGeneration), payload,
                             (installed, actualFacts, hostDigest, generation, step, index) ->
@@ -625,7 +625,7 @@ public final class MmmmFabricHost implements ModInitializer {
                             }));
                 } else if ("calibration_run_source".equals(kind)) {
                     Invocation original = retainedNativeInvocation(paired, context, HostDispatcher.string(payload, "invocationId"));
-                    ObjectNode facts = NativeSourceFacts.observe(server, Long.toString(registryGeneration), environment());
+                    ObjectNode facts = collectSourceFacts(paired, context, control, result, required);
                     result.complete(new NativeCalibrationSource(contracts).inspect(context, facts, artifactDigest(container("mmmm_host")),
                             Long.toString(registryGeneration), payload, original, null));
                 } else if ("native_targets".equals(kind)) {
@@ -685,6 +685,37 @@ public final class MmmmFabricHost implements ModInitializer {
         try { result.orTimeout(Math.min(10_000, control.remainingMillis()), java.util.concurrent.TimeUnit.MILLISECONDS); }
         catch (RuntimeException failure) { result.completeExceptionally(failure); }
         return result.minimalCompletionStage();
+    }
+
+    private ObjectNode collectSourceFacts(HostSession paired, ObjectNode context,
+                                         HostDispatcher.InspectionControl control, CompletableFuture<ObjectNode> response,
+                                         Set<String> required) {
+        final MinecraftServer currentServer; final long generation; final String currentEpoch;
+        synchronized (definitionCollection) { currentServer = server; generation = registryGeneration; currentEpoch = epoch; }
+        String contextId = HostDispatcher.string(context, "contextId");
+        NativeSourceFacts.Checkpoint checkpoint = () -> {
+            control.checkpoint(); paired.checkOpen();
+            if (response.isDone()) throw new ContractException("CANCELLATION_REQUESTED", "Source inspection response ended");
+            if (server != currentServer || registryGeneration != generation || !java.util.Objects.equals(epoch, currentEpoch)) {
+                throw new ContractException("SESSION_EPOCH_MISMATCH", "Source observation generation ended");
+            }
+        };
+        checkpoint.check();
+        requireServerThread();
+        if (!paired.context(contextId).equals(context)) throw new ContractException("STALE_CONTEXT", "Source observation context differs from its installed owner");
+        try {
+            ObjectNode observation = NativeSourceFacts.observe(currentServer, Long.toString(generation), environment(), checkpoint);
+            // 같은 inspect 분기의 원 permission을 사용하며 entry별 platform I/O를 추가하지 않는다.
+            checkpoint.check();
+            new PlatformAuthority(null).check(paired, context, required, false);
+            if (!paired.context(contextId).equals(context)) throw new ContractException("STALE_CONTEXT", "Source observation owner changed");
+            checkpoint.check();
+            return observation;
+        } catch (RuntimeException failure) {
+            try { checkpoint.check(); }
+            catch (RuntimeException current) { if (current != failure) failure.addSuppressed(current); }
+            throw failure;
+        }
     }
 
     private ObjectNode collectRegistryDefinitions(HostSession paired, ObjectNode context,

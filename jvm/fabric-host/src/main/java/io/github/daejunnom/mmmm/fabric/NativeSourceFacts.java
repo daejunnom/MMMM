@@ -45,6 +45,7 @@ import java.util.regex.Pattern;
  * this collector. Directory, dynamic, opaque and unavailable inputs remain unknown.
  */
 final class NativeSourceFacts {
+    @FunctionalInterface interface Checkpoint { void check(); }
     private static final int MAX_ENTRIES = 256;
     private static final long MAX_ARCHIVE_BYTES = 128L * 1024 * 1024;
     private static final long MAX_TOTAL_BYTES = 512L * 1024 * 1024;
@@ -59,14 +60,21 @@ final class NativeSourceFacts {
     private final Map<Path, CachedArchive> pathReceipts = new HashMap<>();
     private final Map<String, ObjectNode> contentReceipts = new HashMap<>();
     private final Map<String, ObjectNode> modsById = new LinkedHashMap<>();
+    private final Checkpoint checkpoint;
+    private RuntimeException checkpointFailure;
     private long bytesRead;
     private int entries;
 
     private record CachedArchive(ObjectNode receipt, BasicFileAttributes attributes) { }
 
-    private NativeSourceFacts() { }
+    private NativeSourceFacts(Checkpoint checkpoint) { this.checkpoint = Objects.requireNonNull(checkpoint); }
 
     static ObjectNode observe(MinecraftServer server, String registryGeneration, ObjectNode environment) {
+        return observe(server, registryGeneration, environment, () -> { });
+    }
+
+    static ObjectNode observe(MinecraftServer server, String registryGeneration, ObjectNode environment, Checkpoint checkpoint) {
+        Objects.requireNonNull(checkpoint).check();
         if (server == null || !server.isSameThread()) {
             throw new ContractException("HOST_NOT_READY", "Native source observation requires the server thread");
         }
@@ -74,10 +82,12 @@ final class NativeSourceFacts {
                 || !safeEnvironment(environment)) {
             throw new ContractException("SOURCE_FACTS_INPUT", "Native source observation identity is invalid");
         }
-        return new NativeSourceFacts().collect(server, registryGeneration, environment);
+        checkpoint.check();
+        return new NativeSourceFacts(checkpoint).collect(server, registryGeneration, environment);
     }
 
     private ObjectNode collect(MinecraftServer server, String generation, ObjectNode environment) {
+        checkDeadline();
         ObjectNode result = ContractJson.newObject().put("format", "mmmm.native.source-facts/1")
                 .put("registryGeneration", generation).put("observedAt", Instant.now().toString())
                 .put("archiveReceiptScope", "container_input_bytes")
@@ -91,10 +101,14 @@ final class NativeSourceFacts {
         result.put("developmentEnvironment", loader.isDevelopmentEnvironment());
         var containers = new ArrayList<ModContainer>();
         for (ModContainer container : loader.getAllMods()) {
+            checkDeadline();
             if (containers.size() >= MAX_ENTRIES) throw limit();
             containers.add(container);
         }
-        containers.sort(Comparator.comparing(container -> container.getMetadata().getId()));
+        containers.sort(Comparator.comparing(container -> {
+            checkDeadline(); String id = container.getMetadata().getId(); checkDeadline(); return id;
+        }));
+        checkDeadline();
         ArrayNode mods = result.putArray("mods");
         for (ModContainer container : containers) {
             tick();
@@ -115,24 +129,31 @@ final class NativeSourceFacts {
         game.set("serverClassCodeSource", codeSource(MinecraftServer.class));
         result.set("originalInputGameJars", inputGameJars(loader));
         result.set("platformReadAccess", NativePlatformReadFacts.observe(server, codeSource(NativePlatformReadFacts.class)));
+        checkDeadline();
         ArrayNode packs = result.putArray("serverPacks");
         // The stream's observed order is retained, including hidden native packs.
         // Closing the stream does not close the manager-owned PackResources elements.
         try (var stream = server.getResourceManager().listPacks()) {
             var iterator = stream.iterator();
             int ordinal = 0;
-            while (iterator.hasNext()) {
+            while (true) {
+                checkDeadline(); boolean next = iterator.hasNext(); checkDeadline();
+                if (!next) break;
                 tick();
                 packs.add(pack(iterator.next(), ordinal++));
+                checkDeadline();
             }
         }
+        checkDeadline();
         result.putNull("clientPacks");
         result.put("clientPackObservation", "not_observed");
         revalidateArchives();
         result.set("archives", archives);
         result.put("bytesRead", bytesRead).put("entryCount", entries);
         checkDeadline();
-        if (ContractJson.bytes(result).length > MAX_RESULT_BYTES) throw limit();
+        byte[] encoded = ContractJson.bytes(result);
+        checkDeadline();
+        if (encoded.length > MAX_RESULT_BYTES) throw limit();
         return result;
     }
 
@@ -157,8 +178,10 @@ final class NativeSourceFacts {
     }
 
     private ObjectNode installation(ModContainer container) {
+        checkDeadline();
         try {
             ModOrigin origin = container.getOrigin();
+            checkDeadline();
             if (origin == null) return unknown("INSTALLATION_ORIGIN_UNAVAILABLE");
             ObjectNode result = ContractJson.newObject().put("scope", "installation_origin");
             switch (origin.getKind()) {
@@ -186,17 +209,21 @@ final class NativeSourceFacts {
                             .put("reason", "INSTALLATION_ORIGIN_UNAVAILABLE");
                 }
             }
+            checkDeadline();
             return result;
         } catch (ContractException exception) {
             throw exception;
         } catch (RuntimeException exception) {
+            checkAfterFailure(exception);
             return unknown("INSTALLATION_ORIGIN_UNAVAILABLE");
         }
     }
 
     private ArrayNode inputGameJars(FabricLoader loader) {
+        checkDeadline();
         ArrayNode result = ContractJson.newObject().putArray("inputGameJars");
         Object shared = loader.getObjectShare().get("fabric-loader:inputGameJars");
+        checkDeadline();
         if (!(shared instanceof List<?> paths) || paths.isEmpty()) {
             result.add(unknown("ORIGINAL_GAME_INPUTS_UNAVAILABLE"));
             return result;
@@ -208,6 +235,7 @@ final class NativeSourceFacts {
             receipt.put("inputIndex", ordinal++).put("scope", "original_game_input_container");
             result.add(receipt);
         }
+        checkDeadline();
         return result;
     }
 
@@ -217,16 +245,19 @@ final class NativeSourceFacts {
             var domain = type.getProtectionDomain();
             var source = domain == null ? null : domain.getCodeSource();
             URL location = source == null ? null : source.getLocation();
+            checkDeadline();
             if (location == null) return unknown("CLASS_CODE_SOURCE_UNAVAILABLE");
             Path path = archivePath(location.toURI());
             if (path == null) return unknown("CLASS_CODE_SOURCE_NOT_ORDINARY_ARCHIVE");
             return archive(path).put("scope", "loaded_class_container");
         } catch (IOException | URISyntaxException | IllegalArgumentException | SecurityException exception) {
+            checkAfterFailure(exception);
             return unknown("CLASS_CODE_SOURCE_UNAVAILABLE");
         }
     }
 
     private ObjectNode pack(PackResources pack, int ordinal) {
+        checkDeadline();
         ObjectNode result = ContractJson.newObject().put("packIndex", ordinal)
                 .put("resourceContentObservation", "not_enumerated");
         String id = pack.packId();
@@ -257,6 +288,7 @@ final class NativeSourceFacts {
         ArrayNode sources = result.putArray("linkedRuntimeContainerSources");
         if (linked != null) {
             for (var root : linked.path("runtimeRoots")) {
+                checkDeadline();
                 var source = root.path("sourceId");
                 if (source.isTextual()) sources.add(source.asText());
             }
@@ -265,20 +297,24 @@ final class NativeSourceFacts {
         // implementations serve only those containers. Opaque overlays stay unknown.
         result.put("packSourceCompleteness", "unknown");
         result.put("packSourceReason", linked == null ? "OPAQUE_PACK_RESOURCES" : "CONTENT_MAPPING_NOT_EXHAUSTIVELY_OBSERVED");
+        checkDeadline();
         return result;
     }
 
     private ObjectNode archiveRoot(Path root) {
+        checkDeadline();
         if (root == null) return unknown("SOURCE_ROOT_UNAVAILABLE");
         try {
             Path path = archivePath(root.toUri());
             return path == null ? unknown("SOURCE_ROOT_NOT_ORDINARY_ARCHIVE") : archive(path);
         } catch (IOException | IllegalArgumentException | SecurityException exception) {
+            checkAfterFailure(exception);
             return unknown("SOURCE_ROOT_UNAVAILABLE");
         }
     }
 
-    private static Path archivePath(URI uri) throws IOException {
+    private Path archivePath(URI uri) throws IOException {
+        checkDeadline();
         if ("file".equalsIgnoreCase(uri.getScheme())) {
             if (uri.getAuthority() != null && !uri.getAuthority().isEmpty()) return null;
             return Path.of(uri);
@@ -287,6 +323,7 @@ final class NativeSourceFacts {
         // This only parses the already-observed ZipFS URI; it does not connect or
         // open another archive. Nested jar:jar: and non-local origins are unknown.
         var connection = uri.toURL().openConnection();
+        checkDeadline();
         if (!(connection instanceof JarURLConnection jar)) return null;
         URL underlying = jar.getJarFileURL();
         if (!"file".equalsIgnoreCase(underlying.getProtocol())) return null;
@@ -301,6 +338,13 @@ final class NativeSourceFacts {
 
     private ObjectNode archive(Path candidate) {
         checkDeadline();
+        ObjectNode receipt = readArchive(candidate);
+        // 조기 unknown 반환도 FileChannel close가 끝난 뒤 원 요청을 다시 검사한다.
+        checkDeadline();
+        return receipt;
+    }
+
+    private ObjectNode readArchive(Path candidate) {
         try {
             if (!candidate.isAbsolute() || !candidate.getFileSystem().equals(Path.of(".").getFileSystem())) {
                 return unknown("SOURCE_NOT_LOCAL_ARCHIVE");
@@ -309,9 +353,12 @@ final class NativeSourceFacts {
             String filename = normalized.getFileName() == null ? "" : normalized.getFileName().toString().toLowerCase(Locale.ROOT);
             if (!allowedArchiveName(filename)) return unknown("SOURCE_NOT_ARCHIVE");
             if (normalized.toString().startsWith("\\\\")) return unknown("SOURCE_NOT_LOCAL_ARCHIVE");
+            checkDeadline();
             BasicFileAttributes before = Files.readAttributes(normalized, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            checkDeadline();
             if (!before.isRegularFile() || before.isSymbolicLink() || before.isOther()) return unknown("SOURCE_NOT_ORDINARY_ARCHIVE");
             Path real = normalized.toRealPath();
+            checkDeadline();
             if (!real.equals(normalized)) return unknown("SOURCE_LINK_OR_ALIAS");
             CachedArchive cached = pathReceipts.get(real);
             if (cached != null) {
@@ -324,12 +371,16 @@ final class NativeSourceFacts {
             ByteBuffer buffer = ByteBuffer.allocate(64 * 1024);
             long read = 0;
             boolean archiveHeader = false;
+            checkDeadline();
             try (FileChannel channel = FileChannel.open(real, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
-                if (channel.size() != before.size()) return unknown("SOURCE_CHANGED_DURING_OBSERVATION");
+                checkDeadline();
+                long channelSize = channel.size(); checkDeadline();
+                if (channelSize != before.size()) return unknown("SOURCE_CHANGED_DURING_OBSERVATION");
                 while (true) {
                     checkDeadline();
                     buffer.clear();
                     int count = channel.read(buffer);
+                    checkDeadline();
                     if (count < 0) break;
                     if (count == 0) continue;
                     read += count;
@@ -345,11 +396,16 @@ final class NativeSourceFacts {
                         if (!archiveHeader) return unknown("SOURCE_NOT_ZIP_ARCHIVE");
                     }
                     digest.update(buffer);
+                    checkDeadline();
                 }
-                if (read != before.size() || channel.size() != before.size()) return unknown("SOURCE_CHANGED_DURING_OBSERVATION");
+                checkDeadline(); channelSize = channel.size(); checkDeadline();
+                if (read != before.size() || channelSize != before.size()) return unknown("SOURCE_CHANGED_DURING_OBSERVATION");
             }
+            checkDeadline();
             BasicFileAttributes after = Files.readAttributes(real, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-            if (!archiveHeader || !sameFile(before, after) || !real.equals(real.toRealPath())) {
+            checkDeadline();
+            Path currentReal = real.toRealPath(); checkDeadline();
+            if (!archiveHeader || !sameFile(before, after) || !real.equals(currentReal)) {
                 return unknown("SOURCE_CHANGED_DURING_OBSERVATION");
             }
             String hash = HexFormat.of().formatHex(digest.digest());
@@ -365,10 +421,12 @@ final class NativeSourceFacts {
                 archives.add(source);
             }
             pathReceipts.put(real, new CachedArchive(receipt, after));
+            checkDeadline();
             return receipt.deepCopy();
         } catch (ContractException exception) {
             throw exception;
         } catch (IOException | IllegalArgumentException | SecurityException exception) {
+            checkAfterFailure(exception);
             return unknown("SOURCE_ARCHIVE_UNAVAILABLE");
         }
     }
@@ -392,13 +450,17 @@ final class NativeSourceFacts {
             checkDeadline();
             try {
                 BasicFileAttributes current = Files.readAttributes(entry.getKey(), BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-                if (!sameFile(entry.getValue().attributes(), current) || !entry.getKey().equals(entry.getKey().toRealPath())) {
+                checkDeadline();
+                Path currentReal = entry.getKey().toRealPath(); checkDeadline();
+                if (!sameFile(entry.getValue().attributes(), current) || !entry.getKey().equals(currentReal)) {
                     throw new ContractException("SOURCE_FACTS_DRIFT", "Native source containers changed during observation");
                 }
             } catch (IOException | SecurityException exception) {
+                checkAfterFailure(exception);
                 throw new ContractException("SOURCE_FACTS_DRIFT", "Native source containers became unavailable during observation");
             }
         }
+        checkDeadline();
     }
 
     private static boolean safeEnvironment(ObjectNode environment) {
@@ -433,7 +495,19 @@ final class NativeSourceFacts {
     }
 
     private void checkDeadline() {
+        // 원 요청의 종료는 이 관측 안에서 되살아나거나 metadata unknown으로 바뀌지 않는다.
+        if (checkpointFailure != null) throw checkpointFailure;
+        try { checkpoint.check(); }
+        catch (RuntimeException failure) { checkpointFailure = failure; throw failure; }
         if (System.nanoTime() - started > MAX_OBSERVATION_NANOS) throw limit();
+    }
+
+    private void checkAfterFailure(Throwable failure) {
+        try { checkDeadline(); }
+        catch (RuntimeException stopped) {
+            if (stopped != failure) stopped.addSuppressed(failure);
+            throw stopped;
+        }
     }
 
     private static ContractException limit() {

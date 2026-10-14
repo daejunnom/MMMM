@@ -2,6 +2,10 @@ package io.github.daejunnom.mmmm.fabric;
 
 import io.github.daejunnom.mmmm.host.HostSession;
 import io.github.daejunnom.mmmm.sdk.ContractException;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import net.fabricmc.loader.api.ModContainer;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -112,6 +116,43 @@ final class NativeDefinitionCollectorTest {
                 () -> { if (checks.incrementAndGet() == 2) throw original; }, new Port());
         assertSame(original, assertThrows(ContractException.class, () -> collector.observe(getClass(), BLOCK)));
         assertEquals("DEADLINE_EXCEEDED", collector.snapshot().stopReason()); assertFalse(collector.snapshot().completed());
+    }
+
+    /** 기존 class port는 source metadata의 RuntimeException fallback을 지나지 않는다.
+     * 실제 installation 메서드에 같은 종료 callback을 연결하며 게임/source 권한은 만들지 않는다. */
+    private static ObjectNode installation(NativeSourceFacts.Checkpoint checkpoint, Runnable duringOrigin,
+                                           AtomicInteger originCalls) throws ReflectiveOperationException {
+        var constructor = NativeSourceFacts.class.getDeclaredConstructor(NativeSourceFacts.Checkpoint.class);
+        constructor.setAccessible(true);
+        NativeSourceFacts facts = constructor.newInstance(checkpoint);
+        ModContainer container = (ModContainer) Proxy.newProxyInstance(ModContainer.class.getClassLoader(),
+                new Class<?>[] { ModContainer.class }, (proxy, method, arguments) -> {
+                    if (!"getOrigin".equals(method.getName())) throw new IllegalStateException("Unrequested metadata port");
+                    originCalls.incrementAndGet(); duringOrigin.run(); return null;
+                });
+        var method = NativeSourceFacts.class.getDeclaredMethod("installation", ModContainer.class);
+        method.setAccessible(true);
+        return (ObjectNode) method.invoke(facts, container);
+    }
+
+    @Test void sourceMetadataPreservesOriginalStopBeforeAndAfterItsPortInsteadOfReturningUnknown() throws Exception {
+        AtomicInteger untouched = new AtomicInteger();
+        ContractException original = new ContractException("CANCELLATION_REQUESTED", "Original source request ended");
+        assertSame(original, assertThrows(InvocationTargetException.class,
+                () -> installation(() -> { throw original; }, () -> fail("Stopped source cannot read metadata"), untouched)).getCause());
+        assertEquals(0, untouched.get());
+        for (boolean cancel : new boolean[] { true, false }) {
+            CompletableFuture<Object> response = new CompletableFuture<>(); AtomicInteger calls = new AtomicInteger();
+            RuntimeException stopped = cancel ? original : new IllegalStateException("Original source response completed");
+            NativeSourceFacts.Checkpoint checkpoint = () -> { if (response.isDone()) throw stopped; };
+            assertSame(stopped, assertThrows(InvocationTargetException.class,
+                    () -> installation(checkpoint, () -> {
+                        if (cancel) response.cancel(false); else response.complete(new Object());
+                    }, calls)).getCause());
+            assertEquals(1, calls.get());
+            assertTrue(response.isDone()); assertEquals(cancel, response.isCancelled());
+        }
+        assertEquals("unknown", installation(() -> { }, () -> { }, new AtomicInteger()).path("status").asText());
     }
     // 기존 raw port fixture를 실제 publication slot과 연결한다. 네이티브 관측을 발급하지 않는다.
     private static HostSession owner(NativeDefinitionSlot slot) {

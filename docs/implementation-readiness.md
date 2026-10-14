@@ -269,7 +269,65 @@ external write/flush ACK 조건은 그대로다. 실제 kernel thread 상태나 
 deadline·drain을 확인해 command 0·12,116 ms·명시 owned-tail 정리·완전한 출력·
 export·scratch 정리·lease 해제·오류 0으로 완료했다. 해당 integration target의
 strict Clippy도 command 0·20,820 ms·자연 종료·동일 정리 조건으로 완료했다.
-새 Unix query의 실제 Linux/macOS 실행은 후속 CI에서 확인해야 한다.
+해당 fixture의 실제 Linux/macOS 실행 결과는 아래 후속 CI에서 확인했다.
+
+### 새 진행 관측과 source 요청 수명의 후속 검증
+
+source `c86332b6acb1bc77b0af83e47c646c8b4da91cd3`의
+[마흔한 번째 Rust CI](https://github.com/daejunnom/MMMM/actions/runs/38622880877)는
+Windows·Linux job 성공, macOS·집계 실패다. 실제 세 archive의 source·expected·PR
+head를 대조했다. Windows 49,701 bytes·SHA
+`f1cf8dc73c1bf2cf099f78224e1510ce370290b270b4742de034de33c6151845`,
+Linux 50,332 bytes·SHA
+`444ad73529151747d841475e7f4627fe187cbd7d469967331595c5f61cff70ed`,
+macOS 53,109 bytes·SHA
+`54576e3e170fe82337a807a1f7169038e55ed9146e4de7fdd291ea24ca4996fa`다.
+Windows의 표준 unit/bin 검사는 1,128개 통과·2개 ignored와 doc 1개 통과,
+Linux는 1,140개 통과·4개 ignored와 doc 1개 통과다. 별도 native stdio 실행도
+두 OS에서 통과했다. Linux는 같은 요청의 진행 65,536 bytes·90 ms와 종료 뒤
+retained 65,536 bytes, macOS는 65,536 bytes·450 ms와 retained 65,536 bytes를
+기록했다. 진행 시각은 최대 2초 준비 구간의 관측 시각이며 관측 이후의 200 ms
+구간 길이가 아니다. 실제 deadline·drain을 확인했으며 전달량 사이 순서나 kernel
+thread 상태를 추정하지 않는다.
+
+macOS의 전체 test command는 0·261,443 ms·자연 종료다. 이 실행 중 D043의 실제
+ObservedMember TaskInfo result 0·ESRCH 3과 양쪽 INEXIT·동일 anchor 조건을 한 번
+관측하고 이후 회복했다. 이후 strict Clippy command는 49,596 ms에
+`observation_failure`·signal 9·exit unknown으로 실패했다. 원인은 별도 member의
+실제 Rusage Exited·result 0·errno 0이며 양쪽 non-SZOMB·INEXIT·동일 anchor가
+기록됐다. D043의 TaskInfo 조건과 달라 기존 strict 판정이 거절한 결과다. 해당
+실행의 RSS·footprint·VM·worker peak는 기존 상한보다 작으며 compiler/lint 오류나
+timeout으로 바꾸어 보고하지 않는다. 세 OS의 관측한 managed 실행은 drain·완전한
+출력·export·scratch 정리·lease 해제·supervisor/cleanup 오류 0을 보존했다.
+
+같은 source의 [서른두 번째 JVM CI](https://github.com/daejunnom/MMMM/actions/runs/38622881050)는
+Windows·macOS job 성공, Linux·집계 실패다. 실제로 내려받아 대조한 Linux archive는
+1,856,037 bytes·SHA
+`168484a07ab6db67f2693b5d16cc4dfeccc94ed96aa3fc404752776cda83cc43`다.
+JVM 7모듈 326개·필수 11 executed tasks·실패/오류/skip 0이며 managed JVM은
+0·91,912 ms·자연 종료다. Header 내부 ABI witness는 성공했으나 그 외부 감독은
+5,192 ms에 `observation_failure`·signal 9·exit unknown으로 실패했다. 원 RSS
+Open/ESRCH 3의 역할은 OwnedMember이며 양쪽 Zombie·threads 2·동일 원 identity와
+실제 BoundValidated pidfd TerminalPoll/NotReady를 기록했다. D046의 reserved
+leader 조건과 달라 기존 strict 판정이 거절했다. 마지막 Complete부터 실패까지의
+실제 경과는 기록하지 않아 새 1초 정책의 과거 실행 허용 여부를 추정하지 않는다.
+native/header의 실제 finalization 6개와 prior JVM 5개 digest 연결이 일치하며
+정의 startup은 미실행이다. 내부 witness 성공을 외부 감독·observer 전체 성공으로
+올리지 않는다. Windows·macOS는 job 결과만 확인했으며 이 run의 원본 archive는
+아직 대조하지 않았다.
+
+제품의 네 source 관측 분기는 원래 InspectionControl과 같은 session·context·server
+epoch·registry generation 및 response 수명을 내부 collector까지 전달한다. 기존
+5초 관측 상한 안에서 metadata port·파일 metadata·64 KiB 읽기·마지막 재검사와
+직렬화의 전후 checkpoint를 확인하며, 원 취소·기한 및 typed RuntimeException을
+unknown fallback으로 삼키지 않는다. 기존 비검사 호출은 같은 관측 상한을 유지한다.
+동기 syscall 선점이나 새 SourceAdmission·pack 완전성을 보장하지 않는다.
+기존 class port 검사가 source metadata fallback에 도달하지 못하므로 기존 검사
+파일에 실제 installation port의 전후 종료와 활성 unknown 기준을 확인하는 검사
+하나를 추가했다. 독립 소스 리뷰 뒤 Windows의 실제 전체 JVM 검사는 7모듈
+327개·실패/오류/skip 0, 29 actionable tasks 모두 executed로 완료했다. command
+0·29,169 ms·자연 종료·drain·완전한 출력·export·scratch 정리·lease 해제·오류 0이며
+실제 게임 관측이나 다른 OS의 이 새 소스 실행은 별도 검증이다.
 
 실패한 실행의 원본 판정은 유지한다. native drain과 정확한 소유 기록을 확인하고
 로그를 별도로 내보내며 digest를 대조한 경우에만 해당 실행의 알려진 임시 파일을
