@@ -63,6 +63,13 @@ commit SHA, PID, GUID 또는 시각마다 새 대형 빌드 트리를 만들지 
 삭제하지 않는다. 수동 복구는 이전 소유 실행의 종료, 정확한 경로, token과 기록을
 대조한 뒤 배정된 소유 범위에서 수행한다.
 
+슬롯의 `cache` 최상위는 `cargo-target`, `cargo-home`, `gradle-build`,
+`gradle-project-cache`, `gradle-user-home` 디렉터리만 허용한다. 직접 실행한
+`rustc`의 EXE와 동반 PDB도 `cargo-target` 아래에 명시적으로 출력한다.
+생성이 끝난 뒤에는 주 파일뿐 아니라 같은 실행의 동반 출력까지 확인한다.
+알 수 없는 cache 항목을 정리 허용으로 바꾸지 않는다. 정확한 소유와 종료를
+대조한 수동 복구에서도 원 export 실패와 별도 로그 보존·복구 결과를 구분한다.
+
 ## 초기 예산
 
 | 항목 | 초기 값과 적용 범위 |

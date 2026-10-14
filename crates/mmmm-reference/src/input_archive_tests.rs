@@ -58,6 +58,21 @@ fn directory(bytes: &[u8]) -> usize {
 fn headers(bytes: &[u8]) -> Vec<Header> {
     preflight(bytes, InputArchiveLimits::default(), &mut || Ok(())).unwrap()
 }
+fn deflated_directory(body: &[u8]) -> Vec<u8> {
+    // Reuse the real file compressor; change only same-length local/central
+    // names and directory metadata so even forged zero lengths reach decoding.
+    let mut bytes = zip(&[("dir_", body)], true);
+    let h = &headers(&bytes)[0];
+    let at = directory(&bytes);
+    bytes[h.local + 30 + h.name.len() - 1] = b'/';
+    bytes[at + 46 + h.name.len() - 1] = b'/';
+    set32(&mut bytes, h.local + 14, 0);
+    set32(&mut bytes, h.local + 22, 0);
+    set32(&mut bytes, at + 16, 0);
+    set32(&mut bytes, at + 24, 0);
+    set32(&mut bytes, at + 38, (0o040755 << 16) | 0x10);
+    bytes
+}
 
 #[test]
 fn whole_actual_container_and_each_literal_member_have_observed_digests() {
@@ -452,6 +467,69 @@ fn real_deflate_must_end_at_exact_consumed_input_and_actual_size() {
     set32(&mut forged, h.local + 22, 1);
     set32(&mut forged, at + 24, 1);
     rejected(&forged, "INPUT_ARCHIVE_SIZE_MISMATCH");
+}
+
+#[test]
+fn deflated_empty_directories_require_the_complete_actual_decoder_checks() {
+    let original = deflated_directory(b"");
+    let h = &headers(&original)[0];
+    assert_eq!(h.method, 8);
+    assert!(h.compressed > 0);
+    let observed = run(&original, InputArchiveLimits::default()).unwrap();
+    assert!(observed.complete());
+    assert_eq!(observed.input_sha256(), &raw_digest(&original));
+    assert_eq!(observed.decoded_bytes(), 0);
+    assert_eq!(observed.members().len(), 1);
+    assert_eq!(observed.members()[0].name(), "dir/");
+    assert_eq!(
+        observed.members()[0].kind(),
+        InputArchiveMemberKind::Directory
+    );
+    assert_eq!(observed.members()[0].byte_length(), 0);
+    assert_eq!(observed.members()[0].sha256(), &raw_digest(b""));
+
+    // A declared empty directory must not skip its nonempty actual stream.
+    rejected(
+        &deflated_directory(b"nonempty"),
+        "INPUT_ARCHIVE_SIZE_MISMATCH",
+    );
+    let mut trailing = original.clone();
+    trailing.insert(h.end, 0);
+    let at = directory(&original) + 1;
+    let end = trailing.len() - 22;
+    set32(&mut trailing, h.local + 18, h.compressed + 1);
+    set32(&mut trailing, at + 20, h.compressed + 1);
+    set32(&mut trailing, end + 16, at as u32);
+    rejected(&trailing, "INPUT_ARCHIVE_DEFLATE_TRAILING");
+    for removed in [1, h.compressed as usize] {
+        let mut short = original.clone();
+        drop(short.drain(h.end - removed..h.end));
+        let at = directory(&original) - removed;
+        let end = short.len() - 22;
+        let compressed = h.compressed - removed as u32;
+        set32(&mut short, h.local + 18, compressed);
+        set32(&mut short, at + 20, compressed);
+        set32(&mut short, end + 16, at as u32);
+        let error = run(&short, InputArchiveLimits::default()).unwrap_err();
+        assert!(matches!(
+            error.code(),
+            "INPUT_ARCHIVE_DEFLATE" | "INPUT_ARCHIVE_DEFLATE_TRUNCATED"
+        ));
+        if error.code() == "INPUT_ARCHIVE_DEFLATE" {
+            assert!(error.source().is_some());
+        }
+    }
+    // Zero decoded length and CRC remain mandatory before opening a member.
+    let mut crc = original.clone();
+    let at = directory(&crc);
+    set32(&mut crc, h.local + 14, 1);
+    set32(&mut crc, at + 16, 1);
+    rejected(&crc, "INPUT_ARCHIVE_DIRECTORY_PAYLOAD");
+    let mut size = original;
+    let at = directory(&size);
+    set32(&mut size, h.local + 22, 1);
+    set32(&mut size, at + 24, 1);
+    rejected(&size, "INPUT_ARCHIVE_DIRECTORY_PAYLOAD");
 }
 
 #[test]

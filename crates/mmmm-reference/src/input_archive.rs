@@ -187,7 +187,9 @@ impl fmt::Debug for InputArchiveInventory {
 }
 
 /// Stored/Deflate classic ZIP with literal UTF-8 names and explicit empty
-/// directories. No manifest or executable/source authority is inferred.
+/// directories. Deflated directories must finish the same actual decoder checks
+/// as files and produce zero bytes. No manifest or executable/source authority
+/// is inferred.
 pub fn inventory_input_archive(
     bytes: &[u8],
     limits: InputArchiveLimits,
@@ -535,9 +537,9 @@ fn preflight(
             InputArchiveMemberKind::File
         };
         names.insert(name, kind, &mut metadata, limits)?;
-        if is_directory
-            && (compressed != 0 || length != 0 || method != 0 || u32_at(directory, at + 16)? != 0)
-        {
+        // Deflated empty directories still pass through the common decoder,
+        // including StreamEnd, consumed input, actual length, CRC, and hashing.
+        if is_directory && (length != 0 || u32_at(directory, at + 16)? != 0) {
             return Err(failure("INPUT_ARCHIVE_DIRECTORY_PAYLOAD"));
         }
         extra(range(directory, at + 46 + name_len, extra_len)?)?;
