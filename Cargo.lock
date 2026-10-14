@@ -722,6 +722,7 @@ dependencies = [
  "mmmm-contracts",
  "mmmm-domain",
  "mmmm-exchange",
+ "mmmm-native-process",
  "mmmm-planner",
  "mmmm-policy",
  "mmmm-reference",
@@ -762,6 +763,13 @@ dependencies = [
 [[package]]
 name = "mmmm-game-observer"
 version = "0.1.0"
+
+[[package]]
+name = "mmmm-native-process"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "mmmm-planner"
@@ -820,6 +828,7 @@ version = "0.1.0"
 dependencies = [
  "ctrlc",
  "libc",
+ "mmmm-native-process",
  "serde",
  "serde_json",
  "sha2",

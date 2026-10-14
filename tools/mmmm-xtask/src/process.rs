@@ -51,6 +51,9 @@ pub struct ProcessSpec {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub cwd: PathBuf,
+    /// Controlled startup can use only the explicit environment below. General
+    /// managed commands retain inheritance; inherited values are never logged.
+    pub inherit_environment: bool,
     pub env: BTreeMap<OsString, OsString>,
     pub stdout_log: PathBuf,
     pub stderr_log: PathBuf,
@@ -74,6 +77,7 @@ impl ProcessSpec {
             program,
             args: Vec::new(),
             cwd,
+            inherit_environment: true,
             env: BTreeMap::new(),
             stdout_log,
             stderr_log,
@@ -1062,7 +1066,7 @@ mod native {
                 let application = wide(spec.program.as_os_str());
                 let directory = current_directory(&spec.cwd)?;
                 let mut command = command_line(spec)?;
-                let mut environment = environment_block(&spec.env)?;
+                let mut environment = environment_block(spec.inherit_environment, &spec.env)?;
                 let mut info: PROCESS_INFORMATION = zeroed();
                 if CreateProcessW(
                     application.as_ptr(),
@@ -1445,14 +1449,18 @@ mod native {
         Ok(command)
     }
     fn environment_block(
+        inherit: bool,
         overrides: &BTreeMap<OsString, OsString>,
     ) -> Result<Vec<u16>, ProcessError> {
         // Inheritance is used for executable/toolchain discovery. Values are
         // passed to the child only; they are never logged or put into receipts.
         let mut entries = BTreeMap::new();
-        for (name, value) in
-            std::env::vars_os().chain(overrides.iter().map(|(k, v)| (k.clone(), v.clone())))
-        {
+        if inherit {
+            for (name, value) in std::env::vars_os() {
+                entries.insert(name.to_string_lossy().to_uppercase(), (name, value));
+            }
+        }
+        for (name, value) in overrides.iter().map(|(k, v)| (k.clone(), v.clone())) {
             entries.insert(name.to_string_lossy().to_uppercase(), (name, value));
         }
         let mut block = Vec::new();
@@ -1522,6 +1530,9 @@ mod native {
                 darwin_resources::Tracker::new(memory)?
             };
             let mut command = Command::new(&spec.program);
+            if !spec.inherit_environment {
+                command.env_clear();
+            }
             #[cfg(target_os = "linux")]
             let linux_address_limit: libc::rlim_t =
                 spec.resource_policy.linux_address_space_limit()?;
@@ -2346,6 +2357,14 @@ mod tests {
                 println!("owned-output");
                 eprintln!("owned-error");
             }
+            "explicit_environment" => {
+                assert!(std::env::var_os("PATH").is_none());
+                assert_eq!(
+                    std::env::var_os("MMMM_OWNED_ENVIRONMENT_SENTINEL"),
+                    Some(OsString::from("explicit-only"))
+                );
+                println!("owned explicit environment verified");
+            }
             "failure" => std::process::exit(23),
             "hold" => std::thread::sleep(Duration::from_secs(30)),
             "brief_hold" => std::thread::sleep(Duration::from_millis(500)),
@@ -2493,6 +2512,29 @@ mod tests {
                 .contains("owned-error")
         );
         run.cleanup(result.drained);
+    }
+
+    #[test]
+    fn explicit_environment_has_no_inherited_search_path() {
+        let mut run = TestRun::new("explicit_environment");
+        assert!(run.spec.inherit_environment);
+        run.spec.inherit_environment = false;
+        run.spec.env.insert(
+            "MMMM_OWNED_ENVIRONMENT_SENTINEL".into(),
+            "explicit-only".into(),
+        );
+        let capture =
+            supervise_with_progress_captured(&run.spec, &AtomicBool::new(false), |_| Ok(()))
+                .unwrap();
+        let outcome = capture.into_outcome();
+        assert_eq!(outcome.command_exit, Some(0));
+        assert!(outcome.drained && outcome.supervisor_errors.is_empty());
+        assert!(
+            fs::read_to_string(&run.spec.stdout_log)
+                .unwrap()
+                .contains("owned explicit environment verified")
+        );
+        run.cleanup(outcome.drained);
     }
 
     #[test]

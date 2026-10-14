@@ -1,7 +1,8 @@
 //! Darwin cooperative resource observations, separate from native drain proof.
 //! Adjusted VM, RSS and physical footprint are distinct measured quantities.
-//! ABI: Apple's public proc_info.h/resource.h; XNU xnu-11417.140.69.
+//! The shared native-process crate owns the public libproc memory ABI only.
 use super::ProcessError;
+use mmmm_native_process::darwin::{NativeResourceError, NativeResourceFailure};
 use serde::Serialize;
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,7 @@ const WORKER_LIMIT: usize = 32;
 const TARGET: Duration = Duration::from_millis(100);
 const MAX_GAP: Duration = Duration::from_secs(1);
 // Darwin errno.h; pure classification tests also run on non-Unix targets.
+#[cfg(test)]
 const DARWIN_ESRCH: i32 = 3;
 
 #[derive(Clone, Debug, Serialize)]
@@ -179,117 +181,37 @@ fn sum_overflow() -> ProcessError {
     )
 }
 
+#[cfg(test)]
 fn task_result(bytes: i32, number: i32) -> Result<(), ProcessError> {
-    if bytes == 96 {
-        return Ok(());
-    }
-    // ESRCH is an exit-class result, not permission to omit the PID. The
-    // caller must still independently confirm the unchanged native zombie.
-    if bytes == 0 && number == DARWIN_ESRCH {
-        return Err(ProcessError::new(
-            "resource_process_exit",
-            "Darwin task resource process exit requires identity confirmation",
-        ));
-    }
-    Err(ProcessError::new(
-        "resource_observation",
-        format!("Darwin task resource observation unavailable; bytes={bytes}; errno={number}",),
-    ))
+    mmmm_native_process::darwin::classify_task_result(bytes, number).map_err(native_error)
 }
+#[cfg(test)]
 fn rusage_result(result: i32, number: i32, start: u64, exit: u64) -> Result<(), ProcessError> {
-    if result != 0 {
-        if number == DARWIN_ESRCH {
-            return Err(ProcessError::new(
-                "resource_process_exit",
-                "Darwin footprint process exit requires identity confirmation",
-            ));
-        }
-        return Err(ProcessError::new(
-            "resource_observation",
-            format!("Darwin footprint observation unavailable; errno={number}",),
-        ));
-    }
-    if start == 0 {
-        return Err(ProcessError::new(
-            "resource_observation",
-            "Darwin resource observation does not identify a live process",
-        ));
-    }
-    if exit != 0 {
-        return Err(ProcessError::new(
-            "resource_process_exit",
-            "Darwin resource process exit requires identity confirmation",
-        ));
-    }
-    Ok(())
+    mmmm_native_process::darwin::classify_rusage_result(result, number, start, exit)
+        .map_err(native_error)
 }
 
-#[repr(C)]
-#[cfg(target_os = "macos")]
-struct TaskInfo {
-    virtual_size: u64,
-    resident_size: u64,
-    times: [u64; 4],
-    counters: [i32; 12],
+fn native_error(error: NativeResourceError) -> ProcessError {
+    // ESRCH and an observed exit timestamp remain exit-class failures. Only
+    // process.rs may independently confirm the unchanged native zombie.
+    let kind = if error.failure == NativeResourceFailure::Exited {
+        "resource_process_exit"
+    } else {
+        "resource_observation"
+    };
+    ProcessError::new(kind, error.to_string())
 }
-#[repr(C)]
-#[cfg(target_os = "macos")]
-struct RusageInfoV0 {
-    uuid: [u8; 16],
-    times_and_counts: [u64; 6],
-    resident_size: u64,
-    phys_footprint: u64,
-    start_abstime: u64,
-    exit_abstime: u64,
-}
-#[cfg(target_os = "macos")]
-const _: () = {
-    assert!(std::mem::size_of::<TaskInfo>() == 96);
-    assert!(std::mem::offset_of!(TaskInfo, resident_size) == 8);
-    assert!(std::mem::size_of::<RusageInfoV0>() == 96);
-    assert!(std::mem::offset_of!(RusageInfoV0, resident_size) == 64);
-    assert!(std::mem::offset_of!(RusageInfoV0, phys_footprint) == 72);
-    assert!(std::mem::offset_of!(RusageInfoV0, start_abstime) == 80);
-};
 
-#[cfg(target_os = "macos")]
-#[link(name = "proc")]
-unsafe extern "C" {
-    fn proc_pidinfo(
-        pid: i32,
-        flavor: i32,
-        arg: u64,
-        buffer: *mut std::ffi::c_void,
-        bytes: i32,
-    ) -> i32;
-    fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut std::ffi::c_void) -> i32;
-}
 #[cfg(target_os = "macos")]
 pub(super) fn memory(pid: i32) -> Result<Memory, ProcessError> {
-    let mut task: TaskInfo = unsafe { std::mem::zeroed() };
-    let mut usage: RusageInfoV0 = unsafe { std::mem::zeroed() };
-    let bytes = unsafe {
-        *libc::__error() = 0;
-        proc_pidinfo(pid, 4, 0, (&mut task as *mut TaskInfo).cast(), 96)
-    };
-    task_result(
-        bytes,
-        std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-    )?;
-    let result = unsafe {
-        *libc::__error() = 0;
-        proc_pid_rusage(pid, 0, (&mut usage as *mut RusageInfoV0).cast())
-    };
-    rusage_result(
-        result,
-        std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-        usage.start_abstime,
-        usage.exit_abstime,
-    )?;
+    let actual = mmmm_native_process::darwin::observe_memory(pid).map_err(native_error)?;
+    // tools retains its existing before/after BSD birth/UID/group sandwich.
+    // The shared observation additionally returns rusage start identity for
+    // consumers that keep it fixed throughout a single worker lifecycle.
     Ok(Memory {
-        adjusted_vm: task.virtual_size,
-        rss: task.resident_size.max(usage.resident_size),
-        footprint: usage.phys_footprint,
+        adjusted_vm: actual.adjusted_vm,
+        rss: actual.rss,
+        footprint: actual.footprint,
     })
 }
 

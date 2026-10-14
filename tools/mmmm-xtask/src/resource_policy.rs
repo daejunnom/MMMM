@@ -62,6 +62,18 @@ impl ResourcePolicy {
         }
     }
 
+    /// The fixed definition observer launches the same pinned JVM directly,
+    /// under its own purpose and original startup deadline. Reuse the JVM's
+    /// finite VM/RSS semantics without relabeling it as a build or changing
+    /// the general process policy.
+    pub const fn for_definition_startup() -> Self {
+        if cfg!(target_os = "linux") {
+            Self::LinuxJvmObserved
+        } else {
+            Self::current()
+        }
+    }
+
     pub fn validate_current(&self) -> Result<(), ProcessError> {
         let available = *self == Self::current()
             || (cfg!(target_os = "linux") && *self == Self::LinuxJvmObserved);

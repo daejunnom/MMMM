@@ -11,17 +11,17 @@ use std::sync::atomic::AtomicBool;
 
 const MIB: u64 = 1024 * 1024;
 const MAX_INPUTS: usize = 32;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 const MAX_INPUT_BYTES: u64 = 512 * MIB;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 const MAX_FRAME_BYTES: usize = 18 * 1024 * 1024;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 const PROBE: &str = "io.github.daejunnom.mmmm.observer.DefinitionStartupProbe";
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 const OWNER: &str = "io/github/daejunnom/mmmm/observer/DefinitionStartupProbe";
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 const LAMBDA: &str = "io/github/daejunnom/mmmm/observer/DefinitionStartupProbe$$Lambda";
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 const TARGET: &str = "lambda$ownedRunnable$0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -237,7 +237,7 @@ impl fmt::Display for DefinitionStartupError {
 }
 impl std::error::Error for DefinitionStartupError {}
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 fn remaining_process_budget(
     remaining: std::time::Duration,
 ) -> Result<std::time::Duration, DefinitionStartupError> {
@@ -249,8 +249,81 @@ fn remaining_process_budget(
     Ok(remaining)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupPlatform {
+    Windows,
+    Linux,
+    Macos,
+}
+impl StartupPlatform {
+    fn current() -> Result<Self, DefinitionStartupError> {
+        if cfg!(all(
+            windows,
+            target_arch = "x86_64",
+            target_env = "msvc",
+            target_endian = "little"
+        )) {
+            Ok(Self::Windows)
+        } else if cfg!(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_env = "gnu",
+            target_endian = "little"
+        )) {
+            Ok(Self::Linux)
+        } else if cfg!(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_endian = "little"
+        )) {
+            Ok(Self::Macos)
+        } else {
+            Err(DefinitionStartupError::new("UNSUPPORTED_PLATFORM"))
+        }
+    }
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Windows => "jdk25-windows-x64-msvc-controlled-startup-v1",
+            Self::Linux => "jdk25-linux-x64-gnu-controlled-startup-v1",
+            Self::Macos => "jdk25-macos-arm64-darwin-controlled-startup-v1",
+        }
+    }
+    fn role_name(self, role: DefinitionSourceRole, name: &str) -> bool {
+        match role {
+            DefinitionSourceRole::JavaExecutable => {
+                name == if self == Self::Windows {
+                    "java.exe"
+                } else {
+                    "java"
+                }
+            }
+            DefinitionSourceRole::ObserverLibrary | DefinitionSourceRole::JdkLibrary => name
+                .ends_with(match self {
+                    Self::Windows => ".dll",
+                    Self::Linux => ".so",
+                    Self::Macos => ".dylib",
+                }),
+            DefinitionSourceRole::ObserverJar => name.ends_with(".jar"),
+            DefinitionSourceRole::JdkArchive => name.ends_with(if self == Self::Windows {
+                ".zip"
+            } else {
+                ".tar.gz"
+            }),
+            DefinitionSourceRole::JdkModules => name == "modules",
+            DefinitionSourceRole::BuildSourceManifest => name.ends_with(".json"),
+        }
+    }
+}
+
 fn selected_inputs(
     selection: &DefinitionStartupSelection,
+) -> Result<Vec<(DefinitionSourceRole, &Path)>, DefinitionStartupError> {
+    selected_inputs_for_platform(selection, StartupPlatform::current()?)
+}
+
+fn selected_inputs_for_platform(
+    selection: &DefinitionStartupSelection,
+    platform: StartupPlatform,
 ) -> Result<Vec<(DefinitionSourceRole, &Path)>, DefinitionStartupError> {
     if selection
         .source_inputs
@@ -304,10 +377,14 @@ fn selected_inputs(
     let mut paths = std::collections::BTreeSet::new();
     for (role, path) in &inputs {
         validate_input_path(path)?;
-        let key = path
+        let text = path
             .to_str()
-            .ok_or_else(|| DefinitionStartupError::new("INPUT_PATH"))?
-            .to_lowercase();
+            .ok_or_else(|| DefinitionStartupError::new("INPUT_PATH"))?;
+        let key = if platform == StartupPlatform::Windows {
+            text.to_lowercase()
+        } else {
+            text.to_owned()
+        };
         if matches!(
             role,
             DefinitionSourceRole::ObserverLibrary | DefinitionSourceRole::ObserverJar
@@ -323,18 +400,13 @@ fn selected_inputs(
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| DefinitionStartupError::new("INPUT_PATH"))?
-            .to_ascii_lowercase();
-        let correct = match role {
-            DefinitionSourceRole::JavaExecutable => name == "java.exe",
-            DefinitionSourceRole::ObserverLibrary | DefinitionSourceRole::JdkLibrary => {
-                name.ends_with(".dll")
-            }
-            DefinitionSourceRole::ObserverJar => name.ends_with(".jar"),
-            DefinitionSourceRole::JdkArchive => name.ends_with(".zip"),
-            DefinitionSourceRole::JdkModules => name == "modules",
-            DefinitionSourceRole::BuildSourceManifest => name.ends_with(".json"),
+            .ok_or_else(|| DefinitionStartupError::new("INPUT_PATH"))?;
+        let name = if platform == StartupPlatform::Windows {
+            name.to_ascii_lowercase()
+        } else {
+            name.to_owned()
         };
+        let correct = platform.role_name(*role, &name);
         if !correct {
             return Err(DefinitionStartupError::new("INPUT_ROLE_PATH"));
         }
@@ -346,6 +418,10 @@ fn validate_input_path(path: &Path) -> Result<(), DefinitionStartupError> {
     let text = path
         .to_str()
         .ok_or_else(|| DefinitionStartupError::new("INPUT_PATH"))?;
+    #[cfg(unix)]
+    if text.starts_with("//") {
+        return Err(DefinitionStartupError::new("INPUT_PATH"));
+    }
     if !path.is_absolute()
         || path.components().count() > 64
         || text.len() > 32760
@@ -400,30 +476,29 @@ pub fn run_owned(
     selection: &DefinitionStartupSelection,
     cancellation: &AtomicBool,
 ) -> Result<DefinitionStartupRun, DefinitionStartupError> {
+    StartupPlatform::current()?;
     #[cfg(windows)]
     {
-        if !cfg!(all(
-            target_arch = "x86_64",
-            target_env = "msvc",
-            target_endian = "little"
-        )) {
-            return Err(DefinitionStartupError::new("UNSUPPORTED_PLATFORM"));
-        }
         windows_run::run(build, selection, cancellation)
     }
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        unix_run::run(build, selection, cancellation)
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         let _ = (build, selection, cancellation);
         Err(DefinitionStartupError::new("UNSUPPORTED_PLATFORM"))
     }
 }
 
-#[cfg(any(windows, test))]
-fn fixed_java_args(dll: &Path, jar: &Path) -> Vec<std::ffi::OsString> {
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
+fn fixed_java_args(dll: &Path, jar: &Path, platform: StartupPlatform) -> Vec<std::ffi::OsString> {
     use std::ffi::OsString;
     let mut native = OsString::from("-agentpath:");
     native.push(dll);
-    native.push("=jdk25-windows-x64-msvc-controlled-startup-v1");
+    native.push("=");
+    native.push(platform.marker());
     let mut agent = OsString::from("-javaagent:");
     agent.push(jar);
     agent.push("=protocol=mmmm.definition-observer/1");
@@ -448,6 +523,16 @@ fn fixed_java_args(dll: &Path, jar: &Path) -> Vec<std::ffi::OsString> {
     .into_iter()
     .map(OsString::from)
     .collect();
+    if platform != StartupPlatform::Windows {
+        // This developer fixture does not use shared perfdata monitoring.
+        // HotSpot's POSIX perfdata store uses os::get_temp_directory(); managed
+        // Java TMPDIR alone must not be treated as a containment guarantee.
+        // https://github.com/openjdk/jdk25u/blob/jdk-25.0.4.1%2B1/src/hotspot/os/posix/perfMemory_posix.cpp
+        args.push(OsString::from("-XX:-UsePerfData"));
+        // The process cwd is this owner's scratch, so Java API temp creation
+        // resolves here without depending on an inherited host temp property.
+        args.push(OsString::from("-Djava.io.tmpdir=."));
+    }
     args.extend([
         native,
         agent,
@@ -457,7 +542,7 @@ fn fixed_java_args(dll: &Path, jar: &Path) -> Vec<std::ffi::OsString> {
     ]);
     args
 }
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 fn fixed_environment(
     base: std::collections::BTreeMap<String, String>,
 ) -> std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> {
@@ -476,6 +561,266 @@ fn fixed_environment(
     result
 }
 
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+use sha2::{Digest, Sha256};
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+use std::sync::atomic::Ordering;
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+use std::time::{Duration, Instant};
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+struct Deadline<'a> {
+    cancellation: &'a AtomicBool,
+    deadline: Instant,
+}
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+impl<'a> Deadline<'a> {
+    fn new(cancellation: &'a AtomicBool) -> Self {
+        Self {
+            cancellation,
+            deadline: Instant::now() + Duration::from_secs(60),
+        }
+    }
+    fn check(&self) -> Result<(), DefinitionStartupError> {
+        if self.cancellation.load(Ordering::Acquire) {
+            return Err(DefinitionStartupError::new("CANCELLED"));
+        }
+        if Instant::now() >= self.deadline {
+            return Err(DefinitionStartupError::new("DEADLINE"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+trait StartupInputPin: Sized {
+    type Context: Default;
+    fn acquire(
+        context: &mut Self::Context,
+        role: DefinitionSourceRole,
+        path: &Path,
+        build: &storage::ManagedBuild,
+        check: &Deadline<'_>,
+        remaining: u64,
+    ) -> Result<Self, DefinitionStartupError>;
+    fn source_identity(&self) -> (u64, u64);
+    fn report(&self) -> &DefinitionSourcePin;
+    fn recheck(
+        &mut self,
+        build: &storage::ManagedBuild,
+        check: &Deadline<'_>,
+    ) -> Result<(), DefinitionStartupError>;
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn measure(
+    build: &storage::ManagedBuild,
+    check: &Deadline<'_>,
+) -> Result<(), DefinitionStartupError> {
+    let value = build
+        .measure_with_progress(&mut || check.check().map_err(|error| error.to_string()))
+        .map_err(|original| {
+            let mut error = DefinitionStartupError::new("OWNERSHIP");
+            error.storage_error = Some(Box::new(original));
+            error
+        })?;
+    if !value.within_budget {
+        return Err(DefinitionStartupError::new("DISK_BUDGET"));
+    }
+    Ok(())
+}
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn attach(
+    mut error: DefinitionStartupError,
+    capture: process::CapturedProcessOutcome,
+    pins: SourcePins,
+    raw: Option<Vec<u8>>,
+) -> DefinitionStartupError {
+    error.process_started = Some(capture.process_started());
+    error.outcome = Some(Box::new(capture.into_outcome()));
+    error.source_pins = Some(pins);
+    error.raw_candidate = raw;
+    error
+}
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn post_check<P: StartupInputPin>(
+    pins: &mut [P],
+    build: &storage::ManagedBuild,
+    check: &Deadline<'_>,
+) -> Result<(), DefinitionStartupError> {
+    for pin in pins {
+        pin.recheck(build, check)?;
+    }
+    measure(build, check)
+}
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn run_with_pins<P: StartupInputPin>(
+    build: &storage::ManagedBuild,
+    selection: &DefinitionStartupSelection,
+    cancellation: &AtomicBool,
+) -> Result<DefinitionStartupRun, DefinitionStartupError> {
+    let check = Deadline::new(cancellation);
+    measure(build, &check)?;
+    let selected = selected_inputs(selection)?;
+    let mut context = P::Context::default();
+    let mut pins: Vec<P> = Vec::new();
+    let mut total = 0_u64;
+    for (role, path) in selected {
+        let pin = P::acquire(
+            &mut context,
+            role,
+            path,
+            build,
+            &check,
+            MAX_INPUT_BYTES - total,
+        )?;
+        if pins
+            .iter()
+            .any(|other| other.source_identity() == pin.source_identity())
+        {
+            return Err(DefinitionStartupError::new("INPUT_DUPLICATE"));
+        }
+        total = total
+            .checked_add(pin.report().size)
+            .ok_or_else(|| DefinitionStartupError::new("INPUT_SIZE"))?;
+        if total > MAX_INPUT_BYTES {
+            return Err(DefinitionStartupError::new("INPUT_SIZE"));
+        }
+        pins.push(pin);
+    }
+    let source_pins = SourcePins {
+        files: pins.iter().map(|pin| pin.report().clone()).collect(),
+    };
+    for pin in &mut pins {
+        pin.recheck(build, &check)?;
+    }
+    measure(build, &check)?;
+    let mut spec = process::ProcessSpec::new(
+        selection.java_exe.clone(),
+        build.paths().scratch.clone(),
+        build.paths().scratch.join("definition-startup.stdout.bin"),
+        build.paths().scratch.join("definition-startup.stderr.log"),
+    );
+    spec.args = fixed_java_args(
+        &selection.observer_dll,
+        &selection.observer_jar,
+        StartupPlatform::current()?,
+    );
+    spec.env = fixed_environment(build.environment());
+    #[cfg(unix)]
+    {
+        // The fixed absolute Java does not require inherited PATH or HOME.
+        // Clear inherited native-loader injectors and diagnostics without
+        // reading their values; explicit managed paths/Java overrides remain.
+        spec.inherit_environment = false;
+    }
+    check.check()?;
+    spec.timeout =
+        remaining_process_budget(check.deadline.saturating_duration_since(Instant::now()))?;
+    spec.absolute_deadline = Some(check.deadline);
+    spec.drain_timeout = Duration::from_secs(15);
+    spec.max_log_bytes = 64 * MIB;
+    spec.tail_policy = process::TailPolicy::Reject;
+    spec.resource_policy = process::ResourcePolicy::for_definition_startup();
+    let mut capture =
+        match process::supervise_with_progress_captured(&spec, cancellation, |progress| {
+            check.check().map_err(|error| error.to_string())?;
+            let value = build
+                .measure_with_progress(&mut || {
+                    check.check().map_err(|error| error.to_string())?;
+                    progress()?;
+                    check.check().map_err(|error| error.to_string())
+                })
+                .map_err(|error| error.to_string())?;
+            check.check().map_err(|error| error.to_string())?;
+            if value.within_budget {
+                Ok(())
+            } else {
+                Err("MMMM_DEFINITION_STARTUP_DISK_BUDGET".into())
+            }
+        }) {
+            Ok(capture) => capture,
+            Err(original) => {
+                let mut error = DefinitionStartupError::new("PROCESS");
+                error.process_started = None;
+                error.process_error = Some(Box::new(original));
+                error.source_pins = Some(source_pins);
+                error.post_check_error = post_check(&mut pins, build, &check).err().map(Box::new);
+                return Err(error);
+            }
+        };
+    let outcome = capture.outcome();
+    if !capture.process_started()
+        || outcome.command_exit != Some(0)
+        || outcome.command_signal.is_some()
+        || !outcome.drained
+        || !outcome.output_complete
+        || !outcome.supervisor_errors.is_empty()
+        || outcome.termination_reason != process::TerminationReason::Completed
+        || outcome.owned_tail_terminated
+    {
+        let mut error = DefinitionStartupError::new("PROCESS_INCOMPLETE");
+        error.post_check_error = post_check(&mut pins, build, &check).err().map(Box::new);
+        return Err(attach(error, capture, source_pins, None));
+    }
+    let mut capture_ownership_error = None;
+    let raw = match capture.read_stdout(MAX_FRAME_BYTES, || {
+        check.check().map_err(|error| error.to_string())?;
+        if let Err(original) = build.check_current_ownership() {
+            capture_ownership_error = Some(original);
+            return Err("MMMM_DEFINITION_STARTUP_OWNERSHIP".into());
+        }
+        check.check().map_err(|error| error.to_string())
+    }) {
+        Ok(raw) => raw,
+        Err(original) => {
+            let mut error = DefinitionStartupError::new("CAPTURE");
+            error.process_error = Some(Box::new(original));
+            error.storage_error = capture_ownership_error.map(Box::new);
+            error.post_check_error = post_check(&mut pins, build, &check).err().map(Box::new);
+            return Err(attach(error, capture, source_pins, None));
+        }
+    };
+    for pin in &mut pins {
+        if let Err(error) = pin.recheck(build, &check) {
+            return Err(attach(error, capture, source_pins, Some(raw)));
+        }
+    }
+    if let Err(error) = measure(build, &check) {
+        return Err(attach(error, capture, source_pins, Some(raw)));
+    }
+    if let Err(error) = check.check() {
+        return Err(attach(error, capture, source_pins, Some(raw)));
+    }
+    let summary = match decode_abi2(&raw) {
+        Ok(summary) => summary,
+        Err(error) => {
+            return Err(attach(error, capture, source_pins, Some(raw)));
+        }
+    };
+    if let Err(error) = check.check() {
+        return Err(attach(error, capture, source_pins, Some(raw)));
+    }
+    let raw_sha256 = format!("{:x}", Sha256::digest(&raw));
+    if let Err(error) = check.check() {
+        return Err(attach(error, capture, source_pins, Some(raw)));
+    }
+    // Converting releases the original stdout handle. Input and ancestor
+    // handles remain held until this function returns, before root cleanup.
+    Ok(DefinitionStartupRun {
+        process_started: capture.process_started(),
+        outcome: capture.into_outcome(),
+        source_pins,
+        raw_abi2: raw,
+        raw_sha256,
+        summary,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "definition_startup_unix.rs"]
+mod unix_run;
+
 #[cfg(windows)]
 mod windows_run {
     use super::*;
@@ -485,8 +830,6 @@ mod windows_run {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use std::path::Prefix;
-    use std::sync::atomic::Ordering;
-    use std::time::{Duration, Instant};
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, GetDriveTypeW,
@@ -498,27 +841,6 @@ mod windows_run {
     // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getdrivetypew
     const DRIVE_FIXED: u32 = 3;
 
-    struct Deadline<'a> {
-        cancellation: &'a AtomicBool,
-        deadline: Instant,
-    }
-    impl<'a> Deadline<'a> {
-        fn new(cancellation: &'a AtomicBool) -> Self {
-            Self {
-                cancellation,
-                deadline: Instant::now() + Duration::from_secs(60),
-            }
-        }
-        fn check(&self) -> Result<(), DefinitionStartupError> {
-            if self.cancellation.load(Ordering::Acquire) {
-                return Err(DefinitionStartupError::new("CANCELLED"));
-            }
-            if Instant::now() >= self.deadline {
-                return Err(DefinitionStartupError::new("DEADLINE"));
-            }
-            Ok(())
-        }
-    }
     #[derive(Clone, Copy, Eq, PartialEq)]
     struct Identity {
         volume: u32,
@@ -653,10 +975,13 @@ mod windows_run {
         }
         Ok((total, format!("{:x}", digest.finalize())))
     }
-    impl InputPin {
+    impl StartupInputPin for InputPin {
+        type Context = ();
         fn acquire(
+            _context: &mut Self::Context,
             role: DefinitionSourceRole,
             path: &Path,
+            _build: &storage::ManagedBuild,
             check: &Deadline<'_>,
             remaining: u64,
         ) -> Result<Self, DefinitionStartupError> {
@@ -683,7 +1008,17 @@ mod windows_run {
                 report: DefinitionSourcePin { role, size, sha256 },
             })
         }
-        fn recheck(&mut self, check: &Deadline<'_>) -> Result<(), DefinitionStartupError> {
+        fn source_identity(&self) -> (u64, u64) {
+            (u64::from(self.identity.volume), self.identity.index)
+        }
+        fn report(&self) -> &DefinitionSourcePin {
+            &self.report
+        }
+        fn recheck(
+            &mut self,
+            _build: &storage::ManagedBuild,
+            check: &Deadline<'_>,
+        ) -> Result<(), DefinitionStartupError> {
             for directory in &self.directories {
                 check.check()?;
                 let held = information(&directory.file)?;
@@ -715,196 +1050,20 @@ mod windows_run {
             Ok(())
         }
     }
-    fn measure(
-        build: &storage::ManagedBuild,
-        check: &Deadline<'_>,
-    ) -> Result<(), DefinitionStartupError> {
-        let value = build
-            .measure_with_progress(&mut || check.check().map_err(|error| error.to_string()))
-            .map_err(|original| {
-                let mut error = DefinitionStartupError::new("OWNERSHIP");
-                error.storage_error = Some(Box::new(original));
-                error
-            })?;
-        if !value.within_budget {
-            return Err(DefinitionStartupError::new("DISK_BUDGET"));
-        }
-        Ok(())
-    }
-    fn attach(
-        mut error: DefinitionStartupError,
-        capture: process::CapturedProcessOutcome,
-        pins: SourcePins,
-        raw: Option<Vec<u8>>,
-    ) -> DefinitionStartupError {
-        error.process_started = Some(capture.process_started());
-        error.outcome = Some(Box::new(capture.into_outcome()));
-        error.source_pins = Some(pins);
-        error.raw_candidate = raw;
-        error
-    }
-    fn post_check(
-        pins: &mut [InputPin],
-        build: &storage::ManagedBuild,
-        check: &Deadline<'_>,
-    ) -> Result<(), DefinitionStartupError> {
-        for pin in pins {
-            pin.recheck(check)?;
-        }
-        measure(build, check)
-    }
     pub(super) fn run(
         build: &storage::ManagedBuild,
         selection: &DefinitionStartupSelection,
         cancellation: &AtomicBool,
     ) -> Result<DefinitionStartupRun, DefinitionStartupError> {
-        let check = Deadline::new(cancellation);
-        measure(build, &check)?;
-        let selected = selected_inputs(selection)?;
-        let mut pins = Vec::new();
-        let mut total = 0_u64;
-        for (role, path) in selected {
-            let pin = InputPin::acquire(role, path, &check, MAX_INPUT_BYTES - total)?;
-            if pins
-                .iter()
-                .any(|other: &InputPin| same_object(other.identity, pin.identity))
-            {
-                return Err(DefinitionStartupError::new("INPUT_DUPLICATE"));
-            }
-            total = total
-                .checked_add(pin.report.size)
-                .ok_or_else(|| DefinitionStartupError::new("INPUT_SIZE"))?;
-            if total > MAX_INPUT_BYTES {
-                return Err(DefinitionStartupError::new("INPUT_SIZE"));
-            }
-            pins.push(pin);
-        }
-        let source_pins = SourcePins {
-            files: pins.iter().map(|pin| pin.report.clone()).collect(),
-        };
-        for pin in &mut pins {
-            pin.recheck(&check)?;
-        }
-        measure(build, &check)?;
-        let mut spec = process::ProcessSpec::new(
-            selection.java_exe.clone(),
-            build.paths().scratch.clone(),
-            build.paths().scratch.join("definition-startup.stdout.bin"),
-            build.paths().scratch.join("definition-startup.stderr.log"),
-        );
-        spec.args = fixed_java_args(&selection.observer_dll, &selection.observer_jar);
-        spec.env = fixed_environment(build.environment());
-        check.check()?;
-        spec.timeout =
-            remaining_process_budget(check.deadline.saturating_duration_since(Instant::now()))?;
-        spec.absolute_deadline = Some(check.deadline);
-        spec.drain_timeout = Duration::from_secs(15);
-        spec.max_log_bytes = 64 * MIB;
-        spec.tail_policy = process::TailPolicy::Reject;
-        spec.resource_policy = process::ResourcePolicy::current();
-        let mut capture =
-            match process::supervise_with_progress_captured(&spec, cancellation, |progress| {
-                check.check().map_err(|error| error.to_string())?;
-                let value = build
-                    .measure_with_progress(&mut || {
-                        check.check().map_err(|error| error.to_string())?;
-                        progress()?;
-                        check.check().map_err(|error| error.to_string())
-                    })
-                    .map_err(|error| error.to_string())?;
-                check.check().map_err(|error| error.to_string())?;
-                if value.within_budget {
-                    Ok(())
-                } else {
-                    Err("MMMM_DEFINITION_STARTUP_DISK_BUDGET".into())
-                }
-            }) {
-                Ok(capture) => capture,
-                Err(original) => {
-                    let mut error = DefinitionStartupError::new("PROCESS");
-                    error.process_started = None;
-                    error.process_error = Some(Box::new(original));
-                    error.source_pins = Some(source_pins);
-                    error.post_check_error =
-                        post_check(&mut pins, build, &check).err().map(Box::new);
-                    return Err(error);
-                }
-            };
-        let outcome = capture.outcome();
-        if !capture.process_started()
-            || outcome.command_exit != Some(0)
-            || outcome.command_signal.is_some()
-            || !outcome.drained
-            || !outcome.output_complete
-            || !outcome.supervisor_errors.is_empty()
-            || outcome.termination_reason != process::TerminationReason::Completed
-            || outcome.owned_tail_terminated
-        {
-            let mut error = DefinitionStartupError::new("PROCESS_INCOMPLETE");
-            error.post_check_error = post_check(&mut pins, build, &check).err().map(Box::new);
-            return Err(attach(error, capture, source_pins, None));
-        }
-        let mut capture_ownership_error = None;
-        let raw = match capture.read_stdout(MAX_FRAME_BYTES, || {
-            check.check().map_err(|error| error.to_string())?;
-            if let Err(original) = build.check_current_ownership() {
-                capture_ownership_error = Some(original);
-                return Err("MMMM_DEFINITION_STARTUP_OWNERSHIP".into());
-            }
-            check.check().map_err(|error| error.to_string())
-        }) {
-            Ok(raw) => raw,
-            Err(original) => {
-                let mut error = DefinitionStartupError::new("CAPTURE");
-                error.process_error = Some(Box::new(original));
-                error.storage_error = capture_ownership_error.map(Box::new);
-                error.post_check_error = post_check(&mut pins, build, &check).err().map(Box::new);
-                return Err(attach(error, capture, source_pins, None));
-            }
-        };
-        for pin in &mut pins {
-            if let Err(error) = pin.recheck(&check) {
-                return Err(attach(error, capture, source_pins, Some(raw)));
-            }
-        }
-        if let Err(error) = measure(build, &check) {
-            return Err(attach(error, capture, source_pins, Some(raw)));
-        }
-        if let Err(error) = check.check() {
-            return Err(attach(error, capture, source_pins, Some(raw)));
-        }
-        let summary = match decode_abi2(&raw) {
-            Ok(summary) => summary,
-            Err(error) => {
-                return Err(attach(error, capture, source_pins, Some(raw)));
-            }
-        };
-        if let Err(error) = check.check() {
-            return Err(attach(error, capture, source_pins, Some(raw)));
-        }
-        let raw_sha256 = format!("{:x}", Sha256::digest(&raw));
-        if let Err(error) = check.check() {
-            return Err(attach(error, capture, source_pins, Some(raw)));
-        }
-        // Converting releases the original stdout handle. Input and ancestor
-        // handles remain held until this function returns, before root cleanup.
-        Ok(DefinitionStartupRun {
-            process_started: capture.process_started(),
-            outcome: capture.into_outcome(),
-            source_pins,
-            raw_abi2: raw,
-            raw_sha256,
-            summary,
-        })
+        run_with_pins::<InputPin>(build, selection, cancellation)
     }
 }
-
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 struct Reader<'a> {
     bytes: &'a [u8],
     position: usize,
 }
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 impl<'a> Reader<'a> {
     fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, position: 0 }
@@ -965,11 +1124,11 @@ impl<'a> Reader<'a> {
         require(self.position == self.bytes.len())
     }
 }
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 fn frame_error() -> DefinitionStartupError {
     DefinitionStartupError::new("FRAME")
 }
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 fn require(condition: bool) -> Result<(), DefinitionStartupError> {
     if condition {
         Ok(())
@@ -978,7 +1137,7 @@ fn require(condition: bool) -> Result<(), DefinitionStartupError> {
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 struct Definition<'a> {
     id: u64,
     generation: u64,
@@ -997,7 +1156,7 @@ struct Definition<'a> {
     static_target: bool,
     instance_run: bool,
 }
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 fn definition(bytes: &[u8], kind: u8) -> Result<Definition<'_>, DefinitionStartupError> {
     require(!bytes.is_empty() && bytes.len() <= 8 * 1024 * 1024)?;
     let mut r = Reader::new(bytes);
@@ -1088,7 +1247,7 @@ fn definition(bytes: &[u8], kind: u8) -> Result<Definition<'_>, DefinitionStartu
         instance_run,
     })
 }
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 fn summary(definition: &Definition<'_>) -> FixtureDefinitionSummary {
     FixtureDefinitionSummary {
         class_identity: definition.id.to_string(),
@@ -1099,12 +1258,12 @@ fn summary(definition: &Definition<'_>) -> FixtureDefinitionSummary {
         constant_pool_count: definition.cp_count,
     }
 }
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 fn hidden_name(name: &str, prefix: &str) -> bool {
     name.strip_prefix(prefix)
         .is_some_and(|suffix| !suffix.is_empty() && !suffix.contains('/'))
 }
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 fn decode_abi2(bytes: &[u8]) -> Result<DefinitionFixtureSummary, DefinitionStartupError> {
     require(!bytes.is_empty() && bytes.len() <= MAX_FRAME_BYTES)?;
     let mut outer = Reader::new(bytes);

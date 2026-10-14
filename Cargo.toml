@@ -10,6 +10,7 @@ members = [
     "crates/mmmm-compiler",
     "crates/mmmm-planner",
     "crates/mmmm-game-observer",
+    "crates/mmmm-native-process",
 ]
 resolver = "3"
 

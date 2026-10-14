@@ -6,6 +6,9 @@
 //! the cooperative ownership boundary.
 use super::ProcessError;
 
+#[path = "linux_pidfd.rs"]
+mod pidfd;
+
 const STAT_BYTES: usize = 8192;
 const ROLLUP_BYTES: usize = 32 * 1024;
 #[cfg(target_os = "linux")]
@@ -78,6 +81,16 @@ fn settle_member(
     memory: Option<Result<u64, ProcessError>>,
     is_leader: bool,
 ) -> Result<Option<MemberSample>, ProcessError> {
+    settle_member_with_terminal(before, after, memory, is_leader, None)
+}
+
+fn settle_member_with_terminal(
+    before: Stat,
+    after: Option<Stat>,
+    memory: Option<Result<u64, ProcessError>>,
+    is_leader: bool,
+    terminal: Option<&pidfd::TerminalWitness>,
+) -> Result<Option<MemberSample>, ProcessError> {
     if after.is_none() && is_leader {
         return Err(ProcessError::new(
             "process_identity",
@@ -87,7 +100,10 @@ fn settle_member(
     if let Some(after) = after {
         verify_identity(before, after)?;
     }
-    let live = after.is_some_and(|stat| !stat.definitely_exited());
+    let kernel_terminal = after.is_some_and(|after| {
+        terminal.is_some_and(|witness| witness.matches(before.identity, after.identity))
+    });
+    let live = after.is_some_and(|stat| !stat.definitely_exited()) && !kernel_terminal;
     let rss = match memory {
         Some(Ok(rss)) => Some(rss),
         Some(Err(error)) if live => return Err(error),
@@ -491,15 +507,16 @@ mod native {
             };
             // The held leader is observed explicitly, using its original stat
             // FD. Enumeration is only for the remaining process candidates.
-            let leader_sample = match observe_member(&mut self.leader, include_rss, true) {
-                Ok(sample) => sample,
-                Err(error) => {
-                    if error.kind == "process_identity" {
-                        self.reservation_valid = false;
+            let leader_sample =
+                match observe_member(&self.root, &mut self.leader, include_rss, true) {
+                    Ok(sample) => sample,
+                    Err(error) => {
+                        if error.kind == "process_identity" {
+                            self.reservation_valid = false;
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
-                }
-            };
+                };
             if let Some(member) = leader_sample {
                 push(&mut sample, member)?;
             }
@@ -531,7 +548,7 @@ mod native {
                     continue;
                 }
                 let read_rss = include_rss && sample.live_processes < LIVE_LIMIT;
-                if let Some(member) = observe_member(&mut member, read_rss, false)? {
+                if let Some(member) = observe_member(&self.root, &mut member, read_rss, false)? {
                     push(&mut sample, member)?;
                 }
             }
@@ -572,6 +589,7 @@ mod native {
     }
 
     fn observe_member(
+        root: &File,
         process: &mut ProcDirectory,
         include_rss: bool,
         is_leader: bool,
@@ -589,18 +607,57 @@ mod native {
         if before.definitely_exited() {
             return Ok(None);
         }
+        // Only an already identified member can bind a process-lifetime FD.
+        // Binding is optional: unsupported syscalls or uncertain namespace /
+        // mount metadata never turn a later RSS error into a successful sample.
+        let bound = if include_rss {
+            match pidfd::bind(
+                root,
+                &process.directory,
+                &mut process.stat,
+                before,
+                |file| read_stat(file, pid, role),
+            )? {
+                pidfd::Binding::Bound(bound) => Some(bound),
+                pidfd::Binding::Unavailable(reason) => {
+                    // Keep the closed reason distinct inside the producer;
+                    // it is not a replacement for the actual RSS failure.
+                    let _ = reason;
+                    None
+                }
+                pidfd::Binding::OriginalGone => return unavailable_member(is_leader),
+            }
+        } else {
+            None
+        };
         let memory = if include_rss {
             Some(read_rollup(&process.directory, role))
         } else {
             None
         };
         let after = read_stat(&mut process.stat, pid, role)?;
+        if let Some(after) = after {
+            verify_identity(before, after)?;
+        }
+        // Exactly one nonblocking kernel check, after an actual RSS failure.
+        // The witness requires a matching post-RSS original stat identity;
+        // losing the leader reservation cannot be repaired with a pidfd.
+        let terminal = match (&memory, after, bound.as_ref()) {
+            (Some(Err(_)), Some(after), Some(bound)) if !after.definitely_exited() => {
+                bound.terminal_after(after.identity)
+            }
+            _ => None,
+        };
         // smaps_rollup ESRCH/ENOENT alone never proves death: a live original
         // stat identity makes that exact RSS observation error fatal.
         // Successful RSS stays an observed fact even when this process exits
         // immediately afterwards. Its live count may drop; its measured RSS
         // and VM must not disappear from the resource budget evidence.
-        settle_member(before, after, memory, is_leader)
+        if let Some(terminal) = terminal.as_ref() {
+            settle_member_with_terminal(before, after, memory, is_leader, Some(terminal))
+        } else {
+            settle_member(before, after, memory, is_leader)
+        }
     }
 
     fn unavailable_member(is_leader: bool) -> Result<Option<MemberSample>, ProcessError> {
@@ -688,6 +745,40 @@ mod native {
             )
         })?;
         parse_rollup(&bytes)
+    }
+
+    // Native regression tests reuse the real anchored producers. This private
+    // test boundary cannot synthesize an identity, terminal witness or raw FD.
+    #[cfg(test)]
+    pub(super) fn test_open_member(
+        root: &File,
+        pid: i32,
+        role: ProcessRole,
+    ) -> Result<Option<(File, File, Stat)>, ProcessError> {
+        open_process(root, pid, role)
+            .map(|member| member.map(|member| (member.directory, member.stat, member.initial)))
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_read_stat(
+        file: &mut File,
+        pid: i32,
+        role: ProcessRole,
+    ) -> Result<Option<Stat>, ProcessError> {
+        read_stat(file, pid, role)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_metadata(
+        directory: &File,
+        file: MetadataRole,
+        role: ProcessRole,
+    ) -> Result<Option<u64>, ProcessError> {
+        match file {
+            MetadataRole::Stat => open_file(directory, file, role).map(|_| None),
+            MetadataRole::RssRollup => read_rollup(directory, role).map(Some),
+            MetadataRole::PidDirectory => Err(metadata("test metadata role is not a file")),
+        }
     }
 
     fn open_file(

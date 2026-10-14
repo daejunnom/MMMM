@@ -8,6 +8,7 @@ publish.workspace = true
 description = "Authenticated local MMMM Coordinator and shared service boundary"
 
 [dependencies]
+mmmm-native-process = { path = "../mmmm-native-process" }
 mmmm-application = { path = "../mmmm-application" }
 mmmm-adapters = { path = "../mmmm-adapters" }
 mmmm-compiler = { path = "../mmmm-compiler" }

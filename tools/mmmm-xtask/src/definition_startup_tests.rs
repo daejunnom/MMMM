@@ -887,12 +887,16 @@ fn test_selection() -> TestSelection {
 fn test_selected(
     value: &TestSelection,
 ) -> Result<DefinitionStartupSelection, DefinitionStartupError> {
-    DefinitionStartupSelection::new(
-        value.java.clone(),
-        value.dll.clone(),
-        value.jar.clone(),
-        value.sources.clone(),
-    )
+    // Keep the established Windows role grammar explicit on every test OS.
+    // Unix role selection has its own independent fixtures below.
+    let selection = DefinitionStartupSelection {
+        java_exe: value.java.clone(),
+        observer_dll: value.dll.clone(),
+        observer_jar: value.jar.clone(),
+        source_inputs: value.sources.clone(),
+    };
+    selected_inputs_for_platform(&selection, StartupPlatform::Windows)?;
+    Ok(selection)
 }
 
 #[test]
@@ -900,7 +904,7 @@ fn startup_java_argv_is_fixed_and_retains_spaced_paths_as_single_arguments() {
     use std::ffi::OsString;
     let dll = test_rooted("owned files/observer.dll");
     let jar = test_rooted("owned files/observer.jar");
-    let args = fixed_java_args(&dll, &jar);
+    let args = fixed_java_args(&dll, &jar, StartupPlatform::Windows);
     let mut native = OsString::from("-agentpath:");
     native.push(&dll);
     native.push("=jdk25-windows-x64-msvc-controlled-startup-v1");
@@ -982,7 +986,8 @@ fn startup_environment_adds_empty_overrides_to_an_empty_caller_map() {
 #[test]
 fn startup_selection_accepts_required_roles_without_filesystem_access() {
     let selection = test_selected(&test_selection()).expect("lexical owned selection is valid");
-    let inputs = selected_inputs(&selection).expect("validated input roles remain available");
+    let inputs = selected_inputs_for_platform(&selection, StartupPlatform::Windows)
+        .expect("validated input roles remain available");
     assert_eq!(inputs.len(), 7);
     assert_eq!(inputs[0].0, DefinitionSourceRole::JavaExecutable);
     assert_eq!(inputs[1].0, DefinitionSourceRole::ObserverLibrary);
@@ -1234,5 +1239,88 @@ fn startup_selection_rejects_named_streams_and_win32_normalization_aliases_lexic
             ),
         ];
         assert!(test_selected(&value).is_err());
+    }
+}
+
+#[test]
+fn startup_role_grammar_and_marker_match_each_supported_platform() {
+    for (platform, java, library, archive, marker) in [
+        (
+            StartupPlatform::Windows,
+            "java.exe",
+            "observer.dll",
+            "jdk.zip",
+            "jdk25-windows-x64-msvc-controlled-startup-v1",
+        ),
+        (
+            StartupPlatform::Linux,
+            "java",
+            "observer.so",
+            "jdk.tar.gz",
+            "jdk25-linux-x64-gnu-controlled-startup-v1",
+        ),
+        (
+            StartupPlatform::Macos,
+            "java",
+            "observer.dylib",
+            "jdk.tar.gz",
+            "jdk25-macos-arm64-darwin-controlled-startup-v1",
+        ),
+    ] {
+        let selection = DefinitionStartupSelection {
+            java_exe: test_rooted(&format!("jdk/bin/{java}")),
+            observer_dll: test_rooted(library),
+            observer_jar: test_rooted("observer.jar"),
+            source_inputs: vec![
+                test_source(DefinitionSourceRole::JdkArchive, archive),
+                test_source(DefinitionSourceRole::JdkModules, "jdk/lib/modules"),
+                test_source(
+                    DefinitionSourceRole::JdkLibrary,
+                    &format!("jdk/lib/{library}"),
+                ),
+                test_source(DefinitionSourceRole::BuildSourceManifest, "source.json"),
+            ],
+        };
+        assert_eq!(
+            selected_inputs_for_platform(&selection, platform)
+                .unwrap()
+                .len(),
+            7
+        );
+        let args = fixed_java_args(&selection.observer_dll, &selection.observer_jar, platform);
+        let mut expected = std::ffi::OsString::from("-agentpath:");
+        expected.push(&selection.observer_dll);
+        expected.push("=");
+        expected.push(marker);
+        if platform == StartupPlatform::Windows {
+            assert_eq!(args.len(), 17);
+            assert_eq!(args[12], expected);
+        } else {
+            assert_eq!(args.len(), 19);
+            assert_eq!(args[12], std::ffi::OsString::from("-XX:-UsePerfData"));
+            assert_eq!(args[13], std::ffi::OsString::from("-Djava.io.tmpdir=."));
+            assert_eq!(args[14], expected);
+        }
+        for other in [
+            StartupPlatform::Windows,
+            StartupPlatform::Linux,
+            StartupPlatform::Macos,
+        ] {
+            if other != platform {
+                assert!(selected_inputs_for_platform(&selection, other).is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn unix_role_names_are_exact_and_do_not_reinterpret_windows_or_versioned_libraries() {
+    for platform in [StartupPlatform::Linux, StartupPlatform::Macos] {
+        assert!(!platform.role_name(DefinitionSourceRole::JavaExecutable, "JAVA"));
+        assert!(!platform.role_name(DefinitionSourceRole::JavaExecutable, "java.exe"));
+        assert!(!platform.role_name(DefinitionSourceRole::JdkArchive, "jdk.zip"));
+        assert!(!platform.role_name(DefinitionSourceRole::JdkArchive, "jdk.tar"));
+        assert!(!platform.role_name(DefinitionSourceRole::ObserverLibrary, "observer.dll"));
+        assert!(!platform.role_name(DefinitionSourceRole::ObserverLibrary, "observer.so.1"));
     }
 }
