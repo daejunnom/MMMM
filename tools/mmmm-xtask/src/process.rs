@@ -622,7 +622,20 @@ fn supervise_with_progress_captured_phased(
                 outcome.termination_reason = TerminationReason::SupervisorFailure;
             }
         }
-        if leader.is_some() && scope_empty && (capture_failed || process.outputs_closed()) {
+        #[cfg(target_os = "linux")]
+        let resource_observation_pending =
+            failure_checks_active(&outcome, stopping_at) && process.resource_observation_pending();
+        #[cfg(not(target_os = "linux"))]
+        let resource_observation_pending = false;
+        // A count-only empty observation cannot complete an unresolved RSS
+        // sample. Keep the reservation until the next normally scheduled
+        // resource observation resolves it, or a finite failure stops it.
+        // Physical drain after a hard failure remains independent.
+        if leader.is_some()
+            && scope_empty
+            && !resource_observation_pending
+            && (capture_failed || process.outputs_closed())
+        {
             match process.reap() {
                 Ok(()) => outcome.drained = true,
                 Err(error) => {
@@ -1867,7 +1880,9 @@ mod native {
         pub(super) fn scope_empty(&mut self) -> Result<bool, ProcessError> {
             #[cfg(target_os = "linux")]
             {
-                Ok(self.linux_sample(false)?.live_processes == 0)
+                self.linux_sample(false)
+                    .map(|observation| observation.scope_empty())
+                    .map_err(|error| self.resources.with_linux_pending_diagnostics(error))
             }
             #[cfg(target_os = "macos")]
             {
@@ -1926,32 +1941,41 @@ mod native {
         }
         #[cfg(target_os = "linux")]
         pub(super) fn observe_resources(&mut self) -> Result<(), ProcessError> {
-            if self.resources.due() {
-                let include_rss = self.resources.requires_linux_rss();
-                let sample = self.linux_sample(include_rss)?;
-                if include_rss {
-                    self.resources.record_linux_jvm(
-                        sample.live_processes,
-                        sample.aggregate_rss_bytes,
-                        sample.max_virtual_bytes,
-                    )?;
-                } else {
-                    self.resources.record_linux(sample.live_processes)?;
+            let result = (|| {
+                if !self.resources.begin_linux_sample()? {
+                    return Ok(());
                 }
-            }
-            Ok(())
+                let include_rss = self.resources.requires_linux_rss();
+                let observation = self.linux_sample(include_rss)?;
+                self.resources.finish_linux_sample(observation)
+            })();
+            result.map_err(|error| self.resources.with_linux_pending_diagnostics(error))
+        }
+        #[cfg(target_os = "linux")]
+        pub(super) fn resource_observation_pending(&self) -> bool {
+            self.resources.linux_pending()
         }
         #[cfg(target_os = "linux")]
         fn linux_sample(
             &mut self,
             include_rss: bool,
-        ) -> Result<linux_resources::Sample, ProcessError> {
+        ) -> Result<linux_resources::GroupObservation, ProcessError> {
             let group = self.linux_group.as_mut().ok_or_else(|| {
                 ProcessError::new("process_identity", "missing anchored Linux group identity")
             })?;
-            let result = group.sample(include_rss);
+            let mut pending = None;
+            let result = group.sample(
+                include_rss,
+                self.reservation_valid && !self.reaped,
+                &mut pending,
+            );
             if !group.reservation_valid() {
                 self.reservation_valid = false;
+            }
+            // Merge once on both success and failure, before propagating a
+            // later enumeration/member/identity or partial-budget error.
+            if let Some(observation) = pending {
+                self.resources.record_linux_pending_fact(observation);
             }
             result
         }

@@ -346,10 +346,12 @@ fn measured_rss_and_vm_remain_in_peaks_when_kernel_terminal_is_known() {
     let mut sample = Sample {
         live_processes: 0,
         aggregate_rss_bytes: Some(0),
+        known_rss_bytes: 0,
         max_virtual_bytes: 0,
     };
     push(&mut sample, member).unwrap();
     assert_eq!(sample.live_processes, 0);
     assert_eq!(sample.aggregate_rss_bytes, Some(measured));
+    assert_eq!(sample.known_rss_bytes, measured);
     assert_eq!(sample.max_virtual_bytes, after.virtual_bytes);
 }

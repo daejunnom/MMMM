@@ -504,7 +504,13 @@ fn blocked_raw_stderr_never_acknowledges() {
     scenario.drain();
     let mut delivered = Vec::new();
     output_eof(&mut scenario.output, &mut delivered);
-    assert!(!delivered.is_empty() && delivered.len() < bytes.len());
+    assert!(
+        !delivered.is_empty() && delivered.len() < bytes.len(),
+        "blocked raw stderr delivery witness: delivered_bytes={}; requested_bytes={}; write_error={}; write_deadline_ms=200; drain_completed=true",
+        delivered.len(),
+        bytes.len(),
+        error.code,
+    );
     assert!(delivered.iter().all(|b| *b == 0x5A));
 }
 

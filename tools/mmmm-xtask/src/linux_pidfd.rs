@@ -4,6 +4,7 @@
 //! pidfd, verifies its positive Pid through the original procfs namespace, and
 //! rereads the original stat FD before accepting a single nonblocking poll.
 use super::Identity;
+use serde::Serialize;
 use std::fmt;
 
 const FDINFO_BYTES: usize = 4096;
@@ -13,14 +14,15 @@ const POLL_HUP: i16 = 0x0010;
 
 /// Closed secondary observations. These carry no process, path, fdinfo or
 /// process-lifetime authority, and never replace an original metadata error.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub(in super::super) struct Diagnostic {
     phase: DiagnosticPhase,
     category: DiagnosticCategory,
     native_errno: Option<i32>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(in super::super) enum DiagnosticPhase {
     InputIdentity,
     ProcRootFilesystem,
@@ -85,7 +87,8 @@ impl DiagnosticPhase {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(in super::super) enum DiagnosticCategory {
     Terminal,
     NotReady,
@@ -131,6 +134,12 @@ impl DiagnosticCategory {
 }
 
 impl Diagnostic {
+    pub(super) fn terminal_not_ready(self) -> bool {
+        self.phase == DiagnosticPhase::TerminalPoll
+            && self.category == DiagnosticCategory::NotReady
+            && self.native_errno.is_none()
+    }
+
     pub(in super::super) const fn new(
         phase: DiagnosticPhase,
         category: DiagnosticCategory,

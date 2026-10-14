@@ -5,6 +5,7 @@
 //! snapshot nor a kernel resident-memory quota. Detached sessions are outside
 //! the cooperative ownership boundary.
 use super::ProcessError;
+use serde::Serialize;
 use std::fmt;
 
 #[path = "linux_pidfd.rs"]
@@ -39,7 +40,8 @@ impl Stat {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum StatState {
     Running,
     Sleeping,
@@ -75,7 +77,7 @@ impl StatState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 struct IdentityMatches {
     pid: bool,
     start_ticks: bool,
@@ -94,7 +96,8 @@ impl IdentityMatches {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum PidfdBindingState {
     NotRequiredBySample,
     NotAttempted,
@@ -107,7 +110,7 @@ enum PidfdBindingState {
 /// Diagnostic-only facts from reads the observer already performed. No native
 /// identity values, path, comm or original procfs tokens are retained here.
 /// Missing observations stay absent and grant no exit or drain authority.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub(super) struct StatDiagnostic {
     role: ProcessRole,
     before_state: Option<StatState>,
@@ -218,7 +221,137 @@ impl fmt::Display for StatDiagnostic {
 pub(super) struct Sample {
     pub live_processes: usize,
     pub aggregate_rss_bytes: Option<u64>,
+    // Only actually read RSS values contribute. This remains a lower bound
+    // when one member is Pending; it never becomes a complete RSS sample.
+    pub known_rss_bytes: u64,
     pub max_virtual_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum GroupObservation {
+    Complete(Sample),
+    Pending(Sample),
+}
+
+impl GroupObservation {
+    pub(super) fn scope_empty(&self) -> bool {
+        matches!(self, Self::Complete(sample) if sample.live_processes == 0)
+    }
+}
+
+/// Only closed facts from the actual failed RSS read and its existing stat /
+/// pidfd observations. No native identity or terminal witness is retained.
+#[derive(Clone, Debug, Serialize)]
+pub struct PendingObservation {
+    original_error_kind: &'static str,
+    original_error: String,
+    original_drained: bool,
+    stat_observation: StatDiagnostic,
+}
+
+impl PendingObservation {
+    fn new(error: ProcessError, stat_observation: StatDiagnostic) -> Self {
+        Self {
+            original_error_kind: error.kind,
+            original_error: error.message,
+            original_drained: error.drained,
+            stat_observation,
+        }
+    }
+
+    pub(super) fn original_error(&self) -> ProcessError {
+        let mut error = ProcessError::new(self.original_error_kind, &self.original_error);
+        error.drained = self.original_drained;
+        if let Some(observation) = self.stat_observation.pidfd_terminal_observation {
+            error = error.with_linux_pidfd_diagnostic(observation);
+        }
+        error.with_linux_stat_diagnostic(self.stat_observation)
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PendingHistory {
+    pub(super) count: u64,
+    pub(super) first: PendingObservation,
+    pub(super) last: PendingObservation,
+}
+
+impl PendingHistory {
+    pub(super) fn record(history: &mut Option<Box<Self>>, observation: PendingObservation) {
+        if let Some(history) = history {
+            history.count = history.count.saturating_add(1);
+            history.last = observation;
+        } else {
+            *history = Some(Box::new(Self {
+                count: 1,
+                first: observation.clone(),
+                last: observation,
+            }));
+        }
+    }
+}
+
+enum RssFailure {
+    Open(std::io::Error),
+    Read(std::io::Error),
+    Parse(ProcessError),
+}
+
+impl RssFailure {
+    fn open_esrch(&self) -> bool {
+        matches!(self, Self::Open(error) if error.raw_os_error() == Some(3))
+    }
+
+    fn into_process_error(self, role: ProcessRole) -> ProcessError {
+        match self {
+            Self::Open(error) => metadata_io_error(
+                role,
+                MetadataRole::RssRollup,
+                MetadataOperation::Open,
+                error,
+            ),
+            Self::Read(error) => metadata_io_error(
+                role,
+                MetadataRole::RssRollup,
+                MetadataOperation::Read,
+                error,
+            ),
+            Self::Parse(error) => error,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PendingConditions {
+    reserved_leader: bool,
+    reservation_valid: bool,
+    bound_validated: bool,
+    terminal: Option<PidfdDiagnostic>,
+}
+
+// This predicate grants no exit, drain or complete-sample authority. The
+// native caller supplies these conditions only from its held reservation and
+// an actual already validated whole-thread-group pidfd check.
+fn pending_leader_transition(
+    original: Identity,
+    before: Stat,
+    after: Option<Stat>,
+    failure: &RssFailure,
+    conditions: PendingConditions,
+) -> bool {
+    conditions.reserved_leader
+        && conditions.reservation_valid
+        && conditions.bound_validated
+        && conditions
+            .terminal
+            .is_some_and(PidfdDiagnostic::terminal_not_ready)
+        && before.identity == original
+        && before.state == b'Z'
+        && before.threads == 2
+        && after.is_some_and(|after| {
+            after.identity == original && after.state == b'Z' && after.threads == 2
+        })
+        && failure.open_esrch()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -226,6 +359,36 @@ struct MemberSample {
     live: bool,
     virtual_bytes: u64,
     rss: Option<u64>,
+}
+
+enum MemberObservation {
+    Settled(Option<MemberSample>),
+    Pending(MemberSample, Box<PendingObservation>),
+}
+
+fn accumulate(
+    sample: &mut Sample,
+    observation: MemberObservation,
+    pending: &mut Option<PendingObservation>,
+) -> Result<(), ProcessError> {
+    match observation {
+        MemberObservation::Settled(Some(member)) => push(sample, member)?,
+        MemberObservation::Settled(None) => {}
+        MemberObservation::Pending(member, observation) => {
+            // Retain this fact before any subsequent partial budget,
+            // enumeration, member or final leader check can fail.
+            *pending = Some(*observation);
+            push(sample, member)?;
+        }
+    }
+    if pending.is_some() {
+        super::resource_policy::check_linux_jvm_budget(
+            sample.live_processes,
+            Some(sample.known_rss_bytes),
+            sample.max_virtual_bytes,
+        )?;
+    }
+    Ok(())
 }
 
 fn push(sample: &mut Sample, member: MemberSample) -> Result<(), ProcessError> {
@@ -236,6 +399,12 @@ fn push(sample: &mut Sample, member: MemberSample) -> Result<(), ProcessError> {
             .ok_or_else(|| metadata("native live process count overflow"))?;
     }
     sample.max_virtual_bytes = sample.max_virtual_bytes.max(member.virtual_bytes);
+    if let Some(rss) = member.rss {
+        sample.known_rss_bytes = sample
+            .known_rss_bytes
+            .checked_add(rss)
+            .ok_or_else(|| metadata("native RSS sum overflow"))?;
+    }
     sample.aggregate_rss_bytes = match (sample.aggregate_rss_bytes, member.rss) {
         (Some(sum), Some(rss)) => Some(
             sum.checked_add(rss)
@@ -299,7 +468,8 @@ fn metadata(message: &'static str) -> ProcessError {
     ProcessError::new("resource_observation", message)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum ProcessRole {
     ReservedLeader,
     EnumeratedCandidate,
@@ -671,29 +841,38 @@ mod native {
         pub(in super::super) fn sample(
             &mut self,
             include_rss: bool,
-        ) -> Result<Sample, ProcessError> {
+            held_child_reservation_valid: bool,
+            pending: &mut Option<PendingObservation>,
+        ) -> Result<GroupObservation, ProcessError> {
+            // This output belongs only to this scan, including its failure
+            // path. Prior observations live in the tracker, never here.
+            *pending = None;
             let leader_before = self.check_leader()?;
             let group = leader_before.identity.pid;
             let mut sample = Sample {
                 live_processes: 0,
                 aggregate_rss_bytes: include_rss.then_some(0),
+                known_rss_bytes: 0,
                 max_virtual_bytes: 0,
             };
             // The held leader is observed explicitly, using its original stat
             // FD. Enumeration is only for the remaining process candidates.
-            let leader_sample =
-                match observe_member(&self.root, &mut self.leader, include_rss, true) {
-                    Ok(sample) => sample,
-                    Err(error) => {
-                        if error.kind == "process_identity" {
-                            self.reservation_valid = false;
-                        }
-                        return Err(error);
+            let leader_sample = match observe_member(
+                &self.root,
+                &mut self.leader,
+                include_rss,
+                true,
+                self.reservation_valid && held_child_reservation_valid,
+            ) {
+                Ok(sample) => sample,
+                Err(error) => {
+                    if error.kind == "process_identity" {
+                        self.reservation_valid = false;
                     }
-                };
-            if let Some(member) = leader_sample {
-                push(&mut sample, member)?;
-            }
+                    return Err(error);
+                }
+            };
+            accumulate(&mut sample, leader_sample, pending)?;
             let mut entries = DirectoryEntries::new(&self.root)?;
             let mut observed_entries = 0usize;
             while let Some(name) = entries.next()? {
@@ -722,12 +901,21 @@ mod native {
                     continue;
                 }
                 let read_rss = include_rss && sample.live_processes < LIVE_LIMIT;
-                if let Some(member) = observe_member(&self.root, &mut member, read_rss, false)? {
-                    push(&mut sample, member)?;
-                }
+                let observation = observe_member(
+                    &self.root,
+                    &mut member,
+                    read_rss,
+                    false,
+                    self.reservation_valid && held_child_reservation_valid,
+                )?;
+                accumulate(&mut sample, observation, pending)?;
             }
             self.check_leader()?;
-            Ok(sample)
+            Ok(if pending.is_some() {
+                GroupObservation::Pending(sample)
+            } else {
+                GroupObservation::Complete(sample)
+            })
         }
 
         fn check_leader(&mut self) -> Result<Stat, ProcessError> {
@@ -767,7 +955,8 @@ mod native {
         process: &mut ProcDirectory,
         include_rss: bool,
         is_leader: bool,
-    ) -> Result<Option<MemberSample>, ProcessError> {
+        reservation_valid: bool,
+    ) -> Result<MemberObservation, ProcessError> {
         let role = if is_leader {
             ProcessRole::ReservedLeader
         } else {
@@ -775,8 +964,15 @@ mod native {
         };
         let mut diagnostic =
             StatDiagnostic::observed(role, process.initial.identity, None, None, include_rss);
-        observe_member_with_facts(root, process, include_rss, is_leader, &mut diagnostic)
-            .map_err(|error| error.with_linux_stat_diagnostic(diagnostic))
+        observe_member_with_facts(
+            root,
+            process,
+            include_rss,
+            is_leader,
+            reservation_valid,
+            &mut diagnostic,
+        )
+        .map_err(|error| error.with_linux_stat_diagnostic(diagnostic))
     }
 
     fn observe_member_with_facts(
@@ -784,8 +980,9 @@ mod native {
         process: &mut ProcDirectory,
         include_rss: bool,
         is_leader: bool,
+        reservation_valid: bool,
         diagnostic: &mut StatDiagnostic,
-    ) -> Result<Option<MemberSample>, ProcessError> {
+    ) -> Result<MemberObservation, ProcessError> {
         let pid = process.initial.identity.pid;
         let role = if is_leader {
             ProcessRole::ReservedLeader
@@ -793,12 +990,12 @@ mod native {
             ProcessRole::OwnedMember
         };
         let Some(before) = read_stat(&mut process.stat, pid, role)? else {
-            return unavailable_member(is_leader);
+            return unavailable_member(is_leader).map(MemberObservation::Settled);
         };
         diagnostic.record_stats(process.initial.identity, Some(before), None);
         verify_identity(process.initial, before)?;
         if before.definitely_exited() {
-            return Ok(None);
+            return Ok(MemberObservation::Settled(None));
         }
         // Only an already identified member can bind a process-lifetime FD.
         // Binding is optional: unsupported syscalls or uncertain namespace /
@@ -827,7 +1024,7 @@ mod native {
                 }
                 Ok(pidfd::Binding::OriginalGone) => {
                     diagnostic.pidfd_binding = PidfdBindingState::OriginalGone;
-                    return unavailable_member(is_leader);
+                    return unavailable_member(is_leader).map(MemberObservation::Settled);
                 }
                 Err(error) => {
                     diagnostic.pidfd_binding = PidfdBindingState::Failed;
@@ -838,7 +1035,7 @@ mod native {
             None
         };
         let memory = if include_rss {
-            Some(read_rollup(&process.directory, role))
+            Some(read_rollup(&process.directory))
         } else {
             None
         };
@@ -859,8 +1056,38 @@ mod native {
             }
             _ => None,
         };
-        // smaps_rollup ESRCH/ENOENT alone never proves death: a live original
-        // stat identity makes that exact RSS observation error fatal.
+        let memory = match memory {
+            Some(Err(failure))
+                if pending_leader_transition(
+                    process.initial.identity,
+                    before,
+                    after,
+                    &failure,
+                    PendingConditions {
+                        reserved_leader: is_leader,
+                        reservation_valid,
+                        bound_validated: bound.is_some(),
+                        terminal: diagnostic.pidfd_terminal_observation,
+                    },
+                ) =>
+            {
+                let error = failure.into_process_error(role);
+                return Ok(MemberObservation::Pending(
+                    MemberSample {
+                        live: true,
+                        virtual_bytes: before
+                            .virtual_bytes
+                            .max(after.map_or(0, |s| s.virtual_bytes)),
+                        rss: None,
+                    },
+                    Box::new(PendingObservation::new(error, *diagnostic)),
+                ));
+            }
+            result => result.map(|result| result.map_err(|error| error.into_process_error(role))),
+        };
+        // smaps_rollup ESRCH/ENOENT alone never proves death. Except for the
+        // narrow incomplete transition above, a live original stat identity
+        // makes that exact RSS observation error fatal.
         // Successful RSS stays an observed fact even when this process exits
         // immediately afterwards. Its live count may drop; its measured RSS
         // and VM must not disappear from the resource budget evidence.
@@ -870,9 +1097,11 @@ mod native {
         } else {
             settle_member(before, after, memory, is_leader)
         };
-        settled.map_err(|error| match (failed_rss, pidfd_diagnostic) {
-            (true, Some(diagnostic)) => error.with_linux_pidfd_diagnostic(diagnostic),
-            _ => error,
+        settled.map(MemberObservation::Settled).map_err(|error| {
+            match (failed_rss, pidfd_diagnostic) {
+                (true, Some(diagnostic)) => error.with_linux_pidfd_diagnostic(diagnostic),
+                _ => error,
+            }
         })
     }
 
@@ -950,17 +1179,13 @@ mod native {
         parse_stat(&bytes, pid).map(Some)
     }
 
-    fn read_rollup(directory: &File, role: ProcessRole) -> Result<u64, ProcessError> {
-        let mut file = open_file(directory, MetadataRole::RssRollup, role)?;
-        let bytes = read_bounded(&mut file, ROLLUP_BYTES).map_err(|error| {
-            metadata_io_error(
-                role,
-                MetadataRole::RssRollup,
-                MetadataOperation::Read,
-                error,
-            )
-        })?;
-        parse_rollup(&bytes)
+    fn read_rollup(directory: &File) -> Result<u64, RssFailure> {
+        let name = MetadataRole::RssRollup
+            .file_name()
+            .map_err(RssFailure::Parse)?;
+        let mut file = open_file_io(directory, name).map_err(RssFailure::Open)?;
+        let bytes = read_bounded(&mut file, ROLLUP_BYTES).map_err(RssFailure::Read)?;
+        parse_rollup(&bytes).map_err(RssFailure::Parse)
     }
 
     // Native regression tests reuse the real anchored producers. This private
@@ -992,7 +1217,9 @@ mod native {
     ) -> Result<Option<u64>, ProcessError> {
         match file {
             MetadataRole::Stat => open_file(directory, file, role).map(|_| None),
-            MetadataRole::RssRollup => read_rollup(directory, role).map(Some),
+            MetadataRole::RssRollup => read_rollup(directory)
+                .map(Some)
+                .map_err(|error| error.into_process_error(role)),
             MetadataRole::PidDirectory => Err(metadata("test metadata role is not a file")),
         }
     }
@@ -1003,6 +1230,11 @@ mod native {
         role: ProcessRole,
     ) -> Result<File, ProcessError> {
         let name = file.file_name()?;
+        open_file_io(directory, name)
+            .map_err(|error| metadata_io_error(role, file, MetadataOperation::Open, error))
+    }
+
+    fn open_file_io(directory: &File, name: &CStr) -> std::io::Result<File> {
         let descriptor = unsafe {
             libc::openat(
                 directory.as_raw_fd(),
@@ -1011,12 +1243,7 @@ mod native {
             )
         };
         if descriptor < 0 {
-            return Err(metadata_io_error(
-                role,
-                file,
-                MetadataOperation::Open,
-                std::io::Error::last_os_error(),
-            ));
+            return Err(std::io::Error::last_os_error());
         }
         Ok(unsafe { File::from_raw_fd(descriptor) })
     }
@@ -1135,7 +1362,7 @@ mod native {
 pub(super) use native::OwnedGroup;
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     fn stat_fields(state: char, threads: u64) -> Vec<String> {
@@ -1155,6 +1382,227 @@ mod tests {
 
     fn stat(state: char, threads: u64) -> Vec<u8> {
         render_stat("123", &stat_fields(state, threads))
+    }
+
+    fn pending_conditions() -> PendingConditions {
+        PendingConditions {
+            reserved_leader: true,
+            reservation_valid: true,
+            bound_validated: true,
+            terminal: Some(PidfdDiagnostic::new(
+                pidfd::DiagnosticPhase::TerminalPoll,
+                pidfd::DiagnosticCategory::NotReady,
+                None,
+            )),
+        }
+    }
+
+    // Reuse the existing parsed stat fixture. This has no native reservation,
+    // descriptor or exit authority and is available only in pure tests.
+    pub(in super::super) fn pending_observation() -> PendingObservation {
+        let before = parse_stat(&stat('Z', 2), 123).unwrap();
+        let mut diagnostic = StatDiagnostic::observed(
+            ProcessRole::ReservedLeader,
+            before.identity,
+            Some(before),
+            Some(before),
+            true,
+        );
+        diagnostic.pidfd_binding = PidfdBindingState::BoundValidated;
+        diagnostic.pidfd_terminal_observation = pending_conditions().terminal;
+        PendingObservation::new(
+            RssFailure::Open(std::io::Error::from_raw_os_error(3))
+                .into_process_error(ProcessRole::ReservedLeader),
+            diagnostic,
+        )
+    }
+
+    #[test]
+    fn pending_leader_requires_the_exact_observed_transition_and_never_proves_exit() {
+        let before = parse_stat(&stat('Z', 2), 123).unwrap();
+        let original = before.identity;
+        let failure = RssFailure::Open(std::io::Error::from_raw_os_error(3));
+        let conditions = pending_conditions();
+        assert!(pending_leader_transition(
+            original,
+            before,
+            Some(before),
+            &failure,
+            conditions
+        ));
+        // The old settlement remains fatal without the new incomplete policy.
+        assert!(
+            settle_member(
+                before,
+                Some(before),
+                Some(Err(pending_observation().original_error())),
+                true
+            )
+            .is_err()
+        );
+        for changed in [
+            Identity {
+                pid: original.pid + 1,
+                ..original
+            },
+            Identity {
+                start_ticks: original.start_ticks + 1,
+                ..original
+            },
+            Identity {
+                group: original.group + 1,
+                ..original
+            },
+            Identity {
+                session: original.session + 1,
+                ..original
+            },
+        ] {
+            let changed = Stat {
+                identity: changed,
+                ..before
+            };
+            assert!(!pending_leader_transition(
+                original,
+                changed,
+                Some(before),
+                &failure,
+                conditions
+            ));
+            assert!(!pending_leader_transition(
+                original,
+                before,
+                Some(changed),
+                &failure,
+                conditions
+            ));
+        }
+        for changed in [
+            parse_stat(&stat('S', 2), 123).unwrap(),
+            parse_stat(&stat('R', 2), 123).unwrap(),
+            parse_stat(&stat('X', 2), 123).unwrap(),
+            parse_stat(&stat('x', 2), 123).unwrap(),
+            parse_stat(&stat('Z', 1), 123).unwrap(),
+            parse_stat(&stat('Z', 3), 123).unwrap(),
+        ] {
+            assert!(!pending_leader_transition(
+                original,
+                changed,
+                Some(before),
+                &failure,
+                conditions
+            ));
+            assert!(!pending_leader_transition(
+                original,
+                before,
+                Some(changed),
+                &failure,
+                conditions
+            ));
+        }
+        assert!(!pending_leader_transition(
+            original, before, None, &failure, conditions
+        ));
+        for conditions in [
+            PendingConditions {
+                reserved_leader: false,
+                ..conditions
+            },
+            PendingConditions {
+                reservation_valid: false,
+                ..conditions
+            },
+            PendingConditions {
+                bound_validated: false,
+                ..conditions
+            },
+            PendingConditions {
+                terminal: None,
+                ..conditions
+            },
+        ] {
+            assert!(!pending_leader_transition(
+                original,
+                before,
+                Some(before),
+                &failure,
+                conditions
+            ));
+        }
+        for category in [
+            pidfd::DiagnosticCategory::Terminal,
+            pidfd::DiagnosticCategory::NativeFailure,
+            pidfd::DiagnosticCategory::UnexpectedPollEvents,
+            pidfd::DiagnosticCategory::UnexpectedPollResult,
+        ] {
+            let conditions = PendingConditions {
+                terminal: Some(PidfdDiagnostic::new(
+                    pidfd::DiagnosticPhase::TerminalPoll,
+                    category,
+                    None,
+                )),
+                ..conditions
+            };
+            assert!(!pending_leader_transition(
+                original,
+                before,
+                Some(before),
+                &failure,
+                conditions
+            ));
+        }
+        for terminal in [
+            PidfdDiagnostic::new(
+                pidfd::DiagnosticPhase::TerminalIdentity,
+                pidfd::DiagnosticCategory::NotReady,
+                None,
+            ),
+            PidfdDiagnostic::new(
+                pidfd::DiagnosticPhase::TerminalPoll,
+                pidfd::DiagnosticCategory::NotReady,
+                Some(3),
+            ),
+        ] {
+            assert!(!pending_leader_transition(
+                original,
+                before,
+                Some(before),
+                &failure,
+                PendingConditions {
+                    terminal: Some(terminal),
+                    ..conditions
+                }
+            ));
+        }
+        for failure in [
+            RssFailure::Open(std::io::Error::from_raw_os_error(2)),
+            RssFailure::Read(std::io::Error::from_raw_os_error(3)),
+            // Even identical text cannot masquerade as the typed native open.
+            RssFailure::Parse(pending_observation().original_error()),
+        ] {
+            assert!(!pending_leader_transition(
+                original,
+                before,
+                Some(before),
+                &failure,
+                conditions
+            ));
+            assert_eq!(
+                failure.into_process_error(ProcessRole::ReservedLeader).kind,
+                "resource_observation"
+            );
+        }
+        let actual = pending_observation();
+        let rendered = actual.original_error().to_string();
+        assert!(rendered.starts_with("resource_observation: native process metadata failed; process_role=reserved_leader; file_role=rss_rollup; operation=open;"));
+        assert!(rendered.contains("os_error=Some(3)"));
+        assert!(rendered.contains(
+            "pidfd_observation(phase=terminal_poll; category=not_ready; native_errno=None)"
+        ));
+        assert!(rendered.len() < 1280);
+        let closed = serde_json::to_string(&actual).unwrap();
+        assert!(!closed.contains("start_ticks\":456"));
+        assert!(!closed.contains("native ) comm"));
     }
 
     #[test]
@@ -1758,6 +2206,7 @@ mod tests {
         let mut sample = Sample {
             live_processes: 0,
             aggregate_rss_bytes: Some(0),
+            known_rss_bytes: 0,
             max_virtual_bytes: 0,
         };
         for _ in 0..LIVE_LIMIT {
@@ -1785,9 +2234,22 @@ mod tests {
         .unwrap();
         assert_eq!(sample.live_processes, LIVE_LIMIT + 1);
         assert_eq!(sample.aggregate_rss_bytes, None);
+        let known = sample.known_rss_bytes;
+        push(
+            &mut sample,
+            MemberSample {
+                live: true,
+                virtual_bytes: 0,
+                rss: Some(8192),
+            },
+        )
+        .unwrap();
+        assert_eq!(sample.aggregate_rss_bytes, None);
+        assert_eq!(sample.known_rss_bytes, known + 8192);
         let mut overflow = Sample {
             live_processes: 0,
             aggregate_rss_bytes: Some(u64::MAX),
+            known_rss_bytes: u64::MAX,
             max_virtual_bytes: 0,
         };
         assert!(
@@ -1813,6 +2275,100 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn pending_scan_preserves_other_members_lower_bounds_and_facts_before_hard_errors() {
+        use super::super::resource_policy::{JVM_VM_LIMIT, MEMORY_LIMIT};
+        let actual = parse_stat(&stat('Z', 2), 123).unwrap();
+        for member in [
+            MemberSample {
+                live: true,
+                virtual_bytes: actual.virtual_bytes,
+                rss: Some(MEMORY_LIMIT + 1),
+            },
+            MemberSample {
+                live: true,
+                virtual_bytes: JVM_VM_LIMIT + 1,
+                rss: Some(1),
+            },
+        ] {
+            let mut sample = Sample {
+                live_processes: 0,
+                aggregate_rss_bytes: Some(0),
+                known_rss_bytes: 0,
+                max_virtual_bytes: 0,
+            };
+            let mut pending = None;
+            accumulate(&mut sample, MemberObservation::Settled(None), &mut pending).unwrap();
+            accumulate(
+                &mut sample,
+                MemberObservation::Pending(
+                    MemberSample {
+                        live: true,
+                        virtual_bytes: actual.virtual_bytes,
+                        rss: None,
+                    },
+                    Box::new(pending_observation()),
+                ),
+                &mut pending,
+            )
+            .unwrap();
+            assert_eq!(sample.aggregate_rss_bytes, None);
+            assert_eq!(sample.known_rss_bytes, 0);
+            assert_eq!(sample.live_processes, 1);
+            let error = accumulate(
+                &mut sample,
+                MemberObservation::Settled(Some(member)),
+                &mut pending,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind, "resource_budget");
+            assert_eq!(sample.live_processes, 2);
+            assert_eq!(sample.known_rss_bytes, member.rss.unwrap());
+            assert_eq!(
+                sample.max_virtual_bytes,
+                member.virtual_bytes.max(actual.virtual_bytes)
+            );
+            assert_eq!(sample.aggregate_rss_bytes, None);
+            assert!(
+                pending
+                    .unwrap()
+                    .original_error()
+                    .to_string()
+                    .contains("operation=open;")
+            );
+        }
+        let mut sample = Sample {
+            live_processes: LIVE_LIMIT,
+            aggregate_rss_bytes: None,
+            known_rss_bytes: 4096,
+            max_virtual_bytes: actual.virtual_bytes,
+        };
+        let mut pending = Some(pending_observation());
+        assert_eq!(
+            accumulate(
+                &mut sample,
+                MemberObservation::Settled(Some(MemberSample {
+                    live: true,
+                    virtual_bytes: actual.virtual_bytes,
+                    rss: None,
+                })),
+                &mut pending
+            )
+            .unwrap_err()
+            .kind,
+            "resource_budget"
+        );
+        assert!(pending.is_some());
+        let empty = Sample {
+            live_processes: 0,
+            aggregate_rss_bytes: None,
+            known_rss_bytes: 0,
+            max_virtual_bytes: 0,
+        };
+        assert!(!GroupObservation::Pending(empty).scope_empty());
+        assert!(GroupObservation::Complete(empty).scope_empty());
     }
 
     #[test]
@@ -1845,6 +2401,7 @@ mod tests {
             let mut sample = Sample {
                 live_processes: 0,
                 aggregate_rss_bytes: Some(0),
+                known_rss_bytes: 0,
                 max_virtual_bytes: 0,
             };
             push(&mut sample, member).unwrap();

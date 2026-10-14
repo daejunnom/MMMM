@@ -349,8 +349,9 @@ Rust 관리 명령의 `ResourcePolicy`는 현재 OS와 목적에 일치해야 �
 리더는 포함하고 supervisor wrapper는 제외한다. Linux의 설정은 process별 VM
 상한이며 그룹 전체 memory, kernel resident memory나 kernel process quota가 아니다.
 두 정책은 100 ms 목표로 관측하고 설정·readback·표본 수·peak·최대 표본 간격을
-`resource_limits`에 보존한다. Linux에 별도의 1초 표본 간격 실패 조건을 추가하지
-않는다. 실제 Windows 자식의 설정 및 readback 검사는 통과했으며, 다른 OS의 새
+`resource_limits`에 보존한다. 일반 Linux process 수 검사에는 별도의 1초 표본 간격
+실패 조건을 추가하지 않는다. 아래의 좁은 JVM Pending은 별도 조건이다.
+실제 Windows 자식의 설정 및 readback 검사는 통과했으며, 다른 OS의 새
 일반 정책과 JVM의 주소 공간 요구는 실제 후속 실행으로 확인한다. 이전 bootstrap
 또는 이전 감독 도구의 성공을 새 일반 명령 정책의 완료 근거로 사용하지 않는다.
 
@@ -373,6 +374,24 @@ RSS의 `ENOENT`·`ESRCH`만으로 종료를 판정하지 않고 원래 stat의 �
 이미 성공적으로 읽은 RSS와 VM은 바로 뒤의 종료로 없애지 않고 관측 사실로 보존한다.
 초기 leader identity를 확보하지 못하거나 reservation을 잃으면 group signal과 drain
 완료를 허용하지 않으며 lease와 진단을 보존한다.
+
+D046의 Linux JVM Pending은 실제로 확인한 예약 leader의 좁은 RSS 미완료 전이에만
+적용한다. 원 anchor와 미회수 Child 예약이 유효하고, RSS 전후 PID·start·group·session이
+원 identity와 같으며 모두 Zombie·threads 2여야 한다. 실제 RSS open ESRCH와 이미
+검증한 whole-group pidfd의 실제 TerminalPoll/NotReady·errno 없음도 함께 요구한다.
+같은 관측 안에서 reader를 다시 부르지 않는다. 기존 100 ms 관측 시도를 마지막 완전
+표본 시각과 분리하고, 이전 완전 표본부터 1,000 ms 안에서만 Pending을 허용한다.
+이전 완전 표본이 없거나 창이 만료되면 원 오류와 새 종료 이유를 보존해 실패한다.
+늦은 Complete도 peak·sample 수·완료 시각을 갱신하기 전에 같은 창을 검사한다.
+
+Pending leader의 RSS는 미관측으로 두고 다른 member의 실제 RSS·VM·live lower bound로
+기존 상한을 계속 검사한다. Pending은 완전 표본·peak·마지막 성공 시각·RSS 0·empty나
+drain이 아니다. count-only empty만으로 미해결 Pending의 정상 reap을 허용하지 않으며,
+다음 정규 관측이나 유한한 실패를 기다린다. hard failure 후의 실제 물리 drain은 별도로
+확인한다. 원 오류와 닫힌 stat/pidfd 사실의 first·last·count를 후속 실패에도 보존한다.
+새 native 조회·poll·sleep·자동 한도 확대를 추가하지 않고, 일반 Linux 또는 Pending이 없는
+JVM에 전역 1초 gap 제한을 적용하지 않는다. 이는 새 조건부 관측 유예 정책이며 이전
+Linux 실행에 이미 존재한 보장으로 해석하지 않는다.
 
 RSS 합계는 각 process를 순서대로 읽은 관측이다. 공유 페이지를 process마다 포함하며
 그룹 전체의 동시 snapshot, 유일한 물리 메모리 사용량이나 kernel resident quota가

@@ -67,6 +67,8 @@
 
 | MMMM-D045 | Darwin stdio cleanup은 동일한 미회수 zombie와 실제 빈 scope를 새로 확인한 경우에만 신호를 생략하며 기존 drain 판정을 계속 따른다. | CI36에서 실제 group SIGKILL의 EPERM을 관측했지만 errno 자체를 성공이나 종료 증명으로 사용하지 않는다. 기존 reserved·고정 identity·resource identity 검사를 통과한 fresh SZOMB·non-pending leader에 한해 원 cleanup deadline 안의 WNOWAIT exit 확인과 기존 scope 전체의 실제 empty 관측을 요구한다. 그 한 번의 신호만 생략하며 두 번 안정 관측과 reap이 끝나야 drain을 발급한다. 미확인 exit·nonempty는 기존 signal 경로, 관측·identity·기한 오류는 원 typed 오류와 자원 사실로 보존한다. Child·reservation·기한·자원 상한·EPERM/ESRCH 처리와 기존 sleep은 유지한다. 이번 CI에는 pre-signal empty 관측이 없으므로 정책 채택을 원 실패의 해결로 표시하지 않으며 실제 macOS 실행을 별도로 확인한다. |
 
+| MMMM-D046 | Linux JVM의 실제로 확인한 좁은 leader RSS 미완료 전이는 원 오류를 보존하는 조건부 Pending으로 표현하며 이전 완전 표본부터 1,000 ms 안에서만 허용한다. | 유효한 원 leader anchor·미회수 Child 예약, 양쪽 원 PID/start/group/session 일치·Zombie·threads 2, 실제 RSS Open/ESRCH, 검증한 whole-group pidfd의 실제 TerminalPoll/NotReady·errno 없음이 모두 필요하다. 진단 문자열을 권한 증명으로 쓰지 않고 일반 member·다른 오류·미확정 poll은 엄격히 거절한다. 동일 관측의 reader 재시도 없이 기존 100 ms 시도 cadence와 마지막 완전 표본을 분리한다. 이전 완전 표본이 없거나 그 이후 1,000 ms를 넘으면 실패하고, 늦게 돌아온 Complete도 성공 수치 갱신 전에 거절한다. 다른 member의 실제 RSS·VM·live lower bound는 같은 상한으로 검사하되 Pending을 RSS 0·완전 표본·peak·마지막 성공 시각·empty·drain 또는 정상 reap으로 승격하지 않는다. 원 오류와 닫힌 stat/pidfd first·last·count를 후속 hard error에서도 한 번 보존한다. 실패 후 물리 drain과 정상 완료를 구분하며 원 기한·취소·자원·저장·출력 한도를 유지한다. 일반 Linux 및 Pending이 없는 JVM에 전역 1초 gap 제한을 추가하지 않는다. 새 native 조회·poll·sleep은 없고 실제 Linux 전이의 새 판정 검증은 후속 CI다. |
+
 ## 구현 전에 확인할 항목
 
 - 원본 계약과 예제 패키지의 내용, 버전 및 digest.
