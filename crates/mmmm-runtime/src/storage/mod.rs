@@ -41,14 +41,33 @@ pub struct DurableStore {
 
 impl DurableStore {
     pub fn open(config: StoreConfig) -> StorageResult<Self> {
+        Self::open_inner(config, true)
+    }
+
+    /// Opens an already initialized protected Store. Root, lock, journal and
+    /// CAS directories must exist; SQLite is opened without CREATE. Normal WAL
+    /// recovery and durable uncertain-intent reconciliation still apply.
+    pub fn open_existing(config: StoreConfig) -> StorageResult<Self> {
+        Self::open_inner(config, false)
+    }
+
+    fn open_inner(config: StoreConfig, create_missing: bool) -> StorageResult<Self> {
         verify_plain_path(&config.data_root)?;
-        create_private_dir(&config.data_root)?;
+        if create_missing {
+            create_private_dir(&config.data_root)?;
+        } else if !std::fs::metadata(&config.data_root)?.is_dir() {
+            return Err(StorageError::UnsafePath);
+        }
         cas::verify_private_root(&config.data_root)?;
         verify_local_filesystem(&config.data_root)?;
         let lock_path = config.data_root.join("coordinator.lock");
         verify_plain_path(&lock_path)?;
         let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
+        options
+            .read(true)
+            .write(true)
+            .create(create_missing)
+            .truncate(false);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -64,7 +83,7 @@ impl DurableStore {
         verify_plain_path(&database)?;
         verify_plain_path(&config.data_root.join("journal.sqlite3-wal"))?;
         verify_plain_path(&config.data_root.join("journal.sqlite3-shm"))?;
-        if !database.exists() {
+        if create_missing && !database.exists() {
             drop(cas::private_new_file(&database)?);
         }
         if !std::fs::metadata(&database)?.is_file() {
@@ -72,12 +91,30 @@ impl DurableStore {
         }
         // No URI filename processing, extension loading, remote SQLite driver,
         // or secondary journal backend is enabled.
-        let connection = Connection::open_with_flags(
-            database,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        if create_missing {
+            flags |= OpenFlags::SQLITE_OPEN_CREATE;
+        }
+        let connection = Connection::open_with_flags(database, flags)?;
+        // Reject an uninitialized/foreign existing database before changing its
+        // journal mode or applying schema. Omitting CREATE above also preserves
+        // a missing journal if it disappears after the metadata observation.
+        let existing_cas = if create_missing {
+            None
+        } else {
+            let version: i64 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            let application: i64 =
+                connection.pragma_query_value(None, "application_id", |r| r.get(0))?;
+            if version != 1 || application != 0x4d4d4d4d {
+                return Err(StorageError::Corrupt(
+                    "An initialized MMMM durable journal is required".into(),
+                ));
+            }
+            Some(Cas::open_existing(
+                config.data_root.join("blobs"),
+                config.max_blob_bytes,
+            )?)
+        };
         connection.busy_timeout(Duration::from_secs(2))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -130,7 +167,10 @@ impl DurableStore {
                 ));
             }
         }
-        let cas = Cas::open(config.data_root.join("blobs"), config.max_blob_bytes)?;
+        let cas = match existing_cas {
+            Some(cas) => cas,
+            None => Cas::open(config.data_root.join("blobs"), config.max_blob_bytes)?,
+        };
         let validator =
             ContractValidator::embedded().map_err(|e| StorageError::Contract(e.to_string()))?;
         let mut store = Self {

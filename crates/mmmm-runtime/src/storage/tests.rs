@@ -97,6 +97,73 @@ fn op(id: &str) -> OperationId {
 }
 
 #[test]
+fn existing_open_preserves_missing_root_and_empty_directory() {
+    let root = TestRoot::new();
+    let absent = root.0.join("absent-store");
+    assert!(matches!(
+        DurableStore::open_existing(StoreConfig::new(absent.clone())),
+        Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+    ));
+    assert!(!absent.exists());
+    let names = || {
+        let mut result: Vec<_> = fs::read_dir(&root.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        result.sort();
+        result
+    };
+    let before = names();
+    assert!(matches!(
+        DurableStore::open_existing(StoreConfig::new(root.0.clone())),
+        Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+    ));
+    assert_eq!(names(), before);
+}
+
+#[test]
+fn existing_open_requires_initialized_journal_without_adopting_blank_bytes() {
+    let root = TestRoot::new();
+    drop(root.store());
+    let database = root.0.join("journal.sqlite3");
+    fs::write(&database, []).unwrap();
+    assert!(matches!(
+        DurableStore::open_existing(StoreConfig::new(root.0.clone())),
+        Err(StorageError::Corrupt(_))
+    ));
+    assert_eq!(fs::read(&database).unwrap(), Vec::<u8>::new());
+    assert!(!root.0.join("journal.sqlite3-wal").exists());
+    assert!(!root.0.join("journal.sqlite3-shm").exists());
+    fs::remove_file(&database).unwrap();
+    assert!(matches!(
+        DurableStore::open_existing(StoreConfig::new(root.0.clone())),
+        Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+    ));
+    assert!(!database.exists());
+}
+
+#[test]
+fn existing_open_reuses_exact_data_and_keeps_single_owner() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let project = example("project.json");
+    store.save_project(&project, None).unwrap();
+    let blob = store.put_blob(b"retained existing-only source").unwrap();
+    assert!(matches!(
+        DurableStore::open_existing(StoreConfig::new(root.0.clone())),
+        Err(StorageError::Busy)
+    ));
+    drop(store);
+    let reopened = DurableStore::open_existing(StoreConfig::new(root.0.clone())).unwrap();
+    let project_id = serde_json::from_value(project["projectId"].clone()).unwrap();
+    assert_eq!(reopened.project(&project_id).unwrap(), project);
+    assert_eq!(
+        reopened.read_blob(&blob).unwrap(),
+        b"retained existing-only source"
+    );
+}
+
+#[test]
 fn root_is_exclusive_and_sqlite_pragmas_are_verified() {
     let root = TestRoot::new();
     let store = root.store();

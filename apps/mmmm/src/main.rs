@@ -13,6 +13,9 @@ const USAGE: &str = "Usage:\n\
   mmmm start --data-root <absolute root> --project <projectId>\n\
   mmmm daemon --data-root <absolute root> --project <projectId> [--lifetime-seconds <1..1800>]\n\
   mmmm host-setup --data-root <absolute root> --project <projectId> --host-jar <absolute jar> --output <absolute config> --scope-json <json>\n\
+  mmmm source-import --data-root <absolute root> --project <projectId> --expected-revision <sha256> --document <prefab|instance|clip>:<JSON> [--document <kind>:<JSON> ...]\n\
+    Source import is a cold native management command: 1..256 documents, each <=8 MiB, total <=32 MiB; actual OS argv limits may be smaller.\n\
+    Prefab and Clip references can share a batch. The data root must contain an initialized Project and have no active daemon owner; referenced resource bytes must already be retained.\n\
   mmmm call <function.name> --data-root <absolute root> [--json|--summary] < request.json\n\
   mmmm mcp --data-root <absolute root>\n\
   mmmm --version\n";
@@ -62,6 +65,12 @@ impl fmt::Display for PublicEntryError<'_> {
         match self.0 {
             EntryError::Daemon(error) => PublicDaemonError(error).fmt(f),
             EntryError::Output(error) => write!(f, "Native result delivery failed: {error}"),
+            EntryError::OutputDrain { primary, cleanup } => write!(
+                f,
+                "Native result output failed: {}; output drain failed: {}",
+                PublicEntryError(primary),
+                PublicEntryError(cleanup)
+            ),
             EntryError::Shutdown { primary, cleanup } => {
                 if let Some(primary) = primary {
                     write!(f, "{}; ", PublicEntryError(primary))?;
@@ -75,6 +84,14 @@ impl fmt::Display for PublicEntryError<'_> {
             } => write!(
                 f,
                 "Project {project} at revision {revision} was initialized and retained; result delivery failed: {}",
+                PublicEntryError(delivery)
+            ),
+            EntryError::SourcesCommitted { receipt, delivery } => write!(
+                f,
+                "Project {} advanced from {} to {} with committed sources retained; result delivery failed: {}",
+                receipt.project_id,
+                receipt.base_revision,
+                receipt.project_revision,
                 PublicEntryError(delivery)
             ),
             // EntryError's other diagnostics contain fixed text, public pins,

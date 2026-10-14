@@ -227,6 +227,21 @@ pub(crate) struct Cas {
     max_bytes: u64,
 }
 impl Cas {
+    pub(crate) fn open_existing(root: PathBuf, max_bytes: u64) -> StorageResult<Self> {
+        if max_bytes == 0 || max_bytes > i64::MAX as u64 {
+            return Err(StorageError::InvalidInput(
+                "Blob limit must be positive and fit SQLite's signed length".into(),
+            ));
+        }
+        for directory in [&root, &root.join("incoming")] {
+            verify_plain_path(directory)?;
+            if !fs::metadata(directory)?.is_dir() {
+                return Err(StorageError::UnsafePath);
+            }
+        }
+        Ok(Self { root, max_bytes })
+    }
+
     pub(crate) fn open(root: PathBuf, max_bytes: u64) -> StorageResult<Self> {
         if max_bytes == 0 || max_bytes > i64::MAX as u64 {
             return Err(StorageError::InvalidInput(
