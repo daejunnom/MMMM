@@ -195,6 +195,13 @@ owner/lease를 포함한 선택 retained root의 크기를 현재 build slot/cat
 합산하여 기존 8/12 GiB에 대조한다. 다른 retained roots 전체의 quota나 관측 사이의
 증가 방지는 보장하지 않는다. 초과 자료를 자동 삭제하지 않는다.
 
+storage 완료와 실행 성공은 별도다. `complete`는 drain/export를 확인한 자료를 보존하고
+known lease를 반납하는 API이며, 반환한 최종 `observed_before_release.within_budget`가
+false일 수도 있다. 실행 소비자는 이 실제 최종 관측을 성공 gate에 반영해야 한다.
+완료 owner 기록의 크기 증가로 넘은 경우도 `released_over_budget`와 실제 lease 해제
+사실을 함께 남기고 전체 실행을 실패로 판정한다. 알려진 정리 완료를 결과 불명으로
+바꾸거나 상한 초과 자료를 삭제하지 않는다.
+
 실패한 명령도 실제 native drain과 증거 export를 확인하면 owner를 complete로 기록하고
 해당 lease만 해제할 수 있다. world/config와 실패 진단은 보존하며 Drop·build finish·
 cache eviction이 game root를 회수하지 않는다. 마지막 ownership 검증 뒤 path unlink는
@@ -213,6 +220,20 @@ partial bytes·WouldBlock·실제 native error·close 불확실성을 보존한�
 명령 처리·월드 저장·정상 stop acknowledgement가 아니며 결과도 `not_observed`다.
 실제 CLI 연결, 동의한 EULA, final game cwd·launcher·ordinary host JAR origin 및 실제
 게임 결과는 [구현 착수 조건](implementation-readiness.md)의 별도 관측으로 확인한다.
+
+관리 CLI의 `run --retained-game-root <절대 경로>`는 `purpose=jvm`과 기본 tail
+정책 `reject`를 요구한다. 직접 자식의 cwd와 `MMMM_RETAINED_GAME_DIR`를 검증한 game
+디렉터리로 지정한다. 선택한 `--minecraft-stop-after-seconds`는 1~3600초이면서 전체
+timeout보다 작아야 한다. stop 시계는 retained 입장 전의 요청 시점부터 시작하며,
+원래 5초 관측과 저장량 검사 뒤 Running에서 한 번 요청하므로 정확한 spawn 시각이나
+초 단위 전송 시각을 보장하지 않는다. 일반 run은 기존 null stdin과 cwd를 유지한다.
+
+확인된 native drain 결과를 받은 뒤에는 실행과 별개인 단일 30초 보존 기한을 시작한다.
+retained 측정, 64 KiB 단위 원시 로그 복사와 sync, complete 및 완료 receipt 기록은
+같은 남은 기한을 소비한다. 원 timeout·취소와 native 결과는 유지하며 게임 실행을
+재개하지 않는다. I/O 앞뒤의 협력 checkpoint이며 OS 호출 자체의 선점을 보장하지
+않는다. 미확인 drain은 로그 복사와 retained 완료를 허용하지 않는다. 증거 기록이나
+정리가 실패하면 원 실패와 구분해 보존하며 build lease를 자동 복구하지 않는다.
 
 ## 정리 경계와 복구
 

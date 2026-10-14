@@ -583,6 +583,62 @@ verification→unlink 경계를 소스와 빌드 문서에 명시했으며 hosti
 교체 방어를 발급하지 않는다. 실제 CLI 연결·게임 시작·Minecraft 처리/저장 acknowledgement
 및 pairing 양성은 이 lib 검증과 별개다.
 
+### Retained CLI의 실제 Windows 종료와 timeout
+
+관리 `run`에 명시 retained root와 선택 stop schedule을 연결했다. 독립 검토에서 원
+timeout·취소 checkpoint를 post-drain export에 재사용하던 오류와 최종 완료 측정의
+예산 초과를 성공 gate가 놓치던 오류를 수정했다. drain 뒤의 단일 30초 보존 시계와
+64 KiB 로그 복사 checkpoint는 원 실행 실패를 바꾸지 않는다. 최종 예산 초과는
+`released_over_budget`·실제 lease 해제·`resource_budget` 오류를 함께 보존한다.
+이 마지막 예산 초과의 소비 검사는 순수 projection이며 실제 대용량 game 결과가 아니다.
+
+수정한 CLI 검사 4개와 locked all-targets strict Clippy를 Windows에서 실행해 모두
+통과했다. 각각 command 0·8,578 ms·명시 owned-tail 종료와 0·6,662 ms·자연 종료다.
+기존 supervisor의 고정 snapshot을 부모로 사용해 실행 중인 EXE를 덮어쓰지 않고 새
+CLI를 빌드했다. 새 EXE는 3,063,808 bytes·SHA
+`520257e12d8b44ab4f2e72d954c02ebe8d3806a8b3c3bb132680f5d48bfe1ade`이며,
+formatted `main.rs`는 SHA
+`9e61f7d96fe5421deb7eeccf8780b732b695814f90227de99c131d26f6a254fe`다.
+
+첫 실제 CLI fixture는 일반 drive 경로와 Windows verbatim drive 경로를 문자열로
+동일시하지 못해 child exit 1로 끝났다. native supervisor 오류는 없었고 stop은
+미요청·0 bytes였다. 원 실패와 로그를 보존한 채 fixture의 정확한 drive-prefix 표현만
+정규화했다. 제품의 경로·소유권 검사를 완화하거나 WSL로 전환하지 않았다.
+
+수정한 fixture는 command 0·14,616 ms·자연 종료로, 실제 cwd와 retained game 환경의
+일치, 고정 stop LF 5 bytes와 EOF, 표식 생성 및 stderr 0을 확인했다. stop 요청은
+입장 전 요청 시계의 15,969 ms에서 관측됐으며 정확한 10초 전송을 주장하지 않는다.
+같은 complete root 재사용은 command 0·574 ms로 표식 보존과 기본 null stdin의 EOF를
+확인했다. 별도 15초 timeout 실행은 실제 command 124·13,714 ms·timeout과 원
+`command timeout exceeded`를 유지했다. 이 시간은 입장 전부터 시작한 원 기한과
+별도인 native elapsed다. drain 뒤 8,327 ms의 보존 관측 안에서 raw export와 완료를
+기록했으며 owner complete·root lease 부재·17-byte 표식 보존을 확인했다.
+
+관련 실제 실행은 native drain·완전한 출력·export·scratch 정리와 build lease 해제를
+확인했고 cleanup 오류 0이다. timeout은 예상한 실패 결과이며 전체 CLI exit도 1이다.
+게임·EULA 수락·Minecraft 명령 처리/저장 acknowledgement는 실행하거나 발급하지 않았다.
+CLI 취소, Unix CLI와 실제 게임 검증은 별도 미검증이다.
+
+### 현재 source의 CI와 macOS bootstrap 실패 보존
+
+source `74c26bcf59b92125fb10d98958710f2556a175b2`의
+[Rust CI 46](https://github.com/daejunnom/MMMM/actions/runs/38638920726)은 Linux와
+Windows job 성공, macOS bootstrap 및 집계 실패다. 실패 archive는 3,174 bytes·SHA
+`59f051624f3a210baf4f6e3002dd2ab1a9353aba7f87e03185ea40f065e596a7`이며 7개
+entry를 실제 대조했다. source·예상 source·PR head는 위 SHA로 같고 event SHA
+`aea1023a37dce7d1381f3c26a86b7cf187c5f476`는 별도다. 원 오류는 Darwin native
+zombie identity로 process exit를 확인하지 못했다는 supervisor failure다.
+command exit null·drain/export true를 함께 보존하며 정상 Cargo 종료나 Rust 검사
+실패로 재분류하지 않는다. finish는 없고 slot·lease는 보존됐다.
+
+실제 자원 표본 44개·최대 gap 182 ms, RSS 456,704,000 bytes·footprint 215,100,992
+bytes·worker 9개는 기존 상한 안이다. 원 native stage/result/errno·BSD status·role와
+항목별 identity 비교값이 기록되지 않아 PID 재사용이나 특정 종료 전이를 확정할 수
+없다. strict 종료 판정과 상한을 유지하고 진단 보강을 진행한다. 같은 source의
+[JVM CI 37](https://github.com/daejunnom/MMMM/actions/runs/38638920986)은 세 OS와
+집계 성공 metadata를 확인했으나 이 기록에서는 새 JVM archive를 대조하지 않았다.
+위 로컬 CLI 연결 변경은 이 CI source에 포함되지 않는다.
+
 ### 게임 실행 전의 launcher 및 보존 경로 준비
 
 Windows의 별도 help action에서 실제 `:fabric-host:runServer` task의 metadata만

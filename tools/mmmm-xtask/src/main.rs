@@ -6,7 +6,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn main() {
     match entry() {
@@ -95,6 +95,236 @@ fn export_log(source: &Path, destination: &Path) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+fn export_retained_log(
+    source: &Path,
+    destination: &Path,
+    checkpoint: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    checkpoint()?;
+    validate_local_ancestry(source, false, true)?;
+    checkpoint()?;
+    let metadata = fs::symlink_metadata(source)?;
+    checkpoint()?;
+    if !metadata.is_file() || is_link(&metadata) || metadata.len() > 64 * 1024 * 1024 {
+        return Err("managed command log kind or size invalid".into());
+    }
+    let mut input = fs::File::open(source)?;
+    checkpoint()?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    checkpoint()?;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut copied = 0_u64;
+    loop {
+        checkpoint()?;
+        let count = input.read(&mut buffer)?;
+        checkpoint()?;
+        if count == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(count as u64)
+            .ok_or("managed log byte count overflow")?;
+        if copied > metadata.len() {
+            return Err("managed command log size changed during export".into());
+        }
+        output.write_all(&buffer[..count])?;
+        checkpoint()?;
+    }
+    if copied != metadata.len() {
+        return Err("managed command log size changed during export".into());
+    }
+    checkpoint()?;
+    output.sync_all()?;
+    checkpoint()?;
+    Ok(())
+}
+
+fn write_new_json_with_checkpoint(
+    path: &Path,
+    value: &serde_json::Value,
+    checkpoint: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    checkpoint()?;
+    let encoded = serde_json::to_vec_pretty(value)?;
+    checkpoint()?;
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    checkpoint()?;
+    for chunk in encoded.chunks(64 * 1024) {
+        checkpoint()?;
+        file.write_all(chunk)?;
+        checkpoint()?;
+    }
+    file.write_all(b"\n")?;
+    checkpoint()?;
+    file.sync_all()?;
+    checkpoint()?;
+    Ok(())
+}
+
+struct RetainedPreservation {
+    started: Instant,
+}
+
+impl RetainedPreservation {
+    fn check(&self) -> Result<(), String> {
+        if self.started.elapsed() >= Duration::from_secs(30) {
+            return Err("retained post-drain preservation deadline exceeded".into());
+        }
+        Ok(())
+    }
+
+    fn report(&self) -> serde_json::Value {
+        serde_json::json!({
+            "phase": "post_drain_preservation",
+            "clock_origin": "confirmed_native_drain_result_received",
+            "budget_ms": 30_000,
+            "elapsed_ms": u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "original_cancel_ignored_for_preservation_only": true,
+            "game_execution_permitted": false,
+            "os_io_preemptible": false,
+        })
+    }
+}
+
+struct RetainedRunOptions {
+    root: PathBuf,
+    stop_after: Option<Duration>,
+}
+
+fn retained_run_options(
+    flags: &mut BTreeMap<String, String>,
+    purpose: &str,
+    tail_policy: process::TailPolicy,
+    timeout: u64,
+) -> Result<Option<RetainedRunOptions>, Box<dyn std::error::Error>> {
+    let root = optional_path(flags, "--retained-game-root");
+    let stop_after = flags
+        .remove("--minecraft-stop-after-seconds")
+        .map(|value| value.parse::<u64>())
+        .transpose()?;
+    let Some(root) = root else {
+        if stop_after.is_some() {
+            return Err("Minecraft stop requires --retained-game-root".into());
+        }
+        return Ok(None);
+    };
+    if !root.is_absolute() {
+        return Err("retained game root must be absolute".into());
+    }
+    if purpose != "jvm" {
+        return Err("retained game mode requires purpose jvm".into());
+    }
+    if tail_policy != process::TailPolicy::Reject {
+        return Err("retained game mode requires owned tail policy reject".into());
+    }
+    if stop_after.is_some_and(|seconds| !(1..=3600).contains(&seconds) || seconds >= timeout) {
+        return Err(
+            "Minecraft stop must be 1..3600 seconds and less than the command timeout".into(),
+        );
+    }
+    Ok(Some(RetainedRunOptions {
+        root,
+        stop_after: stop_after.map(Duration::from_secs),
+    }))
+}
+
+struct MinecraftStopSchedule {
+    handle: process::MinecraftStopHandle,
+    after: Duration,
+    requested_at_elapsed_ms: Option<u64>,
+}
+
+impl MinecraftStopSchedule {
+    fn request_if_due(
+        &mut self,
+        phase: process::ObservationPhase,
+        elapsed: Duration,
+    ) -> Result<(), String> {
+        if phase == process::ObservationPhase::Running
+            && self.requested_at_elapsed_ms.is_none()
+            && elapsed >= self.after
+        {
+            self.handle.request().map_err(|error| error.to_string())?;
+            self.requested_at_elapsed_ms =
+                Some(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+        }
+        Ok(())
+    }
+
+    fn report(&self, observation_interval: Duration) -> serde_json::Value {
+        serde_json::json!({
+            "after_seconds": self.after.as_secs(),
+            "clock_origin": "supervision_request_start_before_retained_admission",
+            "pre_spawn_observation_included": true,
+            "exact_spawn_clock": false,
+            "request_phase": "running_observation",
+            "observation_interval_ms": u64::try_from(observation_interval.as_millis()).unwrap_or(u64::MAX),
+            "measurement_work_may_delay_request": true,
+            "requested_at_elapsed_ms": self.requested_at_elapsed_ms,
+            "acknowledgement": "not_observed",
+        })
+    }
+}
+
+fn process_error_report(error: &process::ProcessError) -> serde_json::Value {
+    let mut report = serde_json::json!({
+        "kind": error.kind,
+        "message": error.message,
+        "drained": error.drained,
+    });
+    if let Some(stop) = &error.minecraft_stop {
+        report["minecraft_stop"] = serde_json::json!(stop);
+    }
+    report
+}
+
+fn storage_error_report(error: &storage::StorageError) -> serde_json::Value {
+    let mut report = serde_json::json!({"kind": error.kind, "message": error.message});
+    let mut cause = std::error::Error::source(error);
+    let mut causes = Vec::new();
+    // 실제 오류 연결을 유한하게 보존하며 파일이나 환경을 추가로 조회하지 않는다.
+    for _ in 0..16 {
+        let Some(current) = cause else { break };
+        causes.push(
+            if let Some(typed) = current.downcast_ref::<storage::StorageError>() {
+                serde_json::json!({"kind": typed.kind, "message": typed.message})
+            } else {
+                serde_json::json!({"message": current.to_string()})
+            },
+        );
+        cause = current.source();
+    }
+    if !causes.is_empty() {
+        report["causes"] = causes.into();
+    }
+    if cause.is_some() {
+        report["causes_truncated"] = true.into();
+    }
+    report
+}
+
+fn retained_completion_report(
+    completion: &storage::retained_game::RetainedCompletion,
+    supervisor_errors: &mut Vec<String>,
+) -> serde_json::Value {
+    let within_budget = completion.observed_before_release.within_budget;
+    let mut report = serde_json::json!({
+        "schema": "mmmm-retained-game-completion/1",
+        "status": if within_budget { "released" } else { "released_over_budget" },
+        "completion": completion,
+        "game_save_acknowledgement": "not_observed",
+    });
+    if !within_budget {
+        let message = "final retained game and managed disk measurement exceeds resource budget";
+        report["error"] = serde_json::json!({"kind": "resource_budget", "message": message});
+        supervisor_errors.push(format!("resource_budget: {message}"));
+    }
+    report
+}
+
 fn run_managed(
     checkout: PathBuf,
     mut flags: BTreeMap<String, String>,
@@ -105,7 +335,6 @@ fn run_managed(
     let purpose = flags
         .remove("--purpose")
         .ok_or("required flag: --purpose")?;
-    let managed_jvm_helper = purpose == "jvm";
     let resource_policy = process::ResourcePolicy::for_managed_purpose(&purpose);
     let timeout = flags
         .remove("--timeout-seconds")
@@ -120,6 +349,8 @@ fn run_managed(
         Some("terminate-build") => process::TailPolicy::TerminateForBuild,
         Some(_) => return Err("owned tail policy must be reject or terminate-build".into()),
     };
+    let retained_options = retained_run_options(&mut flags, &purpose, tail_policy, timeout)?;
+    let managed_jvm_helper = purpose == "jvm" && retained_options.is_none();
     reject_remaining(&flags)?;
     let program = child_args
         .first()
@@ -140,14 +371,60 @@ fn run_managed(
     let cancellation = Arc::new(AtomicBool::new(false));
     let signal = cancellation.clone();
     ctrlc::set_handler(move || signal.store(true, std::sync::atomic::Ordering::Release))?;
+    // retained 입장과 spawn 전 관측도 같은 요청 기한을 소비한다. 일반 run의 시계는 바꾸지 않는다.
+    let supervision_requested_at = retained_options.as_ref().map(|_| Instant::now());
+    let request_deadline =
+        supervision_requested_at.map(|start| start + Duration::from_secs(timeout));
+    let mut original_checkpoint = || {
+        if cancellation.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("managed command cancelled".into());
+        }
+        if request_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err("original managed command deadline exceeded".into());
+        }
+        Ok(())
+    };
+    let mut retained = if let Some(options) = &retained_options {
+        match storage::retained_game::RetainedGame::acquire(
+            &build,
+            &checkout,
+            &options.root,
+            &mut original_checkpoint,
+        ) {
+            Ok(retained) => Some(retained),
+            Err(error) => {
+                let report = serde_json::json!({
+                    "schema": "mmmm-retained-game-admission/1",
+                    "status": "admission_failed",
+                    "error": storage_error_report(&error),
+                    "build_lease_release_attempted": false,
+                });
+                if let Err(export) =
+                    write_new_json(&build.paths().evidence.join("game-admission.json"), &report)
+                {
+                    eprintln!("retained admission evidence export: {export}");
+                }
+                return Err(Box::new(error));
+            }
+        }
+    } else {
+        None
+    };
+    let mut stop_schedule = retained_options
+        .as_ref()
+        .and_then(|options| options.stop_after)
+        .map(|after| MinecraftStopSchedule {
+            handle: process::MinecraftStopHandle::new(),
+            after,
+            requested_at_elapsed_ms: None,
+        });
     let stdout = build.paths().scratch.join("command.stdout.log");
     let stderr = build.paths().scratch.join("command.stderr.log");
-    let mut spec = process::ProcessSpec::new(
-        program,
-        fs::canonicalize(&checkout)?,
-        stdout.clone(),
-        stderr.clone(),
-    );
+    let cwd = match &retained {
+        Some(retained) => retained.game_directory()?.to_path_buf(),
+        None => fs::canonicalize(&checkout)?,
+    };
+    let mut spec = process::ProcessSpec::new(program, cwd, stdout.clone(), stderr.clone());
     spec.args = child_args
         .iter()
         .skip(1)
@@ -165,13 +442,45 @@ fn run_managed(
         spec.env
             .insert("DOTNET_EnableDiagnostics".into(), "0".into());
     }
+    if retained.is_some() {
+        spec.env.insert(
+            "MMMM_RETAINED_GAME_DIR".into(),
+            spec.cwd.clone().into_os_string(),
+        );
+    }
     spec.env.insert("CARGO_BUILD_JOBS".into(), "2".into());
     spec.timeout = Duration::from_secs(timeout);
     spec.tail_policy = tail_policy;
     spec.resource_policy = resource_policy;
+    spec.absolute_deadline = request_deadline;
+    spec.minecraft_stop = stop_schedule
+        .as_ref()
+        .map(|schedule| schedule.handle.clone());
     let mut observation_retries = storage::ObservationRetryLog::default();
+    let mut retained_measurement = None;
     let result =
         process::supervise_with_progress_phased(&spec, &cancellation, |phase, checkpoint| {
+            if let Some(retained) = &retained {
+                let mut current = || {
+                    checkpoint()?;
+                    original_checkpoint()
+                };
+                let measurement = retained
+                    .measure_with_progress(&mut current)
+                    .map_err(|error| error.to_string())?;
+                let within_budget = measurement.within_budget;
+                retained_measurement = Some(measurement);
+                if !within_budget {
+                    return Err("combined retained game and managed disk budget exceeded".into());
+                }
+                current()?;
+                if let (Some(schedule), Some(started)) =
+                    (&mut stop_schedule, supervision_requested_at)
+                {
+                    schedule.request_if_due(phase, started.elapsed())?;
+                }
+                return Ok(());
+            }
             let measurement = match phase {
                 process::ObservationPhase::PreSpawn => build.measure_with_progress(checkpoint),
                 process::ObservationPhase::Running => build
@@ -183,6 +492,18 @@ fn run_managed(
             }
             Ok(())
         });
+    // 원 실행 결과는 그대로 두고, 확인된 drain 뒤의 보존에만 별도 유한 기한을 사용한다.
+    let native_drained = match &result {
+        Ok(outcome) => outcome.drained,
+        Err(error) => error.drained,
+    };
+    let preservation = if retained.is_some() && native_drained {
+        Some(RetainedPreservation {
+            started: Instant::now(),
+        })
+    } else {
+        None
+    };
     let (command_exit, drained, mut supervisor_errors, command_success, mut report) = match result {
         Ok(outcome) => {
             let success = outcome.command_exit == Some(0)
@@ -197,14 +518,33 @@ fn run_managed(
                 serde_json::to_value(outcome)?,
             )
         }
+        // Display의 기존 Linux 진단도 원 supervisor_errors에 그대로 보존한다.
         Err(error) => (
             None,
             error.drained,
             vec![error.to_string()],
             false,
-            serde_json::json!({"kind": error.kind, "message": error.message, "drained": error.drained}),
+            process_error_report(&error),
         ),
     };
+    let mut preservation_checkpoint = || {
+        preservation
+            .as_ref()
+            .ok_or("native drain is unconfirmed; preservation was not admitted")?
+            .check()
+    };
+    if retained.is_some() {
+        report["retained_game"] = serde_json::json!({
+            "schema": "mmmm-retained-game-run/1",
+            "working_directory": "validated_retained_game_directory",
+            "working_directory_scope": "direct_child_only",
+            "native_resource_policy_scope": "managed_jvm",
+            "last_measurement": retained_measurement,
+            "minecraft_stop_schedule": stop_schedule.as_ref().map(|schedule| schedule.report(spec.observation_interval)),
+            "preservation": preservation.as_ref().map(RetainedPreservation::report),
+            "game_save_acknowledgement": "not_observed",
+        });
+    }
     let (retry_summary, retry_export) =
         export_observation_retries(&build.paths().evidence, &observation_retries);
     report["storage_observation_retries"] = retry_summary;
@@ -214,17 +554,54 @@ fn run_managed(
     }
     let mut exported = false;
     let export = (|| -> Result<(), Box<dyn std::error::Error>> {
-        write_new_json(&build.paths().evidence.join("process.json"), &report)?;
+        if let (Some(retained), Some(_)) = (&retained, &preservation) {
+            let mut current = || {
+                preservation_checkpoint()?;
+                retained
+                    .check_current_ownership()
+                    .map_err(|error| storage_error_report(&error).to_string())?;
+                preservation_checkpoint()
+            };
+            write_new_json_with_checkpoint(
+                &build.paths().evidence.join("process.json"),
+                &report,
+                &mut current,
+            )?;
+        } else {
+            // 미drain의 원 결과 진단은 남기되 retained 측정/완료/로그 복사는 시작하지 않는다.
+            write_new_json(&build.paths().evidence.join("process.json"), &report)?;
+        }
         retry_export?;
         if !drained {
             return Err("unconfirmed drain prevents command log export and cleanup".into());
         }
-        build.measure()?;
+        if let Some(retained) = &retained {
+            let measurement = retained.measure_with_progress(&mut preservation_checkpoint)?;
+            if !measurement.within_budget {
+                return Err("combined retained game and managed disk budget exceeded".into());
+            }
+        } else {
+            build.measure()?;
+        }
         for (source, name) in [
             (&stdout, "command.stdout.log"),
             (&stderr, "command.stderr.log"),
         ] {
-            if source.try_exists()? {
+            if let Some(retained) = &retained {
+                let mut current = || {
+                    preservation_checkpoint()?;
+                    retained
+                        .check_current_ownership()
+                        .map_err(|error| storage_error_report(&error).to_string())?;
+                    preservation_checkpoint()
+                };
+                current()?;
+                let exists = source.try_exists()?;
+                current()?;
+                if exists {
+                    export_retained_log(source, &build.paths().evidence.join(name), &mut current)?;
+                }
+            } else if source.try_exists()? {
                 export_log(source, &build.paths().evidence.join(name))?;
             }
         }
@@ -234,22 +611,126 @@ fn run_managed(
         Ok(()) => exported = true,
         Err(error) => supervisor_errors.push(format!("evidence export: {error}")),
     }
-    write_new_json(
-        &build.paths().evidence.join("finalization-input.json"),
-        &serde_json::json!({
-            "schema": "mmmm-build-finalization-input/1",
-            "command_exit": command_exit,
-            "drained": drained,
-            "evidence_exported": exported,
-            "supervisor_errors": supervisor_errors,
-        }),
-    )?;
-    let receipt = build.finish(storage::FinishOutcome {
+    let mut finish_outcome = storage::FinishOutcome {
         command_exit,
         supervisor_errors,
         drained,
         evidence_exported: exported,
-    })?;
+    };
+    let mut game_completion = None;
+    if let Some(retained) = retained.take() {
+        if finish_outcome.drained && finish_outcome.evidence_exported {
+            // 원시 로그 export가 늘린 저장량도 lease 해제 전에 같은 합산 예산으로 확인한다.
+            match retained.measure_with_progress(&mut preservation_checkpoint) {
+                Ok(measurement) if measurement.within_budget => {}
+                Ok(_) => {
+                    finish_outcome.evidence_exported = false;
+                    finish_outcome.supervisor_errors.push(
+                        "retained completion preparation: combined disk budget exceeded".into(),
+                    );
+                }
+                Err(error) => {
+                    finish_outcome.evidence_exported = false;
+                    finish_outcome.supervisor_errors.push(format!(
+                        "retained completion preparation: {}",
+                        storage_error_report(&error),
+                    ));
+                }
+            }
+        }
+        let mut completion_report = if !drained {
+            // Drop만으로 lease나 game 자료를 변경하지 않는다. 미확인 scope의 정리는 입장시키지 않는다.
+            drop(retained);
+            serde_json::json!({
+                "schema": "mmmm-retained-game-completion/1",
+                "status": "not_attempted_undrained",
+                "game_removal_attempted": false,
+                "build_lease_release_attempted": false,
+            })
+        } else {
+            match retained.complete(&finish_outcome, &mut preservation_checkpoint) {
+                Ok(completion) => {
+                    retained_completion_report(&completion, &mut finish_outcome.supervisor_errors)
+                }
+                Err(error) => {
+                    finish_outcome.evidence_exported = false;
+                    finish_outcome
+                        .supervisor_errors
+                        .push(format!("retained completion: {error}"));
+                    serde_json::json!({
+                        "schema": "mmmm-retained-game-completion/1",
+                        "status": "release_unconfirmed",
+                        "error": storage_error_report(&error),
+                        "game_removal_attempted": false,
+                        "build_lease_release_attempted": false,
+                    })
+                }
+            }
+        };
+        completion_report["preservation"] =
+            serde_json::json!(preservation.as_ref().map(RetainedPreservation::report));
+        let completion_export = if preservation.is_some() {
+            write_new_json_with_checkpoint(
+                &build.paths().evidence.join("game-completion.json"),
+                &completion_report,
+                &mut preservation_checkpoint,
+            )
+        } else {
+            write_new_json(
+                &build.paths().evidence.join("game-completion.json"),
+                &completion_report,
+            )
+        };
+        if let Err(error) = completion_export {
+            finish_outcome.evidence_exported = false;
+            finish_outcome
+                .supervisor_errors
+                .push(format!("retained completion evidence export: {error}"));
+            // 실제 complete 반환 사실은 남기되 receipt 내구성 실패를 lease 복구로 바꾸지 않는다.
+            completion_report["status"] = "release_unconfirmed".into();
+            completion_report["receipt_exported"] = false.into();
+            completion_report["receipt_export_error"] = error.to_string().into();
+            eprintln!(
+                "retained completion evidence export: {error}; completion: {completion_report}"
+            );
+        } else {
+            completion_report["receipt_exported"] = true.into();
+        }
+        game_completion = Some(completion_report);
+    }
+    drop(retained);
+    let mut finalization = serde_json::json!({
+        "schema": "mmmm-build-finalization-input/1",
+        "command_exit": finish_outcome.command_exit,
+        "drained": finish_outcome.drained,
+        "evidence_exported": finish_outcome.evidence_exported,
+        "supervisor_errors": finish_outcome.supervisor_errors,
+    });
+    if let Some(completion) = game_completion {
+        finalization["retained_game"] = completion;
+    }
+    if let Some(preservation) = &preservation {
+        finalization["retained_preservation"] = preservation.report();
+        let finalization_export = write_new_json_with_checkpoint(
+            &build.paths().evidence.join("finalization-input.json"),
+            &finalization,
+            &mut preservation_checkpoint,
+        );
+        if let Err(error) = finalization_export {
+            // 남은 보존 기한을 넘겨 파일 작업을 재시도하지 않는다. 원 실패와 정리 실패를 분리해 출력한다.
+            eprintln!(
+                "retained finalization evidence export: {error}; finalization: {finalization}"
+            );
+            return Err(error);
+        }
+    } else {
+        write_new_json(
+            &build.paths().evidence.join("finalization-input.json"),
+            &finalization,
+        )?;
+    }
+    // retained borrow는 complete 또는 보존 실패로 끝난 뒤에만 build finish로 이동한다.
+    let receipt = build.finish(finish_outcome)?;
     let success = command_success
         && receipt.lease_released
         && receipt.supervisor_errors.is_empty()
@@ -304,6 +785,218 @@ fn export_observation_retries(
 #[cfg(test)]
 mod observation_evidence_tests {
     use super::*;
+
+    #[test]
+    fn retained_options_reject_invalid_combinations_before_storage_admission() {
+        let root = std::env::current_dir().unwrap();
+        let root_text = root.to_str().unwrap();
+        let mut generic = BTreeMap::new();
+        assert!(
+            retained_run_options(
+                &mut generic,
+                "fixture",
+                process::TailPolicy::TerminateForBuild,
+                1200,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(generic.is_empty());
+        for (purpose, tail, root_value, stop, timeout) in [
+            ("jvm", process::TailPolicy::Reject, None, Some("1"), 2),
+            (
+                "fixture",
+                process::TailPolicy::Reject,
+                Some(root_text),
+                None,
+                2,
+            ),
+            (
+                "jvm",
+                process::TailPolicy::TerminateForBuild,
+                Some(root_text),
+                None,
+                2,
+            ),
+            (
+                "jvm",
+                process::TailPolicy::Reject,
+                Some("relative-game-root"),
+                None,
+                2,
+            ),
+            (
+                "jvm",
+                process::TailPolicy::Reject,
+                Some(root_text),
+                Some("0"),
+                2,
+            ),
+            (
+                "jvm",
+                process::TailPolicy::Reject,
+                Some(root_text),
+                Some("3601"),
+                3600,
+            ),
+            (
+                "jvm",
+                process::TailPolicy::Reject,
+                Some(root_text),
+                Some("2"),
+                2,
+            ),
+            (
+                "jvm",
+                process::TailPolicy::Reject,
+                Some(root_text),
+                Some("invalid"),
+                2,
+            ),
+        ] {
+            let mut flags = BTreeMap::new();
+            if let Some(root) = root_value {
+                flags.insert("--retained-game-root".into(), root.into());
+            }
+            if let Some(stop) = stop {
+                flags.insert("--minecraft-stop-after-seconds".into(), stop.into());
+            }
+            assert!(retained_run_options(&mut flags, purpose, tail, timeout).is_err());
+        }
+        let mut flags = BTreeMap::from([
+            ("--retained-game-root".into(), root_text.into()),
+            ("--minecraft-stop-after-seconds".into(), "1".into()),
+        ]);
+        let options = retained_run_options(&mut flags, "jvm", process::TailPolicy::Reject, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(options.root, root);
+        assert_eq!(options.stop_after, Some(Duration::from_secs(1)));
+        assert!(flags.is_empty());
+    }
+
+    #[test]
+    fn minecraft_stop_schedule_waits_for_running_and_preserves_first_request_time() {
+        let mut schedule = MinecraftStopSchedule {
+            handle: process::MinecraftStopHandle::new(),
+            after: Duration::from_secs(1),
+            requested_at_elapsed_ms: None,
+        };
+        schedule
+            .request_if_due(process::ObservationPhase::PreSpawn, Duration::from_secs(5))
+            .unwrap();
+        schedule
+            .request_if_due(
+                process::ObservationPhase::Running,
+                Duration::from_millis(999),
+            )
+            .unwrap();
+        assert_eq!(schedule.requested_at_elapsed_ms, None);
+        schedule
+            .request_if_due(
+                process::ObservationPhase::Running,
+                Duration::from_millis(5100),
+            )
+            .unwrap();
+        schedule
+            .request_if_due(process::ObservationPhase::Running, Duration::from_secs(8))
+            .unwrap();
+        assert_eq!(schedule.requested_at_elapsed_ms, Some(5100));
+        let report = schedule.report(Duration::from_secs(5));
+        assert_eq!(report["exact_spawn_clock"], false);
+        assert_eq!(report["observation_interval_ms"], 5000);
+        assert_eq!(report["requested_at_elapsed_ms"], 5100);
+        assert_eq!(report["acknowledgement"], "not_observed");
+    }
+
+    #[test]
+    fn process_and_retained_projection_preserves_original_failures_and_final_budget() {
+        // 상대 실행 파일은 validate에서 거절되어 child, pipe, log를 만들지 않는다.
+        let root = std::env::current_dir().unwrap();
+        let spec = process::ProcessSpec::new(
+            "relative-program".into(),
+            root.clone(),
+            root.join("unused-stdout"),
+            root.join("unused-stderr"),
+        );
+        assert!(spec.minecraft_stop.is_none() && spec.absolute_deadline.is_none());
+        let mut error = process::supervise(&spec, &AtomicBool::new(false), || Ok(())).unwrap_err();
+        let generic = process_error_report(&error);
+        assert_eq!(
+            generic,
+            serde_json::json!({
+                "kind": error.kind, "message": error.message, "drained": error.drained,
+            })
+        );
+        let original_display = error.to_string();
+        // 아래 값은 직렬화 경계용 자료다. native 쓰기나 게임 처리 성공의 증거를 발급하지 않는다.
+        error.minecraft_stop = Some(Box::new(process::MinecraftStopEvidence {
+            requested: true,
+            request_observed: true,
+            control_closed: true,
+            writer_available: true,
+            writer_closed: true,
+            write_attempts: 1,
+            would_block: 0,
+            last_would_block: None,
+            bytes_written: 2,
+            write_error: Some(process::MinecraftStopIoError {
+                kind: "BrokenPipe".into(),
+                raw_os_error: Some(109),
+            }),
+            close_error: None,
+            pipe_capacity_bytes: Some(4096),
+            write_mode: "projection_fixture",
+            acknowledgement: "not_observed",
+        }));
+        let report = process_error_report(&error);
+        assert_eq!(report["kind"], generic["kind"]);
+        assert_eq!(report["message"], generic["message"]);
+        assert_eq!(report["drained"], generic["drained"]);
+        assert_eq!(error.to_string(), original_display);
+        assert_eq!(report["minecraft_stop"]["bytes_written"], 2);
+        assert_eq!(
+            report["minecraft_stop"]["write_error"]["kind"],
+            "BrokenPipe"
+        );
+        assert_eq!(report["minecraft_stop"]["write_error"]["raw_os_error"], 109);
+        assert_eq!(report["minecraft_stop"]["acknowledgement"], "not_observed");
+        let mut completion = storage::retained_game::RetainedCompletion {
+            lease_released: true,
+            game_retained: true,
+            observed_before_release: storage::retained_game::RetainedMeasurement {
+                game_bytes: 1,
+                retained_bytes: 3,
+                build_slot_bytes: 4,
+                build_catalog_bytes: 5,
+                combined_slot_bytes: 7,
+                combined_catalog_bytes: 8,
+                within_budget: true,
+            },
+        };
+        let mut finish = storage::FinishOutcome {
+            command_exit: Some(0),
+            supervisor_errors: Vec::new(),
+            drained: true,
+            evidence_exported: true,
+        };
+        let admitted = retained_completion_report(&completion, &mut finish.supervisor_errors);
+        assert_eq!(admitted["status"], "released");
+        assert!(finish.supervisor_errors.is_empty());
+        completion.observed_before_release.within_budget = false;
+        let rejected = retained_completion_report(&completion, &mut finish.supervisor_errors);
+        assert_eq!(rejected["status"], "released_over_budget");
+        assert_eq!(rejected["completion"]["lease_released"], true);
+        assert_eq!(
+            rejected["completion"]["observed_before_release"]["within_budget"],
+            false
+        );
+        assert_eq!(rejected["error"]["kind"], "resource_budget");
+        // build finish와 전체 성공 gate가 공유하는 원 supervisor_errors에 남는다.
+        assert_eq!(finish.supervisor_errors.len(), 1);
+        assert!(finish.supervisor_errors[0].starts_with("resource_budget:"));
+        assert!(finish.drained && finish.evidence_exported);
+    }
 
     #[test]
     fn required_retry_companion_failure_preserves_the_owned_lease_and_scratch() {

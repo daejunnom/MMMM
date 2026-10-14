@@ -262,6 +262,8 @@ impl<'build> RetainedGame<'build> {
 
     /// A failed command can complete storage once native drain and durable
     /// evidence export are verified. No game/world/config is ever removed.
+    /// Releasing this known lease is storage completion, not budget acceptance:
+    /// callers must fail execution success if the final measurement is over budget.
     pub fn complete(
         mut self,
         outcome: &FinishOutcome,
