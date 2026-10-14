@@ -55,6 +55,9 @@ pub struct ProcessSpec {
     pub stdout_log: PathBuf,
     pub stderr_log: PathBuf,
     pub timeout: Duration,
+    /// Optional original caller deadline. Relative supervision and observations
+    /// may shorten this budget, but never move this absolute deadline forward.
+    pub absolute_deadline: Option<Instant>,
     pub observation_interval: Duration,
     pub drain_timeout: Duration,
     /// Combined retained stdout and stderr bytes. Excess output fails the run.
@@ -75,6 +78,7 @@ impl ProcessSpec {
             stdout_log,
             stderr_log,
             timeout: Duration::from_secs(1200),
+            absolute_deadline: None,
             observation_interval: Duration::from_secs(5),
             drain_timeout: Duration::from_secs(15),
             max_log_bytes: 64 * 1024 * 1024,
@@ -129,6 +133,7 @@ pub struct ProcessOutcome {
 pub struct CapturedProcessOutcome {
     outcome: ProcessOutcome,
     stdout_log: File,
+    process_started: bool,
 }
 
 impl fmt::Debug for CapturedProcessOutcome {
@@ -136,6 +141,7 @@ impl fmt::Debug for CapturedProcessOutcome {
         // File's Debug representation may include its private physical path.
         f.debug_struct("CapturedProcessOutcome")
             .field("outcome", &self.outcome)
+            .field("process_started", &self.process_started)
             .finish_non_exhaustive()
     }
 }
@@ -143,6 +149,12 @@ impl fmt::Debug for CapturedProcessOutcome {
 impl CapturedProcessOutcome {
     pub fn outcome(&self) -> &ProcessOutcome {
         &self.outcome
+    }
+
+    /// Set only by this supervisor's actual native spawn result. A pre-spawn
+    /// cancellation/expired deadline has a completion record without a child.
+    pub fn process_started(&self) -> bool {
+        self.process_started
     }
 
     /// Close the original capture handle and retain the unchanged JSON outcome.
@@ -368,6 +380,22 @@ pub fn supervise_with_progress_captured(
         return Ok(CapturedProcessOutcome {
             outcome,
             stdout_log,
+            process_started: false,
+        });
+    }
+    if spec
+        .absolute_deadline
+        .is_some_and(|deadline| Instant::now() >= deadline)
+    {
+        outcome.drained = true;
+        outcome.termination_reason = TerminationReason::Timeout;
+        outcome
+            .supervisor_errors
+            .push("deadline expired before process creation".into());
+        return Ok(CapturedProcessOutcome {
+            outcome,
+            stdout_log,
+            process_started: false,
         });
     }
     let mut process = native::Process::spawn(spec)?;
@@ -447,7 +475,7 @@ pub fn supervise_with_progress_captured(
                 "command cancelled".into(),
             );
         }
-        if failure_checks_active(&outcome, stopping_at) && started.elapsed() >= spec.timeout {
+        if failure_checks_active(&outcome, stopping_at) && command_deadline_expired(spec, started) {
             request_stop(
                 &mut process,
                 &mut outcome,
@@ -604,7 +632,15 @@ pub fn supervise_with_progress_captured(
     Ok(CapturedProcessOutcome {
         outcome,
         stdout_log,
+        process_started: true,
     })
+}
+
+fn command_deadline_expired(spec: &ProcessSpec, started: Instant) -> bool {
+    started.elapsed() >= spec.timeout
+        || spec
+            .absolute_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
 }
 
 fn observation_reason(error: &ProcessError) -> TerminationReason {
@@ -644,7 +680,7 @@ fn progress_sample(
     if cancellation.load(Ordering::Acquire) {
         return Err(ProcessError::new("command_cancelled", "command cancelled"));
     }
-    if started.elapsed() >= spec.timeout {
+    if command_deadline_expired(spec, started) {
         return Err(ProcessError::new(
             "command_timeout",
             "command timeout exceeded",
@@ -2441,6 +2477,7 @@ mod tests {
         assert!(current_checks > 1);
         assert!(String::from_utf8(stdout).unwrap().contains("owned-output"));
         assert_eq!(captured.outcome().command_exit, Some(0));
+        assert!(captured.process_started());
         let result = captured.into_outcome();
         assert_eq!(result.command_exit, Some(0));
         assert_eq!(result.termination_reason, TerminationReason::Completed);
@@ -2458,6 +2495,64 @@ mod tests {
         run.cleanup(result.drained);
     }
 
+    #[test]
+    fn pre_spawn_cancellation_and_original_deadline_have_no_created_process() {
+        for cancelled in [true, false] {
+            let mut run = TestRun::new("normal");
+            run.spec.absolute_deadline = Some(if cancelled {
+                Instant::now() + Duration::from_secs(2)
+            } else {
+                Instant::now() - Duration::from_secs(1)
+            });
+            let capture = supervise_with_progress_captured(
+                &run.spec,
+                &AtomicBool::new(cancelled),
+                |_| Ok(()),
+            )
+            .unwrap();
+            assert!(!capture.process_started());
+            assert!(capture.outcome().drained);
+            assert_eq!(capture.outcome().command_exit, None);
+            assert_eq!(capture.outcome().stdout_bytes, 0);
+            assert_eq!(capture.outcome().stderr_bytes, 0);
+            assert_eq!(
+                capture.outcome().termination_reason,
+                if cancelled {
+                    TerminationReason::Cancelled
+                } else {
+                    TerminationReason::Timeout
+                }
+            );
+            let outcome = capture.into_outcome();
+            run.cleanup(outcome.drained);
+        }
+    }
+
+    #[test]
+    fn original_absolute_deadline_survives_pre_spawn_observation_work() {
+        let mut run = TestRun::new("hold");
+        run.spec.absolute_deadline = Some(Instant::now() + Duration::from_secs(1));
+        let mut initial = true;
+        let capture = supervise_with_progress_captured(&run.spec, &AtomicBool::new(false), |_| {
+            if initial {
+                initial = false;
+                std::thread::sleep(Duration::from_millis(350));
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            capture.outcome().termination_reason,
+            TerminationReason::Timeout
+        );
+        assert!(capture.outcome().drained);
+        // The relative fixture budget is three seconds. Native supervision
+        // must use the earlier caller deadline after the pre-spawn work.
+        assert!(capture.outcome().elapsed_ms < 2500);
+        let outcome = capture.into_outcome();
+        run.cleanup(outcome.drained);
+    }
+
     // These fixture outcomes exercise only the private captured-read boundary.
     // The normal-exit test above obtains its outcome from real native supervision.
     fn captured_read_fixture(run: &TestRun, body: &[u8]) -> CapturedProcessOutcome {
@@ -2466,6 +2561,7 @@ mod tests {
         stdout_log.sync_all().unwrap();
         CapturedProcessOutcome {
             stdout_log,
+            process_started: false,
             outcome: ProcessOutcome {
                 command_exit: Some(0),
                 command_signal: None,

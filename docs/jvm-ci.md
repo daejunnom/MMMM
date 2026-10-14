@@ -2,8 +2,11 @@
 
 `.github/workflows/jvm.yml`은 Windows x64 (`windows-2025`), Linux x64
 (`ubuntu-24.04`), macOS ARM64 (`macos-15`)에서 같은 후보 source SHA를 확인하고
-Java SDK, 호스트 core 및 public Java adapter 테스트와 Fabric 호스트 컴파일·테스트를
-실행하도록 작성한 기반이다. 후보 `1498ea14f253b03bf97a72323feddad934118b03`의
+Java SDK, 호스트 core 및 public Java adapter 테스트와 Fabric 호스트 컴파일·테스트,
+definition observer 및 두 acceptance fixture의 테스트와 JAR 생성을 실행하도록
+작성한 기반이다. 새 세 모듈의 CI 연결은 소스 등록이며 실제 CI 실행 결과는 별도로
+확인한다. observer Java 테스트와 JAR 생성은 Rust JNI/JVMTI observer의 실제 로딩이나
+게임 정의 관측을 증명하지 않는다. 후보 `1498ea14f253b03bf97a72323feddad934118b03`의
 [실제 첫 실행](https://github.com/daejunnom/MMMM/actions/runs/38462192682)은 세 runner 모두 실패했다.
 Windows는 Rust bootstrap 생성물 관측에서, macOS는 JVM helper의 읽기 전용 PowerShell
 자동 변수 대입에서, Linux는 제한된 PowerShell의 helper 시작 전 ICU 초기화에서 멈췄다.
@@ -14,7 +17,19 @@ Windows는 Rust bootstrap 생성물 관측에서, macOS는 JVM helper의 읽기 
 Windows 검증이 성공하고 macOS와 Linux가 실패했다. 두 Unix 실행의 원본 관리 증거에서는
 `native_kind=unix_fifo`, `generated_relative=scratch/clr-debug-pipe-<pid>-<start>-in`을
 관측했다. 해당 특수 파일 때문에 측정과 evidence export가 실패했으며 소유 슬롯과 lease를
-보존했다. 이 관측을 근거로 채택한 D025의 새 설정은 아래와 같고 아직 실제 실행하지 않았다.
+보존했다. 이 관측을 근거로 채택한 D025의 설정과 후속 실제 결과는 아래와 같다.
+
+후보 `b0cacc56577df8d7c73692d4d3e10f079320daa6`의
+[일곱 번째 JVM 실행](https://github.com/daejunnom/MMMM/actions/runs/38475236519)은
+세 OS와 집계가 성공했다. 세 artifact의 bytes·SHA-256과 해당 source, 각 OS의
+기존 네 모듈 255개 검사·다섯 필수 task 실행을 대조했다. inside probe의 diagnostics
+비활성화는 모두 true였고 command 0·drain·완전한 출력·export·scratch 정리·lease
+해제를 확인했다. 이는 이 실행의 성공이며 이후 모든 실행의 성공 보장은 아니다.
+다음 후보 `3f2becc4cb0620675dcd9a0a4f69c4962ca51f4e`의
+[여덟 번째 JVM 실행](https://github.com/daejunnom/MMMM/actions/runs/38478101982)은
+Windows·macOS job이 성공했으나 Linux와 집계가 실패했다. Linux의 Gradle 종료 0과
+255개 검사 통과 뒤 fixed metadata open의 ESRCH 자원 관측 오류가 발생했다.
+Gradle 성공과 전체 관리 실행 성공을 구분하고 원본 실패를 보존한다.
 
 PR은 merge commit 대신 `pull_request.head.sha`를 checkout한다. event SHA,
 PR head/base SHA, repository, workflow, run, attempt 및 실제 runner image를
@@ -57,7 +72,8 @@ symlink 객체를 만들지 않는다. Unix 파일은 소유자의 읽기·쓰�
 archive는 하나당 512 MiB, member는 10000개, 파일은 256 MiB,
 해제된 bytes는 archive당 2 GiB로 제한한다. JDK root는 `jdk-25.0.4.1+1`,
 macOS Java 경로는 그 root의 `Contents/Home/bin/java`라는 계약으로 검사한다.
-이 예상 배치를 실제 3개 OS archive 해제 결과와 대조하는 검증은 아직 미실행이다.
+위 일곱 번째 실행에서는 세 고정 archive의 해제와 실제 Java 실행을 확인했다.
+새 후보도 해당 입력과 실행을 별도로 검사하며 과거 성공을 자동 채택하지 않는다.
 이전 또는 실패한 extraction을 덮어쓰거나 자동 채택하지 않는다.
 
 ## 실행과 결과
@@ -72,7 +88,10 @@ launcher heap은 256 MiB, 단일 사용 Gradle daemon heap은 1 GiB다.
 소유 process scope 안에서 종료를 확인한다.
 
 필수 task는 `:provider-sdk:test`, `:host-core:test`, `:public-java-adapter:test`,
-`:fabric-host:compileJava`, `:fabric-host:test`다. `--rerun-tasks`로 이번 실행을 요구하고 `--continue`로
+`:fabric-host:compileJava`, `:fabric-host:test`, `:definition-observer:test`,
+`:definition-observer:jar`, `:fixture-legacy:test`, `:fixture-legacy:jar`,
+`:fixture-provider:test`, `:fixture-provider:jar`의 11개다. 같은 task 목록으로 Gradle 명령과
+생성 init script의 관측 대상을 구성한다. `--rerun-tasks`로 이번 실행을 요구하고 `--continue`로
 독립 task의 결과도 보존한다. task의 `executed`, `failed`, `up_to_date`, `skipped`,
 `no_source`와 `no_work`를 구분한다. 이 profile에서는 필수 task의 실제 실행만 성공으로
 받으며 이전 XML이나 cache hit를 현재 실행의 통과로 채택하지 않는다.
@@ -80,11 +99,18 @@ launcher heap은 256 MiB, 단일 사용 Gradle daemon heap은 1 GiB다.
 각 테스트 module의 이번 XML을 유한한 개수와 bytes 안에서 읽고, suite count와 실제
 testcase count를 대조한다. 원본 XML SHA, 테스트·실패·오류·skip 수를 외부 요약에
 남긴다. 최소 한 테스트의 실제 통과와 실패·오류 0을 요구한다. Gradle의 실제 종료
-코드 0, 다섯 필수 task 실행, 네 module 결과, source 불변 확인 및 evidence export를
+코드 0, 11개 필수 task 실행, 일곱 module 결과, source 불변 확인 및 evidence export를
 함께 충족해야 `jvm-result.json`의 상태를 `passed`로 둔다. Rust 감독기의 drain,
 export와 lease 해제도 성공한 경우에만 CI verify step이 성공한다.
 
-필수 task의 실제 classpath JAR는 원래 index, 파일명, bytes와 SHA를 기록한다.
+XML 집계 대상은 `provider-sdk`, `host-core`, `public-java-adapter`, `fabric-host`,
+`definition-observer`, `fixture-legacy`, `fixture-provider`다. skip 수는 그대로 기록하며
+각 모듈에 최소 한 개의 실제 통과가 있어야 한다. 테스트 수를 미리 정한 상수와 비교하거나
+JAR task의 실행을 테스트 통과로 대신하지 않는다. 세 추가 JAR task는 이번 실제 생성
+여부를 확인하지만, 게임 실행·네이티브 ABI·릴리스 artifact의 bytes 동등성은 별도 검사다.
+
+필수 task 중 JavaCompile과 Test의 실제 classpath JAR는 원래 index, 파일명, bytes와
+SHA를 기록한다. classpath가 없는 JAR task도 같은 종료 상태 기록과 실제 실행 조건을 따른다.
 source 입력과 Gradle/JDK archive를 함께 식별하지만, classpath의 directory output,
 모든 plugin의 전이 입력 또는 OS 간 동일 JAR bytes를 완전히 증명하는 자료는 아니다.
 Hermetic build, 게임 profile 검증과 릴리스 artifact 동등성은 별도 검증이 필요하다.
@@ -179,6 +205,7 @@ source 및 toolchain 식별, 개별 task·XML 요약과 관리 종료 기록을 
 URL과 환경 변수 전체도 기록하지 않는다. 원시 native 로그는 외부 CI artifact에 두며
 개인 개발 경로가 포함된 로그를 저장소 문서로 복사하지 않는다.
 
-새 D025 정책은 소스 작성 및 정적 검토 범위다. 정책 적용 후 실제 3개 OS CI 성공,
-Minecraft 서버·수동 클라이언트·멀티플레이·vanilla 생성물 검증과 공개 `v0.1.0`
-배포는 미완료이며 이 workflow의 SDK 테스트나 Fabric 컴파일로 대체하지 않는다.
+D025의 실제 성공과 다음 실행의 Linux 실패는 위 고정 SHA의 결과로 남긴다.
+새 세 모듈의 CI 등록은 아직 해당 후보에서 실행하지 않았다. Minecraft 서버·수동
+클라이언트·멀티플레이·vanilla 생성물 검증과 공개 `v0.1.0` 배포는 미완료이며,
+이 workflow의 JVM 테스트나 Fabric 컴파일로 대체하지 않는다.

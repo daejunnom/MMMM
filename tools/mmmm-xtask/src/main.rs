@@ -1,4 +1,4 @@
-use mmmm_xtask::{policy, process, storage};
+use mmmm_xtask::{definition_startup, policy, process, storage};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -21,11 +21,13 @@ fn entry() -> Result<i32, Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let command = args
         .next()
-        .ok_or("expected run, check-repository or bootstrap-complete")?;
+        .ok_or("expected run, definition-startup, check-repository or bootstrap-complete")?;
     let mut flags = BTreeMap::new();
     let mut child_args = Vec::new();
+    let mut child_separator = false;
     while let Some(flag) = args.next() {
         if flag == "--" {
+            child_separator = true;
             child_args.extend(args);
             break;
         }
@@ -38,6 +40,12 @@ fn entry() -> Result<i32, Box<dyn std::error::Error>> {
     let checkout = optional_path(&mut flags, "--checkout").unwrap_or(std::env::current_dir()?);
     match command.as_str() {
         "run" => run_managed(checkout, flags, child_args),
+        "definition-startup" => {
+            if child_separator || !child_args.is_empty() {
+                return Err("definition-startup accepts no child command or arguments".into());
+            }
+            run_definition_startup(checkout, flags)
+        }
         "check-repository" => {
             if !child_args.is_empty() {
                 return Err("check-repository has no child command".into());
@@ -234,6 +242,264 @@ fn run_managed(
         && receipt.cleanup_errors.is_empty();
     println!("{}", serde_json::to_string_pretty(&receipt)?);
     Ok(if success { 0 } else { 1 })
+}
+
+fn run_definition_startup(
+    checkout: PathBuf,
+    mut flags: BTreeMap<String, String>,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    use definition_startup::{
+        DefinitionSourceInput, DefinitionSourceRole, DefinitionStartupSelection,
+    };
+    let evidence_root = required_path(&mut flags, "--evidence-root")?;
+    let output_root = optional_path(&mut flags, "--output-root");
+    let java = required_path(&mut flags, "--java-executable")?;
+    let library = required_path(&mut flags, "--observer-library")?;
+    let jar = required_path(&mut flags, "--observer-jar")?;
+    let mut sources = Vec::new();
+    for (flag, role) in [
+        ("--jdk-archive", DefinitionSourceRole::JdkArchive),
+        ("--jdk-modules", DefinitionSourceRole::JdkModules),
+        (
+            "--build-source-manifest",
+            DefinitionSourceRole::BuildSourceManifest,
+        ),
+    ] {
+        sources.push(DefinitionSourceInput::new(
+            role,
+            required_path(&mut flags, flag)?,
+        ));
+    }
+    // Three primary inputs and three mandatory source inputs leave at most 26
+    // explicit library selections. No delimiter, wildcard or child argv codec.
+    let mut gap = false;
+    let mut libraries = 0;
+    for index in 1..=26 {
+        match optional_path(&mut flags, &format!("--jdk-library-{index}")) {
+            Some(path) if !gap => {
+                sources.push(DefinitionSourceInput::new(
+                    DefinitionSourceRole::JdkLibrary,
+                    path,
+                ));
+                libraries += 1;
+            }
+            Some(_) => {
+                return Err("JDK library flags must be contiguous from --jdk-library-1".into());
+            }
+            None => gap = true,
+        }
+    }
+    if libraries == 0 {
+        return Err("required flag: --jdk-library-1".into());
+    }
+    reject_remaining(&flags)?;
+    let selection = DefinitionStartupSelection::new(java, library, jar, sources)?;
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let signal = cancellation.clone();
+    ctrlc::set_handler(move || signal.store(true, std::sync::atomic::Ordering::Release))?;
+    let build = storage::ManagedBuild::acquire(
+        storage::StorageConfig {
+            output_root,
+            evidence_root,
+            purpose: "definition-startup".into(),
+            budgets: storage::Budgets::default(),
+        },
+        &checkout,
+    )?;
+    let result = definition_startup::run_owned(&build, &selection, &cancellation);
+    let outcome = match &result {
+        Ok(observed) => Some(observed.outcome()),
+        Err(error) => error.outcome(),
+    };
+    // Supervision records pre-spawn cancellation too. Only the private capture
+    // receipt establishes actual creation; a ProcessError alone stays unknown.
+    let started = match &result {
+        Ok(observed) => Some(observed.process_started()),
+        Err(error) => error.process_started(),
+    };
+    let command_exit = outcome.and_then(|value| value.command_exit);
+    let drained = outcome.map(|value| value.drained).unwrap_or_else(|| {
+        result.as_ref().err().is_some_and(|error| {
+            error.process_started() == Some(false)
+                || error.process_error().is_some_and(|error| error.drained)
+        })
+    });
+    let mut supervisor_errors = outcome
+        .map(|value| value.supervisor_errors.clone())
+        .unwrap_or_default();
+    let process_report = match (&result, outcome) {
+        (_, Some(value)) => serde_json::to_value(value)?,
+        (Err(error), None) => definition_startup_error_json(error),
+        (Ok(_), None) => return Err("observed startup has no original process outcome".into()),
+    };
+    let (status, observation, raw) = match &result {
+        Ok(observed) => (
+            "observed",
+            serde_json::json!({
+                "schema": "mmmm-definition-startup-observation/1",
+                "scope": "development_fixture",
+                "status": "observed",
+                "process_started": started,
+                "source_pins": observed.source_pins(),
+                "raw_sha256": observed.raw_sha256(),
+                "summary": observed.summary(),
+            }),
+            Some(observed.raw_abi2()),
+        ),
+        Err(error) => {
+            supervisor_errors.push(error.to_string());
+            (
+                "failed",
+                serde_json::json!({
+                    "schema": "mmmm-definition-startup-observation/1",
+                    "scope": "development_fixture",
+                    "status": "failed",
+                    "process_started": started,
+                    "source_pins": error.source_pins(),
+                    "error": definition_startup_error_json(error),
+                    "raw_candidate_present": error.raw_candidate().is_some(),
+                }),
+                error.raw_candidate(),
+            )
+        }
+    };
+    let mut exported = false;
+    let export = (|| -> Result<(), Box<dyn std::error::Error>> {
+        build.check_current_ownership()?;
+        write_new_json(
+            &build.paths().evidence.join("process.json"),
+            &process_report,
+        )?;
+        write_new_json(
+            &build.paths().evidence.join("definition-startup.json"),
+            &observation,
+        )?;
+        if !drained {
+            return Err("unconfirmed drain prevents startup log export and cleanup".into());
+        }
+        build.measure()?;
+        if let Some(bytes) = raw {
+            let name = if result.is_ok() {
+                "definition-startup.abi2.bin"
+            } else {
+                "definition-startup.candidate.bin"
+            };
+            export_definition_frame(
+                &build,
+                &cancellation,
+                &build.paths().evidence.join(name),
+                bytes,
+            )?;
+        }
+        for name in [
+            "definition-startup.stdout.bin",
+            "definition-startup.stderr.log",
+        ] {
+            let source = build.paths().scratch.join(name);
+            if source.try_exists()? {
+                export_log(&source, &build.paths().evidence.join(name))?;
+            }
+        }
+        build.check_current_ownership()?;
+        Ok(())
+    })();
+    match export {
+        Ok(()) => exported = true,
+        Err(error) => supervisor_errors.push(format!("evidence export: {error}")),
+    }
+    write_new_json(
+        &build.paths().evidence.join("finalization-input.json"),
+        &serde_json::json!({
+            "schema": "mmmm-build-finalization-input/1",
+            "command_exit": command_exit,
+            "drained": drained,
+            "evidence_exported": exported,
+            "supervisor_errors": supervisor_errors,
+        }),
+    )?;
+    let observed = result.is_ok();
+    let receipt = build.finish(storage::FinishOutcome {
+        command_exit,
+        supervisor_errors,
+        drained,
+        evidence_exported: exported,
+    })?;
+    let success = observed
+        && receipt.lease_released
+        && receipt.supervisor_errors.is_empty()
+        && receipt.cleanup_errors.is_empty();
+    // Raw frames and original diagnostics stay in the owned evidence root.
+    // Public stdout contains the observation scope, path-free pins and summary.
+    let public_observation = match &result {
+        Ok(value) => {
+            serde_json::json!({"source_pins": value.source_pins(), "raw_sha256": value.raw_sha256(), "summary": value.summary()})
+        }
+        Err(value) => {
+            serde_json::json!({"source_pins": value.source_pins(), "error_kind": value.kind(), "native_os_code": value.native_os_code()})
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "mmmm-definition-startup-result/1",
+            "scope": "development_fixture",
+            "status": status,
+            "process_started": started,
+            "observation": public_observation,
+            "receipt": receipt,
+        }))?
+    );
+    Ok(if success { 0 } else { 1 })
+}
+
+fn definition_startup_error_json(
+    error: &definition_startup::DefinitionStartupError,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": error.kind(),
+        "native_os_code": error.native_os_code(),
+        "process_error": error.process_error().map(|value| serde_json::json!({"kind":value.kind,"message":value.message,"drained":value.drained})),
+        "storage_error": error.storage_error().map(|value| serde_json::json!({"kind":value.kind,"message":value.message})),
+        "post_check_error": error.post_check_error().map(definition_startup_error_json),
+    })
+}
+
+fn export_definition_frame(
+    build: &storage::ManagedBuild,
+    cancellation: &AtomicBool,
+    destination: &Path,
+    bytes: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if bytes.is_empty() || bytes.len() > 18 * 1024 * 1024 {
+        return Err("startup frame export exceeds the original 18 MiB cap".into());
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let check = || -> Result<(), Box<dyn std::error::Error>> {
+        if cancellation.load(std::sync::atomic::Ordering::Acquire)
+            || std::time::Instant::now() >= deadline
+        {
+            return Err("startup frame export cancelled or deadline expired".into());
+        }
+        build.check_current_ownership()?;
+        if cancellation.load(std::sync::atomic::Ordering::Acquire)
+            || std::time::Instant::now() >= deadline
+        {
+            return Err("startup frame export cancelled or deadline expired".into());
+        }
+        Ok(())
+    };
+    check()?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    for chunk in bytes.chunks(64 * 1024) {
+        check()?;
+        file.write_all(chunk)?;
+        check()?;
+    }
+    file.sync_all()?;
+    check()
 }
 
 fn optional_path(flags: &mut BTreeMap<String, String>, key: &str) -> Option<PathBuf> {

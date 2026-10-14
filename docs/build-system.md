@@ -355,7 +355,42 @@ RSS 합계는 각 process를 순서대로 읽은 관측이다. 공유 페이지�
 실제 sample 수, peak RSS·VM·process 수, 최대 sample 간격과 미완성 memory sample을
 보존한다. process 상한 초과로 RSS 전체를 읽지 않은 sample은 완전한 memory sample로
 기록하지 않는다. 관측 위반과 오류는 소유 종료·출력 수집·drain 경로로 전달한다.
-새 Linux JVM 정책의 native 실행과 실제 Gradle 적합성은 아직 별도 검증 대상이다.
+실제 Linux 정책과 Gradle 결과는 구현 착수 조건의 실행별 기록으로 확인한다.
+정책 소스나 이전 성공만으로 현재 실행의 적합성을 선언하지 않는다.
+
+Linux native metadata 실패는 process 역할(reserved leader, 열거한 candidate,
+owned member), 고정 file 역할(pid directory, stat, RSS rollup), open·rewind·read
+단계 및 OS error kind/code를 유한하게 기록한다. 원시 proc 토큰, comm과 개인 경로를
+진단에 넣지 않는다. missing pathname 또는 open 단계의 ENOENT·ESRCH를 자동으로
+종료 증거로 승격하지 않으며, kernel의 실제 종료와 접근 실패를 구분할 후속 관측이
+필요하다.
+
+`definition-startup`은 Windows x64의 개발용 JNI/JVMTI fixture 관측 명령이다.
+기존 고정 JDK archive·modules·명시적 native library와 실제 Java executable·observer
+DLL·JAR·build source manifest를 최대 32개, 합계 512 MiB로 선택한다. 현재 고정 JDK
+ZIP의 실제 141,167,264 bytes에 맞춰 archive role을 192 MiB로 제한한다. 선택한
+파일과 조상 디렉터리의 실제 핸들을 유지하고 같은 핸들의 size·identity·SHA를
+실행 전후 대조한다. secret 이름, named stream, link와 Windows 경로 정규화 alias는
+파일을 열기 전에 거절한다. 이 선택과 hash는 JDK 전체 image나 agent roster의
+source admission을 발급하지 않는다.
+
+준비·native 실행·같은 stdout 핸들 판독·입력 재검사·ABI2 decode와 hash는 원래
+60초 절대 기한을 공유한다. 남은 프로세스 시간이 1초 미만이면 올림하지 않고
+실행을 거절한다. 원래 native drain 15초와 bounded evidence export 5초를 별도로
+기록한다. 고정 fixture heap 256 MiB·metaspace 256 MiB·code cache 64 MiB,
+일반 Windows 2 GiB Job·process 32, raw ABI2 18 MiB·combined log 64 MiB를
+사용한다. Java injector 환경 네 개는 원래 값을 읽거나 출력하지 않고 빈 값으로
+override한다. 현재 구현은 Linux와 macOS의 이 개발용 startup 명령을 지원하지 않는다.
+JVM unified logging의 기본 warning·error 선택은 stderr로 다시 구성하여 원래
+bounded 진단에 보존한다. stdout은 단일 바이너리 프레임으로 엄격히 검사하며,
+추가 문자열을 찾거나 잘라낸 뒤 성공으로 처리하지 않는다.
+
+process outcome 존재만으로 시작을 선언하지 않는다. supervisor의 private capture
+receipt가 실제 spawn 뒤 true, 생성 전 취소·만료에 false를 기록하며, outcome 없는
+오류는 미확정으로 남긴다. 일반 `run`의 기존 JSON과 기본 상대 기한은 유지한다.
+성공과 실패의 원래 outcome, 선택 입력 pin, raw frame 또는 candidate, 후속 검사
+오류를 보존한 뒤 기존 export·finish 수명을 따른다. 이 관측은 실제 게임 target
+profile, 쓰기 허가, SAM·참조 전체 closure 또는 제품 인수 완료를 의미하지 않는다.
 
 Linux JVM native VM probe는 일반 `checks`의 이미 낮아진 hard limit 안에서 실행하지
 않는다. 고정 `jvm` 소유 실행에서만 명시적으로 선택하는 ignored 검사이며, inherited

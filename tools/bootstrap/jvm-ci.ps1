@@ -14,10 +14,14 @@ $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
 $pathComparison = if ($IsWindows) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
 $phase = 'preflight'
 $operation = 'managed_paths'
-$tasks = @(':provider-sdk:test', ':host-core:test', ':public-java-adapter:test', ':fabric-host:compileJava', ':fabric-host:test')
+$testModules = @('provider-sdk', 'host-core', 'public-java-adapter', 'fabric-host',
+    'definition-observer', 'fixture-legacy', 'fixture-provider')
+$tasks = @(':provider-sdk:test', ':host-core:test', ':public-java-adapter:test', ':fabric-host:compileJava', ':fabric-host:test',
+    ':definition-observer:test', ':definition-observer:jar', ':fixture-legacy:test', ':fixture-legacy:jar',
+    ':fixture-provider:test', ':fixture-provider:jar')
 $nativeExit = $null
 $record = [ordered]@{ schema='mmmm-jvm-ci-result/1'; source_sha=$ExpectedSourceSha; target=$Target;
-    status='not_run'; phase=$phase; gradle_exit=$null; required_tasks=$tasks; tasks=@(); tests=@();
+    status='not_run'; phase=$phase; gradle_exit=$null; required_tasks=$tasks; required_test_modules=$testModules; tasks=@(); tests=@();
     game_verification='not_run'; release_verification='not_run'; evidence_errors=@(); failure_details=@();
     profile=[ordered]@{ gradle='9.6.0'; jdk_archive_release='25.0.4.1+1'; gradle_workers=2;
         junit_forks=1; launcher_heap_bytes=268435456; daemon_heap_bytes=1073741824; test_heap_bytes=536870912;
@@ -307,13 +311,14 @@ try {
     $initText = @'
 import groovy.json.JsonOutput
 import java.security.MessageDigest
-def selected = [':provider-sdk:test', ':host-core:test', ':public-java-adapter:test', ':fabric-host:compileJava', ':fabric-host:test']
+def selected = __MMMM_REQUIRED_TASKS__
 def evidence = new File(System.getProperty('mmmm.ci.evidence'))
 def events = new File(evidence, 'jvm-task-events.ndjson')
 def inputs = new File(evidence, 'jvm-classpath-inputs.ndjson')
 def sourceSha = System.getProperty('mmmm.ci.sourceSha')
 gradle.taskGraph.beforeTask { task ->
     if (!selected.contains(task.path)) return
+    if (!(task instanceof org.gradle.api.tasks.compile.JavaCompile) && !(task instanceof org.gradle.api.tasks.testing.Test)) return
     def classpath = task.classpath.files
     def jars = classpath.findAll { it.name.endsWith('.jar') }
     if (jars.size() > 1024) throw new GradleException('JVM_CLASSPATH_ENTRY_BUDGET')
@@ -350,6 +355,9 @@ gradle.taskGraph.afterTask { task, state ->
     events.append(line, 'UTF-8')
 }
 '@
+    # JSON arrays with the fixed task names are valid Groovy list literals.
+    # Use the command's own required list for both task selection and evidence.
+    $initText = $initText.Replace('__MMMM_REQUIRED_TASKS__', (ConvertTo-Json -InputObject $tasks -Compress))
     [System.IO.File]::WriteAllText($init, $initText, $utf8)
     $record.init_script_sha256 = Get-RegularHash $init 64KB
     $arguments = @('-Xms64m','-Xmx256m','-XX:MaxMetaspaceSize=192m', "-XX:ErrorFile=$gradleBuild/jvm-fatal-%p.log",
@@ -380,7 +388,7 @@ gradle.taskGraph.afterTask { task, state ->
     if (@($events | Group-Object task | Where-Object Count -ne 1).Count -ne 0) { throw 'DUPLICATE_TASK_EVIDENCE' }
     $record.tasks = $events
     $testSummaries = [System.Collections.Generic.List[object]]::new()
-    foreach ($module in @('provider-sdk','host-core','public-java-adapter','fabric-host')) {
+    foreach ($module in $testModules) {
         $event = @($events | Where-Object task -CEQ ":${module}:test")
         if ($event.Count -eq 1 -and $event[0].status -cin @('executed','failed')) {
             try { $testSummaries.Add((Export-TestSummary $module (Join-Path $gradleBuild "$module/test-results/test"))) }
@@ -393,7 +401,7 @@ gradle.taskGraph.afterTask { task, state ->
     $record.tests = $testSummaries.ToArray()
     $record.classpath_inputs_sha256 = Get-RegularHash $classpathEvidence 1MB
     $allExecuted = $events.Count -eq $tasks.Count -and @($events | Where-Object status -CNE 'executed').Count -eq 0
-    $allTests = $testSummaries.Count -eq 4 -and @($testSummaries | Where-Object passed -NE $true).Count -eq 0
+    $allTests = $testSummaries.Count -eq $testModules.Count -and @($testSummaries | Where-Object passed -NE $true).Count -eq 0
     $record.status = if ($nativeExit -eq 0 -and $allExecuted -and $allTests -and $record.evidence_errors.Count -eq 0) { 'passed' } else { 'failed' }
     $record.phase = $phase
     Write-NewJson (Join-Path $evidence 'jvm-result.json') $record 1MB

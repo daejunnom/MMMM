@@ -30,4 +30,5 @@ if (gradle.startParameter.isBuildCacheEnabled()) {
 }
 
 rootProject.name = 'mmmm-jvm'
-include 'provider-sdk', 'host-core', 'public-java-adapter', 'fabric-host'
+include 'provider-sdk', 'host-core', 'public-java-adapter', 'fabric-host', 'definition-observer'
+include 'fixture-legacy', 'fixture-provider'

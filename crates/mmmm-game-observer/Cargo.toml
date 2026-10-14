@@ -1,0 +1,17 @@
+[package]
+name = "mmmm-game-observer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "MMMM bounded JDK 25 startup definition observer at the game boundary"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+test = true
+
+[lints]
+workspace = true

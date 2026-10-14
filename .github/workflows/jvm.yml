@@ -156,7 +156,7 @@ jobs:
           if (-not (Test-Path -LiteralPath $tool -PathType Leaf)) { throw 'Completed bootstrap tool is missing.' }
           "MMMM_XTASK=$tool" | Add-Content -LiteralPath $env:GITHUB_ENV
 
-      - name: Run SDK tests and actual Fabric compilation and tests
+      - name: Run JVM tests, Fabric compilation, and observer and fixture JAR tasks
         id: verify
         timeout-minutes: 22
         env:

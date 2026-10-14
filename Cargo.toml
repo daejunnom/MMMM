@@ -9,6 +9,7 @@ members = [
     "crates/mmmm-exchange",
     "crates/mmmm-compiler",
     "crates/mmmm-planner",
+    "crates/mmmm-game-observer",
 ]
 resolver = "3"
 

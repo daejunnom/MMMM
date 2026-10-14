@@ -110,6 +110,87 @@ fn metadata(message: &'static str) -> ProcessError {
 }
 
 #[derive(Clone, Copy)]
+enum ProcessRole {
+    ReservedLeader,
+    EnumeratedCandidate,
+    OwnedMember,
+}
+
+impl ProcessRole {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ReservedLeader => "reserved_leader",
+            Self::EnumeratedCandidate => "enumerated_candidate",
+            Self::OwnedMember => "owned_member",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MetadataRole {
+    PidDirectory,
+    Stat,
+    RssRollup,
+}
+
+impl MetadataRole {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PidDirectory => "pid_directory",
+            Self::Stat => "stat",
+            Self::RssRollup => "rss_rollup",
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn file_name(self) -> Result<&'static std::ffi::CStr, ProcessError> {
+        match self {
+            Self::Stat => Ok(c"stat"),
+            Self::RssRollup => Ok(c"smaps_rollup"),
+            Self::PidDirectory => Err(metadata("PID directory is not a fixed metadata file")),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MetadataOperation {
+    Open,
+    Rewind,
+    Read,
+}
+
+impl MetadataOperation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Rewind => "rewind",
+            Self::Read => "read",
+        }
+    }
+}
+
+fn metadata_io_error(
+    process: ProcessRole,
+    file: MetadataRole,
+    operation: MetadataOperation,
+    error: std::io::Error,
+) -> ProcessError {
+    // All context comes from closed roles. Neither the numeric PID, native
+    // pathname, comm, raw procfs tokens nor the OS message enters the receipt.
+    ProcessError::new(
+        "resource_observation",
+        format!(
+            "native process metadata failed; process_role={}; file_role={}; operation={}; error_kind={:?}; os_error={:?}",
+            process.label(),
+            file.label(),
+            operation.label(),
+            error.kind(),
+            error.raw_os_error(),
+        ),
+    )
+}
+
+#[derive(Clone, Copy)]
 enum NumericField {
     StatPid,
     DirectoryPid,
@@ -374,9 +455,10 @@ mod native {
             if filesystem.f_type != PROC_MAGIC {
                 return Err(metadata("fixed process observation root is not procfs"));
             }
-            let leader = open_process(&root, leader_pid)?.ok_or_else(|| {
-                ProcessError::new("process_identity", "reserved Linux leader is unavailable")
-            })?;
+            let leader =
+                open_process(&root, leader_pid, ProcessRole::ReservedLeader)?.ok_or_else(|| {
+                    ProcessError::new("process_identity", "reserved Linux leader is unavailable")
+                })?;
             if leader.initial.identity.group != leader_pid
                 || leader.initial.identity.session != leader_pid
             {
@@ -437,7 +519,9 @@ mod native {
                 if pid == group {
                     continue;
                 }
-                let Some(mut member) = open_process(&self.root, pid)? else {
+                let Some(mut member) =
+                    open_process(&self.root, pid, ProcessRole::EnumeratedCandidate)?
+                else {
                     // This candidate disappeared before it had an anchored
                     // identity. It is not a confirmed owned-process exit.
                     continue;
@@ -462,17 +546,21 @@ mod native {
                     "reserved Linux leader identity was already lost",
                 ));
             }
-            let result = read_stat(&mut self.leader.stat, self.leader.initial.identity.pid)
-                .and_then(|value| match value {
-                    Some(value) => {
-                        verify_identity(self.leader.initial, value)?;
-                        Ok(value)
-                    }
-                    None => Err(ProcessError::new(
-                        "process_identity",
-                        "reserved Linux leader disappeared from its original procfs FD",
-                    )),
-                });
+            let result = read_stat(
+                &mut self.leader.stat,
+                self.leader.initial.identity.pid,
+                ProcessRole::ReservedLeader,
+            )
+            .and_then(|value| match value {
+                Some(value) => {
+                    verify_identity(self.leader.initial, value)?;
+                    Ok(value)
+                }
+                None => Err(ProcessError::new(
+                    "process_identity",
+                    "reserved Linux leader disappeared from its original procfs FD",
+                )),
+            });
             if result
                 .as_ref()
                 .is_err_and(|error| error.kind == "process_identity")
@@ -489,7 +577,12 @@ mod native {
         is_leader: bool,
     ) -> Result<Option<MemberSample>, ProcessError> {
         let pid = process.initial.identity.pid;
-        let Some(before) = read_stat(&mut process.stat, pid)? else {
+        let role = if is_leader {
+            ProcessRole::ReservedLeader
+        } else {
+            ProcessRole::OwnedMember
+        };
+        let Some(before) = read_stat(&mut process.stat, pid, role)? else {
             return unavailable_member(is_leader);
         };
         verify_identity(process.initial, before)?;
@@ -497,11 +590,11 @@ mod native {
             return Ok(None);
         }
         let memory = if include_rss {
-            Some(read_rollup(&process.directory))
+            Some(read_rollup(&process.directory, role))
         } else {
             None
         };
-        let after = read_stat(&mut process.stat, pid)?;
+        let after = read_stat(&mut process.stat, pid, role)?;
         // smaps_rollup ESRCH/ENOENT alone never proves death: a live original
         // stat identity makes that exact RSS observation error fatal.
         // Successful RSS stays an observed fact even when this process exits
@@ -521,7 +614,11 @@ mod native {
         }
     }
 
-    fn open_process(root: &File, pid: i32) -> Result<Option<ProcDirectory>, ProcessError> {
+    fn open_process(
+        root: &File,
+        pid: i32,
+        role: ProcessRole,
+    ) -> Result<Option<ProcDirectory>, ProcessError> {
         let name = CString::new(pid.to_string()).map_err(|_| metadata("invalid numeric PID"))?;
         let descriptor = unsafe {
             libc::openat(
@@ -535,11 +632,16 @@ mod native {
             if error.raw_os_error() == Some(libc::ENOENT) {
                 return Ok(None);
             }
-            return Err(io_error("open native PID directory", error));
+            return Err(metadata_io_error(
+                role,
+                MetadataRole::PidDirectory,
+                MetadataOperation::Open,
+                error,
+            ));
         }
         let directory = unsafe { File::from_raw_fd(descriptor) };
-        let mut stat = open_file(&directory, c"stat")?;
-        let Some(initial) = read_stat(&mut stat, pid)? else {
+        let mut stat = open_file(&directory, MetadataRole::Stat, role)?;
+        let Some(initial) = read_stat(&mut stat, pid, role)? else {
             return Ok(None);
         };
         Ok(Some(ProcDirectory {
@@ -549,28 +651,51 @@ mod native {
         }))
     }
 
-    fn read_stat(file: &mut File, pid: i32) -> Result<Option<Stat>, ProcessError> {
-        file.rewind()
-            .map_err(|error| io_error("rewind original native stat FD", error))?;
+    fn read_stat(
+        file: &mut File,
+        pid: i32,
+        role: ProcessRole,
+    ) -> Result<Option<Stat>, ProcessError> {
+        file.rewind().map_err(|error| {
+            metadata_io_error(role, MetadataRole::Stat, MetadataOperation::Rewind, error)
+        })?;
         let bytes = match read_bounded(file, STAT_BYTES) {
             Ok(bytes) => bytes,
             // An already opened stat inode's actual read reaches
             // proc_single_show/get_pid_task. ESRCH there confirms that the
             // original task disappeared, rather than merely losing its mm.
             Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
-            Err(error) => return Err(io_error("read original native stat FD", error)),
+            Err(error) => {
+                return Err(metadata_io_error(
+                    role,
+                    MetadataRole::Stat,
+                    MetadataOperation::Read,
+                    error,
+                ));
+            }
         };
         parse_stat(&bytes, pid).map(Some)
     }
 
-    fn read_rollup(directory: &File) -> Result<u64, ProcessError> {
-        let mut file = open_file(directory, c"smaps_rollup")?;
-        let bytes = read_bounded(&mut file, ROLLUP_BYTES)
-            .map_err(|error| io_error("read native RSS rollup", error))?;
+    fn read_rollup(directory: &File, role: ProcessRole) -> Result<u64, ProcessError> {
+        let mut file = open_file(directory, MetadataRole::RssRollup, role)?;
+        let bytes = read_bounded(&mut file, ROLLUP_BYTES).map_err(|error| {
+            metadata_io_error(
+                role,
+                MetadataRole::RssRollup,
+                MetadataOperation::Read,
+                error,
+            )
+        })?;
         parse_rollup(&bytes)
     }
 
-    fn open_file(directory: &File, name: &CStr) -> Result<File, ProcessError> {
+    fn open_file(
+        directory: &File,
+        file: MetadataRole,
+        role: ProcessRole,
+    ) -> Result<File, ProcessError> {
+        let name = file.file_name()?;
         let descriptor = unsafe {
             libc::openat(
                 directory.as_raw_fd(),
@@ -578,7 +703,15 @@ mod native {
                 libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             )
         };
-        owned_file(descriptor, "open fixed native metadata file")
+        if descriptor < 0 {
+            return Err(metadata_io_error(
+                role,
+                file,
+                MetadataOperation::Open,
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(unsafe { File::from_raw_fd(descriptor) })
     }
 
     fn owned_file(descriptor: i32, context: &'static str) -> Result<File, ProcessError> {
@@ -715,6 +848,64 @@ mod tests {
 
     fn stat(state: char, threads: u64) -> Vec<u8> {
         render_stat("123", &stat_fields(state, threads))
+    }
+
+    #[test]
+    fn metadata_failure_roles_stay_bounded_without_native_details() {
+        for process in [
+            ProcessRole::ReservedLeader,
+            ProcessRole::EnumeratedCandidate,
+            ProcessRole::OwnedMember,
+        ] {
+            for file in [
+                MetadataRole::PidDirectory,
+                MetadataRole::Stat,
+                MetadataRole::RssRollup,
+            ] {
+                for operation in [
+                    MetadataOperation::Open,
+                    MetadataOperation::Rewind,
+                    MetadataOperation::Read,
+                ] {
+                    let actual = metadata_io_error(
+                        process,
+                        file,
+                        operation,
+                        std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "untrusted native detail",
+                        ),
+                    );
+                    assert_eq!(actual.kind, "resource_observation");
+                    assert_eq!(
+                        actual.message,
+                        format!(
+                            "native process metadata failed; process_role={}; file_role={}; operation={}; error_kind=PermissionDenied; os_error=None",
+                            process.label(),
+                            file.label(),
+                            operation.label(),
+                        )
+                    );
+                    assert!(actual.message.len() <= 256);
+                    assert!(!actual.message.contains("untrusted native detail"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stat_open_absence_remains_an_error_with_its_exact_static_role_and_code() {
+        let actual = metadata_io_error(
+            ProcessRole::EnumeratedCandidate,
+            MetadataRole::Stat,
+            MetadataOperation::Open,
+            std::io::Error::from_raw_os_error(2),
+        );
+        assert_eq!(actual.kind, "resource_observation");
+        assert_eq!(
+            actual.message,
+            "native process metadata failed; process_role=enumerated_candidate; file_role=stat; operation=open; error_kind=NotFound; os_error=Some(2)"
+        );
     }
 
     #[test]

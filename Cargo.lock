@@ -760,6 +760,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mmmm-game-observer"
+version = "0.1.0"
+
+[[package]]
 name = "mmmm-planner"
 version = "0.1.0"
 dependencies = [

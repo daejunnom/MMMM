@@ -491,6 +491,13 @@ impl ManagedBuild {
         &self.paths
     }
 
+    /// Recheck this already acquired owner's exact lease and slot records.
+    /// This bounded checkpoint neither scans generated trees nor acquires or
+    /// adopts another lease. Native filesystem calls remain cooperative.
+    pub fn check_current_ownership(&self) -> Result<(), StorageError> {
+        self.verify_ownership()
+    }
+
     pub fn environment(&self) -> BTreeMap<String, String> {
         let mut result = BTreeMap::new();
         for (key, path) in [
