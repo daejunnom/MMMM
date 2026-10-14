@@ -128,14 +128,18 @@ public final class PairedLoopbackServer implements AutoCloseable {
             }
             ObjectNode result = ContractJson.newObject().put("jsonrpc", "2.0");
             result.set("id", envelope.get("id"));
+            java.util.concurrent.CompletableFuture<ObjectNode> pending = null;
             try {
                 long remaining = Duration.between(Instant.now(), Instant.parse(request.path("deadlineAt").asText())).toMillis();
                 if (remaining <= 0) throw new TimeoutException();
-                JsonNode host = dispatcher.handle(session, request).toCompletableFuture().get(Math.min(remaining, 120_000), TimeUnit.MILLISECONDS);
+                pending = dispatcher.handle(session, request).toCompletableFuture();
+                JsonNode host = pending.get(Math.min(remaining, 120_000), TimeUnit.MILLISECONDS);
                 result.set("result", host);
             } catch (TimeoutException exception) {
+                if (pending != null) pending.cancel(false);
                 result.set("error", rpcError("DEADLINE_EXCEEDED", "dispatch".equals(request.path("method").asText()) ? "unknown" : "none_confirmed"));
             } catch (InterruptedException exception) {
+                if (pending != null) pending.cancel(false);
                 Thread.currentThread().interrupt();
                 result.set("error", rpcError("HOST_INTERRUPTED", "unknown"));
             } catch (java.util.concurrent.ExecutionException exception) {

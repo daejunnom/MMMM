@@ -74,6 +74,9 @@ public final class MmmmFabricHost implements ModInitializer {
     private String epoch;
     private String worldId;
     private long registryGeneration;
+    private volatile DefinitionCollection definitionCollection;
+    private record DefinitionCollection(HostSession owner, String contextId, String contextDigest,
+                                        String epoch, long generation, NativeDefinitionCollector.Snapshot snapshot) { }
 
     public static MmmmFabricHost instance() {
         if (instance == null) throw new ContractException("HOST_NOT_LOADED", "Fabric host has not initialized");
@@ -111,6 +114,7 @@ public final class MmmmFabricHost implements ModInitializer {
     private void newGeneration() {
         if (registryGeneration == Long.MAX_VALUE) throw new ContractException("GENERATION_EXHAUSTED", "Host registry generation exhausted");
         registryGeneration++;
+        definitionCollection = null;
         tombstones.clear();
         epoch = "epoch-" + UUID.randomUUID();
     }
@@ -178,6 +182,7 @@ public final class MmmmFabricHost implements ModInitializer {
     void revokePairing(String installedEpoch) {
         HostSession current = session;
         if (installedEpoch != null && current != null && installedEpoch.equals(current.epoch())) {
+            definitionCollection = null;
             current.close(); PairedLoopbackServer listener = endpoint; if (listener != null) listener.close();
         }
     }
@@ -486,13 +491,14 @@ public final class MmmmFabricHost implements ModInitializer {
         }
     }
 
-    private CompletionStage<ObjectNode> inspect(HostSession paired, ObjectNode context, ObjectNode payload) {
+    private CompletionStage<ObjectNode> inspect(HostSession paired, ObjectNode context, ObjectNode payload, HostDispatcher.InspectionControl control) {
+        control.checkpoint();
         String kind = HostDispatcher.string(payload, "kind");
         if ("registered_read".equals(kind)) {
             HostDispatcher.exactFields(payload, Set.of("kind", "request"));
             RegisteredActionRead request = new RegisteredActionRead(contracts, payload.get("request"));
             if (!context.path("contextId").asText().equals(request.contextId())) throw new ContractException("CONTEXT_SCOPE_MISMATCH", "Registered read context differs from its host envelope");
-            return runtime.registeredRead(paired, request, java.time.Instant.now().plusSeconds(10)).thenApply(ProviderResult::wire);
+            return runtime.registeredRead(paired, request, control.deadlineAt()).thenApply(ProviderResult::wire);
         }
         if ("execution_context".equals(kind)) {
             HostDispatcher.exactFields(payload, Set.of("kind"));
@@ -510,9 +516,11 @@ public final class MmmmFabricHost implements ModInitializer {
         if (pendingInspections.incrementAndGet() > 32) { pendingInspections.decrementAndGet(); throw new ContractException("INSPECTION_LIMIT", "Native inspection queue is full"); }
         CompletableFuture<ObjectNode> result = new CompletableFuture<>();
         result.whenComplete((value, failure) -> pendingInspections.decrementAndGet());
+        control.whenStopped(() -> result.cancel(false));
         try { server.execute(() -> {
             try {
                 if (result.isDone()) return;
+                control.checkpoint();
                 Set<String> required = "command_complete".equals(kind) ? Set.of("mmmm:command_complete")
                         : Set.of("undo_registration", "undo_material", "undo_role", "undo_job").contains(kind) ? Set.of("mmmm:provider_inventory") : Set.of("mmmm:world_read");
                 new PlatformAuthority(null).check(paired, context, required, false);
@@ -565,7 +573,7 @@ public final class MmmmFabricHost implements ModInitializer {
                 } else if ("native_registry".equals(kind)) {
                     HostDispatcher.exactFields(payload, Set.of("kind"));
                     long fromTick = Integer.toUnsignedLong(server.getTickCount());
-                    ObjectNode observation = NativeRegistry.observe();
+                    ObjectNode observation = collectRegistryDefinitions(paired, context, control, result);
                     byte[] raw = ContractJson.bytes(observation);
                     if (raw.length > 256 * 1024) throw new ContractException("INPUT_LIMIT", "Native registry observation exceeds its raw transport limit");
                     ObjectNode registry = ContractJson.newObject().put("registryDigest", ContractJson.digest(observation)).put("registryGeneration", Long.toString(registryGeneration))
@@ -582,7 +590,7 @@ public final class MmmmFabricHost implements ModInitializer {
                     result.complete(new NativeTargetAdmission(contracts).inspect(server, player(paired), context, facts,
                             artifactDigest(container("mmmm_host")), Long.toString(registryGeneration), payload,
                             (installed, actualFacts, hostDigest, generation, step, index) ->
-                                    NativeTargetAdmission.SourceDecision.unsupported("LOADED_DEFINITION_UNAVAILABLE"),
+                                    NativeTargetAdmission.SourceDecision.unsupported(definitionAdmissionReason(paired, context)),
                             (installed, step, index, parsed, admitted) -> {
                                 throw new ContractException("NATIVE_READONLY_GUARD_UNAVAILABLE", "No admitted loaded-definition parser closure is installed");
                             }));
@@ -645,7 +653,50 @@ public final class MmmmFabricHost implements ModInitializer {
             } catch (RuntimeException exception) { result.completeExceptionally(exception); }
         }); } catch (RuntimeException exception) { result.completeExceptionally(exception); }
         // Parser futures are observed off the server thread. A stalled native completer has a finite wait.
-        return result.orTimeout(10, java.util.concurrent.TimeUnit.SECONDS).minimalCompletionStage();
+        try { result.orTimeout(Math.min(10_000, control.remainingMillis()), java.util.concurrent.TimeUnit.MILLISECONDS); }
+        catch (RuntimeException failure) { result.completeExceptionally(failure); }
+        return result.minimalCompletionStage();
+    }
+
+    private ObjectNode collectRegistryDefinitions(HostSession paired, ObjectNode context,
+                                                 HostDispatcher.InspectionControl control, CompletableFuture<ObjectNode> response) {
+        MinecraftServer currentServer = server; long generation = registryGeneration; String currentEpoch = epoch;
+        String contextId = HostDispatcher.string(context, "contextId"); String contextDigest = HostDispatcher.string(context, "contextDigest");
+        NativeDefinitionCollector.Checkpoint checkpoint = () -> {
+            control.checkpoint(); paired.checkOpen();
+            if (response.isDone()) throw new ContractException("CANCELLATION_REQUESTED", "Registry inspection response ended");
+            if (server != currentServer || registryGeneration != generation || !java.util.Objects.equals(epoch, currentEpoch)) {
+                throw new ContractException("SESSION_EPOCH_MISMATCH", "Registry observation generation ended");
+            }
+        };
+        checkpoint.check();
+        if (!paired.context(contextId).equals(context)) throw new ContractException("STALE_CONTEXT", "Registry observation context differs from its installed owner");
+        NativeDefinitionCollector collector = NativeDefinitionCollector.production(checkpoint);
+        try {
+            ObjectNode observation = NativeRegistry.observe(collector);
+            collector.finish();
+            new PlatformAuthority(null).check(paired, context, Set.of("mmmm:world_read"), false);
+            if (!paired.context(contextId).equals(context)) throw new ContractException("STALE_CONTEXT", "Registry observation owner changed");
+            checkpoint.check();
+            return observation;
+        } catch (RuntimeException failure) {
+            collector.stopped(failure); throw failure;
+        } finally {
+            definitionCollection = new DefinitionCollection(paired, contextId, contextDigest, currentEpoch, generation, collector.snapshot());
+        }
+    }
+
+    private String definitionAdmissionReason(HostSession paired, ObjectNode context) {
+        DefinitionCollection collected = definitionCollection;
+        // 실제 원자료 수집 여부만 진단한다. 최종 변환/실행 경로 승인으로 승격하지 않는다.
+        if (collected != null && collected.owner() == paired && !paired.closed()
+                && collected.generation() == registryGeneration && java.util.Objects.equals(collected.epoch(), epoch)
+                && collected.contextId().equals(context.path("contextId").asText())
+                && collected.contextDigest().equals(context.path("contextDigest").asText())
+                && collected.snapshot().completed() && collected.snapshot().hasRawObservation()) {
+            return "LOADED_DEFINITION_FINALITY_UNVERIFIED";
+        }
+        return "LOADED_DEFINITION_UNAVAILABLE";
     }
 
     private ObjectNode shapeProbe(HostSession paired, ObjectNode context, ServerLevel level, ObjectNode query, NativeShapes.Observation observation) {
@@ -920,6 +971,7 @@ public final class MmmmFabricHost implements ModInitializer {
         if (server == null || reloading || !server.isSameThread()) throw new ContractException("HOST_NOT_READY", "This operation requires the active ready server thread");
     }
     private void disconnect() {
+        definitionCollection = null;
         synchronized (routes) { routes.forEach((paired, route) -> { route.endpoint().close(); paired.close(); }); routes.clear(); routeOrder.clear(); nativeHistory.clear(); nativeHistoryCount = 0; nativeHistoryBytes = 0; }
         invocationRoutes.clear(); installedSources = Map.of(); installedActions = Set.of(); installedContexts = List.of();
         if (endpoint != null) endpoint.close();
