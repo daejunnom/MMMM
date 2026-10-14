@@ -61,6 +61,8 @@
 
 | MMMM-D042 | ZIP/JAR input inventory는 실제 입력 bytes의 bounded 순수 관측이며 runtime pack·loaded definition·권한과 분리한다. | reference producer는 파일·네트워크를 열거나 extract하지 않는다. 초기 상한은 input/member 각각 64 MiB, decoded 합계 256 MiB, 65,535 entries, ratio 1,000, metadata 16 MiB, 이름 1,024 bytes이며 caller는 낮출 수만 있다. library의 directory 할당 전 EOCD·count·offset·size·전체 이름·local header·descriptor·물리 coverage를 검사한다. secret selector와 alias는 같은 portable fold로 판단하고 보호 대상은 container/member hash 전에 거절한다. classic Stored/Deflate와 명시적인 0-byte Stored directory만 지원하며 ZIP64·암호화·특수 member·alias·비정상 경로와 불일치는 닫힌 오류다. actual stream end·consumed input·decoded size·CRC·SHA를 확인하고 partial inventory를 성공으로 반환하지 않는다. 원 cancellation/deadline을 유지하며 원인과 정적 공개 오류를 분리한다. 입력 inventory 완료가 effective pack mapping·SourceAdmission·게임 호환성이나 재배포 승인은 아니다. 실제 게임 입력·속도·현재 Store 권한에 결합한 consumer는 별도 검증하며 실패 후 자동 한도 확대·재시도는 하지 않는다. |
 
+| MMMM-D043 | Darwin의 관측 구성원에서 확인된 좁은 TaskInfo 종료 전이도 전체 불완전 표본으로 보존하며 완료·empty·drain으로 승격하지 않는다. | CI34에서 실제 관측한 TaskInfo·typed Exited·native result 0·ESRCH와 before/after의 동일 PID·UID·PGID·birth sec/usec, 양쪽 INEXIT·non-SZOMB 조합에만 member Pending을 허용한다. 기존 D036 예약 leader 조건과 이 조합 밖의 미확정 member에 대한 strict 거절은 유지한다. 같은 scan의 member/leader별 실제 first·last·count를 별도로 누적하여 후속 Pending이나 hard failure로 소실하지 않고 한 번만 merge한다. 전체 Pending은 성공 표본 수·peak·마지막 성공 시각을 갱신하지 않으며 알려진 leader/member의 부분 사용량 상한 검사는 유지한다. 원 100 ms cadence·1초 성공 gap·기한·자원·signal 권한을 유지하며 새 native 조회·retry/sleep을 추가하지 않는다. Pending 자체는 scope_empty false이고 이후 독립 native snapshot의 기존 종료 판정과 구분한다. 새 실제 macOS 관측과 stdio errno 보존의 실행 검증은 후속 CI가 필요하다. |
+
 ## 구현 전에 확인할 항목
 
 - 원본 계약과 예제 패키지의 내용, 버전 및 digest.

@@ -182,13 +182,13 @@ pub(super) enum MemoryObservation {
     Zombie(LeaderDiagnostic),
     Pending(LeaderDiagnostic),
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum GroupObservation {
     Complete(usize),
-    Pending(LeaderDiagnostic),
+    Pending(Box<PendingObservations>),
 }
 impl GroupObservation {
-    pub(super) fn scope_empty(self) -> bool {
+    pub(super) fn scope_empty(&self) -> bool {
         matches!(self, Self::Complete(0))
     }
 }
@@ -275,9 +275,10 @@ pub(super) fn classify_leader_session(
     )))
 }
 
-/// The original typed native error remains a diagnostic input. Only an actual
-/// reserved leader may defer an exit-class failure through the INEXIT window;
-/// another observed member still needs the existing same-identity native zombie.
+/// The original typed native error remains a diagnostic input. A reserved
+/// leader retains its existing exit-class INEXIT policy. An observed member
+/// may only leave the whole sample incomplete for the actually observed
+/// TaskInfo 0/ESRCH transition, with the same identity and INEXIT on both sides.
 pub(super) fn classify_memory_exit(
     reserved: Option<(LeaderIdentity, &mut bool)>,
     before: LeaderBsd,
@@ -288,7 +289,7 @@ pub(super) fn classify_memory_exit(
         .as_ref()
         .map(|(anchor, _)| *anchor)
         .unwrap_or(before.identity);
-    let may_be_pending = reserved.is_some();
+    let reserved_leader = reserved.is_some();
     let diagnostic = LeaderDiagnostic::observe(
         anchor,
         Some(before),
@@ -296,7 +297,7 @@ pub(super) fn classify_memory_exit(
         LeaderPhase::MemoryResult,
         LeaderSession::NotObserved,
     )
-    .with_memory_error(native, may_be_pending);
+    .with_memory_error(native, reserved_leader);
     let same_identity = match reserved {
         Some((anchor, reservation_valid)) => {
             same_reserved_identity(anchor, Some(before), after, reservation_valid)
@@ -316,7 +317,15 @@ pub(super) fn classify_memory_exit(
         if after.status == SZOMB {
             return Ok(MemoryObservation::Zombie(diagnostic));
         }
-        if may_be_pending && before.status != SZOMB && after.flags & PROC_FLAG_INEXIT != 0 {
+        let observed_member_task_exit = !reserved_leader
+            && native.stage == NativeResourceStage::TaskInfo
+            && native.native_result == 0
+            && native.native_errno == DARWIN_ESRCH
+            && before.flags & PROC_FLAG_INEXIT != 0;
+        if (reserved_leader || observed_member_task_exit)
+            && before.status != SZOMB
+            && after.flags & PROC_FLAG_INEXIT != 0
+        {
             return Ok(MemoryObservation::Pending(diagnostic));
         }
     }
@@ -326,11 +335,41 @@ pub(super) fn classify_memory_exit(
     )))
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub(super) struct ExitObservationEvidence {
     observations: u64,
     first: LeaderDiagnostic,
     last: LeaderDiagnostic,
+}
+
+/// One scan retains each role independently. The bounded last context is only
+/// an error suffix; it cannot replace either role's first/last/count evidence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct PendingObservations {
+    leader: Option<ExitObservationEvidence>,
+    member: Option<ExitObservationEvidence>,
+    last: Option<LeaderDiagnostic>,
+}
+impl PendingObservations {
+    pub(super) fn record(&mut self, diagnostic: LeaderDiagnostic) {
+        let role = if diagnostic.memory_role == Some(MemoryRole::ObservedMember) {
+            &mut self.member
+        } else {
+            &mut self.leader
+        };
+        ExitObservationEvidence::record(role, diagnostic);
+        self.last = Some(diagnostic);
+    }
+    pub(super) fn last(&self) -> Option<LeaderDiagnostic> {
+        self.last
+    }
+}
+impl From<LeaderDiagnostic> for PendingObservations {
+    fn from(diagnostic: LeaderDiagnostic) -> Self {
+        let mut observations = Self::default();
+        observations.record(diagnostic);
+        observations
+    }
 }
 impl ExitObservationEvidence {
     pub(super) fn record(slot: &mut Option<Self>, diagnostic: LeaderDiagnostic) {
@@ -386,6 +425,7 @@ pub struct Evidence {
     sampling_may_overshoot: bool,
     kernel_resident_quota: bool,
     pending_leader_exit: Option<ExitObservationEvidence>,
+    pending_member_exit: Option<ExitObservationEvidence>,
     native_memory_exits: Option<ExitObservationEvidence>,
 }
 
@@ -428,6 +468,7 @@ impl Tracker {
                 sampling_may_overshoot: true,
                 kernel_resident_quota: false,
                 pending_leader_exit: None,
+                pending_member_exit: None,
                 native_memory_exits: None,
             },
         })
@@ -502,8 +543,8 @@ impl Tracker {
                 self.finish(sample)?;
                 Ok(ResourceObservation::Complete)
             }
-            GroupObservation::Pending(diagnostic) => {
-                ExitObservationEvidence::record(&mut self.evidence.pending_leader_exit, diagnostic);
+            GroupObservation::Pending(observations) => {
+                self.record_pending_observations(*observations);
                 // Other observed members still provide a lower bound: a known
                 // over-budget partial sample remains fatal. No partial sample
                 // increments success/count/peaks or replaces the missing PID
@@ -512,6 +553,14 @@ impl Tracker {
                 self.gap(Instant::now())?;
                 Ok(ResourceObservation::Pending)
             }
+        }
+    }
+    pub(super) fn record_pending_observations(&mut self, observations: PendingObservations) {
+        if let Some(leader) = observations.leader {
+            ExitObservationEvidence::merge(&mut self.evidence.pending_leader_exit, leader);
+        }
+        if let Some(member) = observations.member {
+            ExitObservationEvidence::merge(&mut self.evidence.pending_member_exit, member);
         }
     }
     pub(super) fn record_memory_exits(&mut self, observations: Option<ExitObservationEvidence>) {
@@ -523,6 +572,12 @@ impl Tracker {
         if let Some(evidence) = self.evidence.pending_leader_exit {
             error.message.push_str(&format!(
                 "; first_pending=[{}]; final_pending=[{}]",
+                evidence.first, evidence.last
+            ));
+        }
+        if let Some(evidence) = self.evidence.pending_member_exit {
+            error.message.push_str(&format!(
+                "; first_member_pending=[{}]; final_member_pending=[{}]",
                 evidence.first, evidence.last
             ));
         }
@@ -692,6 +747,270 @@ mod tests {
             classify_rusage_result(0, 0, 11, 12).unwrap_err(),
         ]
     }
+    fn observed_member_pending_diagnostic() -> LeaderDiagnostic {
+        let before = LeaderBsd {
+            flags: PROC_FLAG_INEXIT,
+            ..reserved_leader()
+        };
+        let MemoryObservation::Pending(diagnostic) =
+            classify_memory_exit(None, before, Some(before), native_exit_results()[0]).unwrap()
+        else {
+            panic!("same-identity observed TaskInfo exit was not an incomplete sample")
+        };
+        diagnostic
+    }
+    #[test]
+    fn observed_member_task_exit_preserves_an_incomplete_group_and_distinct_closed_facts() {
+        let diagnostic = observed_member_pending_diagnostic();
+        assert_eq!(diagnostic.memory_role, Some(MemoryRole::ObservedMember));
+        assert_eq!(
+            diagnostic.memory_error,
+            Some(native_exit_results()[0].into())
+        );
+        assert!(diagnostic.before_inexit && diagnostic.after_inexit);
+        assert!(diagnostic.before_anchor_match && diagnostic.after_anchor_match);
+        let observation = GroupObservation::Pending(Box::new(diagnostic.into()));
+        assert!(!observation.scope_empty());
+        let mut tracker = Tracker::new(small()).unwrap();
+        let mut initial = Sample::default();
+        initial.push(small()).unwrap();
+        tracker
+            .finish_observation(GroupObservation::Complete(1), initial)
+            .unwrap();
+        let prior_success = tracker.last_success;
+        let mut partial = Sample::default();
+        partial
+            .push(Memory {
+                adjusted_vm: small().adjusted_vm + 1,
+                rss: small().rss * 2,
+                footprint: small().footprint * 2,
+            })
+            .unwrap();
+        partial.push(small()).unwrap();
+        let mut exits = None;
+        ExitObservationEvidence::record(&mut exits, diagnostic);
+        tracker.record_memory_exits(exits);
+        assert_eq!(
+            tracker.finish_observation(observation, partial).unwrap(),
+            ResourceObservation::Pending
+        );
+        assert_eq!(tracker.evidence.sample_count, 1);
+        assert_eq!(tracker.last_success, prior_success);
+        assert_eq!(
+            tracker.evidence.peak_observed_aggregate_rss_bytes,
+            small().rss
+        );
+        assert_eq!(
+            tracker.evidence.peak_observed_adjusted_vm_bytes,
+            small().adjusted_vm
+        );
+        assert_eq!(
+            tracker.evidence.peak_observed_aggregate_footprint_bytes,
+            small().footprint
+        );
+        assert_eq!(tracker.evidence.peak_observed_workers, 1);
+        assert!(tracker.evidence.pending_leader_exit.is_none());
+        let pending = tracker.evidence.pending_member_exit.unwrap();
+        assert_eq!(pending.observations, 1);
+        assert_eq!(pending.first, diagnostic);
+        assert_eq!(pending.last, diagnostic);
+        let evidence = serde_json::to_value(&tracker.evidence).unwrap();
+        assert_eq!(
+            evidence["pending_member_exit"]["first"]["memory_role"],
+            "observed_member"
+        );
+        assert_eq!(
+            evidence["native_memory_exits"]["last"]["memory_error"]["stage"],
+            "task_info"
+        );
+        let mut original = ProcessError::new("command_timeout", "original deadline failure");
+        original.drained = false;
+        let error = tracker.with_pending_diagnostics(original);
+        assert_eq!(error.kind, "command_timeout");
+        assert!(!error.drained);
+        assert!(
+            error
+                .message
+                .starts_with("original deadline failure; first_member_pending=[")
+        );
+        assert!(error.message.contains("memory_role=Some(ObservedMember)"));
+
+        let before = LeaderBsd {
+            flags: PROC_FLAG_INEXIT,
+            ..reserved_leader()
+        };
+        let MemoryObservation::Pending(second_member) = classify_memory_exit(
+            None,
+            before,
+            Some(LeaderBsd {
+                status: 3,
+                ..before
+            }),
+            native_exit_results()[0],
+        )
+        .unwrap() else {
+            panic!("second same-identity member observation was not incomplete")
+        };
+        assert_ne!(diagnostic, second_member);
+        let leader = pending_diagnostic(LeaderPhase::AfterMemory);
+        for (events, member_count, member_last, has_leader) in [
+            (vec![diagnostic, second_member], 2, second_member, false),
+            (vec![diagnostic, leader], 1, diagnostic, true),
+            (
+                vec![diagnostic, second_member, leader],
+                2,
+                second_member,
+                true,
+            ),
+        ] {
+            let mut scan = PendingObservations::default();
+            for event in &events {
+                scan.record(*event);
+            }
+            assert_eq!(scan.last(), events.last().copied());
+            let observation = GroupObservation::Pending(Box::new(scan));
+            assert!(!observation.scope_empty());
+            let mut complete_scan = Tracker::new(small()).unwrap();
+            let prior_success = complete_scan.last_success;
+            assert_eq!(
+                complete_scan
+                    .finish_observation(observation, Sample::default())
+                    .unwrap(),
+                ResourceObservation::Pending
+            );
+            assert_eq!(complete_scan.evidence.sample_count, 0);
+            assert_eq!(complete_scan.last_success, prior_success);
+            assert_eq!(complete_scan.evidence.peak_observed_aggregate_rss_bytes, 0);
+            assert!(complete_scan.evidence.native_memory_exits.is_none());
+            let member = complete_scan.evidence.pending_member_exit.unwrap();
+            assert_eq!(member.observations, member_count);
+            assert_eq!(member.first, diagnostic);
+            assert_eq!(member.last, member_last);
+            if has_leader {
+                let actual_leader = complete_scan.evidence.pending_leader_exit.unwrap();
+                assert_eq!(actual_leader.observations, 1);
+                assert_eq!(actual_leader.first, leader);
+                assert_eq!(actual_leader.last, leader);
+            } else {
+                assert!(complete_scan.evidence.pending_leader_exit.is_none());
+            }
+            let mut failed_scan = Tracker::new(small()).unwrap();
+            let prior_success = failed_scan.last_success;
+            // A later native/identity failure still retains the scan's already
+            // observed role facts without making a successful resource sample.
+            failed_scan.record_pending_observations(scan);
+            assert_eq!(
+                failed_scan.evidence.pending_member_exit,
+                complete_scan.evidence.pending_member_exit
+            );
+            assert_eq!(
+                failed_scan.evidence.pending_leader_exit,
+                complete_scan.evidence.pending_leader_exit
+            );
+            assert_eq!(failed_scan.evidence.sample_count, 0);
+            assert_eq!(failed_scan.last_success, prior_success);
+            let mut original =
+                ProcessError::new("process_identity", "later original identity failure");
+            original.drained = false;
+            let retained = failed_scan.with_pending_diagnostics(original);
+            assert_eq!(retained.kind, "process_identity");
+            assert!(
+                retained
+                    .message
+                    .starts_with("later original identity failure;")
+            );
+            assert!(!retained.drained);
+            assert!(retained.message.contains("first_member_pending=["));
+            assert_eq!(retained.message.contains("first_pending=["), has_leader);
+        }
+    }
+    #[test]
+    fn observed_member_pending_does_not_extend_to_other_native_results_or_incomplete_identity() {
+        use mmmm_native_process::darwin::classify_task_result;
+        let before = LeaderBsd {
+            flags: PROC_FLAG_INEXIT,
+            ..reserved_leader()
+        };
+        let native = native_exit_results()[0];
+        for other in [
+            native_exit_results()[1],
+            native_exit_results()[2],
+            classify_task_result(95, DARWIN_ESRCH).unwrap_err(),
+            classify_task_result(0, 1).unwrap_err(),
+            NativeResourceError {
+                native_result: -1,
+                ..native
+            },
+            NativeResourceError {
+                native_errno: 1,
+                ..native
+            },
+            NativeResourceError {
+                stage: NativeResourceStage::ProcessIdentifier,
+                ..native
+            },
+        ] {
+            let error = classify_memory_exit(None, before, Some(before), other).unwrap_err();
+            assert!(error.message.contains("memory_role=Some(ObservedMember)"));
+            assert!(
+                error
+                    .message
+                    .contains(&format!("memory_stage={}", other.stage.as_str()))
+            );
+            assert!(
+                error
+                    .message
+                    .contains(&format!("memory_native_result={}", other.native_result))
+            );
+            assert!(
+                error
+                    .message
+                    .contains(&format!("memory_native_errno={}", other.native_errno))
+            );
+        }
+        for (first, after) in [
+            (before, None),
+            (LeaderBsd { flags: 0, ..before }, Some(before)),
+            (before, Some(LeaderBsd { flags: 0, ..before })),
+            (
+                LeaderBsd {
+                    status: SZOMB,
+                    ..before
+                },
+                Some(before),
+            ),
+        ] {
+            assert!(classify_memory_exit(None, first, after, native).is_err());
+        }
+        for identity in [
+            LeaderIdentity {
+                pid: 18,
+                ..before.identity
+            },
+            LeaderIdentity {
+                uid: 502,
+                ..before.identity
+            },
+            LeaderIdentity {
+                pgid: 18,
+                ..before.identity
+            },
+            LeaderIdentity {
+                start_sec: 123456790,
+                ..before.identity
+            },
+            LeaderIdentity {
+                start_usec: 322,
+                ..before.identity
+            },
+        ] {
+            let error =
+                classify_memory_exit(None, before, Some(LeaderBsd { identity, ..before }), native)
+                    .unwrap_err();
+            assert!(error.message.contains("after_anchor_match=false"));
+            assert!(error.message.contains("memory_role=Some(ObservedMember)"));
+        }
+    }
     #[test]
     fn typed_memory_exit_defers_only_the_original_reserved_inexit_leader_without_a_sample() {
         let before = reserved_leader();
@@ -724,7 +1043,7 @@ mod tests {
             let mut exits = None;
             ExitObservationEvidence::record(&mut exits, diagnostic);
             tracker.record_memory_exits(exits);
-            let observation = GroupObservation::Pending(diagnostic);
+            let observation = GroupObservation::Pending(Box::new(diagnostic.into()));
             assert!(!observation.scope_empty());
             assert_eq!(
                 tracker
@@ -864,8 +1183,7 @@ mod tests {
         }
     }
     #[test]
-    fn memory_pending_rejects_nonleaders_no_inexit_missing_identity_and_any_reserved_anchor_mismatch()
-     {
+    fn memory_pending_rejects_incomplete_proof_missing_identity_and_any_reserved_anchor_mismatch() {
         let before = reserved_leader();
         let inexit = LeaderBsd {
             flags: PROC_FLAG_INEXIT,
@@ -1109,7 +1427,7 @@ mod tests {
             .unwrap();
         let prior_success = tracker.last_success;
         for phase in [LeaderPhase::BeforeMemory, LeaderPhase::AfterMemory] {
-            let observation = GroupObservation::Pending(pending_diagnostic(phase));
+            let observation = GroupObservation::Pending(Box::new(pending_diagnostic(phase).into()));
             assert!(!observation.scope_empty());
             let mut partial = Sample::default();
             partial
@@ -1158,83 +1476,107 @@ mod tests {
     }
     #[test]
     fn pending_keeps_the_original_attempt_cadence_without_refreshing_success_age() {
-        let mut tracker = Tracker::new(small()).unwrap();
-        let prior_success = tracker.last_success;
-        assert!(tracker.begin_at(prior_success).unwrap().is_some());
-        tracker
-            .finish_observation(
-                GroupObservation::Pending(pending_diagnostic(LeaderPhase::BeforeMemory)),
-                Sample::default(),
-            )
-            .unwrap();
-        assert_eq!(tracker.last_success, prior_success);
-        assert!(
+        for diagnostic in [
+            pending_diagnostic(LeaderPhase::BeforeMemory),
+            observed_member_pending_diagnostic(),
+        ] {
+            let mut tracker = Tracker::new(small()).unwrap();
+            let prior_success = tracker.last_success;
+            assert!(tracker.begin_at(prior_success).unwrap().is_some());
             tracker
-                .begin_at(prior_success + Duration::from_millis(99))
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(tracker.evidence.sample_count, 0);
-        assert!(
-            tracker
-                .begin_at(prior_success + Duration::from_millis(100))
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            tracker
-                .begin_at(prior_success + Duration::from_millis(1000))
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(
-            tracker
-                .begin_at(prior_success + Duration::from_millis(1001))
-                .unwrap_err()
-                .kind,
-            "resource_observation"
-        );
-        assert_eq!(tracker.evidence.sample_count, 0);
+                .finish_observation(
+                    GroupObservation::Pending(Box::new(diagnostic.into())),
+                    Sample::default(),
+                )
+                .unwrap();
+            assert_eq!(tracker.last_success, prior_success);
+            assert!(
+                tracker
+                    .begin_at(prior_success + Duration::from_millis(99))
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(tracker.evidence.sample_count, 0);
+            assert!(
+                tracker
+                    .begin_at(prior_success + Duration::from_millis(100))
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                tracker
+                    .begin_at(prior_success + Duration::from_millis(1000))
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                tracker
+                    .begin_at(prior_success + Duration::from_millis(1001))
+                    .unwrap_err()
+                    .kind,
+                "resource_observation"
+            );
+            assert_eq!(tracker.evidence.sample_count, 0);
+        }
     }
     #[test]
     fn pending_does_not_hide_known_partial_budget_failure_or_block_later_complete_observation() {
-        let mut tracker = Tracker::new(small()).unwrap();
-        let prior_success = tracker.last_success;
-        let mut over_budget = Sample::default();
-        over_budget
-            .push(Memory {
-                rss: MEMORY_LIMIT + 1,
-                ..small()
-            })
-            .unwrap();
-        let error = tracker
-            .finish_observation(
-                GroupObservation::Pending(pending_diagnostic(LeaderPhase::BeforeMemory)),
-                over_budget,
-            )
-            .unwrap_err();
-        assert_eq!(error.kind, "resource_budget");
-        assert_eq!(tracker.evidence.sample_count, 0);
-        assert_eq!(tracker.last_success, prior_success);
-        assert!(tracker.evidence.pending_leader_exit.is_some());
-        let mut later = Tracker::new(small()).unwrap();
-        later
-            .finish_observation(
-                GroupObservation::Pending(pending_diagnostic(LeaderPhase::BeforeMemory)),
-                Sample::default(),
-            )
-            .unwrap();
-        assert_eq!(later.evidence.sample_count, 0);
-        assert!(GroupObservation::Complete(0).scope_empty());
-        assert!(!GroupObservation::Complete(1).scope_empty());
-        assert_eq!(
+        for diagnostic in [
+            pending_diagnostic(LeaderPhase::BeforeMemory),
+            observed_member_pending_diagnostic(),
+        ] {
+            let mut tracker = Tracker::new(small()).unwrap();
+            let prior_success = tracker.last_success;
+            let mut over_budget = Sample::default();
+            over_budget
+                .push(Memory {
+                    rss: MEMORY_LIMIT + 1,
+                    ..small()
+                })
+                .unwrap();
+            let error = tracker
+                .finish_observation(
+                    GroupObservation::Pending(Box::new(diagnostic.into())),
+                    over_budget,
+                )
+                .unwrap_err();
+            assert_eq!(error.kind, "resource_budget");
+            assert_eq!(tracker.evidence.sample_count, 0);
+            assert_eq!(tracker.last_success, prior_success);
+            assert_eq!(
+                tracker.evidence.pending_member_exit.is_some(),
+                diagnostic.memory_role == Some(MemoryRole::ObservedMember)
+            );
+            assert_eq!(
+                tracker.evidence.pending_leader_exit.is_some(),
+                diagnostic.memory_role != Some(MemoryRole::ObservedMember)
+            );
+            let mut later = Tracker::new(small()).unwrap();
             later
-                .finish_observation(GroupObservation::Complete(0), Sample::default())
-                .unwrap(),
-            ResourceObservation::Complete
-        );
-        assert_eq!(later.evidence.sample_count, 1);
-        assert!(later.evidence.pending_leader_exit.is_some());
+                .finish_observation(
+                    GroupObservation::Pending(Box::new(diagnostic.into())),
+                    Sample::default(),
+                )
+                .unwrap();
+            assert_eq!(later.evidence.sample_count, 0);
+            assert!(GroupObservation::Complete(0).scope_empty());
+            assert!(!GroupObservation::Complete(1).scope_empty());
+            assert_eq!(
+                later
+                    .finish_observation(GroupObservation::Complete(0), Sample::default())
+                    .unwrap(),
+                ResourceObservation::Complete
+            );
+            assert_eq!(later.evidence.sample_count, 1);
+            assert_eq!(
+                later.evidence.pending_member_exit.is_some(),
+                diagnostic.memory_role == Some(MemoryRole::ObservedMember)
+            );
+            assert_eq!(
+                later.evidence.pending_leader_exit.is_some(),
+                diagnostic.memory_role != Some(MemoryRole::ObservedMember)
+            );
+        }
     }
     #[test]
     fn aggregate_and_distinct_measures_are_bounded() {

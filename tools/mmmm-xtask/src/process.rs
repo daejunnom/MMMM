@@ -1872,7 +1872,7 @@ mod native {
             #[cfg(target_os = "macos")]
             {
                 self.mac_group_observation(None)
-                    .map(darwin_resources::GroupObservation::scope_empty)
+                    .map(|observation| observation.scope_empty())
                     .map_err(|error| self.resources.with_pending_diagnostics(error))
             }
         }
@@ -1889,16 +1889,21 @@ mod native {
                 ));
             };
             let mut memory_exits = None;
+            let mut pending = darwin_resources::PendingObservations::default();
             let result = live_group_members(
                 self.pid,
                 identity,
                 &mut self.reservation_valid,
                 resources,
                 &mut memory_exits,
+                &mut pending,
             );
             // Retain native exit facts even if a later member/identity check
             // fails before this partial group sample can be completed.
             self.resources.record_memory_exits(memory_exits);
+            if result.is_err() {
+                self.resources.record_pending_observations(pending);
+            }
             result
         }
         #[cfg(target_os = "macos")]
@@ -2143,6 +2148,7 @@ mod native {
         reservation_valid: &mut bool,
         mut resources: Option<&mut darwin_resources::Sample>,
         memory_exits: &mut Option<darwin_resources::ExitObservationEvidence>,
+        pending: &mut darwin_resources::PendingObservations,
     ) -> Result<darwin_resources::GroupObservation, ProcessError> {
         #[link(name = "proc")]
         unsafe extern "C" {
@@ -2187,7 +2193,6 @@ mod native {
         };
         let mut members = 0;
         let mut leader_seen = false;
-        let mut pending = None;
         let result = (|| {
             for pid in pids.into_iter().filter(|p| *p > 0) {
                 if pid == group {
@@ -2224,6 +2229,7 @@ mod native {
                         darwin_resources::LeaderPhase::GroupIdentity,
                         reservation_valid,
                     )?;
+                    let mut leader_pending = false;
                     let memory = if resources.is_some() && before.status != darwin_resources::SZOMB
                     {
                         match live_leader_session_or_confirmed_zombie(
@@ -2254,14 +2260,16 @@ mod native {
                                             memory_exits,
                                             diagnostic,
                                         );
-                                        pending = Some(diagnostic);
+                                        pending.record(diagnostic);
+                                        leader_pending = true;
                                         None
                                     }
                                 }
                             }
                             darwin_resources::LeaderObservation::Zombie => None,
                             darwin_resources::LeaderObservation::Pending(diagnostic) => {
-                                pending = Some(diagnostic);
+                                pending.record(diagnostic);
+                                leader_pending = true;
                                 None
                             }
                         }
@@ -2302,7 +2310,9 @@ mod native {
                     leader_seen = true;
                     if after.status != darwin_resources::SZOMB {
                         if let Some(sample) = resources.as_deref_mut() {
-                            if pending.is_some() {
+                            // An earlier member's incomplete observation must
+                            // not hide this leader's measured lower bound.
+                            if leader_pending {
                                 continue;
                             }
                             if let Some(memory) = memory {
@@ -2320,7 +2330,7 @@ mod native {
                                     }
                                     darwin_resources::LeaderObservation::Zombie => (),
                                     darwin_resources::LeaderObservation::Pending(diagnostic) => {
-                                        pending = Some(diagnostic)
+                                        pending.record(diagnostic)
                                     }
                                 }
                             } else {
@@ -2360,10 +2370,12 @@ mod native {
                             None
                         }
                         darwin_resources::MemoryObservation::Pending(diagnostic) => {
-                            return Err(diagnostic.attach(ProcessError::new(
-                                "resource_observation",
-                                "unreserved macOS member cannot defer a native memory failure",
-                            )));
+                            darwin_resources::ExitObservationEvidence::record(
+                                memory_exits,
+                                diagnostic,
+                            );
+                            pending.record(diagnostic);
+                            None
                         }
                     }
                 } else {
@@ -2415,15 +2427,15 @@ mod native {
             Ok(())
         })();
         if let Err(mut error) = result {
-            if let Some(diagnostic) = pending {
+            if let Some(diagnostic) = pending.last() {
                 error
                     .message
                     .push_str(&format!("; pending_before_failure=[{diagnostic}]"));
             }
             return Err(error);
         }
-        Ok(match pending {
-            Some(diagnostic) => darwin_resources::GroupObservation::Pending(diagnostic),
+        Ok(match pending.last() {
+            Some(_) => darwin_resources::GroupObservation::Pending(Box::new(*pending)),
             None => darwin_resources::GroupObservation::Complete(members),
         })
     }

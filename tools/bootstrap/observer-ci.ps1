@@ -98,6 +98,44 @@ function Failure-Shape([System.Exception]$Exception) {
     return [ordered]@{ phase=$phase; exceptions=$chain.ToArray(); chain_truncated=($null -ne $Exception) }
 }
 
+function New-VswherePrespawnObservation {
+    return [ordered]@{
+        stage='prepare'; elapsed_ms=0L;
+        steps=[ordered]@{
+            prepare=[ordered]@{ started_ms=0L; completed_ms=$null };
+            program_files_physical=$null; executable_physical=$null;
+            executable_open=$null; executable_hash=$null; spawn_prepare=$null
+        }
+    }
+}
+
+function Update-VswherePrespawnObservation(
+    [System.Collections.IDictionary]$Observation,
+    [ValidateSet('prepare','program_files_physical','executable_physical','executable_open','executable_hash','spawn_prepare')][string]$Stage,
+    [long]$ElapsedMilliseconds,
+    [bool]$Completed
+) {
+    if ($ElapsedMilliseconds -lt 0 -or $ElapsedMilliseconds -lt $Observation.elapsed_ms) { throw 'OBSERVER_VSWHERE_PRESPAWN_OBSERVATION_INVALID' }
+    $Observation.elapsed_ms = $ElapsedMilliseconds
+    if ($Completed) {
+        if ($Stage -cne $Observation.stage -or $null -eq $Observation.steps[$Stage] -or
+            $null -ne $Observation.steps[$Stage].completed_ms) { throw 'OBSERVER_VSWHERE_PRESPAWN_OBSERVATION_INVALID' }
+        $Observation.steps[$Stage].completed_ms = $ElapsedMilliseconds
+    } else {
+        $stages = @('prepare','program_files_physical','executable_physical','executable_open','executable_hash','spawn_prepare')
+        $previous = [System.Array]::IndexOf($stages, $Observation.stage)
+        $next = [System.Array]::IndexOf($stages, $Stage)
+        if ($next -ne ($previous + 1) -or $null -eq $Observation.steps[$Observation.stage].completed_ms -or
+            $null -ne $Observation.steps[$Stage]) { throw 'OBSERVER_VSWHERE_PRESPAWN_OBSERVATION_INVALID' }
+        # A checkpoint cannot turn an expired operation into permission to
+        # start its successor. The unstarted step stays null in the receipt.
+        if ($ElapsedMilliseconds -ge 5000) { throw 'OBSERVER_VSWHERE_PRESPAWN_DEADLINE' }
+        $Observation.stage = $Stage
+        $Observation.steps[$Stage] = [ordered]@{ started_ms=$ElapsedMilliseconds; completed_ms=$null }
+    }
+    if ($ElapsedMilliseconds -ge 5000) { throw 'OBSERVER_VSWHERE_PRESPAWN_DEADLINE' }
+}
+
 function Find-InstalledVisualStudio {
     # Official installation/component selector and pipe encoding:
     # https://github.com/microsoft/vswhere/wiki/Find-VC
@@ -106,10 +144,11 @@ function Find-InstalledVisualStudio {
     # Only its held Process handle is terminated here. Descendant containment
     # and final drain remain factual responsibilities of that outer owner.
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $prespawn = New-VswherePrespawnObservation
     $arguments = @('-latest','-products','*','-requires','Microsoft.VisualStudio.Component.VC.Tools.x86.x64','-property','installationPath','-utf8')
     $record = [ordered]@{
         schema='mmmm-observer-vswhere-discovery/1'; source_sha=$ExpectedSourceSha; target=$Target;
-        status='failed'; phase='vswhere_program_files'; program=[ordered]@{ role='installed_vswhere'; bytes=$null; sha256=$null; revalidated=$false };
+        status='failed'; phase='vswhere_prepare'; program=[ordered]@{ role='installed_vswhere'; bytes=$null; sha256=$null; revalidated=$false };
         argv=$arguments; argv_sha256=[System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($utf8.GetBytes((ConvertTo-Json -InputObject $arguments -Compress)))).ToLowerInvariant();
         limits=[ordered]@{ work_ms=5000; cleanup_ms=2500; stdout_bytes=4096; stderr_bytes=4096 };
         process_started=$false; command_exit=$null; root_exited=$false; root_exit_verified=$false;
@@ -119,7 +158,7 @@ function Find-InstalledVisualStudio {
         selected_root_checked=$false; installation_path_bytes=$null; installation_path_sha256=$null;
         elapsed_ms=0L; failure=$null; secondary_failures=@(); descendant_drain='external_managed_owner_required';
         receipt_export='external_managed_deadline';
-        whole_toolchain_image_verified=$false
+        whole_toolchain_image_verified=$false; prespawn=$prespawn
     }
     $process = [System.Diagnostics.Process]::new()
     $cancel = [System.Threading.CancellationTokenSource]::new()
@@ -129,22 +168,33 @@ function Find-InstalledVisualStudio {
     $originalFailure = $null
     $cleanupDeadline = $null
     try {
+        $script:phase = 'vswhere_prepare'
+        Update-VswherePrespawnObservation $prespawn 'prepare' $clock.ElapsedMilliseconds $true
         $script:phase = 'vswhere_program_files'
+        Update-VswherePrespawnObservation $prespawn 'program_files_physical' $clock.ElapsedMilliseconds $false
         $programFiles = Assert-Physical ([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::ProgramFilesX86)) $true
+        Update-VswherePrespawnObservation $prespawn 'program_files_physical' $clock.ElapsedMilliseconds $true
         $script:phase = 'vswhere_executable'
+        Update-VswherePrespawnObservation $prespawn 'executable_physical' $clock.ElapsedMilliseconds $false
         $program = Assert-Physical (Join-Path $programFiles 'Microsoft Visual Studio/Installer/vswhere.exe') $false
+        Update-VswherePrespawnObservation $prespawn 'executable_physical' $clock.ElapsedMilliseconds $true
+        Update-VswherePrespawnObservation $prespawn 'executable_open' $clock.ElapsedMilliseconds $false
         $heldProgram = [System.IO.File]::Open($program, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        Update-VswherePrespawnObservation $prespawn 'executable_open' $clock.ElapsedMilliseconds $true
+        Update-VswherePrespawnObservation $prespawn 'executable_hash' $clock.ElapsedMilliseconds $false
         if ($heldProgram.Length -le 0 -or $heldProgram.Length -gt 16777216) { throw 'OBSERVER_VSWHERE_EXECUTABLE_BUDGET' }
         $record.program.bytes = $heldProgram.Length
         $record.program.sha256 = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($heldProgram)).ToLowerInvariant()
-        if ($clock.ElapsedMilliseconds -ge 5000) { throw 'OBSERVER_VSWHERE_PRESPAWN_DEADLINE' }
+        Update-VswherePrespawnObservation $prespawn 'executable_hash' $clock.ElapsedMilliseconds $true
         $script:phase = 'vswhere_spawn'
+        Update-VswherePrespawnObservation $prespawn 'spawn_prepare' $clock.ElapsedMilliseconds $false
         $info = [System.Diagnostics.ProcessStartInfo]::new()
         $info.FileName = $program; $info.WorkingDirectory = $headerSlot
         $info.UseShellExecute = $false; $info.CreateNoWindow = $true
         $info.RedirectStandardInput = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
         foreach ($argument in $arguments) { $info.ArgumentList.Add($argument) }
         $process.StartInfo = $info
+        Update-VswherePrespawnObservation $prespawn 'spawn_prepare' $clock.ElapsedMilliseconds $true
         if (-not $process.Start()) { throw 'OBSERVER_VSWHERE_PROCESS_START_FAILED' }
         $record.process_started = $true
         $process.StandardInput.Close()
@@ -214,6 +264,11 @@ function Find-InstalledVisualStudio {
         $originalFailure = $_.Exception
         $record.failure = Failure-Shape $originalFailure
     } finally {
+        if (-not $record.process_started) {
+            # Snapshot a failed synchronous stage without completing it or
+            # claiming that a native method which was never run succeeded.
+            $prespawn.elapsed_ms = $clock.ElapsedMilliseconds
+        }
         # Failure before the normal wait loop still needs an actual bounded
         # root-process exit observation. Never enumerate PIDs or kill a tree.
         if ($record.process_started -and -not $record.root_exit_verified) {
