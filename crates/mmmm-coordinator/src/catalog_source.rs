@@ -38,6 +38,9 @@ use mmmm_runtime::storage::{
 use serde_json::{Value, json};
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
 
+#[path = "catalog_input_archive.rs"]
+mod input_archive;
+
 const MAX_SOURCES: usize = 256;
 const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
@@ -141,6 +144,13 @@ pub(crate) struct NativeCatalogPublication {
     source_use: Sha256Digest,
 }
 impl NativeCatalogPublication {
+    pub(crate) fn same_issuance(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.revision == other.revision
+            && self.read_policy == other.read_policy
+            && self.source_use == other.source_use
+            && Rc::ptr_eq(&self.receipt, &other.receipt)
+    }
     pub(crate) fn read_policy(&self) -> &Sha256Digest {
         &self.read_policy
     }
@@ -195,6 +205,7 @@ struct CatalogRegistrations {
     native_publishers: BTreeMap<(PrincipalId, ContextId), NativeCatalogOrigin>,
     captures: BTreeMap<SnapshotId, CaptureAuthorityReceipt>,
     pending_captures: BTreeMap<SnapshotId, CaptureAuthorityReceipt>,
+    input_archives: BTreeMap<(PrincipalId, ContextId), input_archive::RetainedInputInventories>,
 }
 
 /// In-process registrations have no wire constructor. A restart must reinstall
@@ -601,6 +612,13 @@ impl RegisteredCatalogSources {
         if matches {
             state.environments.remove(&publication.key);
             state.native_publishers.remove(&publication.key);
+            if state
+                .input_archives
+                .get(&publication.key)
+                .is_some_and(|facts| facts.owned_by(publication))
+            {
+                state.input_archives.remove(&publication.key);
+            }
         }
         Ok(())
     }
@@ -614,6 +632,7 @@ impl RegisteredCatalogSources {
         let key = (authenticated.principal().clone(), id.clone());
         state.environments.remove(&key);
         state.native_publishers.remove(&key);
+        state.input_archives.remove(&key);
         Ok(())
     }
 
@@ -807,6 +826,13 @@ impl RegisteredCatalogSources {
             native_checkpoint,
         };
         call.fresh().map_err(app_service)?;
+        input_archive::retain_selected_inputs(&call, slot, &shared).map_err(|cause| {
+            ServiceError::caused_by(
+                cause.code,
+                "입력 archive 사실을 현재 capture에 연결할 수 없습니다",
+                cause,
+            )
+        })?;
         let backend = BorrowedCatalogBackend {
             store: shared.clone(),
             call: call.clone(),
@@ -826,6 +852,16 @@ impl RegisteredCatalogSources {
             access: Box::new(CatalogAccess(call, true, None)),
             source: Box::new(source),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn input_archive_test_facts(&self) -> AppResult<Vec<Value>> {
+        let state = self.state.try_borrow().map_err(|_| busy())?;
+        Ok(state
+            .input_archives
+            .values()
+            .flat_map(|facts| facts.summaries().iter().cloned())
+            .collect())
     }
 
     pub fn catalog_access<'a>(

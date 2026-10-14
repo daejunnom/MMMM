@@ -33,9 +33,10 @@ use mmmm_runtime::storage::{
         self, CatalogSourceUseAction, CatalogSourceUseCurrent, CatalogSourceUsePermit,
         CatalogSourceUseRole, CatalogSourceUseSnapshot,
     },
+    host_setup::HostReadPolicyRecord,
     project_resources::{
         ProjectResourceAuthority, ProjectResourceQuery, ProjectResourceReader,
-        ProjectSourceRpcContext, RegisteredProjectResource,
+        ProjectResourceRequest, ProjectSourceRpcContext, RegisteredProjectResource,
     },
 };
 use serde_json::{Value, json};
@@ -131,7 +132,173 @@ pub(crate) struct NativeCatalogAdmission<'a> {
     pub(crate) hosts: &'a HostBridge,
     pub(crate) sources: &'a RegisteredCatalogSources,
 }
+
+/// 원 요청 안에서만 보유하는 입력 사실이다. owner/request witness는 담지 않고
+/// 저장된 JSON으로 생성하거나 읽기 권한으로 사용할 수 없다.
+pub(crate) struct NativeInputArchivePins {
+    pub(crate) publication: NativeCatalogPublication,
+    pub(crate) policy: HostReadPolicyRecord,
+    pub(crate) selected: CatalogSourceUseSnapshot,
+    pub(crate) revision: Sha256Digest,
+}
 impl NativeCatalogAdmission<'_> {
+    pub(crate) fn selected_input_archive_pins(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        context: &Value,
+        store: &DurableStore,
+        budget: &RequestBudget,
+    ) -> AppResult<Option<NativeInputArchivePins>> {
+        let publication = match self.sources.native_admission_state(principal, context)? {
+            NativeCatalogAdmissionState::Explicit => return Ok(None),
+            NativeCatalogAdmissionState::Missing => return Err(denied()),
+            NativeCatalogAdmissionState::Native(publication) => publication,
+        };
+        let result = (|| {
+            let request = self
+                .request
+                .current_witness("catalog.capture")
+                .map_err(service_error)?;
+            check_request(&request, principal, context, budget)?;
+            let id = ContextId::new(text(context, "contextId")?).map_err(|_| invalid())?;
+            let pairing = Rc::new(self.hosts.completed_pairing_witness(
+                &request,
+                self.authority,
+                &id,
+            )?);
+            let policy = pairing.with_current_native_owner(store, self.authority, |owner| {
+                owner.read_host_policy()
+            })?;
+            if policy.policy_digest() != publication.read_policy()
+                || !policy.policy().native_observation_user_local_only()
+            {
+                return Err(denied());
+            }
+            let selected = read_source_uses(
+                &request,
+                principal,
+                context,
+                budget,
+                &pairing,
+                self.authority,
+                policy.policy_digest(),
+                store,
+            )?;
+            if source_use_pin(&selected)? != *publication.source_use() {
+                return Err(drift());
+            }
+            let rpc = CatalogRpc::new(
+                principal.clone(),
+                budget.clone(),
+                self.authority.clone(),
+                context,
+            )?;
+            let revision = Sha256Digest::new(text(
+                &current_project(store, &rpc, pairing.project())?,
+                "revision",
+            )?)
+            .map_err(|_| invalid())?;
+            check_request(&request, principal, context, budget)?;
+            Ok(Some(NativeInputArchivePins {
+                publication: publication.clone(),
+                policy,
+                selected,
+                revision,
+            }))
+        })();
+        match result {
+            Ok(pins) => Ok(pins),
+            Err(primary) => combine(
+                Err(primary),
+                self.sources.retire_native_publication(&publication),
+            ),
+        }
+    }
+
+    /// 한 입력의 bytes만 반환한다. 기존 실제 owner/Store/game ACL callback과
+    /// same-handle 전체 hash 검증을 유지하고 witness는 이 읽기 뒤 폐기한다.
+    pub(crate) fn read_selected_input_archive(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        context: &Value,
+        store: &DurableStore,
+        budget: &RequestBudget,
+        pins: &NativeInputArchivePins,
+        index: usize,
+    ) -> AppResult<Vec<u8>> {
+        let request = self
+            .request
+            .current_witness("catalog.capture")
+            .map_err(service_error)?;
+        check_request(&request, principal, context, budget)?;
+        let current = self.sources.native_admission_state(principal, context)?;
+        if !matches!(current, NativeCatalogAdmissionState::Native(ref current)
+            if current.same_issuance(&pins.publication))
+        {
+            return Err(denied());
+        }
+        let id = ContextId::new(text(context, "contextId")?).map_err(|_| invalid())?;
+        let pairing = Rc::new(self.hosts.completed_pairing_witness(
+            &request,
+            self.authority,
+            &id,
+        )?);
+        if pairing.context() != context {
+            return Err(drift());
+        }
+        let boundary = || {
+            pairing.with_current_native_owner(store, self.authority, |owner| {
+                if owner.read_host_policy()? != pins.policy {
+                    return Err(drift());
+                }
+                check_request(&request, principal, context, budget)?;
+                owner.check_current()
+            })
+        };
+        boundary()?;
+        let output = (|| {
+            let permit = source_use_reader(
+                &request,
+                principal,
+                context,
+                budget,
+                &pairing,
+                self.authority,
+                store,
+            )?;
+            if permit.revision != pins.revision {
+                return Err(drift());
+            }
+            let selected = pins.selected.selections().get(index).ok_or_else(invalid)?;
+            let mut reader = permit
+                .resource_reader(64 * 1024 * 1024)
+                .map_err(|cause| permit.release(cause))?;
+            let query = ProjectResourceQuery::Current {
+                resource_id: selected.selection().resource_id.clone(),
+            };
+            let result = reader
+                .read(
+                    store,
+                    &permit,
+                    &ProjectResourceRequest {
+                        project: &permit.project,
+                        current_project_revision: &permit.revision,
+                        query: &query,
+                        expected: Some(selected.resource()),
+                    },
+                    64 * 1024 * 1024,
+                )
+                .map_err(|cause| permit.release(cause))?;
+            if result.registered.blob != *selected.blob()
+                || result.registered.owner != ResourceOwner::Project(permit.project.clone())
+            {
+                return Err(drift());
+            }
+            Ok(result.bytes)
+        })();
+        combine(output, boundary())
+    }
+
     /// Capture obtains a fresh call-scoped hook after access admission. The
     /// long-lived source registry retains only its origin proof and receipt.
     pub(crate) fn checkpoint(
@@ -594,36 +761,9 @@ fn read_source_uses(
     };
     boundary()?;
     let output = (|| {
-        let owner = NativeOwnerWitness::capture(store, budget.deadline())
-            .map_err(|cause| AppError::storage("PERMISSION_REQUIRED", cause))?;
-        if owner.principal() != pairing.native_owner() {
-            return Err(denied());
-        }
-        let rpc = CatalogRpc::new(
-            principal.clone(),
-            budget.clone(),
-            authority.clone(),
-            context,
+        let permit = source_use_reader(
+            request, principal, context, budget, pairing, authority, store,
         )?;
-        let project = pairing.project().clone();
-        let document = current_project(store, &rpc, &project)?;
-        let revision = Sha256Digest::new(text(&document, "revision")?).map_err(|_| invalid())?;
-        let policy_id =
-            ResourceId::new(text(&document, "policyResourceId")?).map_err(|_| invalid())?;
-        let permit = NativeSourceUseRead {
-            request: request.clone(),
-            principal: principal.clone(),
-            context: context.clone(),
-            budget: budget.clone(),
-            pairing: pairing.clone(),
-            owner,
-            rpc,
-            project,
-            revision,
-            document,
-            policy_id,
-            failure: Rc::new(RefCell::new(None)),
-        };
         let selected = catalog_source_use::read_catalog_source_uses(
             store,
             &permit,
@@ -641,6 +781,47 @@ fn read_source_uses(
         Ok(selected)
     })();
     combine(output, boundary())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn source_use_reader(
+    request: &RequestContextWitness,
+    principal: &AuthenticatedPrincipal,
+    context: &Value,
+    budget: &RequestBudget,
+    pairing: &Rc<CompletedPairingWitness>,
+    authority: &LocalAuthority,
+    store: &DurableStore,
+) -> AppResult<NativeSourceUseRead> {
+    let owner = NativeOwnerWitness::capture(store, budget.deadline())
+        .map_err(|cause| AppError::storage("PERMISSION_REQUIRED", cause))?;
+    if owner.principal() != pairing.native_owner() {
+        return Err(denied());
+    }
+    let rpc = CatalogRpc::new(
+        principal.clone(),
+        budget.clone(),
+        authority.clone(),
+        context,
+    )?;
+    let project = pairing.project().clone();
+    let document = current_project(store, &rpc, &project)?;
+    let revision = Sha256Digest::new(text(&document, "revision")?).map_err(|_| invalid())?;
+    let policy_id = ResourceId::new(text(&document, "policyResourceId")?).map_err(|_| invalid())?;
+    Ok(NativeSourceUseRead {
+        request: request.clone(),
+        principal: principal.clone(),
+        context: context.clone(),
+        budget: budget.clone(),
+        pairing: pairing.clone(),
+        owner,
+        rpc,
+        project,
+        revision,
+        document,
+        policy_id,
+        failure: Rc::new(RefCell::new(None)),
+    })
 }
 
 fn source_use_pin(selected: &CatalogSourceUseSnapshot) -> AppResult<Sha256Digest> {

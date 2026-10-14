@@ -381,7 +381,13 @@ fn container_selections() -> Vec<CatalogSourceUseSelection> {
         },
     ]
 }
-fn retain_containers(root: &Root, project: &ProjectId, revision: &Sha256Digest, approve: bool) {
+fn retain_containers(
+    root: &Root,
+    project: &ProjectId,
+    revision: &Sha256Digest,
+    approve: bool,
+    malformed: bool,
+) {
     let budget =
         RequestBudget::new(Duration::from_secs(15), Arc::new(AtomicBool::new(false))).unwrap();
     let digest = crate::daemon_launch::current_executable_digest(budget.deadline()).unwrap();
@@ -393,7 +399,11 @@ fn retain_containers(root: &Root, project: &ProjectId, revision: &Sha256Digest, 
         &budget,
     )
     .unwrap();
-    let game = container_bytes(false);
+    let game = if malformed {
+        b"PK\x05\x06".to_vec()
+    } else {
+        container_bytes(false)
+    };
     let mods = container_bytes(true);
     let metadata = |id, bytes: &[u8]| {
         encode_json(&json!({"resourceId":id,
@@ -457,19 +467,29 @@ struct Fixture {
 }
 impl Fixture {
     fn new(selected: Option<bool>, complete: bool) -> Self {
-        Self::build(selected, complete, None, false)
+        Self::build(selected, complete, None, false, false)
     }
     fn containers(grant: bool, approve: bool) -> Self {
-        Self::build(Some(true), true, Some((grant, approve)), false)
+        Self::build(Some(true), true, Some((grant, approve)), false, false)
     }
     fn shapes(containers: bool) -> Self {
-        Self::build(Some(true), true, containers.then_some((true, true)), true)
+        Self::build(
+            Some(true),
+            true,
+            containers.then_some((true, true)),
+            true,
+            false,
+        )
+    }
+    fn rejected_inventory() -> Self {
+        Self::build(Some(true), true, Some((true, true)), false, true)
     }
     fn build(
         selected: Option<bool>,
         complete: bool,
         containers: Option<(bool, bool)>,
         shape_scope: bool,
+        malformed: bool,
     ) -> Self {
         let root = Root::new();
         let initialized = {
@@ -484,7 +504,13 @@ impl Fixture {
         };
         let project = initialized.project_id;
         if let Some((_, approve)) = containers {
-            retain_containers(&root, &project, &initialized.project_revision, approve);
+            retain_containers(
+                &root,
+                &project,
+                &initialized.project_revision,
+                approve,
+                malformed,
+            );
         }
         let executable = std::env::current_exe().unwrap();
         let host_jar = root.0.join("selected-host.jar");
@@ -1149,6 +1175,32 @@ fn protected_whole_containers_share_the_native_publisher_but_leave_both_pack_sta
     let NativeCatalogAdmissionState::Native(original) = fixture.state() else {
         panic!("native publication required")
     };
+    let facts = fixture
+        .registries
+        .catalog
+        .input_archive_test_facts()
+        .unwrap();
+    assert_eq!(facts.len(), 2);
+    for fact in &facts {
+        let manifest = inventory_json(&mut fixture, &fact["manifest"]);
+        assert_eq!(manifest["inventory"]["status"], "complete");
+        assert_eq!(manifest["inventory"]["memberCount"], 0);
+        assert_eq!(manifest["inventory"]["decodedBytes"], 0);
+        assert_eq!(manifest["memberPages"], json!([]));
+        assert_eq!(manifest["inputSha256"], fact["input"]["sha256"]);
+        let provenance = inventory_json(&mut fixture, &manifest["provenance"]);
+        assert_eq!(provenance["sourceUsePin"], original.source_use().as_str());
+        assert_eq!(provenance["readPolicyPin"], original.read_policy().as_str());
+        assert_eq!(provenance["sourceUse"]["generation"], 1);
+        assert_eq!(
+            provenance["sourceUse"]["selections"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(provenance["scope"], "selected_input_container_bytes");
+    }
     let id = ContextId::new(fixture.context["contextId"].as_str().unwrap()).unwrap();
     let sources = fixture
         .registries
@@ -1184,6 +1236,14 @@ fn protected_whole_containers_share_the_native_publisher_but_leave_both_pack_sta
         fixture.state(),
         NativeCatalogAdmissionState::Missing
     ));
+    assert!(
+        fixture
+            .registries
+            .catalog
+            .input_archive_test_facts()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1388,6 +1448,80 @@ fn explicit_native_registration(context: &Value) -> CatalogEnvironmentRegistrati
     }
 }
 
+// 같은 보호 Store에서 이미 보존된 사실만 관리용으로 확인한다. 이 helper는
+// wire read ACL 또는 source/target authority를 발급하지 않는다.
+fn inventory_json(fixture: &mut Fixture, reference: &Value) -> Value {
+    let blob = mmmm_runtime::storage::BlobRef {
+        digest: Sha256Digest::new(reference["sha256"].as_str().unwrap()).unwrap(),
+        byte_length: reference["sizeBytes"].as_u64().unwrap(),
+    };
+    assert!(blob.byte_length <= 256 * 1024);
+    let bytes = fixture.service.management_store().read_blob(&blob).unwrap();
+    assert_eq!(raw_digest(&bytes), blob.digest);
+    parse_json(&bytes).unwrap()
+}
+
+#[test]
+fn rejected_input_inventory_keeps_raw_source_and_independent_artifact_authority() {
+    // 기존 empty ZIP는 structural rejection을 만들 수 없다. 같은 import/owner/
+    // source-use fixture에 header만 있는 자체 작성 입력을 추가하며 게임 자료는 없다.
+    let mut fixture = Fixture::rejected_inventory();
+    fixture.observe_containers();
+    assert_eq!(
+        fixture.capture(&fixture.budget()).unwrap_err().code,
+        "SOURCE_UNAVAILABLE"
+    );
+    assert!(matches!(
+        fixture.state(),
+        NativeCatalogAdmissionState::Native(_)
+    ));
+    let facts = fixture
+        .registries
+        .catalog
+        .input_archive_test_facts()
+        .unwrap();
+    assert_eq!(facts.len(), 2);
+    let rejected = facts
+        .iter()
+        .find(|fact| fact["input"]["resourceId"] == "catalog-game-container")
+        .unwrap();
+    assert_eq!(rejected["inventory"]["status"], "rejected");
+    assert_eq!(rejected["inventory"]["code"], "INPUT_ARCHIVE_TRUNCATED");
+    let manifest = inventory_json(&mut fixture, &rejected["manifest"]);
+    assert_eq!(manifest["inventory"]["complete"], false);
+    assert_eq!(manifest["memberPages"], json!([]));
+    let budget = fixture.budget();
+    let result = fixture
+        .service
+        .call(
+            &fixture.principal,
+            "artifact.read",
+            &json!({"contextId":fixture.context["contextId"],"resourceId":"catalog-game-container",
+            "offset":"0","limitBytes":65536}),
+            &budget,
+        )
+        .unwrap();
+    assert_eq!(
+        result["resource"]["sha256"],
+        raw_digest(b"PK\x05\x06").as_str()
+    );
+    assert_eq!(result["resource"]["sizeBytes"], 4);
+    assert!(matches!(
+        fixture.state(),
+        NativeCatalogAdmissionState::Native(_)
+    ));
+    fixture.withdraw_containers();
+    assert!(fixture.capture(&fixture.budget()).is_err());
+    assert!(
+        fixture
+            .registries
+            .catalog
+            .input_archive_test_facts()
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[test]
 fn describe_rechecks_existing_native_issuance_but_cannot_issue_a_missing_source() {
     let mut fixture = Fixture::new(Some(true), true);
@@ -1548,7 +1682,10 @@ fn actual_host_failure_survives_the_new_admission_boundary_without_issuing_a_sou
 
 #[test]
 fn subsequent_capture_host_failure_and_native_postcheck_survive_the_facade_together() {
-    let mut fixture = Fixture::new(Some(true), true);
+    // 동일 원 요청에서 inventory가 먼저 보존된 경우도 실제 native postcheck의
+    // 취소/retirement가 새 current cache를 남기지 않는지 확인한다.
+    let mut fixture = Fixture::containers(true, true);
+    fixture.observe_containers();
     let cancellation = Arc::new(AtomicBool::new(false));
     let budget = RequestBudget::new(Duration::from_secs(10), cancellation.clone()).unwrap();
     {
@@ -1582,6 +1719,14 @@ fn subsequent_capture_host_failure_and_native_postcheck_survive_the_facade_toget
         fixture.state(),
         NativeCatalogAdmissionState::Missing
     ));
+    assert!(
+        fixture
+            .registries
+            .catalog
+            .input_archive_test_facts()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

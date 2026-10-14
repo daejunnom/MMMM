@@ -63,6 +63,8 @@
 
 | MMMM-D043 | Darwin의 관측 구성원에서 확인된 좁은 TaskInfo 종료 전이도 전체 불완전 표본으로 보존하며 완료·empty·drain으로 승격하지 않는다. | CI34에서 실제 관측한 TaskInfo·typed Exited·native result 0·ESRCH와 before/after의 동일 PID·UID·PGID·birth sec/usec, 양쪽 INEXIT·non-SZOMB 조합에만 member Pending을 허용한다. 기존 D036 예약 leader 조건과 이 조합 밖의 미확정 member에 대한 strict 거절은 유지한다. 같은 scan의 member/leader별 실제 first·last·count를 별도로 누적하여 후속 Pending이나 hard failure로 소실하지 않고 한 번만 merge한다. 전체 Pending은 성공 표본 수·peak·마지막 성공 시각을 갱신하지 않으며 알려진 leader/member의 부분 사용량 상한 검사는 유지한다. 원 100 ms cadence·1초 성공 gap·기한·자원·signal 권한을 유지하며 새 native 조회·retry/sleep을 추가하지 않는다. Pending 자체는 scope_empty false이고 이후 독립 native snapshot의 기존 종료 판정과 구분한다. 새 실제 macOS 관측과 stdio errno 보존의 실행 검증은 후속 CI가 필요하다. |
 
+| MMMM-D044 | 승인된 selected input의 archive 사실은 현재 native catalog 발행과 같은 보호 Store에서 읽고 immutable CAS에 나누어 보존한다. | `catalog.capture`만 실제 완료 pairing·현재 owner/route·Project/Policy·D032·D035 선택 및 전체 CAS를 전후 검사하여 생산한다. 명시 publisher와 FN23/FN31 소비자는 새 inventory를 만들지 않는다. 입력별 raw bytes/member 목록은 한 입력의 생애에만 두고 registry는 exact 발행 receipt와 작은 provenance/manifest 참조·summary만 보유한다. member page는 256 KiB·1,024 entries, 요청 합계는 input 64 MiB·decoded 256 MiB·65,535 entries·encoded 16 MiB이며 기존 JSON 및 registry 1 MiB 제한을 유지한다. parser에 제공한 allowance를 선예약하고 성공 때 실제 사용량만 환급한다. 선택별 실제 rejection manifest 비용을 작업 전에 예약하여 긴 canonical 선택도 기록 공간을 잃지 않게 한다. 형식·지원·합계 초과는 정확한 rejected 사실로 남기고 취소·기한·읽기·ACL 실패는 원 typed 오류로 보존하며 실패한 호출의 새 완료 cache를 게시하지 않는다. 원 source의 독립 FN31 grant, runtime pack mapping·loaded definition·SourceAdmission 및 게임 권한을 이 사실에서 발급하지 않는다. |
+
 ## 구현 전에 확인할 항목
 
 - 원본 계약과 예제 패키지의 내용, 버전 및 digest.
