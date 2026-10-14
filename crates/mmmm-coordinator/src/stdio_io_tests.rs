@@ -299,6 +299,57 @@ fn actual_native_startup_rejection_preserves_admission_or_verified_drain() {
         "unexpected native startup rejection: {error}; drained={}",
         error.drained
     );
+    if !error.drained {
+        match &error.cleanup {
+            Some(cleanup) => eprintln!(
+                "stdio_startup_cleanup present=true code={} native={:?} native_unknown={}",
+                cleanup.code, cleanup.native_code, cleanup.native_code_unknown,
+            ),
+            None => eprintln!("stdio_startup_cleanup present=false"),
+        }
+        match &error.startup {
+            Some(startup) => eprintln!("stdio_startup_observation present=true {startup}"),
+            None => eprintln!("stdio_startup_observation present=false"),
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let resources = error.resources.as_ref();
+            match resources {
+                Some(facts) => eprintln!(
+                    "stdio_startup_resources present=true child_admitted={} parent_confirmed_zombie_observations={} parent_exit_pending_observations={} parent_last_resource_failure_present={} parent_last_resource_failure={} parent_terminal_identity_query_errno={:?}",
+                    facts.child_admitted,
+                    facts.parent_confirmed_zombie_observations,
+                    facts.parent_exit_pending_observations,
+                    facts.parent_last_resource_failure.is_some(),
+                    facts.parent_last_resource_failure.unwrap_or("none"),
+                    facts.parent_terminal_identity_query_errno,
+                ),
+                None => eprintln!("stdio_startup_resources present=false"),
+            }
+            for (role, source) in [
+                ("direct", error.resource_source.as_ref()),
+                (
+                    "parent_resource",
+                    resources.and_then(|facts| facts.parent_last_resource_error.as_ref()),
+                ),
+                (
+                    "parent_exit",
+                    resources.and_then(|facts| facts.parent_last_exit_observation.as_ref()),
+                ),
+            ] {
+                match source {
+                    Some(source) => eprintln!(
+                        "stdio_startup_resource_source role={role} present=true stage={} failure={} native_result={} native_errno={}",
+                        source.stage.as_str(),
+                        source.failure.as_str(),
+                        source.native_result,
+                        source.native_errno,
+                    ),
+                    None => eprintln!("stdio_startup_resource_source role={role} present=false"),
+                }
+            }
+        }
+    }
     assert!(
         error.drained,
         "native failure must preserve a verified drain result; code={}; native={:?}; native_unknown={}; drained={}",

@@ -7,11 +7,13 @@ use super::*;
 use crate::{
     auth::{SessionAuthority, SessionPolicy},
     bootstrap::HostBootstrapProcessor,
-    daemon::{DaemonHandles, DaemonSourceFactory},
+    catalog_source_use::{LocalCatalogSourceUseAction, manage_catalog_source_use},
+    daemon::{DaemonHandles, DaemonSourceFactory, PreparedDaemon},
     features::{FEATURE_METHODS, FeatureExtension},
     local_setup::{
         LocalHostSetup, register_local_host_setup, register_local_host_setup_with_read_policy,
     },
+    native_source_ingress::{NativeRawSourceResource, NativeSourceInput},
     peer_management::{
         BootstrapBudget, HostOffer, ManagementRequest, PublicFrame, management_channel,
     },
@@ -20,11 +22,17 @@ use crate::{
     service::{
         ApplicationPorts, ApplicationService, ExtensionRouter, ServiceDispatcher, ServiceError,
     },
-    workspace_bootstrap::prepare_workspace,
+    workspace_bootstrap::{native_owner_resource_reader, prepare_workspace},
 };
-use mmmm_contracts::{SessionEpoch, TargetProfileId};
-use mmmm_runtime::storage::{StoreConfig, host_setup::HostReadPolicy};
+use mmmm_contracts::{ResourceLocation, SessionEpoch, TargetProfileId, raw_digest};
+use mmmm_runtime::storage::{
+    StoreConfig,
+    catalog_source_use::{CatalogSourceUseReplace, CatalogSourceUseSelection},
+    host_setup::HostReadPolicy,
+    project_resources::ProjectResourceRequest,
+};
 use std::{
+    collections::BTreeSet,
     fs,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
@@ -128,11 +136,13 @@ struct PeerState {
     drift_on_sources: bool,
     fail_sources: bool,
     fail_at_source: Option<usize>,
+    corrupt_at_source: Option<(usize, PathBuf)>,
 }
 struct Peer {
     address: SocketAddr,
     state: Arc<Mutex<PeerState>>,
     source_reads: Arc<AtomicUsize>,
+    catalog_observations: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<Result<(), &'static str>>>,
 }
@@ -151,11 +161,14 @@ impl Peer {
             drift_on_sources: false,
             fail_sources: false,
             fail_at_source: None,
+            corrupt_at_source: None,
         }));
         let source_reads = Arc::new(AtomicUsize::new(0));
+        let catalog_observations = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let shared = state.clone();
         let reads = source_reads.clone();
+        let observations = catalog_observations.clone();
         let stopping = stop.clone();
         let worker = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -178,6 +191,18 @@ impl Peer {
                     .map_err(|_| "host fixture blocking mode")?;
                 let request = read_request(&mut stream, deadline)?;
                 let body = &request["params"];
+                // The public facade resolves and authorizes execution_context
+                // before native admission. Count the actual catalog observer
+                // methods separately so withdrawal fences ensure's host I/O.
+                if body["method"] == "hello"
+                    || (body["method"] == "inspect"
+                        && matches!(
+                            body["payload"]["kind"].as_str(),
+                            Some("runtime_sources" | "native_registry")
+                        ))
+                {
+                    observations.fetch_add(1, Ordering::AcqRel);
+                }
                 let state = shared.lock().map_err(|_| "host fixture state")?;
                 let mut failure = false;
                 let payload = match body["method"].as_str() {
@@ -186,6 +211,12 @@ impl Peer {
                         Some("execution_context") => state.context.clone(),
                         Some("runtime_sources") => {
                             let ordinal = reads.fetch_add(1, Ordering::AcqRel) + 1;
+                            if let Some((at, path)) = &state.corrupt_at_source
+                                && ordinal == *at
+                            {
+                                fs::write(path, b"bounded corrupt selected container")
+                                    .map_err(|_| "host fixture selected CAS mutation")?;
+                            }
                             if let Some(cancelled) = &state.cancel_on_sources
                                 && state.cancel_at_source.is_none_or(|at| ordinal == at)
                             {
@@ -233,6 +264,7 @@ impl Peer {
             address,
             state,
             source_reads,
+            catalog_observations,
             stop,
             worker: Some(worker),
         }
@@ -312,6 +344,93 @@ fn registry_payload(state: &PeerState) -> Value {
         "gameVersion":state.hello["gameVersion"], "locale":"en_us", "observationBytesHex":hex})
 }
 
+fn container_bytes(is_mod: bool) -> Vec<u8> {
+    let mut bytes = b"PK\x05\x06".to_vec();
+    bytes.extend_from_slice(&[0; 18]);
+    if is_mod {
+        bytes[20] = 1;
+        bytes.push(b'm');
+    }
+    bytes
+}
+fn container_selections() -> Vec<CatalogSourceUseSelection> {
+    vec![
+        CatalogSourceUseSelection {
+            resource_id: ResourceId::new("catalog-game-container").unwrap(),
+            role: CatalogSourceUseRole::GameArtifact,
+        },
+        CatalogSourceUseSelection {
+            resource_id: ResourceId::new("catalog-mod-container").unwrap(),
+            role: CatalogSourceUseRole::Mod {
+                canonical_id: ResourceLocation::new("example:fixture_mod").unwrap(),
+                native_id: "fixture_mod".into(),
+            },
+        },
+    ]
+}
+fn retain_containers(root: &Root, project: &ProjectId, revision: &Sha256Digest, approve: bool) {
+    let budget =
+        RequestBudget::new(Duration::from_secs(15), Arc::new(AtomicBool::new(false))).unwrap();
+    let digest = crate::daemon_launch::current_executable_digest(budget.deadline()).unwrap();
+    let mut factory = ProductionFactory::offline_owned(digest);
+    let prepared = PreparedDaemon::open_for_native_source_import(
+        root.config(),
+        project.clone(),
+        &mut factory,
+        &budget,
+    )
+    .unwrap();
+    let game = container_bytes(false);
+    let mods = container_bytes(true);
+    let metadata = |id, bytes: &[u8]| {
+        encode_json(&json!({"resourceId":id,
+        "sha256":raw_digest(bytes), "mediaType":"application/java-archive", "sizeBytes":bytes.len()})).unwrap()
+    };
+    let game_metadata = metadata("catalog-game-container", &game);
+    let mod_metadata = metadata("catalog-mod-container", &mods);
+    let receipt = prepared
+        .import_native_sources(&NativeSourceInput {
+            project,
+            expected_revision: revision,
+            documents: &[],
+            retained_resources: &[],
+            raw_resources: &[
+                NativeRawSourceResource {
+                    metadata: &game_metadata,
+                    bytes: &game,
+                },
+                NativeRawSourceResource {
+                    metadata: &mod_metadata,
+                    bytes: &mods,
+                },
+            ],
+        })
+        .unwrap();
+    if approve {
+        let absent = manage_catalog_source_use(
+            root.config(),
+            project,
+            &receipt.project_revision,
+            LocalCatalogSourceUseAction::Inspect,
+            &budget,
+        )
+        .unwrap();
+        let selected = manage_catalog_source_use(
+            root.config(),
+            project,
+            &receipt.project_revision,
+            LocalCatalogSourceUseAction::Replace {
+                expected_state_digest: absent.state_digest().clone(),
+                selections: container_selections(),
+            },
+            &budget,
+        )
+        .unwrap();
+        assert_eq!(selected.generation(), 1);
+        assert_eq!(selected.selections().len(), 2);
+    }
+}
+
 struct Fixture {
     service: ApplicationService,
     processor: HostBootstrapProcessor,
@@ -325,8 +444,14 @@ struct Fixture {
 }
 impl Fixture {
     fn new(selected: Option<bool>, complete: bool) -> Self {
+        Self::build(selected, complete, None)
+    }
+    fn containers(grant: bool, approve: bool) -> Self {
+        Self::build(Some(true), true, Some((grant, approve)))
+    }
+    fn build(selected: Option<bool>, complete: bool, containers: Option<(bool, bool)>) -> Self {
         let root = Root::new();
-        let project = {
+        let initialized = {
             let mut store = DurableStore::open(root.config()).unwrap();
             crate::native_project::create_native_project(
                 &mut store,
@@ -335,12 +460,20 @@ impl Fixture {
                 Instant::now() + Duration::from_secs(15),
             )
             .unwrap()
-            .project_id
         };
+        let project = initialized.project_id;
+        if let Some((_, approve)) = containers {
+            retain_containers(&root, &project, &initialized.project_revision, approve);
+        }
         let executable = std::env::current_exe().unwrap();
         let host_jar = root.0.join("selected-host.jar");
         let config_path = root.0.join("mmmm-host.json");
-        let scope = json!({"projectId":project,"resourceIds":[],"objectIds":[],"regions":[],"externalTargetIds":[]});
+        let resources = if containers.is_some_and(|(grant, _)| grant) {
+            vec!["catalog-game-container", "catalog-mod-container"]
+        } else {
+            vec![]
+        };
+        let scope = json!({"projectId":project,"resourceIds":resources,"objectIds":[],"regions":[],"externalTargetIds":[]});
         let request = LocalHostSetup {
             executable: &executable,
             installed_host_jar: &host_jar,
@@ -536,6 +669,212 @@ impl Fixture {
             .native_admission_state(&self.principal, &self.context)
             .unwrap()
     }
+    fn observe_containers(&self) {
+        let mut state = self.peer.state.lock().unwrap();
+        let receipt = |is_mod, scope| {
+            let bytes = container_bytes(is_mod);
+            let hash = raw_digest(&bytes);
+            json!({"status":"observed", "sourceId":format!("archive-sha256-{hash}"),
+                "sha256":hash,"sizeBytes":bytes.len(),"scope":scope})
+        };
+        state.facts["archives"] = json!([
+            receipt(false, "container_input_bytes"),
+            receipt(true, "container_input_bytes")
+        ]);
+        let mut original = receipt(false, "original_game_input_container");
+        original["inputIndex"] = json!(0);
+        state.facts["originalInputGameJars"] = json!([original]);
+        state.facts["mods"] = json!([{"modId":"fixture_mod", "runtimeRoots":[receipt(true, "container_input_bytes")]}]);
+    }
+    fn container_path(&self, is_mod: bool) -> PathBuf {
+        let hash = raw_digest(&container_bytes(is_mod));
+        self._root
+            .0
+            .join("blobs")
+            .join(&hash.as_str()[..2])
+            .join(&hash.as_str()[2..])
+    }
+    fn withdraw_containers(&mut self) -> CatalogSourceUseSnapshot {
+        assert!(self.handles.request.current().is_err());
+        let budget = self.budget();
+        let project = ProjectId::new(self.context["projectId"].as_str().unwrap()).unwrap();
+        let game_principal = self.principal.principal().clone();
+        let store = self.service.management_store();
+        let permit = EmptyOwnerWithdrawal::new(store, &project, budget);
+        assert_ne!(permit.owner.principal(), &game_principal);
+        let before = catalog_source_use::inspect_catalog_source_use_state(
+            store,
+            &permit,
+            &project,
+            &permit.revision,
+        )
+        .unwrap();
+        assert_eq!(before.selections().len(), 2);
+        let after = catalog_source_use::replace_catalog_source_uses(
+            store,
+            &permit,
+            &CatalogSourceUseReplace {
+                project: &project,
+                expected_project_revision: &permit.revision,
+                expected_state_digest: before.state_digest(),
+                selections: &[],
+            },
+        )
+        .unwrap();
+        assert_eq!(after.generation(), before.generation() + 1);
+        assert!(after.selections().is_empty());
+        after
+    }
+}
+
+// The cold CLI cannot acquire a second Store lock while this fixture retains
+// its live game publisher. Exercise the actual protected storage transition in
+// that same held Store with a freshly captured native owner. This permit can
+// only inspect or explicitly withdraw the complete set; it grants no game
+// principal, resource bytes, new selection, source or host permission.
+struct EmptyOwnerWithdrawal {
+    owner: NativeOwnerWitness,
+    budget: RequestBudget,
+    project: ProjectId,
+    revision: Sha256Digest,
+    document: Value,
+    policy: Value,
+    policy_resource: RegisteredProjectResource,
+}
+impl EmptyOwnerWithdrawal {
+    fn new(store: &DurableStore, project: &ProjectId, budget: RequestBudget) -> Self {
+        let owner = NativeOwnerWitness::capture(store, budget.deadline()).unwrap();
+        owner.check_project(store, project).unwrap();
+        let revision = Sha256Digest::new(
+            store.project(project).unwrap()["revision"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut reader = native_owner_resource_reader(
+            &owner,
+            project,
+            &revision,
+            BTreeSet::new(),
+            8 * 1024 * 1024,
+        )
+        .unwrap();
+        let document = reader
+            .read_project(store, &owner, project, &revision, 8 * 1024 * 1024)
+            .unwrap();
+        let policy_id = ResourceId::new(document["policyResourceId"].as_str().unwrap()).unwrap();
+        let mut reader = native_owner_resource_reader(
+            &owner,
+            project,
+            &revision,
+            BTreeSet::from([policy_id.clone()]),
+            8 * 1024 * 1024,
+        )
+        .unwrap();
+        let query = ProjectResourceQuery::Current {
+            resource_id: policy_id,
+        };
+        let request = ProjectResourceRequest {
+            project,
+            current_project_revision: &revision,
+            query: &query,
+            expected: None,
+        };
+        let policy_resource = reader.metadata(store, &owner, &request).unwrap();
+        let bytes = reader
+            .read(
+                store,
+                &owner,
+                &ProjectResourceRequest {
+                    expected: Some(&policy_resource.resource),
+                    ..request
+                },
+                8 * 1024 * 1024,
+            )
+            .unwrap()
+            .bytes;
+        let policy = ContractValidator::shared()
+            .unwrap()
+            .parse_and_validate("Policy", &bytes)
+            .unwrap();
+        Self {
+            owner,
+            budget,
+            project: project.clone(),
+            revision,
+            document,
+            policy,
+            policy_resource,
+        }
+    }
+}
+impl ProjectSourceRpcContext for EmptyOwnerWithdrawal {
+    fn check(&self) -> StorageResult<()> {
+        self.budget
+            .check()
+            .map_err(|cause| StorageError::InvalidTransition(cause.code.into()))?;
+        self.owner.check()
+    }
+    fn authenticated_principal(&self) -> StorageResult<PrincipalId> {
+        self.check()?;
+        Ok(self.owner.principal().clone())
+    }
+    fn context_id(&self) -> Option<&ContextId> {
+        None
+    }
+}
+impl CatalogSourceUsePermit for EmptyOwnerWithdrawal {
+    fn check_store(&self, store: &DurableStore) -> StorageResult<()> {
+        self.check()?;
+        self.owner.check_project(store, &self.project)?;
+        self.check()
+    }
+    fn authenticated_native_owner(
+        &self,
+        store: &DurableStore,
+        project: &ProjectId,
+    ) -> StorageResult<PrincipalId> {
+        self.check_store(store)?;
+        if project != &self.project {
+            return Err(StorageError::Conflict("Exact withdrawal Project"));
+        }
+        Ok(self.owner.principal().clone())
+    }
+    fn authorize_current(
+        &self,
+        store: &DurableStore,
+        current: &CatalogSourceUseCurrent<'_>,
+    ) -> StorageResult<()> {
+        self.check_store(store)?;
+        if !matches!(
+            current.action,
+            CatalogSourceUseAction::Inspect | CatalogSourceUseAction::Replace
+        ) || !current.selections.is_empty()
+            || current.native_owner != self.owner.principal()
+            || current.project != &self.document
+            || current.policy != &self.policy
+            || current.policy_resource.resource != self.policy_resource.resource
+            || current.policy_resource.blob != self.policy_resource.blob
+            || current.policy_resource.owner != self.policy_resource.owner
+        {
+            return Err(StorageError::Conflict(
+                "Actual native owner empty withdrawal only",
+            ));
+        }
+        self.check_store(store)
+    }
+    fn resource_reader(&self, ceiling: u64) -> StorageResult<ProjectResourceReader> {
+        self.check()?;
+        native_owner_resource_reader(
+            &self.owner,
+            &self.project,
+            &self.revision,
+            BTreeSet::from([
+                ResourceId::new(self.document["policyResourceId"].as_str().unwrap()).unwrap(),
+            ]),
+            ceiling,
+        )
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -597,6 +936,203 @@ fn real_admission_breaks_the_initial_access_cycle_but_does_not_complete_unknown_
         .registries
         .catalog
         .retire_native_publication(&second)
+        .unwrap();
+}
+
+#[test]
+fn retained_containers_and_native_observation_do_not_implicitly_select_sources() {
+    let mut fixture = Fixture::containers(true, false);
+    fixture.observe_containers();
+    let budget = fixture.budget();
+    assert_eq!(
+        fixture.capture(&budget).unwrap_err().code,
+        "SOURCE_UNAVAILABLE"
+    );
+    let id = ContextId::new(fixture.context["contextId"].as_str().unwrap()).unwrap();
+    let sources = fixture
+        .registries
+        .catalog
+        .source_refs(&fixture.principal, &id, &budget)
+        .unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["kind"], "runtime_observation");
+}
+
+#[test]
+fn protected_selection_does_not_replace_the_actual_game_resource_scope() {
+    let mut fixture = Fixture::containers(false, true);
+    fixture.observe_containers();
+    let budget = fixture.budget();
+    assert_eq!(
+        fixture.capture(&budget).unwrap_err().code,
+        "PERMISSION_REQUIRED"
+    );
+    assert_eq!(fixture.peer.source_reads.load(Ordering::Acquire), 0);
+    assert!(matches!(
+        fixture.state(),
+        NativeCatalogAdmissionState::Missing
+    ));
+}
+
+#[test]
+fn protected_whole_containers_share_the_native_publisher_but_leave_both_pack_stacks_unknown() {
+    let mut fixture = Fixture::containers(true, true);
+    fixture.observe_containers();
+    let budget = fixture.budget();
+    assert_eq!(
+        fixture.capture(&budget).unwrap_err().code,
+        "SOURCE_UNAVAILABLE"
+    );
+    let NativeCatalogAdmissionState::Native(original) = fixture.state() else {
+        panic!("native publication required")
+    };
+    let id = ContextId::new(fixture.context["contextId"].as_str().unwrap()).unwrap();
+    let sources = fixture
+        .registries
+        .catalog
+        .source_refs(&fixture.principal, &id, &budget)
+        .unwrap();
+    assert_eq!(sources.len(), 3);
+    for is_mod in [false, true] {
+        let hash = raw_digest(&container_bytes(is_mod));
+        let matching = sources
+            .iter()
+            .filter(|source| source["sha256"] == hash.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0]["kind"], "user_file");
+        assert_eq!(matching[0]["rights"], "user_local_only");
+    }
+    assert_eq!(
+        fixture.capture(&budget).unwrap_err().code,
+        "SOURCE_UNAVAILABLE"
+    );
+    let NativeCatalogAdmissionState::Native(current) = fixture.state() else {
+        panic!("native publication required")
+    };
+    assert_eq!(current.source_use(), original.source_use());
+    assert_eq!(current.read_policy(), original.read_policy());
+    fixture
+        .registries
+        .catalog
+        .retire_native_publication(&original)
+        .unwrap();
+    assert!(matches!(
+        fixture.state(),
+        NativeCatalogAdmissionState::Missing
+    ));
+}
+
+#[test]
+fn protected_empty_withdrawal_fences_the_old_publication_before_host_io_and_exact_retirement() {
+    let mut fixture = Fixture::containers(true, true);
+    fixture.observe_containers();
+    assert_eq!(
+        fixture.capture(&fixture.budget()).unwrap_err().code,
+        "SOURCE_UNAVAILABLE"
+    );
+    let NativeCatalogAdmissionState::Native(original) = fixture.state() else {
+        panic!("native publication required")
+    };
+    let project = ProjectId::new(fixture.context["projectId"].as_str().unwrap()).unwrap();
+    let before = fixture
+        .service
+        .management_store()
+        .project(&project)
+        .unwrap();
+    let withdrawn = fixture.withdraw_containers();
+    assert_eq!(withdrawn.generation(), 2);
+    assert_eq!(
+        fixture
+            .service
+            .management_store()
+            .project(&project)
+            .unwrap(),
+        before
+    );
+    let reads = fixture.peer.catalog_observations.load(Ordering::Acquire);
+    assert_eq!(
+        fixture.capture(&fixture.budget()).unwrap_err().code,
+        "TARGET_DRIFT"
+    );
+    assert_eq!(
+        fixture.peer.catalog_observations.load(Ordering::Acquire),
+        reads
+    );
+    assert!(matches!(
+        fixture.state(),
+        NativeCatalogAdmissionState::Missing
+    ));
+    // A later explicit request may issue a registry-only publication under the
+    // durable tombstone. The old receipt must leave that new owner untouched.
+    assert_eq!(
+        fixture.capture(&fixture.budget()).unwrap_err().code,
+        "SOURCE_UNAVAILABLE"
+    );
+    let id = ContextId::new(fixture.context["contextId"].as_str().unwrap()).unwrap();
+    let sources = fixture
+        .registries
+        .catalog
+        .source_refs(&fixture.principal, &id, &fixture.budget())
+        .unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["kind"], "runtime_observation");
+    fixture
+        .registries
+        .catalog
+        .retire_native_publication(&original)
+        .unwrap();
+    assert!(matches!(
+        fixture.state(),
+        NativeCatalogAdmissionState::Native(_)
+    ));
+}
+
+#[test]
+fn selected_container_corruption_at_host_io_retires_only_native_receipt_and_preserves_host_error() {
+    let mut fixture = Fixture::containers(true, true);
+    fixture.observe_containers();
+    assert_eq!(
+        fixture.capture(&fixture.budget()).unwrap_err().code,
+        "SOURCE_UNAVAILABLE"
+    );
+    let NativeCatalogAdmissionState::Native(original) = fixture.state() else {
+        panic!("native publication required")
+    };
+    let ordinal = fixture.peer.source_reads.load(Ordering::Acquire) + 1;
+    {
+        let mut state = fixture.peer.state.lock().unwrap();
+        state.corrupt_at_source = Some((ordinal, fixture.container_path(false)));
+        state.fail_at_source = Some(ordinal);
+    }
+    let error = fixture.capture(&fixture.budget()).unwrap_err();
+    assert_eq!(error.code, "HOST_REQUEST_FAILED");
+    let app = std::error::Error::source(&error)
+        .unwrap()
+        .downcast_ref::<AppError>()
+        .unwrap();
+    let both = std::error::Error::source(app)
+        .unwrap()
+        .downcast_ref::<NativePairingOwnerFailure>()
+        .unwrap();
+    assert_eq!(both.primary.code, "HOST_REQUEST_FAILED");
+    assert_eq!(both.checkpoint.code, "SOURCE_UNAVAILABLE");
+    let original_host = std::error::Error::source(&both.primary)
+        .unwrap()
+        .downcast_ref::<NativeCatalogHostFailure>()
+        .unwrap();
+    assert_eq!(
+        original_host.response["error"]["code"],
+        "SOURCE_FACTS_DRIFT"
+    );
+    assert!(matches!(
+        fixture.state(),
+        NativeCatalogAdmissionState::Missing
+    ));
+    fixture
+        .registries
+        .catalog
+        .retire_native_publication(&original)
         .unwrap();
 }
 
@@ -692,9 +1228,10 @@ fn explicit_native_registration(context: &Value) -> CatalogEnvironmentRegistrati
 #[test]
 fn describe_rechecks_existing_native_issuance_but_cannot_issue_a_missing_source() {
     let mut fixture = Fixture::new(Some(true), true);
-    let budget = fixture.budget();
+    // Each service call is an independent request with its own unchanged
+    // ten-second limit. Sharing one absolute deadline would time the sequence.
     assert_eq!(
-        fixture.describe(&budget).unwrap_err().code,
+        fixture.describe(&fixture.budget()).unwrap_err().code,
         "SOURCE_UNAVAILABLE"
     );
     assert_eq!(fixture.peer.source_reads.load(Ordering::Acquire), 0);
@@ -703,14 +1240,17 @@ fn describe_rechecks_existing_native_issuance_but_cannot_issue_a_missing_source(
         NativeCatalogAdmissionState::Missing
     ));
     assert_eq!(
-        fixture.capture(&budget).unwrap_err().code,
+        fixture.capture(&fixture.budget()).unwrap_err().code,
         "SOURCE_UNAVAILABLE"
     );
     let before = fixture.peer.source_reads.load(Ordering::Acquire);
-    assert!(fixture.describe(&budget).is_err());
+    assert!(fixture.describe(&fixture.budget()).is_err());
     assert!(fixture.peer.source_reads.load(Ordering::Acquire) >= before + 2);
     fixture.peer.state.lock().unwrap().drift_on_sources = true;
-    assert_eq!(fixture.describe(&budget).unwrap_err().code, "TARGET_DRIFT");
+    assert_eq!(
+        fixture.describe(&fixture.budget()).unwrap_err().code,
+        "TARGET_DRIFT"
+    );
     assert!(matches!(
         fixture.state(),
         NativeCatalogAdmissionState::Missing

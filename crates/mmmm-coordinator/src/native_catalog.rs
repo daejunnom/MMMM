@@ -5,25 +5,41 @@
 use crate::{
     auth::AuthenticatedPrincipal,
     authority::LocalAuthority,
+    bootstrap::NativeWorkspacePermit,
     catalog_source::{
-        CatalogEnvironmentRegistration, CatalogSourceBacking, CatalogSourceRegistration,
-        NativeCatalogAdmissionState, NativeCatalogPublication, RegisteredCatalogSources,
-        source_facts_pin, validate_source_facts,
+        CatalogEnvironmentRegistration, CatalogRpc, CatalogSourceBacking,
+        CatalogSourceRegistration, NativeCatalogAdmissionState, NativeCatalogPublication,
+        RegisteredCatalogResource, RegisteredCatalogSources, current_project, source_facts_pin,
+        validate_source_facts,
     },
     host::{CompletedPairingWitness, HostBridge, NativePairingOwnerFailure},
     service::{RequestBudget, RequestContextSlot, RequestContextWitness},
+    workspace_bootstrap::NativeOwnerWitness,
 };
 use mmmm_application::{AppError, AppResult};
 use mmmm_contracts::{
-    ContextId, ContractValidator, Sha256Digest, canonical_digest, encode_json, parse_json,
+    ContextId, ContractValidator, PrincipalId, ProjectId, ResourceId, Sha256Digest, SourceId,
+    canonical_digest, encode_json, parse_json,
 };
 use mmmm_reference::{
     CatalogLayer, CatalogSourceCodec, CatalogSourceRole, MAX_NATIVE_REGISTRY_BYTES,
     NATIVE_REGISTRY_FORMAT, RegistryCaptureWitness,
 };
-use mmmm_runtime::storage::DurableStore;
+use mmmm_runtime::storage::{
+    DurableStore, StorageError, StorageResult,
+    artifact::ResourceOwner,
+    bootstrap::POLICY_MEDIA_TYPE,
+    catalog_source_use::{
+        self, CatalogSourceUseAction, CatalogSourceUseCurrent, CatalogSourceUsePermit,
+        CatalogSourceUseRole, CatalogSourceUseSnapshot,
+    },
+    project_resources::{
+        ProjectResourceAuthority, ProjectResourceQuery, ProjectResourceReader,
+        ProjectSourceRpcContext, RegisteredProjectResource,
+    },
+};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, rc::Rc};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
 /// A hook belongs only to the current borrowed CatalogCall. Absence denies
 /// native source I/O; explicit source publishers never invoke this port.
@@ -35,9 +51,8 @@ struct CurrentNativeCatalogCheckpoint {
     principal: AuthenticatedPrincipal,
     context: Value,
     budget: RequestBudget,
-    pairing: CompletedPairingWitness,
+    pairing: Rc<CompletedPairingWitness>,
     authority: LocalAuthority,
-    policy: Sha256Digest,
     sources: RegisteredCatalogSources,
     publication: NativeCatalogPublication,
 }
@@ -49,12 +64,26 @@ impl NativeCatalogCheckpoint for CurrentNativeCatalogCheckpoint {
                 .with_current_native_owner(store, &self.authority, |owner| {
                     let current = owner.read_host_policy()?;
                     if !current.policy().native_observation_user_local_only()
-                        || current.policy_digest() != &self.policy
+                        || current.policy_digest() != self.publication.read_policy()
                     {
                         return Err(denied());
                     }
                     owner.check_current()
-                })
+                })?;
+            let selected = read_source_uses(
+                &self.request,
+                &self.principal,
+                &self.context,
+                &self.budget,
+                &self.pairing,
+                &self.authority,
+                self.publication.read_policy(),
+                store,
+            )?;
+            if source_use_pin(&selected)? != *self.publication.source_use() {
+                return Err(drift());
+            }
+            Ok(())
         })();
         match result {
             Ok(()) => Ok(()),
@@ -72,11 +101,27 @@ impl NativeCatalogCheckpoint for CurrentNativeCatalogCheckpoint {
 pub(crate) struct NativeCatalogObservation {
     registration: CatalogEnvironmentRegistration,
     proof: Sha256Digest,
+    read_policy: Sha256Digest,
+    source_use: Sha256Digest,
     method: String,
 }
 impl NativeCatalogObservation {
-    pub(crate) fn into_parts(self) -> (CatalogEnvironmentRegistration, Sha256Digest, String) {
-        (self.registration, self.proof, self.method)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CatalogEnvironmentRegistration,
+        Sha256Digest,
+        Sha256Digest,
+        Sha256Digest,
+        String,
+    ) {
+        (
+            self.registration,
+            self.proof,
+            self.read_policy,
+            self.source_use,
+            self.method,
+        )
     }
 }
 
@@ -105,18 +150,22 @@ impl NativeCatalogAdmission<'_> {
             let request = self.request.occupied_witness().map_err(service_error)?;
             check_request(&request, principal, context, budget)?;
             let id = ContextId::new(text(context, "contextId")?).map_err(|_| denied())?;
-            let pairing = self
-                .hosts
-                .completed_pairing_witness(&request, self.authority, &id)?;
+            let pairing = Rc::new(self.hosts.completed_pairing_witness(
+                &request,
+                self.authority,
+                &id,
+            )?);
             if pairing.context() != context {
                 return Err(denied());
             }
-            let policy = pairing.with_current_native_owner(store, self.authority, |owner| {
+            pairing.with_current_native_owner(store, self.authority, |owner| {
                 let record = owner.read_host_policy()?;
-                if !record.policy().native_observation_user_local_only() {
+                if !record.policy().native_observation_user_local_only()
+                    || record.policy_digest() != publication.read_policy()
+                {
                     return Err(denied());
                 }
-                Ok(record.policy_digest().clone())
+                Ok(())
             })?;
             let checkpoint: Rc<dyn NativeCatalogCheckpoint> =
                 Rc::new(CurrentNativeCatalogCheckpoint {
@@ -126,10 +175,10 @@ impl NativeCatalogAdmission<'_> {
                     budget: budget.clone(),
                     pairing,
                     authority: self.authority.clone(),
-                    policy,
                     sources: self.sources.clone(),
                     publication: publication.clone(),
                 });
+            checkpoint.check(store)?;
             Ok(Some(checkpoint))
         })();
         match result {
@@ -162,9 +211,11 @@ impl NativeCatalogAdmission<'_> {
         };
         let result = (|| {
             let id = ContextId::new(text(context, "contextId")?).map_err(|_| denied())?;
-            let pairing = self
-                .hosts
-                .completed_pairing_witness(&request, self.authority, &id)?;
+            let pairing = Rc::new(self.hosts.completed_pairing_witness(
+                &request,
+                self.authority,
+                &id,
+            )?);
             if pairing.context() != context {
                 return Err(denied());
             }
@@ -173,12 +224,43 @@ impl NativeCatalogAdmission<'_> {
                 if !policy.policy().native_observation_user_local_only() {
                     return Err(denied());
                 }
+                let selected = read_source_uses(
+                    &request,
+                    principal,
+                    context,
+                    budget,
+                    &pairing,
+                    self.authority,
+                    policy.policy_digest(),
+                    store,
+                )?;
+                let source_use = source_use_pin(&selected)?;
+                if publication.as_ref().is_some_and(|original| {
+                    original.read_policy() != policy.policy_digest()
+                        || original.source_use() != &source_use
+                }) {
+                    return Err(drift());
+                }
                 let checkpoint = || {
                     check_request(&request, principal, context, budget)?;
                     owner.check_current()?;
                     let current = owner.read_host_policy()?;
                     if current != policy || !current.policy().native_observation_user_local_only() {
                         return Err(denied());
+                    }
+                    owner.check_current()?;
+                    let current = read_source_uses(
+                        &request,
+                        principal,
+                        context,
+                        budget,
+                        &pairing,
+                        self.authority,
+                        policy.policy_digest(),
+                        store,
+                    )?;
+                    if source_use_pin(&current)? != source_use {
+                        return Err(drift());
                     }
                     owner.check_current()
                 };
@@ -235,10 +317,11 @@ impl NativeCatalogAdmission<'_> {
                     return Err(drift());
                 }
                 let proof = canonical_digest(&json!({
-                    "format":"mmmm.native-catalog-source-admission/1",
+                    "format":"mmmm.native-catalog-source-admission/2",
                     "principal":principal.principal(), "context":context,
                     "completedOffer":pairing.offer_digest(),
                     "nativeOwner":pairing.native_owner(), "readPolicy":policy.policy_digest(),
+                    "sourceUse":source_use,
                     "hello":hello, "sourceFacts":source_facts_pin(&facts)?,
                     "registryDigest":witness.registry_digest,
                     "generation":witness.registry_generation, "locale":witness.locale,
@@ -249,7 +332,7 @@ impl NativeCatalogAdmission<'_> {
                     "locator":format!("mmmm-host://catalog/{}/native_registry", id.as_str()),
                     "sha256":null, "rights":"user_local_only", "verifiedAt":witness.observed_at,
                 });
-                let registration = CatalogEnvironmentRegistration {
+                let mut registration = CatalogEnvironmentRegistration {
                     context: context.clone(),
                     game_version: Some(witness.game_version),
                     locale: Some(witness.locale),
@@ -267,6 +350,7 @@ impl NativeCatalogAdmission<'_> {
                         backing: CatalogSourceBacking::NativeRegistry,
                     }],
                 };
+                merge_source_uses(&mut registration, &selected, &witness.observed_at)?;
                 checkpoint()?;
                 publication = Some(self.sources.register_native_observation(
                     principal,
@@ -275,6 +359,8 @@ impl NativeCatalogAdmission<'_> {
                     NativeCatalogObservation {
                         registration,
                         proof,
+                        read_policy: policy.policy_digest().clone(),
+                        source_use: source_use.clone(),
                         method: request.method().to_owned(),
                     },
                 )?);
@@ -317,6 +403,299 @@ impl NativeCatalogAdmission<'_> {
         }
         response.get("payload").cloned().ok_or_else(invalid)
     }
+}
+
+/// This reader retains the actual game RPC identity. Only the exact Policy
+/// selected by the checked current Project has an internal native validation
+/// path; every selected container still requires the ordinary game scope.
+/// Neither this adapter nor its factual result is exposed as a read RPC grant.
+#[derive(Clone)]
+struct NativeSourceUseRead {
+    request: RequestContextWitness,
+    principal: AuthenticatedPrincipal,
+    context: Value,
+    budget: RequestBudget,
+    pairing: Rc<CompletedPairingWitness>,
+    owner: NativeOwnerWitness,
+    rpc: CatalogRpc,
+    project: ProjectId,
+    revision: Sha256Digest,
+    document: Value,
+    policy_id: ResourceId,
+    failure: Rc<RefCell<Option<AppError>>>,
+}
+impl NativeSourceUseRead {
+    fn native_store(&self, store: &DurableStore) -> StorageResult<()> {
+        self.check()?;
+        let registered = self.owner.check_project(store, &self.project)?;
+        if &registered != self.pairing.native_owner() {
+            return Err(self.reject(denied()));
+        }
+        self.check()
+    }
+    fn reject(&self, cause: AppError) -> StorageError {
+        if let Ok(mut failure) = self.failure.try_borrow_mut()
+            && failure.is_none()
+        {
+            *failure = Some(cause);
+        }
+        StorageError::Conflict("Current native catalog source use authority")
+    }
+    fn release(&self, cause: StorageError) -> AppError {
+        self.failure
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| self.rpc.storage_error(cause))
+    }
+}
+impl ProjectSourceRpcContext for NativeSourceUseRead {
+    fn check(&self) -> StorageResult<()> {
+        check_request(&self.request, &self.principal, &self.context, &self.budget)
+            .map_err(|cause| self.reject(cause))?;
+        self.owner.check()?;
+        self.rpc.check()
+    }
+    fn authenticated_principal(&self) -> StorageResult<PrincipalId> {
+        self.check()?;
+        Ok(self.principal.principal().clone())
+    }
+    fn context_id(&self) -> Option<&ContextId> {
+        self.rpc.context_id()
+    }
+}
+impl CatalogSourceUsePermit for NativeSourceUseRead {
+    fn check_store(&self, store: &DurableStore) -> StorageResult<()> {
+        self.native_store(store)?;
+        self.rpc
+            .project_acl(self.principal.principal(), self.context_id(), &self.project)?;
+        self.check()
+    }
+    fn authenticated_native_owner(
+        &self,
+        store: &DurableStore,
+        project: &ProjectId,
+    ) -> StorageResult<PrincipalId> {
+        self.check_store(store)?;
+        if project != &self.project {
+            return Err(self.reject(denied()));
+        }
+        Ok(self.pairing.native_owner().clone())
+    }
+    fn authorize_current(
+        &self,
+        store: &DurableStore,
+        current: &CatalogSourceUseCurrent<'_>,
+    ) -> StorageResult<()> {
+        self.check_store(store)?;
+        if current.action != CatalogSourceUseAction::Read
+            || current.native_owner != self.pairing.native_owner()
+            || current.project != &self.document
+            || current.policy_resource.owner != ResourceOwner::Project(self.project.clone())
+            || current.policy_resource.resource["resourceId"] != self.policy_id.as_str()
+            || current.policy_resource.resource["mediaType"] != POLICY_MEDIA_TYPE
+        {
+            return Err(self.reject(denied()));
+        }
+        for selected in current.selections {
+            self.rpc.source_scope(
+                self.principal.principal(),
+                self.context_id(),
+                &self.project,
+                "resourceIds",
+                selected.resource_id.as_str(),
+            )?;
+            // runtimeMods constrains the delivered map, not authoring-host
+            // observation. The actual current mod-use switch still applies.
+            if matches!(selected.role, CatalogSourceUseRole::Mod { .. })
+                && current.policy["modUseEnabled"] != true
+            {
+                return Err(self.reject(denied()));
+            }
+        }
+        self.check_store(store)
+    }
+    fn resource_reader(&self, ceiling: u64) -> StorageResult<ProjectResourceReader> {
+        self.check()?;
+        ProjectResourceReader::new(Box::new(NativeSourceUseAuthority(self.clone())), ceiling)
+    }
+}
+struct NativeSourceUseAuthority(NativeSourceUseRead);
+impl ProjectResourceAuthority for NativeSourceUseAuthority {
+    fn authorize_project_read(
+        &mut self,
+        store: &DurableStore,
+        principal: &PrincipalId,
+        context: Option<&ContextId>,
+        project: &ProjectId,
+        revision: &Sha256Digest,
+    ) -> StorageResult<()> {
+        self.0.native_store(store)?;
+        if revision != &self.0.revision {
+            return Err(self.0.reject(drift()));
+        }
+        self.0.rpc.project_acl(principal, context, project)
+    }
+    fn authorize_resource_read(
+        &mut self,
+        store: &DurableStore,
+        principal: &PrincipalId,
+        context: Option<&ContextId>,
+        project: &ProjectId,
+        resource: &RegisteredProjectResource,
+    ) -> StorageResult<()> {
+        self.0.native_store(store)?;
+        self.0.rpc.project_acl(principal, context, project)?;
+        if resource.owner != ResourceOwner::Project(project.clone()) {
+            return Err(self.0.reject(denied()));
+        }
+        if resource.resource["resourceId"] == self.0.policy_id.as_str()
+            && resource.resource["mediaType"] == POLICY_MEDIA_TYPE
+        {
+            return self.0.check();
+        }
+        self.0.rpc.source_scope(
+            principal,
+            context,
+            project,
+            "resourceIds",
+            text(&resource.resource, "resourceId").map_err(|cause| self.0.reject(cause))?,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_source_uses(
+    request: &RequestContextWitness,
+    principal: &AuthenticatedPrincipal,
+    context: &Value,
+    budget: &RequestBudget,
+    pairing: &Rc<CompletedPairingWitness>,
+    authority: &LocalAuthority,
+    read_policy: &Sha256Digest,
+    store: &DurableStore,
+) -> AppResult<CatalogSourceUseSnapshot> {
+    // D032 and the completed route are fresh around this entire bounded local
+    // read. Reader callbacks below recheck the same native owner/Store and game
+    // ACL, without recursively reopening the D032 reader for each metadata pin.
+    let boundary = || {
+        check_request(request, principal, context, budget)?;
+        if pairing.context() != context {
+            return Err(denied());
+        }
+        pairing.with_current_native_owner(store, authority, |owner| {
+            let policy = owner.read_host_policy()?;
+            if !policy.policy().native_observation_user_local_only()
+                || policy.policy_digest() != read_policy
+            {
+                return Err(denied());
+            }
+            owner.check_current()
+        })
+    };
+    boundary()?;
+    let output = (|| {
+        let owner = NativeOwnerWitness::capture(store, budget.deadline())
+            .map_err(|cause| AppError::storage("PERMISSION_REQUIRED", cause))?;
+        if owner.principal() != pairing.native_owner() {
+            return Err(denied());
+        }
+        let rpc = CatalogRpc::new(
+            principal.clone(),
+            budget.clone(),
+            authority.clone(),
+            context,
+        )?;
+        let project = pairing.project().clone();
+        let document = current_project(store, &rpc, &project)?;
+        let revision = Sha256Digest::new(text(&document, "revision")?).map_err(|_| invalid())?;
+        let policy_id =
+            ResourceId::new(text(&document, "policyResourceId")?).map_err(|_| invalid())?;
+        let permit = NativeSourceUseRead {
+            request: request.clone(),
+            principal: principal.clone(),
+            context: context.clone(),
+            budget: budget.clone(),
+            pairing: pairing.clone(),
+            owner,
+            rpc,
+            project,
+            revision,
+            document,
+            policy_id,
+            failure: Rc::new(RefCell::new(None)),
+        };
+        let selected = catalog_source_use::read_catalog_source_uses(
+            store,
+            &permit,
+            &permit.project,
+            &permit.revision,
+        )
+        .map_err(|cause| permit.release(cause))?;
+        if selected.native_owner() != pairing.native_owner()
+            || selected.project_id() != pairing.project()
+            || selected.rights() != "user_local_only"
+        {
+            return Err(denied());
+        }
+        check_request(request, principal, context, budget)?;
+        Ok(selected)
+    })();
+    combine(output, boundary())
+}
+
+fn source_use_pin(selected: &CatalogSourceUseSnapshot) -> AppResult<Sha256Digest> {
+    // Includes monotonic generation/tombstone, original approval Project and
+    // Policy pins, exact role/native-ID/resource/BlobRef pins and owner/Store
+    // provenance validated above. It is retained factual identity, not a grant.
+    canonical_digest(&json!({"format":"mmmm.native-catalog-source-use/1", "snapshot":selected}))
+        .map_err(|_| invalid())
+}
+
+fn merge_source_uses(
+    registration: &mut CatalogEnvironmentRegistration,
+    selected: &CatalogSourceUseSnapshot,
+    observed_at: &str,
+) -> AppResult<()> {
+    let mut mods = BTreeMap::new();
+    for (index, pin) in selected.selections().iter().enumerate() {
+        // IDs describe this bounded protected set. No caller SourceRef or hash
+        // constructs the registration or grants resource access.
+        let id = SourceId::new(format!("native-container-{index}")).map_err(|_| invalid())?;
+        let role = match &pin.selection().role {
+            CatalogSourceUseRole::GameArtifact => {
+                registration.artifact_source = Some(id.clone());
+                CatalogSourceRole::GameArtifact
+            }
+            CatalogSourceUseRole::Mod {
+                canonical_id,
+                native_id,
+            } => {
+                mods.insert(canonical_id.clone(), id.clone());
+                registration
+                    .native_mod_ids
+                    .insert(canonical_id.clone(), native_id.clone());
+                CatalogSourceRole::Mod(canonical_id.clone())
+            }
+        };
+        registration.sources.push(CatalogSourceRegistration {
+            source: json!({"sourceId":id, "kind":"user_file", "locator":"mmmm-source://selected-container",
+                "sha256":pin.blob().digest, "rights":"user_local_only", "verifiedAt":observed_at}),
+            layer: CatalogLayer::LocalArtifact, role,
+            codec: CatalogSourceCodec::FingerprintOnly {
+                media_type: text(pin.resource(), "mediaType")?.to_owned(),
+            },
+            backing: CatalogSourceBacking::ProjectResource(RegisteredCatalogResource {
+                query: ProjectResourceQuery::Current { resource_id: pin.selection().resource_id.clone() },
+                resource: pin.resource().clone(),
+            }),
+        });
+    }
+    // Absence carries no assertion of an empty native mod set. An actual Mod
+    // selection can identify only the complete independently observed mapping.
+    if !mods.is_empty() {
+        registration.mod_sources = Some(mods);
+    }
+    Ok(())
 }
 
 fn check_request(

@@ -121,10 +121,14 @@ struct InstalledEnvironment {
 #[derive(Clone)]
 enum CatalogPublisher {
     Explicit,
-    NativeObservation {
-        proof: Sha256Digest,
-        receipt: Rc<()>,
-    },
+    NativeObservation(NativeCatalogOrigin),
+}
+#[derive(Clone)]
+struct NativeCatalogOrigin {
+    proof: Sha256Digest,
+    read_policy: Sha256Digest,
+    source_use: Sha256Digest,
+    receipt: Rc<()>,
 }
 /// An exact in-process publication owner, never a source or wire capability.
 /// A failed admission may remove only this native publisher's current element.
@@ -133,6 +137,16 @@ pub(crate) struct NativeCatalogPublication {
     key: (PrincipalId, ContextId),
     revision: Sha256Digest,
     receipt: Rc<()>,
+    read_policy: Sha256Digest,
+    source_use: Sha256Digest,
+}
+impl NativeCatalogPublication {
+    pub(crate) fn read_policy(&self) -> &Sha256Digest {
+        &self.read_policy
+    }
+    pub(crate) fn source_use(&self) -> &Sha256Digest {
+        &self.source_use
+    }
 }
 pub(crate) enum NativeCatalogAdmissionState {
     Explicit,
@@ -178,7 +192,7 @@ pub struct RegisteredCatalogSourceIdentity {
 #[derive(Default)]
 struct CatalogRegistrations {
     environments: BTreeMap<(PrincipalId, ContextId), InstalledEnvironment>,
-    native_publishers: BTreeMap<(PrincipalId, ContextId), (Sha256Digest, Rc<()>)>,
+    native_publishers: BTreeMap<(PrincipalId, ContextId), NativeCatalogOrigin>,
     captures: BTreeMap<SnapshotId, CaptureAuthorityReceipt>,
     pending_captures: BTreeMap<SnapshotId, CaptureAuthorityReceipt>,
 }
@@ -444,7 +458,7 @@ impl RegisteredCatalogSources {
         let key = (authenticated.principal().clone(), context_id);
         if state.environments.contains_key(&key)
             && (state.native_publishers.contains_key(&key)
-                || matches!(publisher, CatalogPublisher::NativeObservation { .. }))
+                || matches!(publisher, CatalogPublisher::NativeObservation(_)))
         {
             // Explicit source composition retains its existing replacement
             // policy. A lazy native publisher cannot replace it, or vice versa.
@@ -456,10 +470,8 @@ impl RegisteredCatalogSources {
         if state.environments.len() >= MAX_BINDINGS && !state.environments.contains_key(&key) {
             return Err(budget_error());
         }
-        if let CatalogPublisher::NativeObservation { proof, receipt } = publisher {
-            state
-                .native_publishers
-                .insert(key.clone(), (proof, receipt));
+        if let CatalogPublisher::NativeObservation(origin) = publisher {
+            state.native_publishers.insert(key.clone(), origin);
         }
         state.environments.insert(key, installed);
         Ok(binding_revision)
@@ -483,11 +495,13 @@ impl RegisteredCatalogSources {
         };
         match state.native_publishers.get(&key) {
             None => Ok(NativeCatalogAdmissionState::Explicit),
-            Some((_, receipt)) => Ok(NativeCatalogAdmissionState::Native(
+            Some(origin) => Ok(NativeCatalogAdmissionState::Native(
                 NativeCatalogPublication {
                     key,
                     revision: installed.revision.clone(),
-                    receipt: receipt.clone(),
+                    receipt: origin.receipt.clone(),
+                    read_policy: origin.read_policy.clone(),
+                    source_use: origin.source_use.clone(),
                 },
             )),
         }
@@ -502,7 +516,7 @@ impl RegisteredCatalogSources {
         store: &DurableStore,
         observation: crate::native_catalog::NativeCatalogObservation,
     ) -> AppResult<NativeCatalogPublication> {
-        let (registration, proof, method) = observation.into_parts();
+        let (registration, proof, read_policy, source_use, method) = observation.into_parts();
         budget.check().map_err(service_app)?;
         let id = context_id(&registration.context)?;
         if !authenticated.is_current()
@@ -515,13 +529,17 @@ impl RegisteredCatalogSources {
         {
             let state = self.state.try_borrow().map_err(|_| busy())?;
             if let Some(previous) = state.environments.get(&key) {
-                let Some((original, receipt)) = state.native_publishers.get(&key) else {
+                let Some(original) = state.native_publishers.get(&key) else {
                     return Err(error(
                         "SOURCE_CONFLICT",
                         "Explicit catalog sources already own this context",
                     ));
                 };
-                if original != &proof || previous.registration.context != registration.context {
+                if original.proof != proof
+                    || original.read_policy != read_policy
+                    || original.source_use != source_use
+                    || previous.registration.context != registration.context
+                {
                     return Err(error(
                         "TARGET_DRIFT",
                         "Actual native catalog source identity changed",
@@ -532,7 +550,9 @@ impl RegisteredCatalogSources {
                 return Ok(NativeCatalogPublication {
                     key,
                     revision: previous.revision.clone(),
-                    receipt: receipt.clone(),
+                    receipt: original.receipt.clone(),
+                    read_policy: original.read_policy.clone(),
+                    source_use: original.source_use.clone(),
                 });
             }
         }
@@ -545,15 +565,19 @@ impl RegisteredCatalogSources {
             budget,
             store,
             registration,
-            CatalogPublisher::NativeObservation {
+            CatalogPublisher::NativeObservation(NativeCatalogOrigin {
                 proof,
+                read_policy: read_policy.clone(),
+                source_use: source_use.clone(),
                 receipt: receipt.clone(),
-            },
+            }),
         )?;
         Ok(NativeCatalogPublication {
             key,
             revision,
             receipt,
+            read_policy,
+            source_use,
         })
     }
 
@@ -572,7 +596,7 @@ impl RegisteredCatalogSources {
                     && state
                         .native_publishers
                         .get(&publication.key)
-                        .is_some_and(|(_, receipt)| Rc::ptr_eq(receipt, &publication.receipt))
+                        .is_some_and(|origin| Rc::ptr_eq(&origin.receipt, &publication.receipt))
             });
         if matches {
             state.environments.remove(&publication.key);
@@ -2229,7 +2253,7 @@ pub(crate) fn source_facts_pin(facts: &Value) -> AppResult<Sha256Digest> {
 }
 
 #[derive(Clone)]
-struct CatalogRpc {
+pub(crate) struct CatalogRpc {
     authenticated: AuthenticatedPrincipal,
     budget: RequestBudget,
     authority: LocalAuthority,
@@ -2238,7 +2262,7 @@ struct CatalogRpc {
     project: ProjectId,
 }
 impl CatalogRpc {
-    fn storage_error(&self, error: StorageError) -> AppError {
+    pub(crate) fn storage_error(&self, error: StorageError) -> AppError {
         // Readers use StorageError for their cooperative callback. Preserve the
         // actual current budget reason without parsing diagnostic strings.
         if let Err(stopped) = self.budget.check() {
@@ -2246,7 +2270,7 @@ impl CatalogRpc {
         }
         storage_app(error)
     }
-    fn new(
+    pub(crate) fn new(
         authenticated: AuthenticatedPrincipal,
         budget: RequestBudget,
         authority: LocalAuthority,
@@ -2261,7 +2285,7 @@ impl CatalogRpc {
             project: project_id(context)?,
         })
     }
-    fn project_acl(
+    pub(crate) fn project_acl(
         &self,
         principal: &PrincipalId,
         context: Option<&ContextId>,
@@ -2284,7 +2308,7 @@ impl CatalogRpc {
             )
             .map_err(app_storage)
     }
-    fn source_scope(
+    pub(crate) fn source_scope(
         &self,
         principal: &PrincipalId,
         context: Option<&ContextId>,
@@ -2532,7 +2556,7 @@ impl OwnedDocumentAuthority for CatalogReadAuthority {
     }
 }
 
-fn current_project(
+pub(crate) fn current_project(
     store: &DurableStore,
     rpc: &CatalogRpc,
     project: &ProjectId,

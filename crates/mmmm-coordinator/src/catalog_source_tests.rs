@@ -708,7 +708,7 @@ fn native_source_receipts_never_fill_unknown_pack_or_client_identity() {
         native_mod_ids: BTreeMap::new(),
         sources: vec![game_source.clone()],
     };
-    let installed = InstalledEnvironment {
+    let mut installed = InstalledEnvironment {
         registration,
         sources: BTreeMap::from([(
             SourceId::new("source-game").unwrap(),
@@ -747,6 +747,30 @@ fn native_source_receipts_never_fill_unknown_pack_or_client_identity() {
         grant.artifact_source,
         Some(SourceId::new("source-game").unwrap())
     );
+    let canonical_mod = ResourceLocation::new("example:canonical_mod").unwrap();
+    let mod_source_id = SourceId::new("source-mod").unwrap();
+    let mut mod_source = installed.sources[&SourceId::new("source-game").unwrap()].clone();
+    mod_source.approved.source["sourceId"] = json!(mod_source_id);
+    mod_source.approved.role = CatalogSourceRole::Mod(canonical_mod.clone());
+    installed.sources.insert(mod_source_id.clone(), mod_source);
+    let mod_map = BTreeMap::from([(canonical_mod.clone(), mod_source_id)]);
+    installed.registration.mod_sources = Some(mod_map.clone());
+    installed
+        .registration
+        .native_mod_ids
+        .insert(canonical_mod, "actual_native_mod".into());
+    let mut native_mods = facts.clone();
+    native_mods["mods"] =
+        json!([{"modId":"actual_native_mod","runtimeRoots":[facts["archives"][0].clone()]}]);
+    apply_actual_source_identity(&mut grant, &installed, &native_mods).unwrap();
+    assert_eq!(grant.mod_sources, Some(mod_map));
+    native_mods["mods"][0]["modId"] = json!("example:canonical_mod");
+    apply_actual_source_identity(&mut grant, &installed, &native_mods).unwrap();
+    assert!(grant.mod_sources.is_none());
+    native_mods["mods"][0]["modId"] = json!("actual_native_mod");
+    native_mods["mods"][0]["runtimeRoots"][0]["scope"] = json!("loaded_class_container");
+    apply_actual_source_identity(&mut grant, &installed, &native_mods).unwrap();
+    assert!(grant.mod_sources.is_none());
     let mut unrelated = facts;
     unrelated["originalInputGameJars"][0]["scope"] = json!("loaded_class_container");
     apply_actual_source_identity(&mut grant, &installed, &unrelated).unwrap();
@@ -1308,12 +1332,15 @@ fn native_source_io_without_a_current_call_checkpoint_is_denied_while_explicit_i
         fixture.authenticated.principal().clone(),
         context_id(&fixture.context).unwrap(),
     );
-    fixture
-        .sources
-        .state
-        .borrow_mut()
-        .native_publishers
-        .insert(key, (raw_digest(b"negative native origin"), Rc::new(())));
+    fixture.sources.state.borrow_mut().native_publishers.insert(
+        key,
+        NativeCatalogOrigin {
+            proof: raw_digest(b"negative native origin"),
+            read_policy: raw_digest(b"negative policy"),
+            source_use: raw_digest(b"negative source use"),
+            receipt: Rc::new(()),
+        },
+    );
     assert_eq!(
         call.check_native_source(&shared).unwrap_err().code,
         "PERMISSION_REQUIRED"
@@ -1342,7 +1369,12 @@ fn exact_native_retirement_contention_preserves_both_failure_causes_and_the_owne
     );
     fixture.sources.state.borrow_mut().native_publishers.insert(
         key.clone(),
-        (raw_digest(b"negative native origin"), Rc::new(())),
+        NativeCatalogOrigin {
+            proof: raw_digest(b"negative native origin"),
+            read_policy: raw_digest(b"negative policy"),
+            source_use: raw_digest(b"negative source use"),
+            receipt: Rc::new(()),
+        },
     );
     let NativeCatalogAdmissionState::Native(publication) = fixture
         .sources
