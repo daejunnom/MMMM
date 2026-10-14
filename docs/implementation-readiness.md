@@ -329,6 +329,44 @@ unknown fallback으로 삼키지 않는다. 기존 비검사 호출은 같은 �
 0·29,169 ms·자연 종료·drain·완전한 출력·export·scratch 정리·lease 해제·오류 0이며
 실제 게임 관측이나 다른 OS의 이 새 소스 실행은 별도 검증이다.
 
+### 구성원 Pending의 부분 자원 보존
+
+D047은 CI32에서 실제로 관측한 owned member의 좁은 RSS 전이를 기존 D046과
+같은 조건부 Pending에 연결한다. scan 시작과 끝의 원 leader anchor·미회수 Child
+예약, member의 원 identity·동일 PGID/SID 및 실제 validated whole-group pidfd
+관측이 모두 필요하다. leader/member의 원 typed 오류와 역할별 first·last·count를
+성공·실패 양쪽에서 한 번 merge하고, 역할이 달라져도 마지막 실제 Complete부터의
+1초와 100 ms attempt clock을 재시작하지 않는다. 불완전 RSS를 0으로 채우지 않고
+다른 구성원의 실제 RSS·VM·live lower bound로 같은 상한을 확인한다.
+
+D048은 CI41의 실제 Rusage 종료 전이에 한정한다. 같은 호출에서 성공한 TaskInfo의
+sealed VM/RSS와 실제 성공한 rusage의 start/exit timestamp 존재를 별도 partial
+사실로 보존하고, 기존 strict API는 같은 native 호출 뒤 원 네 오류 필드를 돌려준다.
+후속 member 판정에는 typed Rusage Exited·result 0·errno 0·양쪽 non-SZOMB·INEXIT와
+원 다섯 identity 일치가 모두 필요하다. footprint와 timestamp identity를 만들어내지
+않고 실제 partial VM/RSS를 scan에 한 번 반영한다.
+
+독립 추가 리뷰에서 memory 없는 Pending 구성원이 worker 수에서 빠져 measured
+32개와 Pending 1개를 거절하지 못하는 문제를 발견했다. Pending worker를 관측
+횟수와 분리해 최대 33개의 scan별 private identity 집합으로 중복 제거하고 checked
+합산하여 기존 32 상한을 적용했다. 같은 worker의 RSS는 최대값 증가분만 더한다.
+또한 full Measured memory 뒤 AfterMemory session만 Pending인 leader가 이미 얻은
+VM/RSS/footprint를 잃는 기존 경로도 수정했다. 먼저 진단을 기록한 뒤 worker 증가
+없는 같은 합산 helper를 호출하고, worker는 Pending 집합에서 한 번만 센다.
+private identity는 직렬화·출력에서 제외한다. native PID 목록의 유일성에 대한 기존
+measured 경로의 전제와 일반적인 containment 보장을 구분한다.
+
+재리뷰에서 두 누락의 해결과 추가 확정 finding 없음, Windows의 실제 Native process
+5개·도구 lib 211개·bin 1개 PASS와 isolated 1개 ignored를 확인했다. 기존 순수
+검사들을 여러 역할·hard error·clock·상한·overflow·중복·scan 간 누적 부재로 확장하고,
+sealed partial 오류의 strict 호환 검사 1개와 Rusage/partial/worker 검사 3개를 추가했다.
+test command 0·18,113 ms·명시 owned-tail 정리, 두 package all-targets strict Clippy
+0·2,587 ms·자연 종료다. formatting·drain·출력·export·scratch 정리·lease 해제와
+supervisor/cleanup 오류 0이다. Pending은 complete 수·peak·마지막 성공 시각·empty·
+terminal·normal reap·drain을 발급하지 않으며 원 native 호출·poll·cadence·기한·상한과
+실패 후 물리 drain을 유지한다. Linux/Darwin 전용 native 분기의 새 실행 성공은
+Windows 순수 검사로 대신하지 않으며 후속 CI에서 별도로 검증한다.
+
 ### 실제 게임 입력의 archive 관측
 
 로컬의 실제 Minecraft merged JAR 관측은 처음에

@@ -8,6 +8,7 @@ use mmmm_native_process::darwin::{
 use serde::Serialize;
 use std::{
     fmt,
+    ops::Deref,
     time::{Duration, Instant},
 };
 
@@ -73,6 +74,65 @@ enum MemoryRole {
     ReservedLeader,
     ObservedMember,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+struct TaskMemoryLowerBound {
+    adjusted_vm: u64,
+    rss: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+struct RusageTimestamps {
+    start_observed: bool,
+    exit_observed: bool,
+}
+/// Kept only for bounded scan deduplication; identity never enters a report.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PendingWorkerIdentity(LeaderIdentity);
+impl fmt::Debug for PendingWorkerIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PendingWorkerIdentity")
+    }
+}
+/// Copy adapter keeps existing callers' native fields while partial facts
+/// can only enter production through the shared native producer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct MemoryFailure {
+    native: NativeResourceError,
+    task_lower_bound: Option<TaskMemoryLowerBound>,
+    rusage_timestamps: Option<RusageTimestamps>,
+}
+impl Deref for MemoryFailure {
+    type Target = NativeResourceError;
+    fn deref(&self) -> &Self::Target {
+        &self.native
+    }
+}
+impl From<NativeResourceError> for MemoryFailure {
+    fn from(native: NativeResourceError) -> Self {
+        Self {
+            native,
+            task_lower_bound: None,
+            rusage_timestamps: None,
+        }
+    }
+}
+#[cfg(target_os = "macos")]
+impl From<mmmm_native_process::darwin::MemoryObservationFailure> for MemoryFailure {
+    fn from(actual: mmmm_native_process::darwin::MemoryObservationFailure) -> Self {
+        Self {
+            native: actual.native_error(),
+            task_lower_bound: actual.task_lower_bound().map(|lower| TaskMemoryLowerBound {
+                adjusted_vm: lower.adjusted_vm(),
+                rss: lower.rss(),
+            }),
+            rusage_timestamps: actual
+                .rusage_timestamps()
+                .map(|timestamps| RusageTimestamps {
+                    start_observed: timestamps.start_observed(),
+                    exit_observed: timestamps.exit_observed(),
+                }),
+        }
+    }
+}
 impl From<NativeResourceError> for NativeMemoryDiagnostic {
     fn from(error: NativeResourceError) -> Self {
         Self {
@@ -83,7 +143,8 @@ impl From<NativeResourceError> for NativeMemoryDiagnostic {
         }
     }
 }
-/// Closed facts only: no PID, UID, birth timestamp, path or process label.
+/// Reports omit PID, UID, birth timestamp, path and process label. The private
+/// Pending worker key is neither serialized nor displayed and grants no authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub(super) struct LeaderDiagnostic {
     phase: LeaderPhase,
@@ -97,6 +158,10 @@ pub(super) struct LeaderDiagnostic {
     after_anchor_match: bool,
     memory_error: Option<NativeMemoryDiagnostic>,
     memory_role: Option<MemoryRole>,
+    memory_task_lower_bound: Option<TaskMemoryLowerBound>,
+    memory_rusage_timestamps: Option<RusageTimestamps>,
+    #[serde(skip)]
+    pending_worker: Option<PendingWorkerIdentity>,
 }
 impl LeaderDiagnostic {
     pub(super) fn observe(
@@ -124,15 +189,29 @@ impl LeaderDiagnostic {
             after_anchor_match: after.is_some_and(|info| info.identity == anchor),
             memory_error: None,
             memory_role: None,
+            memory_task_lower_bound: None,
+            memory_rusage_timestamps: None,
+            pending_worker: None,
         }
     }
-    pub(super) fn with_memory_error(mut self, error: NativeResourceError, reserved: bool) -> Self {
-        self.memory_error = Some(error.into());
+    pub(super) fn with_memory_error(
+        mut self,
+        error: impl Into<MemoryFailure>,
+        reserved: bool,
+    ) -> Self {
+        let error = error.into();
+        self.memory_error = Some(error.native.into());
+        self.memory_task_lower_bound = error.task_lower_bound;
+        self.memory_rusage_timestamps = error.rusage_timestamps;
         self.memory_role = Some(if reserved {
             MemoryRole::ReservedLeader
         } else {
             MemoryRole::ObservedMember
         });
+        self
+    }
+    fn with_pending_worker(mut self, identity: LeaderIdentity) -> Self {
+        self.pending_worker = Some(PendingWorkerIdentity(identity));
         self
     }
     pub(super) fn attach(self, mut error: ProcessError) -> ProcessError {
@@ -164,6 +243,20 @@ impl fmt::Display for LeaderDiagnostic {
                 error.native_result,
                 error.native_errno,
                 self.memory_role
+            )?;
+        }
+        if let Some(lower) = self.memory_task_lower_bound {
+            write!(
+                f,
+                ",memory_task_vm_lower_bound={},memory_task_rss_lower_bound={}",
+                lower.adjusted_vm, lower.rss
+            )?;
+        }
+        if let Some(timestamps) = self.memory_rusage_timestamps {
+            write!(
+                f,
+                ",memory_rusage_start_observed={},memory_rusage_exit_observed={}",
+                timestamps.start_observed, timestamps.exit_observed
             )?;
         }
         Ok(())
@@ -266,7 +359,9 @@ pub(super) fn classify_leader_session(
         // Exact ESRCH plus this same reserved INEXIT process is incomplete;
         // it proves neither a live memory sample nor native zombie/drain.
         if before.status != SZOMB && after.flags & PROC_FLAG_INEXIT != 0 {
-            return Ok(LeaderObservation::Pending(diagnostic));
+            return Ok(LeaderObservation::Pending(
+                diagnostic.with_pending_worker(anchor),
+            ));
         }
     }
     Err(diagnostic.attach(ProcessError::new(
@@ -278,13 +373,15 @@ pub(super) fn classify_leader_session(
 /// The original typed native error remains a diagnostic input. A reserved
 /// leader retains its existing exit-class INEXIT policy. An observed member
 /// may only leave the whole sample incomplete for the actually observed
-/// TaskInfo 0/ESRCH transition, with the same identity and INEXIT on both sides.
+/// TaskInfo 0/ESRCH or successful rusage with actual start/exit timestamps,
+/// with the same identity and INEXIT on both sides.
 pub(super) fn classify_memory_exit(
     reserved: Option<(LeaderIdentity, &mut bool)>,
     before: LeaderBsd,
     after: Option<LeaderBsd>,
-    native: NativeResourceError,
+    native: impl Into<MemoryFailure>,
 ) -> Result<MemoryObservation, ProcessError> {
+    let native = native.into();
     let anchor = reserved
         .as_ref()
         .map(|(anchor, _)| *anchor)
@@ -322,11 +419,24 @@ pub(super) fn classify_memory_exit(
             && native.native_result == 0
             && native.native_errno == DARWIN_ESRCH
             && before.flags & PROC_FLAG_INEXIT != 0;
-        if (reserved_leader || observed_member_task_exit)
+        let observed_member_rusage_exit = !reserved_leader
+            && native.stage == NativeResourceStage::Rusage
+            && native.native_result == 0
+            && native.native_errno == 0
+            && native.task_lower_bound.is_some()
+            && native.rusage_timestamps
+                == Some(RusageTimestamps {
+                    start_observed: true,
+                    exit_observed: true,
+                })
+            && before.flags & PROC_FLAG_INEXIT != 0;
+        if (reserved_leader || observed_member_task_exit || observed_member_rusage_exit)
             && before.status != SZOMB
             && after.flags & PROC_FLAG_INEXIT != 0
         {
-            return Ok(MemoryObservation::Pending(diagnostic));
+            return Ok(MemoryObservation::Pending(
+                diagnostic.with_pending_worker(anchor),
+            ));
         }
     }
     Err(diagnostic.attach(ProcessError::new(
@@ -349,6 +459,56 @@ pub(super) struct PendingObservations {
     leader: Option<ExitObservationEvidence>,
     member: Option<ExitObservationEvidence>,
     last: Option<LeaderDiagnostic>,
+    task_lower_bound: Option<TaskMemoryLowerBound>,
+    task_sum_overflow: bool,
+    workers: PendingWorkers,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingWorker {
+    identity: PendingWorkerIdentity,
+    rss_lower_bound: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingWorkers {
+    // At limit+1 distinct pending workers the original budget must already
+    // fail, even without measured workers. No unbounded identity registry.
+    entries: [Option<PendingWorker>; WORKER_LIMIT + 1],
+    len: usize,
+}
+impl Default for PendingWorkers {
+    fn default() -> Self {
+        Self {
+            entries: [None; WORKER_LIMIT + 1],
+            len: 0,
+        }
+    }
+}
+impl PendingWorkers {
+    fn record(
+        &mut self,
+        identity: PendingWorkerIdentity,
+        lower: Option<TaskMemoryLowerBound>,
+    ) -> Option<u64> {
+        let rss = lower.map_or(0, |lower| lower.rss);
+        if let Some(worker) = self.entries[..self.len]
+            .iter_mut()
+            .flatten()
+            .find(|worker| worker.identity == identity)
+        {
+            let additional_rss = rss.saturating_sub(worker.rss_lower_bound);
+            worker.rss_lower_bound = worker.rss_lower_bound.max(rss);
+            return Some(additional_rss);
+        }
+        if self.len == self.entries.len() {
+            return None; // The retained worker lower bound already exceeds 32.
+        }
+        self.entries[self.len] = Some(PendingWorker {
+            identity,
+            rss_lower_bound: rss,
+        });
+        self.len += 1; // Bounded by the fixed array above.
+        Some(rss)
+    }
 }
 impl PendingObservations {
     pub(super) fn record(&mut self, diagnostic: LeaderDiagnostic) {
@@ -359,6 +519,30 @@ impl PendingObservations {
         };
         ExitObservationEvidence::record(role, diagnostic);
         self.last = Some(diagnostic);
+        // live_group_members records at most one Pending per native PID-list
+        // entry: leader's early Pending skips AfterMemory, and a member has
+        // one memory observation. Identity deduplication also keeps repeated
+        // diagnostic records from adding the same worker or RSS twice. Like
+        // existing Sample::push, measured-versus-Pending uniqueness across
+        // entries still relies on the native PID snapshot containing each PID
+        // once; this scan-local state cannot deduplicate a measured PID.
+        let additional_rss = diagnostic.pending_worker.and_then(|identity| {
+            self.workers
+                .record(identity, diagnostic.memory_task_lower_bound)
+        });
+        if let (Some(lower), Some(additional_rss)) =
+            (diagnostic.memory_task_lower_bound, additional_rss)
+        {
+            let accumulated = self.task_lower_bound.get_or_insert(TaskMemoryLowerBound {
+                adjusted_vm: 0,
+                rss: 0,
+            });
+            accumulated.adjusted_vm = accumulated.adjusted_vm.max(lower.adjusted_vm);
+            match accumulated.rss.checked_add(additional_rss) {
+                Some(rss) => accumulated.rss = rss,
+                None => self.task_sum_overflow = true,
+            }
+        }
     }
     pub(super) fn last(&self) -> Option<LeaderDiagnostic> {
         self.last
@@ -536,7 +720,7 @@ impl Tracker {
     pub(super) fn finish_observation(
         &mut self,
         observation: GroupObservation,
-        sample: Sample,
+        mut sample: Sample,
     ) -> Result<ResourceObservation, ProcessError> {
         match observation {
             GroupObservation::Complete(_) => {
@@ -549,6 +733,13 @@ impl Tracker {
                 // over-budget partial sample remains fatal. No partial sample
                 // increments success/count/peaks or replaces the missing PID
                 // with zero. The original successful-sample gap keeps running.
+                sample.push_pending_workers(observations.workers.len)?;
+                if observations.task_sum_overflow {
+                    return Err(sum_overflow());
+                }
+                if let Some(lower) = observations.task_lower_bound {
+                    sample.push_task_lower_bound(lower)?;
+                }
                 sample.check()?;
                 self.gap(Instant::now())?;
                 Ok(ResourceObservation::Pending)
@@ -605,13 +796,26 @@ pub(super) struct Sample {
     workers: usize,
 }
 impl Sample {
-    pub(super) fn push(&mut self, memory: Memory) -> Result<(), ProcessError> {
+    fn push_pending_workers(&mut self, workers: usize) -> Result<(), ProcessError> {
+        self.workers = self.workers.checked_add(workers).ok_or_else(sum_overflow)?;
+        Ok(())
+    }
+    fn push_task_lower_bound(&mut self, lower: TaskMemoryLowerBound) -> Result<(), ProcessError> {
+        self.adjusted_vm_peak = self.adjusted_vm_peak.max(lower.adjusted_vm);
+        self.rss = self.rss.checked_add(lower.rss).ok_or_else(sum_overflow)?;
+        Ok(())
+    }
+    pub(super) fn push_memory_lower_bound(&mut self, memory: Memory) -> Result<(), ProcessError> {
         self.adjusted_vm_peak = self.adjusted_vm_peak.max(memory.adjusted_vm);
         self.rss = self.rss.checked_add(memory.rss).ok_or_else(sum_overflow)?;
         self.footprint = self
             .footprint
             .checked_add(memory.footprint)
             .ok_or_else(sum_overflow)?;
+        Ok(())
+    }
+    pub(super) fn push(&mut self, memory: Memory) -> Result<(), ProcessError> {
+        self.push_memory_lower_bound(memory)?;
         self.workers = self.workers.checked_add(1).ok_or_else(sum_overflow)?;
         Ok(())
     }
@@ -649,7 +853,8 @@ fn rusage_result(result: i32, number: i32, start: u64, exit: u64) -> Result<(), 
         .map_err(native_error)
 }
 
-pub(super) fn native_error(error: NativeResourceError) -> ProcessError {
+pub(super) fn native_error(error: impl Into<MemoryFailure>) -> ProcessError {
+    let error = error.into();
     // ESRCH and an observed exit timestamp remain exit-class failures. Only
     // process.rs may independently confirm the unchanged native zombie.
     let kind = if error.failure == NativeResourceFailure::Exited {
@@ -657,12 +862,13 @@ pub(super) fn native_error(error: NativeResourceError) -> ProcessError {
     } else {
         "resource_observation"
     };
-    ProcessError::new(kind, error.to_string())
+    ProcessError::new(kind, error.native.to_string())
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn memory(pid: i32) -> Result<Memory, NativeResourceError> {
-    let actual = mmmm_native_process::darwin::observe_memory(pid)?;
+pub(super) fn memory(pid: i32) -> Result<Memory, MemoryFailure> {
+    let actual = mmmm_native_process::darwin::observe_memory_with_partial(pid)
+        .map_err(MemoryFailure::from)?;
     // tools retains its existing before/after BSD birth/UID/group sandwich.
     // The shared observation additionally returns rusage start identity for
     // consumers that keep it fixed throughout a single worker lifecycle.
@@ -748,16 +954,670 @@ mod tests {
         ]
     }
     fn observed_member_pending_diagnostic() -> LeaderDiagnostic {
+        member_memory_pending(18, native_exit_results()[0])
+    }
+    fn rusage_failure() -> MemoryFailure {
+        // Authored adapter facts exercise policy only; the production adapter
+        // obtains these sealed facts from the one shared native observation.
+        MemoryFailure {
+            native: native_exit_results()[2],
+            task_lower_bound: Some(TaskMemoryLowerBound {
+                adjusted_vm: 17,
+                rss: 23,
+            }),
+            rusage_timestamps: Some(RusageTimestamps {
+                start_observed: true,
+                exit_observed: true,
+            }),
+        }
+    }
+    fn rusage_pending_diagnostic(native: MemoryFailure) -> LeaderDiagnostic {
+        member_memory_pending(18, native)
+    }
+    fn member_memory_pending(pid: u32, native: impl Into<MemoryFailure>) -> LeaderDiagnostic {
         let before = LeaderBsd {
+            identity: LeaderIdentity {
+                pid,
+                ..reserved_leader().identity
+            },
             flags: PROC_FLAG_INEXIT,
             ..reserved_leader()
         };
         let MemoryObservation::Pending(diagnostic) =
-            classify_memory_exit(None, before, Some(before), native_exit_results()[0]).unwrap()
+            classify_memory_exit(None, before, Some(before), native).unwrap()
         else {
-            panic!("same-identity observed TaskInfo exit was not an incomplete sample")
+            panic!("same-identity member memory exit was not an incomplete sample")
         };
         diagnostic
+    }
+    #[test]
+    fn observed_rusage_exit_requires_actual_timestamps_and_preserves_partial_facts() {
+        let native = rusage_failure();
+        let before = LeaderBsd {
+            flags: PROC_FLAG_INEXIT,
+            ..reserved_leader()
+        };
+        let diagnostic = rusage_pending_diagnostic(native);
+        assert_eq!(diagnostic.memory_error, Some(native.native.into()));
+        assert_eq!(diagnostic.memory_role, Some(MemoryRole::ObservedMember));
+        assert_eq!(diagnostic.memory_task_lower_bound, native.task_lower_bound);
+        assert_eq!(
+            diagnostic.memory_rusage_timestamps,
+            native.rusage_timestamps
+        );
+        assert!(!GroupObservation::Pending(Box::new(diagnostic.into())).scope_empty());
+        let json = serde_json::to_value(diagnostic).unwrap();
+        assert!(json.get("pending_worker").is_none());
+        let debug = format!("{diagnostic:?}");
+        assert!(
+            !debug.contains("pid:") && !debug.contains("uid:") && !debug.contains("start_sec:")
+        );
+        assert_eq!(json["memory_task_lower_bound"]["adjusted_vm"], 17);
+        assert_eq!(json["memory_task_lower_bound"]["rss"], 23);
+        assert_eq!(json["memory_rusage_timestamps"]["start_observed"], true);
+        assert_eq!(json["memory_rusage_timestamps"]["exit_observed"], true);
+        assert!(json["memory_task_lower_bound"].get("footprint").is_none());
+        assert!(
+            json["memory_task_lower_bound"]
+                .get("start_abstime")
+                .is_none()
+        );
+        for other in [
+            MemoryFailure::from(native.native),
+            MemoryFailure {
+                task_lower_bound: None,
+                ..native
+            },
+            MemoryFailure {
+                rusage_timestamps: None,
+                ..native
+            },
+            MemoryFailure {
+                rusage_timestamps: Some(RusageTimestamps {
+                    start_observed: false,
+                    exit_observed: true,
+                }),
+                ..native
+            },
+            MemoryFailure {
+                rusage_timestamps: Some(RusageTimestamps {
+                    start_observed: true,
+                    exit_observed: false,
+                }),
+                ..native
+            },
+            MemoryFailure {
+                native: NativeResourceError {
+                    native_result: -1,
+                    ..native.native
+                },
+                ..native
+            },
+            MemoryFailure {
+                native: NativeResourceError {
+                    native_errno: DARWIN_ESRCH,
+                    ..native.native
+                },
+                ..native
+            },
+            MemoryFailure {
+                native: NativeResourceError {
+                    stage: NativeResourceStage::TaskInfo,
+                    ..native.native
+                },
+                ..native
+            },
+            MemoryFailure {
+                native: NativeResourceError {
+                    stage: NativeResourceStage::ProcessIdentifier,
+                    ..native.native
+                },
+                ..native
+            },
+            MemoryFailure {
+                native: NativeResourceError {
+                    failure: NativeResourceFailure::Malformed,
+                    ..native.native
+                },
+                ..native
+            },
+            MemoryFailure {
+                native: NativeResourceError {
+                    failure: NativeResourceFailure::Unavailable,
+                    ..native.native
+                },
+                ..native
+            },
+        ] {
+            let error = classify_memory_exit(None, before, Some(before), other).unwrap_err();
+            assert!(error.message.contains("memory_role=Some(ObservedMember)"));
+            assert!(
+                error
+                    .message
+                    .contains(&format!("memory_native_result={}", other.native_result))
+            );
+            assert!(
+                error
+                    .message
+                    .contains(&format!("memory_native_errno={}", other.native_errno))
+            );
+        }
+        for (first, after) in [
+            (before, None),
+            (LeaderBsd { flags: 0, ..before }, Some(before)),
+            (before, Some(LeaderBsd { flags: 0, ..before })),
+            (
+                LeaderBsd {
+                    status: SZOMB,
+                    ..before
+                },
+                Some(before),
+            ),
+        ] {
+            assert!(classify_memory_exit(None, first, after, native).is_err());
+        }
+        for identity in [
+            LeaderIdentity {
+                pid: 18,
+                ..before.identity
+            },
+            LeaderIdentity {
+                uid: 502,
+                ..before.identity
+            },
+            LeaderIdentity {
+                pgid: 18,
+                ..before.identity
+            },
+            LeaderIdentity {
+                start_sec: 123456790,
+                ..before.identity
+            },
+            LeaderIdentity {
+                start_usec: 322,
+                ..before.identity
+            },
+        ] {
+            assert!(
+                classify_memory_exit(None, before, Some(LeaderBsd { identity, ..before }), native)
+                    .is_err()
+            );
+        }
+        // The reserved leader keeps its prior typed-exit rule and role. The
+        // new member rule neither opens nor closes its original reservation.
+        let mut reservation = true;
+        let MemoryObservation::Pending(leader) = classify_memory_exit(
+            Some((before.identity, &mut reservation)),
+            LeaderBsd { flags: 0, ..before },
+            Some(before),
+            native.native,
+        )
+        .unwrap() else {
+            panic!("the original reserved-leader policy changed")
+        };
+        assert!(reservation);
+        assert_eq!(leader.memory_role, Some(MemoryRole::ReservedLeader));
+        assert!(leader.memory_task_lower_bound.is_none());
+        assert!(leader.memory_rusage_timestamps.is_none());
+        assert!(matches!(
+            classify_memory_exit(
+                None,
+                before,
+                Some(LeaderBsd {
+                    status: SZOMB,
+                    ..before
+                }),
+                native
+            )
+            .unwrap(),
+            MemoryObservation::Zombie(_)
+        ));
+    }
+    #[test]
+    fn pending_task_lower_bounds_are_counted_once_per_scan_without_success_or_carryover() {
+        let mut native = rusage_failure();
+        native.task_lower_bound.as_mut().unwrap().rss = (MEMORY_LIMIT - small().rss) / 2;
+        let first = rusage_pending_diagnostic(native);
+        native.task_lower_bound.as_mut().unwrap().adjusted_vm += 1;
+        let last = member_memory_pending(19, native);
+        let task = member_memory_pending(20, native_exit_results()[0]);
+        let leader = pending_diagnostic(LeaderPhase::AfterMemory);
+        let mut scan = PendingObservations::default();
+        for diagnostic in [first, task, last, leader] {
+            scan.record(diagnostic);
+        }
+        assert_eq!(
+            scan.task_lower_bound.unwrap().rss,
+            MEMORY_LIMIT - small().rss
+        );
+        assert_eq!(scan.task_lower_bound.unwrap().adjusted_vm, 18);
+        assert!(!scan.task_sum_overflow);
+        assert_eq!(scan.workers.len, 4);
+        assert_eq!(scan.member.unwrap().observations, 3);
+        assert_eq!(scan.member.unwrap().first, first);
+        assert_eq!(scan.member.unwrap().last, last);
+        assert_eq!(scan.leader.unwrap().observations, 1);
+        assert_eq!(scan.last(), Some(leader));
+        let mut tracker = Tracker::new(small()).unwrap();
+        let prior_success = tracker.last_success;
+        // Two actual scans each fit at the original limit. Neither scan's
+        // lower bound is stored in the tracker or added to the following one.
+        for _ in 0..2 {
+            let mut measured = Sample::default();
+            measured.push(small()).unwrap();
+            assert_eq!(
+                tracker
+                    .finish_observation(GroupObservation::Pending(Box::new(scan)), measured)
+                    .unwrap(),
+                ResourceObservation::Pending
+            );
+        }
+        assert_eq!(
+            tracker.evidence.pending_member_exit.unwrap().observations,
+            6
+        );
+        assert_eq!(
+            tracker.evidence.pending_leader_exit.unwrap().observations,
+            2
+        );
+        assert_eq!(tracker.evidence.sample_count, 0);
+        assert_eq!(tracker.last_success, prior_success);
+        assert_eq!(tracker.evidence.peak_observed_adjusted_vm_bytes, 0);
+        assert_eq!(tracker.evidence.peak_observed_aggregate_rss_bytes, 0);
+        assert_eq!(tracker.evidence.peak_observed_aggregate_footprint_bytes, 0);
+        assert_eq!(tracker.evidence.peak_observed_workers, 0);
+        let mut measured = Sample::default();
+        measured.push(small()).unwrap();
+        measured
+            .push_task_lower_bound(scan.task_lower_bound.unwrap())
+            .unwrap();
+        assert_eq!(measured.rss, MEMORY_LIMIT);
+        assert_eq!(measured.footprint, small().footprint);
+        assert_eq!(measured.workers, 1);
+        measured.check().unwrap();
+
+        let mut repeated = PendingObservations::default();
+        let mut native = rusage_failure();
+        native.task_lower_bound.as_mut().unwrap().rss = MEMORY_LIMIT / 2;
+        let initial = rusage_pending_diagnostic(native);
+        repeated.record(initial);
+        repeated.record(initial);
+        native.task_lower_bound = Some(TaskMemoryLowerBound {
+            adjusted_vm: 19,
+            rss: MEMORY_LIMIT,
+        });
+        repeated.record(rusage_pending_diagnostic(native));
+        native.task_lower_bound = Some(TaskMemoryLowerBound {
+            adjusted_vm: 18,
+            rss: 1,
+        });
+        repeated.record(rusage_pending_diagnostic(native));
+        repeated.record(observed_member_pending_diagnostic());
+        assert_eq!(repeated.workers.len, 1);
+        assert_eq!(repeated.member.unwrap().observations, 5);
+        assert_eq!(
+            repeated.task_lower_bound,
+            Some(TaskMemoryLowerBound {
+                adjusted_vm: 19,
+                rss: MEMORY_LIMIT
+            })
+        );
+        assert!(!repeated.task_sum_overflow);
+        let mut deduplicated = Tracker::new(small()).unwrap();
+        assert_eq!(
+            deduplicated
+                .finish_observation(
+                    GroupObservation::Pending(Box::new(repeated)),
+                    Sample::default()
+                )
+                .unwrap(),
+            ResourceObservation::Pending
+        );
+        assert_eq!(deduplicated.evidence.sample_count, 0);
+        assert_eq!(deduplicated.evidence.peak_observed_workers, 0);
+
+        for (lower, twice, measured_rss, kind) in [
+            (
+                TaskMemoryLowerBound {
+                    adjusted_vm: VM_LIMIT + 1,
+                    rss: 1,
+                },
+                false,
+                0,
+                "resource_budget",
+            ),
+            (
+                TaskMemoryLowerBound {
+                    adjusted_vm: 1,
+                    rss: MEMORY_LIMIT + 1,
+                },
+                false,
+                0,
+                "resource_budget",
+            ),
+            (
+                TaskMemoryLowerBound {
+                    adjusted_vm: 1,
+                    rss: u64::MAX,
+                },
+                true,
+                0,
+                "resource_observation",
+            ),
+            (
+                TaskMemoryLowerBound {
+                    adjusted_vm: 1,
+                    rss: u64::MAX,
+                },
+                false,
+                1,
+                "resource_observation",
+            ),
+        ] {
+            let native = MemoryFailure {
+                task_lower_bound: Some(lower),
+                ..rusage_failure()
+            };
+            let diagnostic = rusage_pending_diagnostic(native);
+            let mut scan = PendingObservations::from(diagnostic);
+            if twice {
+                scan.record(member_memory_pending(19, native));
+            }
+            let mut partial = Sample::default();
+            partial
+                .push(Memory {
+                    rss: measured_rss,
+                    ..small()
+                })
+                .unwrap();
+            let mut failed = Tracker::new(small()).unwrap();
+            let prior_success = failed.last_success;
+            assert_eq!(
+                failed
+                    .finish_observation(GroupObservation::Pending(Box::new(scan)), partial)
+                    .unwrap_err()
+                    .kind,
+                kind
+            );
+            assert_eq!(failed.evidence.sample_count, 0);
+            assert_eq!(failed.last_success, prior_success);
+            assert_eq!(
+                failed.evidence.pending_member_exit.unwrap().observations,
+                if twice { 2 } else { 1 }
+            );
+            // A later original failure keeps its own kind, message and drain
+            // state. Retaining scan diagnostics cannot apply its budget twice.
+            let mut hard_failure = Tracker::new(small()).unwrap();
+            hard_failure.record_pending_observations(scan);
+            let mut original =
+                ProcessError::new("process_identity", "later original identity failure");
+            original.drained = false;
+            let retained = hard_failure.with_pending_diagnostics(original);
+            assert_eq!(retained.kind, "process_identity");
+            assert!(!retained.drained);
+            assert!(
+                retained
+                    .message
+                    .starts_with("later original identity failure;")
+            );
+            assert_eq!(hard_failure.evidence.sample_count, 0);
+            assert_eq!(
+                hard_failure
+                    .finish_observation(
+                        GroupObservation::Pending(Box::new(
+                            rusage_pending_diagnostic(rusage_failure()).into()
+                        )),
+                        Sample::default()
+                    )
+                    .unwrap(),
+                ResourceObservation::Pending
+            );
+        }
+    }
+    #[test]
+    fn pending_workers_enforce_the_original_limit_without_duplicate_or_historical_counts() {
+        fn measured_workers(count: usize) -> Sample {
+            let mut sample = Sample::default();
+            for _ in 0..count {
+                sample.push(small()).unwrap();
+            }
+            sample
+        }
+        let member = observed_member_pending_diagnostic();
+        let leader = pending_diagnostic(LeaderPhase::BeforeMemory);
+        let rusage = member_memory_pending(19, rusage_failure());
+        for (events, workers) in [
+            (vec![member], 1),
+            (vec![leader], 1),
+            (vec![member, leader], 2),
+            (vec![member, rusage, leader, member], 3),
+        ] {
+            let mut scan = PendingObservations::default();
+            for event in &events {
+                scan.record(*event);
+            }
+            assert_eq!(scan.workers.len, workers);
+            let member_observations = events
+                .iter()
+                .filter(|event| event.memory_role == Some(MemoryRole::ObservedMember))
+                .count() as u64;
+            let leader_observations = events.len() as u64 - member_observations;
+            let mut tracker = Tracker::new(small()).unwrap();
+            let prior_success = tracker.last_success;
+            // Each scan has at most 32 known workers. The same pending worker
+            // is added once, and neither scan changes successful sample data.
+            for _ in 0..2 {
+                assert_eq!(
+                    tracker
+                        .finish_observation(
+                            GroupObservation::Pending(Box::new(scan)),
+                            measured_workers(WORKER_LIMIT - workers),
+                        )
+                        .unwrap(),
+                    ResourceObservation::Pending
+                );
+            }
+            assert_eq!(
+                tracker
+                    .evidence
+                    .pending_member_exit
+                    .map_or(0, |facts| facts.observations),
+                member_observations * 2
+            );
+            assert_eq!(
+                tracker
+                    .evidence
+                    .pending_leader_exit
+                    .map_or(0, |facts| facts.observations),
+                leader_observations * 2
+            );
+            assert_eq!(tracker.last_success, prior_success);
+            assert_eq!(tracker.evidence.sample_count, 0);
+            assert_eq!(tracker.evidence.peak_observed_workers, 0);
+            let mut over_budget = Tracker::new(small()).unwrap();
+            let prior_success = over_budget.last_success;
+            let error = over_budget
+                .finish_observation(
+                    GroupObservation::Pending(Box::new(scan)),
+                    measured_workers(WORKER_LIMIT + 1 - workers),
+                )
+                .unwrap_err();
+            assert_eq!(error.kind, "resource_budget");
+            assert!(error.message.contains("workers=33"));
+            assert_eq!(over_budget.last_success, prior_success);
+            assert_eq!(over_budget.evidence.sample_count, 0);
+            assert_eq!(over_budget.evidence.peak_observed_workers, 0);
+        }
+        let after_memory = pending_diagnostic(LeaderPhase::AfterMemory);
+        let mut known_memory = measured_workers(WORKER_LIMIT - 1);
+        known_memory.push_memory_lower_bound(small()).unwrap();
+        assert_eq!(known_memory.workers, WORKER_LIMIT - 1);
+        assert_eq!(known_memory.rss, small().rss * WORKER_LIMIT as u64);
+        assert_eq!(
+            known_memory.footprint,
+            small().footprint * WORKER_LIMIT as u64
+        );
+        let mut tracker = Tracker::new(small()).unwrap();
+        let prior_success = tracker.last_success;
+        assert_eq!(
+            tracker
+                .finish_observation(
+                    GroupObservation::Pending(Box::new(after_memory.into())),
+                    known_memory
+                )
+                .unwrap(),
+            ResourceObservation::Pending
+        );
+        assert_eq!(tracker.last_success, prior_success);
+        assert_eq!(tracker.evidence.sample_count, 0);
+        assert_eq!(tracker.evidence.peak_observed_adjusted_vm_bytes, 0);
+        assert_eq!(tracker.evidence.peak_observed_aggregate_rss_bytes, 0);
+        assert_eq!(tracker.evidence.peak_observed_aggregate_footprint_bytes, 0);
+        assert_eq!(tracker.evidence.peak_observed_workers, 0);
+        assert_eq!(
+            tracker.evidence.pending_leader_exit.unwrap().observations,
+            1
+        );
+        for memory in [
+            Memory {
+                adjusted_vm: VM_LIMIT + 1,
+                ..small()
+            },
+            Memory {
+                rss: MEMORY_LIMIT + 1,
+                ..small()
+            },
+            Memory {
+                footprint: MEMORY_LIMIT + 1,
+                ..small()
+            },
+        ] {
+            let mut known_memory = Sample::default();
+            known_memory.push_memory_lower_bound(memory).unwrap();
+            assert_eq!(known_memory.workers, 0);
+            let mut tracker = Tracker::new(small()).unwrap();
+            let prior_success = tracker.last_success;
+            assert_eq!(
+                tracker
+                    .finish_observation(
+                        GroupObservation::Pending(Box::new(after_memory.into())),
+                        known_memory
+                    )
+                    .unwrap_err()
+                    .kind,
+                "resource_budget"
+            );
+            assert_eq!(tracker.last_success, prior_success);
+            assert_eq!(tracker.evidence.sample_count, 0);
+            assert_eq!(tracker.evidence.peak_observed_adjusted_vm_bytes, 0);
+            assert_eq!(tracker.evidence.peak_observed_aggregate_rss_bytes, 0);
+            assert_eq!(tracker.evidence.peak_observed_aggregate_footprint_bytes, 0);
+            assert_eq!(tracker.evidence.peak_observed_workers, 0);
+            assert_eq!(
+                tracker.evidence.pending_leader_exit.unwrap().observations,
+                1
+            );
+        }
+        for memory in [
+            Memory {
+                rss: u64::MAX,
+                ..small()
+            },
+            Memory {
+                footprint: u64::MAX,
+                ..small()
+            },
+        ] {
+            // Match the caller's order: retain Pending before adding the
+            // already measured values, including when their sum overflows.
+            let mut scan = PendingObservations::default();
+            scan.record(after_memory);
+            let mut known_memory = measured_workers(1);
+            let mut error = known_memory.push_memory_lower_bound(memory).unwrap_err();
+            assert_eq!(error.kind, "resource_observation");
+            error.drained = false;
+            let mut tracker = Tracker::new(small()).unwrap();
+            tracker.record_pending_observations(scan);
+            let error = tracker.with_pending_diagnostics(error);
+            assert_eq!(error.kind, "resource_observation");
+            assert!(!error.drained);
+            assert!(
+                error
+                    .message
+                    .starts_with("Darwin native resource sum overflow;")
+            );
+            assert_eq!(
+                tracker.evidence.pending_leader_exit.unwrap().observations,
+                1
+            );
+            assert_eq!(tracker.evidence.sample_count, 0);
+            assert_eq!(tracker.evidence.peak_observed_workers, 0);
+        }
+        let mut many = PendingObservations::default();
+        for index in 0..WORKER_LIMIT + 2 {
+            many.record(member_memory_pending(
+                100 + index as u32,
+                native_exit_results()[0],
+            ));
+        }
+        assert_eq!(many.workers.len, WORKER_LIMIT + 1);
+        assert_eq!(many.member.unwrap().observations, (WORKER_LIMIT + 2) as u64);
+        let mut tracker = Tracker::new(small()).unwrap();
+        assert_eq!(
+            tracker
+                .finish_observation(GroupObservation::Pending(Box::new(many)), Sample::default())
+                .unwrap_err()
+                .kind,
+            "resource_budget"
+        );
+        let mut overflow = Tracker::new(small()).unwrap();
+        assert_eq!(
+            overflow
+                .finish_observation(
+                    GroupObservation::Pending(Box::new(member.into())),
+                    Sample {
+                        workers: usize::MAX,
+                        ..Sample::default()
+                    },
+                )
+                .unwrap_err()
+                .kind,
+            "resource_observation"
+        );
+        assert_eq!(overflow.evidence.sample_count, 0);
+
+        let before = LeaderBsd {
+            identity: LeaderIdentity {
+                pid: 18,
+                ..reserved_leader().identity
+            },
+            flags: PROC_FLAG_INEXIT,
+            ..reserved_leader()
+        };
+        for native in [
+            MemoryFailure::from(native_exit_results()[0]),
+            rusage_failure(),
+        ] {
+            let MemoryObservation::Zombie(zombie) = classify_memory_exit(
+                None,
+                before,
+                Some(LeaderBsd {
+                    status: SZOMB,
+                    ..before
+                }),
+                native,
+            )
+            .unwrap() else {
+                panic!("expected the existing native zombie classification")
+            };
+            assert!(zombie.pending_worker.is_none());
+            let mut excluded = PendingObservations::default();
+            // Production records this in native_memory_exits only. Even a direct
+            // diagnostic record cannot issue a pending-worker identity for SZOMB.
+            excluded.record(zombie);
+            assert_eq!(excluded.workers.len, 0);
+            assert!(excluded.task_lower_bound.is_none());
+        }
     }
     #[test]
     fn observed_member_task_exit_preserves_an_incomplete_group_and_distinct_closed_facts() {
@@ -836,6 +1696,10 @@ mod tests {
         assert!(error.message.contains("memory_role=Some(ObservedMember)"));
 
         let before = LeaderBsd {
+            identity: LeaderIdentity {
+                pid: 19,
+                ..reserved_leader().identity
+            },
             flags: PROC_FLAG_INEXIT,
             ..reserved_leader()
         };
@@ -868,6 +1732,7 @@ mod tests {
                 scan.record(*event);
             }
             assert_eq!(scan.last(), events.last().copied());
+            assert_eq!(scan.workers.len, events.len());
             let observation = GroupObservation::Pending(Box::new(scan));
             assert!(!observation.scope_empty());
             let mut complete_scan = Tracker::new(small()).unwrap();
@@ -1479,6 +2344,7 @@ mod tests {
         for diagnostic in [
             pending_diagnostic(LeaderPhase::BeforeMemory),
             observed_member_pending_diagnostic(),
+            rusage_pending_diagnostic(rusage_failure()),
         ] {
             let mut tracker = Tracker::new(small()).unwrap();
             let prior_success = tracker.last_success;
@@ -1524,6 +2390,7 @@ mod tests {
         for diagnostic in [
             pending_diagnostic(LeaderPhase::BeforeMemory),
             observed_member_pending_diagnostic(),
+            rusage_pending_diagnostic(rusage_failure()),
         ] {
             let mut tracker = Tracker::new(small()).unwrap();
             let prior_success = tracker.last_success;

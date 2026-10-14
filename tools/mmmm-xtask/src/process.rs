@@ -1963,7 +1963,7 @@ mod native {
             let group = self.linux_group.as_mut().ok_or_else(|| {
                 ProcessError::new("process_identity", "missing anchored Linux group identity")
             })?;
-            let mut pending = None;
+            let mut pending = linux_resources::PendingObservations::default();
             let result = group.sample(
                 include_rss,
                 self.reservation_valid && !self.reaped,
@@ -1974,9 +1974,7 @@ mod native {
             }
             // Merge once on both success and failure, before propagating a
             // later enumeration/member/identity or partial-budget error.
-            if let Some(observation) = pending {
-                self.resources.record_linux_pending_fact(observation);
-            }
+            self.resources.record_linux_pending_observations(pending);
             result
         }
         #[cfg(target_os = "linux")]
@@ -2354,7 +2352,11 @@ mod native {
                                     }
                                     darwin_resources::LeaderObservation::Zombie => (),
                                     darwin_resources::LeaderObservation::Pending(diagnostic) => {
-                                        pending.record(diagnostic)
+                                        pending.record(diagnostic);
+                                        // The earlier full memory observation
+                                        // remains a lower bound. Pending's
+                                        // identity counts this worker once.
+                                        sample.push_memory_lower_bound(memory)?;
                                     }
                                 }
                             } else {

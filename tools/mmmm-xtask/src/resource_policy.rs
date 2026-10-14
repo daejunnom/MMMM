@@ -2,10 +2,12 @@
 //! Windows caps job commit; Linux caps each process's address space. JVM builds
 //! on Linux additionally observe aggregate RSS. These policies do not claim a
 //! kernel resident-memory quota. Only the narrowly classified Linux JVM
-//! incomplete leader transition has a conditional complete-sample deadline.
+//! incomplete leader/member transition has a conditional complete-sample deadline.
 use super::ProcessError;
+#[cfg(test)]
+use super::linux_resources::PendingObservation;
 #[cfg(any(target_os = "linux", test))]
-use super::linux_resources::{GroupObservation, PendingHistory, PendingObservation};
+use super::linux_resources::{GroupObservation, PendingHistory, PendingObservations, PendingRole};
 use serde::Serialize;
 #[cfg(any(windows, target_os = "linux", test))]
 use std::time::{Duration, Instant};
@@ -204,6 +206,8 @@ pub enum Evidence {
         incomplete_memory_sample_count: u64,
         pending_leader_complete_gap_limit_ms: u64,
         pending_leader_observations: Option<Box<PendingHistory>>,
+        pending_member_complete_gap_limit_ms: u64,
+        pending_member_observations: Option<Box<PendingHistory>>,
         peak_observed_processes: usize,
         peak_observed_aggregate_rss_bytes: u64,
         peak_observed_per_process_vm_bytes: u64,
@@ -219,6 +223,8 @@ pub struct Tracker {
     last_attempt: Option<Instant>,
     #[cfg(any(target_os = "linux", test))]
     pending_active: bool,
+    #[cfg(any(target_os = "linux", test))]
+    last_pending_role: Option<PendingRole>,
 }
 
 #[cfg(any(windows, target_os = "linux", test))]
@@ -232,6 +238,8 @@ impl Tracker {
             last_attempt: None,
             #[cfg(any(target_os = "linux", test))]
             pending_active: false,
+            #[cfg(any(target_os = "linux", test))]
+            last_pending_role: None,
             evidence: Evidence::WindowsJob {
                 memory_semantics: "aggregate_job_committed_memory",
                 process_count_semantics: "active_owned_job_including_command_leader",
@@ -261,6 +269,7 @@ impl Tracker {
             last_complete: None,
             last_attempt: None,
             pending_active: false,
+            last_pending_role: None,
             evidence: Evidence::LinuxAddressSpace {
                 memory_semantics: "per_process_address_space",
                 process_count_semantics: "live_owned_group_including_command_leader",
@@ -288,6 +297,7 @@ impl Tracker {
             last_complete: None,
             last_attempt: None,
             pending_active: false,
+            last_pending_role: None,
             evidence: Evidence::LinuxJvmObserved {
                 memory_semantics: "sequential_sum_of_owned_per_process_rss",
                 process_count_semantics: "live_owned_group_including_command_leader",
@@ -309,6 +319,8 @@ impl Tracker {
                 incomplete_memory_sample_count: 0,
                 pending_leader_complete_gap_limit_ms: LINUX_PENDING_GAP.as_millis() as u64,
                 pending_leader_observations: None,
+                pending_member_complete_gap_limit_ms: LINUX_PENDING_GAP.as_millis() as u64,
+                pending_member_observations: None,
                 peak_observed_processes: 0,
                 peak_observed_aggregate_rss_bytes: 0,
                 peak_observed_per_process_vm_bytes: 0,
@@ -367,15 +379,29 @@ impl Tracker {
         Ok(true)
     }
 
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(test)]
     pub(super) fn record_linux_pending_fact(&mut self, observation: PendingObservation) {
+        self.record_linux_pending_observations(observation.into());
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(super) fn record_linux_pending_observations(&mut self, observations: PendingObservations) {
         if let Evidence::LinuxJvmObserved {
             pending_leader_observations,
+            pending_member_observations,
             ..
         } = &mut self.evidence
         {
-            PendingHistory::record(pending_leader_observations, observation);
-            self.pending_active = true;
+            if let Some(history) = observations.leader {
+                PendingHistory::merge(pending_leader_observations, history);
+            }
+            if let Some(history) = observations.member {
+                PendingHistory::merge(pending_member_observations, history);
+            }
+            if let Some(role) = observations.last_role {
+                self.last_pending_role = Some(role);
+                self.pending_active = true;
+            }
         }
     }
 
@@ -393,18 +419,28 @@ impl Tracker {
             return Ok(());
         }
         let Evidence::LinuxJvmObserved {
-            pending_leader_observations: Some(history),
+            pending_leader_observations,
+            pending_member_observations,
             ..
         } = &self.evidence
         else {
             return Err(wrong_tracker());
         };
+        let role = self.last_pending_role.ok_or_else(wrong_tracker)?;
+        let history = match role {
+            PendingRole::ReservedLeader => pending_leader_observations.as_deref(),
+            PendingRole::OwnedMember => pending_member_observations.as_deref(),
+        }
+        .ok_or_else(wrong_tracker)?;
         let mut error = history.last.original_error();
-        error.message.push_str(if self.last_complete.is_none() {
-            "; Linux JVM pending leader requires an earlier complete resource sample"
+        let reason = if self.last_complete.is_none() {
+            "requires an earlier complete resource sample"
         } else {
-            "; Linux JVM pending leader exceeded the 1000ms complete resource sample gap"
-        });
+            "exceeded the 1000ms complete resource sample gap"
+        };
+        error
+            .message
+            .push_str(&format!("; Linux JVM pending {} {reason}", role.label()));
         Err(error)
     }
 
@@ -452,7 +488,7 @@ impl Tracker {
                         )
                     })?;
                 // These are measured lower bounds, never completed-sample
-                // peaks. A missing leader RSS cannot hide another member's
+                // peaks. A missing process RSS cannot hide another member's
                 // actual count, VM or RSS budget failure.
                 check_linux_jvm_budget(
                     sample.live_processes,
@@ -467,16 +503,24 @@ impl Tracker {
     #[cfg(any(target_os = "linux", test))]
     pub(super) fn with_linux_pending_diagnostics(&self, mut error: ProcessError) -> ProcessError {
         if let Evidence::LinuxJvmObserved {
-            pending_leader_observations: Some(history),
+            pending_leader_observations,
+            pending_member_observations,
             ..
         } = &self.evidence
         {
-            error.message.push_str(&format!(
-                "; linux_pending_leader(count={}; first=[{}]; last=[{}])",
-                history.count,
-                history.first.original_error(),
-                history.last.original_error(),
-            ));
+            for (label, history) in [
+                ("linux_pending_leader", pending_leader_observations),
+                ("linux_pending_member", pending_member_observations),
+            ] {
+                if let Some(history) = history {
+                    error.message.push_str(&format!(
+                        "; {label}(count={}; first=[{}]; last=[{}])",
+                        history.count,
+                        history.first.original_error(),
+                        history.last.original_error(),
+                    ));
+                }
+            }
         }
         error
     }
@@ -689,7 +733,10 @@ fn wrong_tracker() -> ProcessError {
 
 #[cfg(test)]
 mod tests {
-    use super::super::linux_resources::{Sample, tests::pending_observation};
+    use super::super::linux_resources::{
+        Sample,
+        tests::{pending_observation, pending_observation_for_role},
+    };
     use super::*;
 
     fn job() -> JobReadback {
@@ -1004,10 +1051,15 @@ mod tests {
             .record_linux_jvm_at(1, Some(4096), 8192, at)
             .unwrap();
         let before = json(&tracker);
-        for ms in [100, 200, 900, 1000] {
+        for (ms, role) in [
+            (100, PendingRole::ReservedLeader),
+            (200, PendingRole::OwnedMember),
+            (900, PendingRole::ReservedLeader),
+            (1000, PendingRole::OwnedMember),
+        ] {
             let now = at + Duration::from_millis(ms);
             assert!(tracker.begin_linux_sample_at(now).unwrap());
-            tracker.record_linux_pending_fact(pending_observation());
+            tracker.record_linux_pending_fact(pending_observation_for_role(role));
             tracker
                 .finish_linux_sample_at(GroupObservation::Pending(partial), now)
                 .unwrap();
@@ -1027,13 +1079,17 @@ mod tests {
         }
         let evidence = json(&tracker);
         assert_eq!(evidence["incomplete_memory_sample_count"], 4);
-        assert_eq!(evidence["pending_leader_observations"]["count"], 4);
+        assert_eq!(evidence["pending_leader_observations"]["count"], 2);
+        assert_eq!(evidence["pending_member_observations"]["count"], 2);
         assert_eq!(evidence["pending_leader_complete_gap_limit_ms"], 1000);
+        assert_eq!(evidence["pending_member_complete_gap_limit_ms"], 1000);
         let expired = at + Duration::from_millis(1001);
         let error = tracker.begin_linux_sample_at(expired).unwrap_err();
         assert_eq!(error.kind, "resource_observation");
         assert!(error.message.starts_with("native process metadata failed;"));
         assert!(error.to_string().contains("category=not_ready"));
+        assert!(error.to_string().contains("process_role=owned_member"));
+        assert!(error.message.contains("pending owned member exceeded"));
         assert!(
             error
                 .message
@@ -1069,18 +1125,20 @@ mod tests {
             known_rss_bytes: 8192,
             max_virtual_bytes: 65536,
         };
-        let mut first = Tracker::linux_jvm();
-        first.record_linux_pending_fact(pending_observation());
-        let error = first
-            .finish_linux_sample_at(GroupObservation::Pending(partial), at)
-            .unwrap_err();
-        assert!(
-            error
-                .message
-                .contains("requires an earlier complete resource sample")
-        );
-        assert_eq!(json(&first)["sample_count"], 0);
-        assert_eq!(json(&first)["peak_observed_aggregate_rss_bytes"], 0);
+        for role in [PendingRole::ReservedLeader, PendingRole::OwnedMember] {
+            let mut first = Tracker::linux_jvm();
+            first.record_linux_pending_fact(pending_observation_for_role(role));
+            let error = first
+                .finish_linux_sample_at(GroupObservation::Pending(partial), at)
+                .unwrap_err();
+            assert!(
+                error
+                    .message
+                    .contains("requires an earlier complete resource sample")
+            );
+            assert_eq!(json(&first)["sample_count"], 0);
+            assert_eq!(json(&first)["peak_observed_aggregate_rss_bytes"], 0);
+        }
         for sample in [
             Sample {
                 known_rss_bytes: MEMORY_LIMIT + 1,
@@ -1099,7 +1157,8 @@ mod tests {
             tracker
                 .record_linux_jvm_at(1, Some(4096), 8192, at)
                 .unwrap();
-            tracker.record_linux_pending_fact(pending_observation());
+            tracker
+                .record_linux_pending_fact(pending_observation_for_role(PendingRole::OwnedMember));
             assert_eq!(
                 tracker
                     .finish_linux_sample_at(GroupObservation::Pending(sample), at)
@@ -1142,54 +1201,104 @@ mod tests {
         );
         assert!(error.to_string().len() < 4096);
         assert_eq!(json(&tracker)["pending_leader_observations"]["count"], 2);
+        // Match the process boundary: collect every provisional fact, then
+        // merge that scan exactly once even when a later native check fails.
+        let mut scan = PendingObservations::default();
+        scan.record(pending_observation_for_role(PendingRole::OwnedMember));
+        scan.record(pending_observation_for_role(PendingRole::OwnedMember));
+        scan.record(pending_observation());
+        tracker.record_linux_pending_observations(scan);
+        let evidence = json(&tracker);
+        assert_eq!(evidence["pending_leader_observations"]["count"], 3);
+        assert_eq!(evidence["pending_member_observations"]["count"], 2);
+        assert_eq!(tracker.last_pending_role, Some(PendingRole::ReservedLeader));
+        let mut next_scan = PendingObservations::default();
+        next_scan.record(pending_observation_for_role(PendingRole::OwnedMember));
+        tracker.record_linux_pending_observations(next_scan);
+        tracker.record_linux_pending_observations(PendingObservations::default());
+        assert_eq!(tracker.last_pending_role, Some(PendingRole::OwnedMember));
+        let evidence = json(&tracker);
+        assert_eq!(evidence["pending_leader_observations"]["count"], 3);
+        assert_eq!(evidence["pending_member_observations"]["count"], 3);
+        for endpoint in ["first", "last"] {
+            assert_eq!(
+                evidence["pending_member_observations"][endpoint]["role"],
+                "owned_member"
+            );
+            assert_eq!(
+                evidence["pending_member_observations"][endpoint]["stat_observation"]["role"],
+                "owned_member"
+            );
+        }
+        let mut original =
+            ProcessError::new("process_identity", "later original leader anchor lost");
+        original.drained = false;
+        let error = tracker.with_linux_pending_diagnostics(original);
+        assert_eq!(error.kind, "process_identity");
+        assert!(!error.drained);
+        assert!(
+            error
+                .message
+                .starts_with("later original leader anchor lost;")
+        );
+        assert!(error.message.contains("linux_pending_leader(count=3;"));
+        assert!(error.message.contains("linux_pending_member(count=3;"));
+        assert!(error.message.contains("process_role=owned_member"));
+        assert!(error.to_string().len() < 8192);
     }
 
     #[test]
     fn jvm_pending_recovery_at_the_exact_gap_boundary_is_a_new_actual_complete() {
-        let at = Instant::now();
-        let mut tracker = Tracker::linux_jvm();
-        tracker
-            .record_linux_jvm_at(1, Some(4096), 8192, at)
-            .unwrap();
-        tracker.record_linux_pending_fact(pending_observation());
-        tracker
-            .finish_linux_sample_at(
-                GroupObservation::Pending(Sample {
-                    live_processes: 1,
-                    aggregate_rss_bytes: None,
-                    known_rss_bytes: 0,
-                    max_virtual_bytes: 8192,
-                }),
-                at + TARGET,
-            )
-            .unwrap();
-        let now = at + LINUX_PENDING_GAP;
-        tracker
-            .finish_linux_sample_at(
-                GroupObservation::Complete(Sample {
-                    live_processes: 0,
-                    aggregate_rss_bytes: Some(0),
-                    known_rss_bytes: 0,
-                    max_virtual_bytes: 0,
-                }),
-                now,
-            )
-            .unwrap();
-        assert!(!tracker.linux_pending());
-        assert_eq!(tracker.last_complete, Some(now));
-        let evidence = json(&tracker);
-        assert_eq!(evidence["sample_count"], 2);
-        assert_eq!(evidence["max_observed_sample_gap_ms"], 1000);
-        assert_eq!(evidence["peak_observed_aggregate_rss_bytes"], 4096);
-        assert_eq!(evidence["pending_leader_observations"]["count"], 1);
-        assert_eq!(evidence["incomplete_memory_sample_count"], 1);
-        // Only the active transition has a deadline. Its retained history
-        // does not impose a new quota on future ordinary Linux observations.
-        tracker
-            .record_linux_jvm_at(1, Some(8192), 8192, now + Duration::from_secs(2))
-            .unwrap();
-        assert_eq!(json(&tracker)["sample_count"], 3);
-        assert_eq!(json(&tracker)["max_observed_sample_gap_ms"], 2000);
+        for role in [PendingRole::ReservedLeader, PendingRole::OwnedMember] {
+            let at = Instant::now();
+            let mut tracker = Tracker::linux_jvm();
+            tracker
+                .record_linux_jvm_at(1, Some(4096), 8192, at)
+                .unwrap();
+            tracker.record_linux_pending_fact(pending_observation_for_role(role));
+            tracker
+                .finish_linux_sample_at(
+                    GroupObservation::Pending(Sample {
+                        live_processes: 1,
+                        aggregate_rss_bytes: None,
+                        known_rss_bytes: 0,
+                        max_virtual_bytes: 8192,
+                    }),
+                    at + TARGET,
+                )
+                .unwrap();
+            let now = at + LINUX_PENDING_GAP;
+            tracker
+                .finish_linux_sample_at(
+                    GroupObservation::Complete(Sample {
+                        live_processes: 0,
+                        aggregate_rss_bytes: Some(0),
+                        known_rss_bytes: 0,
+                        max_virtual_bytes: 0,
+                    }),
+                    now,
+                )
+                .unwrap();
+            assert!(!tracker.linux_pending());
+            assert_eq!(tracker.last_complete, Some(now));
+            let evidence = json(&tracker);
+            assert_eq!(evidence["sample_count"], 2);
+            assert_eq!(evidence["max_observed_sample_gap_ms"], 1000);
+            assert_eq!(evidence["peak_observed_aggregate_rss_bytes"], 4096);
+            let field = match role {
+                PendingRole::ReservedLeader => "pending_leader_observations",
+                PendingRole::OwnedMember => "pending_member_observations",
+            };
+            assert_eq!(evidence[field]["count"], 1);
+            assert_eq!(evidence["incomplete_memory_sample_count"], 1);
+            // Only the active transition has a deadline. Its retained history
+            // does not impose a new quota on future ordinary Linux observations.
+            tracker
+                .record_linux_jvm_at(1, Some(8192), 8192, now + Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(json(&tracker)["sample_count"], 3);
+            assert_eq!(json(&tracker)["max_observed_sample_gap_ms"], 2000);
+        }
     }
 
     #[test]

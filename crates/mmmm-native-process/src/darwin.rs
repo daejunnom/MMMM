@@ -89,6 +89,67 @@ impl fmt::Display for NativeResourceError {
 }
 impl std::error::Error for NativeResourceError {}
 
+/// Only the fields obtained from a complete task-info result. This cannot
+/// supply a rusage footprint or a process start identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskMemoryLowerBound {
+    adjusted_vm: u64,
+    rss: u64,
+}
+impl TaskMemoryLowerBound {
+    pub const fn adjusted_vm(self) -> u64 {
+        self.adjusted_vm
+    }
+    pub const fn rss(self) -> u64 {
+        self.rss
+    }
+}
+
+/// Presence of timestamps in an actual successful rusage return. These
+/// booleans do not expose or establish the process's current start identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RusageTimestampObservation {
+    start_observed: bool,
+    exit_observed: bool,
+}
+impl RusageTimestampObservation {
+    pub const fn start_observed(self) -> bool {
+        self.start_observed
+    }
+    pub const fn exit_observed(self) -> bool {
+        self.exit_observed
+    }
+}
+
+/// A failed memory observation with only facts already obtained by the same
+/// native query sequence. Construction stays inside this producer. Callers
+/// must still independently establish identity and their own pending policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryObservationFailure {
+    native: NativeResourceError,
+    task_lower_bound: Option<TaskMemoryLowerBound>,
+    rusage_timestamps: Option<RusageTimestampObservation>,
+}
+impl MemoryObservationFailure {
+    pub const fn native_error(self) -> NativeResourceError {
+        self.native
+    }
+    pub const fn task_lower_bound(self) -> Option<TaskMemoryLowerBound> {
+        self.task_lower_bound
+    }
+    pub const fn rusage_timestamps(self) -> Option<RusageTimestampObservation> {
+        self.rusage_timestamps
+    }
+    #[cfg(any(target_os = "macos", test))]
+    fn without_partial(native: NativeResourceError) -> Self {
+        Self {
+            native,
+            task_lower_bound: None,
+            rusage_timestamps: None,
+        }
+    }
+}
+
 /// Validate the entire `proc_pidinfo(PROC_PIDTASKINFO)` return value.
 /// A partial result is never an exit witness, even when errno is ESRCH.
 pub fn classify_task_result(bytes: i32, number: i32) -> Result<(), NativeResourceError> {
@@ -189,6 +250,30 @@ fn complete_observation(task: TaskInfo, usage: RusageInfoV0) -> MemoryObservatio
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn finish_rusage_observation(
+    task: TaskInfo,
+    usage: RusageInfoV0,
+    result: i32,
+    number: i32,
+) -> Result<MemoryObservation, MemoryObservationFailure> {
+    classify_rusage_result(result, number, usage.start_abstime, usage.exit_abstime).map_err(
+        |native| MemoryObservationFailure {
+            native,
+            task_lower_bound: Some(TaskMemoryLowerBound {
+                adjusted_vm: task.virtual_size,
+                rss: task.resident_size,
+            }),
+            // A failed call may have left arbitrary output in its buffer.
+            rusage_timestamps: (result == 0).then_some(RusageTimestampObservation {
+                start_observed: usage.start_abstime != 0,
+                exit_observed: usage.exit_abstime != 0,
+            }),
+        },
+    )?;
+    Ok(complete_observation(task, usage))
+}
+
 #[cfg(target_os = "macos")]
 #[link(name = "proc")]
 unsafe extern "C" {
@@ -211,13 +296,25 @@ unsafe extern "C" {
 /// deadline; the caller must check its original deadline before and after.
 #[cfg(target_os = "macos")]
 pub fn observe_memory(pid: i32) -> Result<MemoryObservation, NativeResourceError> {
+    observe_memory_with_partial(pid).map_err(MemoryObservationFailure::native_error)
+}
+
+/// The same strict native observation, retaining task-info lower bounds when
+/// rusage fails. A partial failure remains an error, never a complete sample.
+/// No native query is repeated for either API.
+#[cfg(target_os = "macos")]
+pub fn observe_memory_with_partial(
+    pid: i32,
+) -> Result<MemoryObservation, MemoryObservationFailure> {
     if pid <= 0 {
-        return Err(NativeResourceError {
-            stage: NativeResourceStage::ProcessIdentifier,
-            failure: NativeResourceFailure::InvalidProcessIdentifier,
-            native_result: 0,
-            native_errno: 0,
-        });
+        return Err(MemoryObservationFailure::without_partial(
+            NativeResourceError {
+                stage: NativeResourceStage::ProcessIdentifier,
+                failure: NativeResourceFailure::InvalidProcessIdentifier,
+                native_result: 0,
+                native_errno: 0,
+            },
+        ));
     }
     let mut task: TaskInfo = unsafe { std::mem::zeroed() };
     let mut usage: RusageInfoV0 = unsafe { std::mem::zeroed() };
@@ -233,7 +330,7 @@ pub fn observe_memory(pid: i32) -> Result<MemoryObservation, NativeResourceError
         );
         (bytes, *libc::__error())
     };
-    classify_task_result(bytes, task_errno)?;
+    classify_task_result(bytes, task_errno).map_err(MemoryObservationFailure::without_partial)?;
     let (result, usage_errno) = unsafe {
         *libc::__error() = 0;
         let result = proc_pid_rusage(
@@ -243,8 +340,7 @@ pub fn observe_memory(pid: i32) -> Result<MemoryObservation, NativeResourceError
         );
         (result, *libc::__error())
     };
-    classify_rusage_result(result, usage_errno, usage.start_abstime, usage.exit_abstime)?;
-    Ok(complete_observation(task, usage))
+    finish_rusage_observation(task, usage, result, usage_errno)
 }
 
 #[cfg(test)]

@@ -47,6 +47,50 @@ fn only_a_successful_started_unexited_rusage_is_usable() {
     assert_eq!(exited.stage, NativeResourceStage::Rusage);
     assert_eq!(exited.failure, NativeResourceFailure::Exited);
     assert_eq!((exited.native_result, exited.native_errno), (0, 0));
+
+    for (result, number, start, exit) in [
+        (-1, DARWIN_ESRCH, 11, 12),
+        (-1, 1, 11, 12),
+        (0, 0, 0, 12),
+        (0, 0, 11, 12),
+        (0, 1, 11, 12),
+    ] {
+        let task = TaskInfo {
+            virtual_size: 17,
+            resident_size: 23,
+            times: [0; 4],
+            counters: [0; 12],
+        };
+        let usage = RusageInfoV0 {
+            uuid: [0; 16],
+            times_and_counts: [0; 6],
+            resident_size: u64::MAX,
+            phys_footprint: u64::MAX,
+            start_abstime: start,
+            exit_abstime: exit,
+        };
+        let partial = finish_rusage_observation(task, usage, result, number).unwrap_err();
+        // The strict API maps the same failure back to precisely the original
+        // four fields, without a second observation or a weaker classification.
+        assert_eq!(
+            partial.native_error(),
+            classify_rusage_result(result, number, start, exit).unwrap_err()
+        );
+        let lower = partial.task_lower_bound().unwrap();
+        assert_eq!((lower.adjusted_vm(), lower.rss()), (17, 23));
+        assert_eq!(
+            partial.rusage_timestamps(),
+            (result == 0).then_some(RusageTimestampObservation {
+                start_observed: start != 0,
+                exit_observed: exit != 0,
+            })
+        );
+    }
+    let task_failure = MemoryObservationFailure::without_partial(
+        classify_task_result(0, DARWIN_ESRCH).unwrap_err(),
+    );
+    assert!(task_failure.task_lower_bound().is_none());
+    assert!(task_failure.rusage_timestamps().is_none());
 }
 
 #[test]
@@ -66,7 +110,7 @@ fn observation_keeps_native_start_and_distinct_memory_quantities() {
         exit_abstime: 0,
     };
     assert_eq!(
-        complete_observation(task, usage),
+        finish_rusage_observation(task, usage, 0, 0).unwrap(),
         MemoryObservation {
             adjusted_vm: 400 * 1024 * 1024 * 1024,
             rss: 1024,
@@ -95,6 +139,25 @@ fn resident_measure_never_drops_the_larger_task_value() {
     let actual = complete_observation(task, usage);
     assert_eq!(actual.rss, u64::MAX);
     assert_eq!(actual.start_abstime, u64::MAX);
+    for value in [0, u64::MAX] {
+        let task = TaskInfo {
+            virtual_size: value,
+            resident_size: value,
+            times: [0; 4],
+            counters: [0; 12],
+        };
+        let usage = RusageInfoV0 {
+            uuid: [0; 16],
+            times_and_counts: [0; 6],
+            resident_size: u64::MAX,
+            phys_footprint: u64::MAX,
+            start_abstime: 1,
+            exit_abstime: 2,
+        };
+        let partial = finish_rusage_observation(task, usage, 0, 0).unwrap_err();
+        let lower = partial.task_lower_bound().unwrap();
+        assert_eq!((lower.adjusted_vm(), lower.rss()), (value, value));
+    }
 }
 
 #[test]
