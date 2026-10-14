@@ -16,9 +16,9 @@ param(
     [string]$RustTarget,
     [string]$ManagedSlotRoot,
     [string]$JdkRoot,
-    # actions/runner-images Windows2025-Readme, image 20261004.281.1, lists
-    # this VS root. Actual path/compiler admission is still required per run.
-    [string]$WindowsVsRoot = 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise'
+    # The image README and the actual runner image can differ. An explicit
+    # root is validated as given; otherwise query the installed VC component.
+    [string]$WindowsVsRoot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -96,6 +96,156 @@ function Failure-Shape([System.Exception]$Exception) {
         $Exception = $Exception.InnerException
     }
     return [ordered]@{ phase=$phase; exceptions=$chain.ToArray(); chain_truncated=($null -ne $Exception) }
+}
+
+function Find-InstalledVisualStudio {
+    # Official installation/component selector and pipe encoding:
+    # https://github.com/microsoft/vswhere/wiki/Find-VC
+    # https://github.com/microsoft/vswhere/wiki/Encoding
+    # This process remains a child of the existing 180-second managed owner.
+    # Only its held Process handle is terminated here. Descendant containment
+    # and final drain remain factual responsibilities of that outer owner.
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $arguments = @('-latest','-products','*','-requires','Microsoft.VisualStudio.Component.VC.Tools.x86.x64','-property','installationPath','-utf8')
+    $record = [ordered]@{
+        schema='mmmm-observer-vswhere-discovery/1'; source_sha=$ExpectedSourceSha; target=$Target;
+        status='failed'; phase='vswhere_program_files'; program=[ordered]@{ role='installed_vswhere'; bytes=$null; sha256=$null; revalidated=$false };
+        argv=$arguments; argv_sha256=[System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($utf8.GetBytes((ConvertTo-Json -InputObject $arguments -Compress)))).ToLowerInvariant();
+        limits=[ordered]@{ work_ms=5000; cleanup_ms=2500; stdout_bytes=4096; stderr_bytes=4096 };
+        process_started=$false; command_exit=$null; root_exited=$false; root_exit_verified=$false;
+        pipes_complete=$false; output_complete=$false; termination_attempted=$false; stop_reason=$null;
+        stdout_bytes=0L; stderr_bytes=0L; stdout_sha256=$null; stderr_sha256=$null;
+        stdout_limit_exceeded=$false; stderr_limit_exceeded=$false;
+        selected_root_checked=$false; installation_path_bytes=$null; installation_path_sha256=$null;
+        elapsed_ms=0L; failure=$null; secondary_failures=@(); descendant_drain='external_managed_owner_required';
+        receipt_export='external_managed_deadline';
+        whole_toolchain_image_verified=$false
+    }
+    $process = [System.Diagnostics.Process]::new()
+    $cancel = [System.Threading.CancellationTokenSource]::new()
+    $heldProgram = $null
+    $pumps = @()
+    $selectedRoot = $null
+    $originalFailure = $null
+    $cleanupDeadline = $null
+    try {
+        $script:phase = 'vswhere_program_files'
+        $programFiles = Assert-Physical ([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::ProgramFilesX86)) $true
+        $script:phase = 'vswhere_executable'
+        $program = Assert-Physical (Join-Path $programFiles 'Microsoft Visual Studio/Installer/vswhere.exe') $false
+        $heldProgram = [System.IO.File]::Open($program, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        if ($heldProgram.Length -le 0 -or $heldProgram.Length -gt 16777216) { throw 'OBSERVER_VSWHERE_EXECUTABLE_BUDGET' }
+        $record.program.bytes = $heldProgram.Length
+        $record.program.sha256 = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($heldProgram)).ToLowerInvariant()
+        if ($clock.ElapsedMilliseconds -ge 5000) { throw 'OBSERVER_VSWHERE_PRESPAWN_DEADLINE' }
+        $script:phase = 'vswhere_spawn'
+        $info = [System.Diagnostics.ProcessStartInfo]::new()
+        $info.FileName = $program; $info.WorkingDirectory = $headerSlot
+        $info.UseShellExecute = $false; $info.CreateNoWindow = $true
+        $info.RedirectStandardInput = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+        foreach ($argument in $arguments) { $info.ArgumentList.Add($argument) }
+        $process.StartInfo = $info
+        if (-not $process.Start()) { throw 'OBSERVER_VSWHERE_PROCESS_START_FAILED' }
+        $record.process_started = $true
+        $process.StandardInput.Close()
+        $pumps = @(
+            [pscustomobject]@{ name='stdout'; source=$process.StandardOutput.BaseStream; buffer=[byte[]]::new(1024); output=[System.IO.MemoryStream]::new(); task=$null; done=$false; overflow=$false },
+            [pscustomobject]@{ name='stderr'; source=$process.StandardError.BaseStream; buffer=[byte[]]::new(1024); output=[System.IO.MemoryStream]::new(); task=$null; done=$false; overflow=$false }
+        )
+        foreach ($pump in $pumps) { $pump.task = $pump.source.ReadAsync($pump.buffer, 0, $pump.buffer.Length, $cancel.Token) }
+        $script:phase = 'vswhere_capture'
+        $stopHandled = $false
+        while ($true) {
+            foreach ($pump in $pumps) {
+                if (-not $pump.done -and -not $pump.overflow -and $pump.task.IsCompleted) {
+                    $read = $pump.task.GetAwaiter().GetResult()
+                    if ($read -eq 0) { $pump.done = $true; continue }
+                    if ($pump.output.Length + $read -gt 4096) {
+                        $pump.overflow = $true
+                        if ($null -eq $record.stop_reason) { $record.stop_reason = 'output_limit' }
+                    } else {
+                        $pump.output.Write($pump.buffer, 0, $read)
+                        $pump.task = $pump.source.ReadAsync($pump.buffer, 0, $pump.buffer.Length, $cancel.Token)
+                    }
+                }
+            }
+            $record.root_exited = $process.HasExited
+            if ($record.root_exited) { $record.command_exit = $process.ExitCode; $record.root_exit_verified = $true }
+            $record.pipes_complete = $pumps[0].done -and $pumps[1].done
+            if ($clock.ElapsedMilliseconds -ge 5000 -and $null -eq $record.stop_reason) { $record.stop_reason = 'deadline' }
+            if ($null -ne $record.stop_reason -and -not $stopHandled) {
+                $stopHandled = $true
+                $cleanupDeadline = [Math]::Min(7500L, $clock.ElapsedMilliseconds + 2500L)
+                if (-not $record.root_exited) {
+                    $record.termination_attempted = $true
+                    try { $process.Kill() }
+                    catch { $record.secondary_failures += Failure-Shape $_.Exception }
+                }
+            }
+            if ($record.root_exited -and $record.pipes_complete) { break }
+            if ($null -ne $cleanupDeadline -and $clock.ElapsedMilliseconds -ge $cleanupDeadline) { break }
+            [System.Threading.Thread]::Sleep(5)
+        }
+        $record.output_complete = $record.pipes_complete -and $null -eq $record.stop_reason
+        if (-not $record.root_exit_verified -or $record.command_exit -ne 0 -or -not $record.output_complete) { throw 'OBSERVER_VSWHERE_NATIVE_COMPLETION_FAILED' }
+        $script:phase = 'vswhere_output_frame'
+        # Do not print or persist the installation pathname. Strict decoding
+        # accepts one nonempty line and one ordinary terminal newline only.
+        $stdoutText = $utf8.GetString($pumps[0].output.ToArray())
+        $stderrText = $utf8.GetString($pumps[1].output.ToArray())
+        if ($stderrText.Length -ne 0 -or $stdoutText -cnotmatch '\A[A-Za-z]:\\[^\x00-\x1f\x7f]+\r?\n\z') { throw 'OBSERVER_VSWHERE_OUTPUT_FRAME' }
+        $candidate = $stdoutText.TrimEnd([char[]]@("`r","`n"))
+        if ($candidate -cne $candidate.Trim() -or $candidate.Contains('"')) { throw 'OBSERVER_VSWHERE_OUTPUT_FRAME' }
+        $script:phase = 'vswhere_installation_root'
+        $selectedRoot = Assert-Physical $candidate $true
+        $record.selected_root_checked = $true
+        $pathBytes = $utf8.GetBytes($selectedRoot)
+        $record.installation_path_bytes = $pathBytes.Length
+        $record.installation_path_sha256 = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($pathBytes)).ToLowerInvariant()
+        $script:phase = 'vswhere_input_revalidation'
+        $heldProgram.Position = 0
+        if ($heldProgram.Length -ne $record.program.bytes -or
+            [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($heldProgram)).ToLowerInvariant() -cne $record.program.sha256 -or
+            (Get-Hash $program 16777216) -cne $record.program.sha256) { throw 'OBSERVER_VSWHERE_EXECUTABLE_CHANGED' }
+        $record.program.revalidated = $true
+        if ($clock.ElapsedMilliseconds -ge 5000) { throw 'OBSERVER_VSWHERE_TOTAL_WORK_DEADLINE' }
+        $record.status = 'passed'
+    } catch {
+        $originalFailure = $_.Exception
+        $record.failure = Failure-Shape $originalFailure
+    } finally {
+        # Failure before the normal wait loop still needs an actual bounded
+        # root-process exit observation. Never enumerate PIDs or kill a tree.
+        if ($record.process_started -and -not $record.root_exit_verified) {
+            try {
+                if ($null -eq $cleanupDeadline) { $cleanupDeadline = [Math]::Min(7500L, $clock.ElapsedMilliseconds + 2500L) }
+                if (-not $process.HasExited) { $record.termination_attempted = $true; $process.Kill() }
+                while (-not $process.HasExited -and $clock.ElapsedMilliseconds -lt $cleanupDeadline) { [System.Threading.Thread]::Sleep(5) }
+                if ($process.HasExited) { $record.root_exited = $true; $record.command_exit = $process.ExitCode; $record.root_exit_verified = $true }
+            } catch { $record.secondary_failures += Failure-Shape $_.Exception }
+        }
+        $cancel.Cancel()
+        foreach ($pump in $pumps) {
+            $record[$pump.name + '_bytes'] = $pump.output.Length
+            $record[$pump.name + '_limit_exceeded'] = $pump.overflow
+            $record[$pump.name + '_sha256'] = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($pump.output.ToArray())).ToLowerInvariant()
+            $pump.output.Dispose()
+        }
+        if ($null -ne $heldProgram) { $heldProgram.Dispose() }
+        $process.Dispose(); $cancel.Dispose()
+        $record.phase = $phase; $record.elapsed_ms = $clock.ElapsedMilliseconds
+        # This immutable receipt describes the completed discovery/cleanup.
+        # Its file export remains under the original outer managed deadline.
+        if ($clock.ElapsedMilliseconds -ge 7500 -and $null -eq $originalFailure) {
+            $originalFailure = [System.InvalidOperationException]::new('OBSERVER_VSWHERE_FINALIZATION_DEADLINE')
+            $record.status = 'failed'; $record.failure = Failure-Shape $originalFailure
+        }
+        try { Write-NewJson (Join-Path $evidence 'observer-vswhere-discovery.json') $record 65536 }
+        catch { if ($null -eq $originalFailure) { $originalFailure = $_.Exception }; $record.status = 'failed' }
+    }
+    if ($null -ne $originalFailure) { throw $originalFailure }
+    if ($record.status -cne 'passed') { throw 'OBSERVER_VSWHERE_DISCOVERY_FAILED' }
+    return $selectedRoot
 }
 
 function Get-ManagedRecords([string]$Root, [string]$Purpose) {
@@ -189,20 +339,44 @@ try {
         if ([System.IO.Path]::GetFileName($headerCatalog) -cne 'managed-v1' -or
             (Is-Inside $candidateEvidence $headerCatalog) -or (Is-Inside $headerCatalog $candidateEvidence)) { throw 'OBSERVER_HEADER_EVIDENCE_BOUNDARY' }
         $evidence = $candidateEvidence
+        $compilerSelection = [ordered]@{ schema='mmmm-observer-compiler-selection/1'; source_sha=$ExpectedSourceSha; target=$Target;
+            mode= $(if ($PSBoundParameters.ContainsKey('WindowsVsRoot')) { 'explicit_root' } elseif ($IsWindows) { 'installed_vswhere' } else { 'native_compiler' });
+            selected_root_checked=$false; discovery_record_sha256=$null; launcher=$null; compiler=$null;
+            whole_toolchain_image_verified=$false }
+        $phase = 'compiler_jdk_root'
         $selectedJdk = Assert-Physical $JdkRoot $true
         if ($IsWindows) {
-            $vs = Assert-Physical $WindowsVsRoot $true
+            if ($PSBoundParameters.ContainsKey('WindowsVsRoot')) {
+                $phase = 'compiler_explicit_vs_root'
+                # An empty or rejected explicit root never triggers discovery.
+                $vs = Assert-Physical $WindowsVsRoot $true
+            } else {
+                $phase = 'compiler_installed_vs_discovery'
+                $vs = Find-InstalledVisualStudio
+                $compilerSelection.discovery_record_sha256 = Get-Hash (Join-Path $evidence 'observer-vswhere-discovery.json') 65536
+            }
+            $compilerSelection.selected_root_checked = $true
+            $phase = 'compiler_devshell_launcher'
             $launcher = Assert-Physical (Join-Path $vs 'Common7/Tools/Launch-VsDevShell.ps1') $false
+            $compilerSelection.launcher = [ordered]@{ role='selected_vs_devshell_launcher'; bytes=[System.IO.FileInfo]::new($launcher).Length; sha256=(Get-Hash $launcher 1048576) }
+            $phase = 'compiler_devshell_setup'
             & $launcher -Arch amd64 -HostArch amd64 -SkipAutomaticLocation | Out-Null
+            $phase = 'compiler_command_lookup'
             $compilerCommand = Get-Command cl.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1
         } else {
+            $phase = 'compiler_command_lookup'
             $compilerName = if ($IsMacOS) { 'clang' } else { 'gcc' }
             $compilerCommand = Get-Command $compilerName -CommandType Application -ErrorAction Stop | Select-Object -First 1
         }
+        $phase = 'compiler_physical_executable'
         $compilerItem = Get-Item -LiteralPath $compilerCommand.Source -Force
         $compilerTarget = $compilerItem.ResolveLinkTarget($true)
         $compiler = Assert-Physical $(if ($null -eq $compilerTarget) { $compilerItem.FullName } else { $compilerTarget.FullName }) $false
+        $phase = 'compiler_executable_profile'
         if ($IsWindows -and (-not (Is-Inside $compiler $vs) -or $compiler -notmatch '[\\/]VC[\\/]Tools[\\/]MSVC[\\/][0-9.]+[\\/]bin[\\/]Hostx64[\\/]x64[\\/]cl\.exe$')) { throw 'OBSERVER_COMPILER_PROFILE_MISMATCH' }
+        $compilerSelection.compiler = [ordered]@{ role='selected_physical_c_compiler'; bytes=[System.IO.FileInfo]::new($compiler).Length; sha256=(Get-Hash $compiler 536870912) }
+        $phase = 'compiler_selection_export'
+        Write-NewJson (Join-Path $evidence 'observer-compiler-selection.json') $compilerSelection 65536
         $phase = 'header_witness'
         # Use its own -File process: the ABI helper's exit belongs to that
         # process, while this launcher and all descendants retain the same
@@ -351,7 +525,11 @@ try {
     $result.header_witness = 'running'
     $headerEvidence = New-Directory (Join-Path $evidence 'header-witness')
     $headerManaged = New-Directory (Join-Path $evidence 'header-managed')
-    & $xtaskProgram run --checkout $checkoutRoot --output-root $output --evidence-root $headerManaged --purpose jvm --timeout-seconds 180 --owned-tail-policy terminate-build -- $pwsh -NoProfile -File (Join-Path $checkoutRoot 'tools/bootstrap/observer-ci.ps1') -Action header -Checkout $checkoutRoot -EvidenceRoot $headerEvidence -ExpectedSourceSha $ExpectedSourceSha -Target $Target -ManagedSlotRoot $jvmSlot -JdkRoot $jdk -WindowsVsRoot $WindowsVsRoot | Out-Null
+    $headerArgs = @('run','--checkout',$checkoutRoot,'--output-root',$output,'--evidence-root',$headerManaged,'--purpose','jvm','--timeout-seconds','180','--owned-tail-policy','terminate-build','--',
+        $pwsh,'-NoProfile','-File',(Join-Path $checkoutRoot 'tools/bootstrap/observer-ci.ps1'),'-Action','header','-Checkout',$checkoutRoot,'-EvidenceRoot',$headerEvidence,
+        '-ExpectedSourceSha',$ExpectedSourceSha,'-Target',$Target,'-ManagedSlotRoot',$jvmSlot,'-JdkRoot',$jdk)
+    if ($PSBoundParameters.ContainsKey('WindowsVsRoot')) { $headerArgs += @('-WindowsVsRoot',$WindowsVsRoot) }
+    & $xtaskProgram @headerArgs | Out-Null
     $headerExit = $LASTEXITCODE
     $headerRecords = Get-ManagedRecords $headerManaged 'jvm'
     Add-ManagedStep 'header_witness' 'header-managed' $headerExit $headerRecords
@@ -397,7 +575,8 @@ try {
         if ($null -ne $evidence) {
             try { Write-NewJson (Join-Path $evidence 'observer-header-launcher-failure.json') ([ordered]@{
                 schema='mmmm-observer-header-launcher-failure/1'; source_sha=$ExpectedSourceSha; target=$Target;
-                failure=$result.failure; abi_witness='not_established'; native_supervision='external_record_required' }) 65536 } catch { }
+                failure=$result.failure; compiler_selection=$(if (Get-Variable compilerSelection -ErrorAction SilentlyContinue) { $compilerSelection } else { $null });
+                abi_witness='not_established'; native_supervision='external_record_required' }) 65536 } catch { }
         }
     }
 } finally {
