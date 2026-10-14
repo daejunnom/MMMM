@@ -395,11 +395,21 @@ impl NativeOwnedSourceCommitPermit for TestPermit {
             |row| row.get(0),
         )?;
         if provisional_project == 1 {
-            let owned: i64 = store.connection.query_row(
-                "SELECT count(*) FROM owned_document_provenance WHERE project_id=?1 AND project_revision=?2",
-                params![view.request.project.as_str(), view.next_project["revision"].as_str().unwrap()],
-                |row| row.get(0),
+            // resource-only 최초 batch에는 owned registry가 아직 없을 수 있다.
+            // 실제 테이블 부재는 0개이며, 다음의 기대 문서 개수 비교는 그대로 유지한다.
+            let owned_registry: bool = store.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='owned_document_provenance')",
+                [], |row| row.get(0),
             )?;
+            let owned: i64 = if owned_registry {
+                store.connection.query_row(
+                    "SELECT count(*) FROM owned_document_provenance WHERE project_id=?1 AND project_revision=?2",
+                    params![view.request.project.as_str(), view.next_project["revision"].as_str().unwrap()],
+                    |row| row.get(0),
+                )?
+            } else {
+                0
+            };
             let resources: i64 = store.connection.query_row(
                 "SELECT count(*) FROM project_resource_provenance WHERE project_id=?1 AND project_revision=?2",
                 params![view.request.project.as_str(), view.next_project["revision"].as_str().unwrap()],
@@ -1329,3 +1339,7 @@ fn unresolved_durable_dispatch_fences_membership_even_with_disjoint_scope() {
     assert_unchanged(&store, &baseline, &base);
     assert_eq!(store.unresolved_dispatches().unwrap().len(), 1);
 }
+
+// 같은 보호 Store/bootstrap/Batch fixture로 source 사용 결정의 별도 수명을 검사한다.
+#[path = "catalog_source_use_tests.rs"]
+mod catalog_source_use_tests;

@@ -12,6 +12,7 @@ mod types;
 pub mod artifact;
 pub mod authored_projection;
 pub mod bootstrap;
+pub mod catalog_source_use;
 pub mod host_setup;
 pub mod native_owned_sources;
 pub mod owned_documents;
