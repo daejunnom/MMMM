@@ -179,6 +179,41 @@ pipe의 끝, 완전한 capture 및 export를 확인해야 정리를 완료로 �
 Rust 최초 인계 control 명령은 기본 strict 정책을 사용한다. 실제 OS별 fixture와
 native 실행 결과를 확인하기 전에는 이 소스 선택을 3개 OS 검증 성공으로 표시하지 않는다.
 
+### 게임 검증 자료와 정상 종료 입력
+
+[MMMM-D050](DECISIONS.md)의 retained game storage는 build slot의 scratch나 cache가
+아닌 명시 root를 사용한다. 현재 `ManagedBuild`를 borrow한 handle만 root/game의
+열린 directory identity, 현재 build 소유권과 closed owner/lease를 검사한다. 새 root는
+이 호출이 직접 생성한 경우만 초기화하고, 기존 빈 디렉터리·제품 DB/CAS·unknown
+entry·중단 lease를 자동 채택하지 않는다. 기존 root는 정확히 일치하는 complete owner가
+있을 때만 재사용한다. raw path나 token은 공개 Debug 및 완료 영수증에 넣지 않는다.
+
+game tree는 내용·hash 없이 실제 파일 길이를 관측한다. 두 lexical secret guard를
+parent와 leaf의 metadata보다 먼저 적용하고, 깊이 64·100000 entries와 원 checkpoint를
+유지한다. 내부 link·reparse·hardlink도 거절하며 missing·I/O 오류를 0으로 채우지 않는다.
+owner/lease를 포함한 선택 retained root의 크기를 현재 build slot/catalog와 checked
+합산하여 기존 8/12 GiB에 대조한다. 다른 retained roots 전체의 quota나 관측 사이의
+증가 방지는 보장하지 않는다. 초과 자료를 자동 삭제하지 않는다.
+
+실패한 명령도 실제 native drain과 증거 export를 확인하면 owner를 complete로 기록하고
+해당 lease만 해제할 수 있다. world/config와 실패 진단은 보존하며 Drop·build finish·
+cache eviction이 game root를 회수하지 않는다. 마지막 ownership 검증 뒤 path unlink는
+기존 관리 catalog와 같은 cooperative filesystem 경계다. hostile 동일 UID가 그 사이
+namespace를 바꾸는 경우의 atomic compare-inode-and-unlink 보장으로 해석하지 않는다.
+
+`ProcessSpec.minecraft_stop`은 기본 None이며 기존 null stdin을 유지한다. opt-in
+`MinecraftStopHandle`은 한 supervision에만 bind하고 writer나 임의 입력 bytes를 공개하지
+않는다. 요청은 private `stop\n` 5 bytes만 전송한다. Windows는 실제 pipe capacity와
+독점 writer를 확인한 cooperative 동기 write이며 Unix는 nonblocking/CLOEXEC writer다.
+partial bytes·WouldBlock·실제 native error·close 불확실성을 보존한다. WouldBlock은
+원 loop와 기한 안에서만 다시 검사하며 새 timeout이나 별도 무한 retry를 만들지 않는다.
+
+정상 요청 뒤에도 자원·disk·capture·취소·기한·tail·drain 감독을 계속한다. 전송 실패는
+기존 supervisor failure와 소유 scope 종료로 연결한다. pipe에 쓴 5 bytes와 close는 게임의
+명령 처리·월드 저장·정상 stop acknowledgement가 아니며 결과도 `not_observed`다.
+실제 CLI 연결, 동의한 EULA, final game cwd·launcher·ordinary host JAR origin 및 실제
+게임 결과는 [구현 착수 조건](implementation-readiness.md)의 별도 관측으로 확인한다.
+
 ## 정리 경계와 복구
 
 정리는 소유 루트의 정확한 대상만 수행한다. 최종 절대 경로, 포함 관계,

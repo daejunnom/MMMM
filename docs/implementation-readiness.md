@@ -427,6 +427,54 @@ native/header는 명시 owned-tail 정리를 거쳤고 다른 해당 단계는 �
 target policy·whole JDK image와 실제 게임·릴리스 인수는 계속 미검증이며, 이어 작성한
 private pack collector의 새 source를 이 성공에 합산하지 않는다.
 
+### Private pack 관측 source의 후속 3개 OS 검증
+
+source `9d071f55c5d05c80865313ba60c01b7d78d6a961`의
+[Rust CI45](https://github.com/daejunnom/MMMM/actions/runs/38633639969)와
+[JVM CI36](https://github.com/daejunnom/MMMM/actions/runs/38633639659)는 세 OS job 및
+각 집계가 모두 성공했다. source·expected·PR head는 이 SHA로 일치하며 event merge
+SHA `c32ec1e1a71491a5afb027cd8c1797487d598d63`와 구분했다. 여섯 원본 ZIP을 별도
+보존하고 실제 bytes·digest를 대조했다. 다음 수치는 이 source의 실행에 한정한다.
+
+| OS | Rust ZIP bytes / SHA-256 | unit/bin PASS / ignored | doc PASS |
+|---|---|---:|---:|
+| Windows | 49,807 / `8c9737d0b5aa574ce99ea80fd78703ad823c42cd0a156e6da5d94efc05066920` | 1,132 / 2 | 1 |
+| Linux | 50,401 / `0c2e3e744de325b5d56e4b97d5a9b21359d89c9591a5c5df71e727063f54b44b` | 1,144 / 4 | 1 |
+| macOS | 52,357 / `8aa1a299833f2c4623efefe349fc8b16a0ef79f82e51820e8da41fbf60380b02` | 1,141 / 1 | 1 |
+
+unit/bin 16개와 doc 14개의 failed는 모두 0이며 별도 harness-free native stdio도
+통과했다. 세 OS의 format·strict Clippy와 저장소 검사 464 files / violations 0이
+일치한다. Windows stderr의 실제 진행은 4,096 bytes / 88 ms, Linux는
+65,536 bytes / 88 ms, macOS는 65,536 bytes / 294 ms다. 사후 witness의
+`delivered_bytes`는 각각 4,096 / 65,536 / 65,536이며 별도 `retained_bytes` field는 없다.
+같은 1 MiB 요청·진행 후 200 ms 상한·deadline 오류·drain을 각각 구분해 보존한다.
+
+JVM ZIP은 Windows 351,347 bytes·SHA
+`4917d25458ea1973311fc2cb650f267f6203dc37e8a2df53ce2fec4f01ef7a8a`、
+Linux 1,862,926 bytes·SHA
+`5088a624b2432b73a9a1215ae4f389c54be87788ff82b0f5c1d074d07dbae221`、
+macOS 537,077 bytes·SHA
+`47ed0dbd8bb556316d5119b79ae34419c9c57570342ae6a55cc55bae51b9351f`다.
+각 OS의 7 modules / 333 tests / failure·error·skip 0, 필수 11 tasks executed를
+확인했다. 내역은 108 / 89 / 17 / 68 / 22 / 18 / 11이며 fabric-host의 새 private pack
+경계 검사 6개를 포함한다. observer 9 receipts와 prior JVM 5 receipts의 raw digest,
+ABI 8 pins, startup의 13 phases·acquire/pre/post 각 12 pins가 일치한다.
+observer manifest 53 source blobs는 세 OS 모두 고정 Git bytes 전체와 일치한다.
+JVM source inventory 169개는 Linux/macOS에서 전체 raw Git blobs와도 대조했다.
+
+이번 Linux JVM 세 단계는 incomplete sample 0·leader/member history null이며,
+macOS의 Rust/JVM 각 네 단계도 Pending/native-memory-exit history가 null이었다.
+CI44/JVM35의 실제 종료 경합을 이번 관측에 이월하지 않고 D047/D048의 순수 검사와
+실제 분기 발현을 구분한다. Linux의 일반 Rust AS policy에는 JVM용 history field
+자체가 없으며 null인 JVM 기록과도 구분한다. macOS Rust test는 221,779 ms,
+strict는 59,751 ms·최대 실제 gap은 294 ms이며 기존 자원 상한 안이었다.
+
+관측한 관리 실행은 exit 0·drain·output·export·scratch 정리·lease 해제와
+supervisor/cleanup 오류 0을 유지한다. Windows JVM native/header의 명시 owned-tail
+종료는 자연 종료와 구분한다. raw XML 및 archive 밖 JDK/compiler/JAR payload 전체의
+재 hash, 실제 Mixin graph 양성, SourceAdmission·target policy·whole JDK image·게임 및
+공개 릴리스 인수는 이 성공에 포함하지 않는다.
+
 ### 실제 게임 입력의 archive 관측
 
 로컬의 실제 Minecraft merged JAR 관측은 처음에
@@ -506,6 +554,90 @@ filter·client active stack·pack completeness·loaded definition·SourceAdmissi
 완료 pairing을 요구하는 runtime_sources 양성을 증명하지 않는다. 실제 게임 준비는
 build scratch와 별개로 world/EULA/config를 보존할 root 및 실제 runtime launcher
 관측이 필요하며, 현재 Gradle dev run 경로를 출시용 launcher로 보고하지 않는다.
+
+### Retained root와 고정 stop 입력의 Windows 검증
+
+D050의 `RetainedGame`과 opt-in `MinecraftStopHandle`을 구현했다. 처음 작성한 Windows
+검사는 compile 성공 뒤 225 PASS·1 FAIL·1 ignored였으며, failure는 열린 directory
+handle 상태의 rename을 Windows가 PermissionDenied/raw 5로 거절한 fixture 전제였다.
+이 실행은 command 101·24,925 ms·명시 owned-tail 종료로 보존했다. Windows의 정확한
+native 거절에서 원 root·owner/lease bytes·world 보존을 확인하도록 검사하고, rename이
+성공한 환경에서는 기존 교체 identity 거절 검사를 유지했다. 오류를 일반 성공이나 WSL
+전환 근거로 재분류하지 않았다.
+
+독립 리뷰에서 bare secret selector의 두 번째 guard가 metadata 뒤에 있던 P2도 발견해
+두 lexical guard를 parent/leaf metadata 앞에 배치했다. 존재하지 않는 parent 아래의
+세 selector를 이용해 I/O보다 secret 오류가 먼저 반환되는지 검사하며 실제 secret
+파일을 생성하거나 열지 않는다. 재리뷰 뒤 Windows 도구 lib 227 PASS·1 ignored,
+command 0·23,174 ms·명시 owned-tail 종료와 lib strict Clippy 0·1,736 ms·자연 종료를
+확인했다. 이 실행은 bin/전체 workspace 검사를 포함하지 않는다. formatting과 모든
+관련 실행의 drain·output·export·scratch 정리·lease 해제, supervisor/cleanup 오류 0을
+보존했다.
+
+새 source의 controlled-input 검사 4개는 실제 고정 5 bytes+EOF·one-use control·기본
+null/미요청 opt-in·peer read-end 종료의 native 오류 및 drain을 확인하고, 집중 port에서
+partial/WouldBlock/뒤따른 오류와 별도 close 오류를 보존한다. retained 검사 12개는
+Windows의 소유권·busy·보존·root 교체·combined budget·취소·secret 경계를 확인했다.
+Unix 전용 검사와 nonblocking write·Darwin 실행은 미검증이다. lease 해제의 cooperative
+verification→unlink 경계를 소스와 빌드 문서에 명시했으며 hostile 동일 UID의 원자
+교체 방어를 발급하지 않는다. 실제 CLI 연결·게임 시작·Minecraft 처리/저장 acknowledgement
+및 pairing 양성은 이 lib 검증과 별개다.
+
+### 게임 실행 전의 launcher 및 보존 경로 준비
+
+Windows의 별도 help action에서 실제 `:fabric-host:runServer` task의 metadata만
+조회했다. 앞선 helper의 missing working-directory 후검사 누락은 실행 전 독립
+리뷰에서 발견했다. 원본은 미실행으로 보존하고 새 v2에서 missing chain 전체와
+nearest-existing physical parent의 metadata를 전후 대조한 뒤 재리뷰했다.
+v2 source는 15,321 bytes·SHA
+`3a0cd649a931f096b1fbee0f815f9e5f31b6c149e2c081e0aa832806135d3749`다.
+실제 help만 1 task executed·command 0·11,846 ms·자연 종료이며 task/dependency/game
+action이나 EULA 처리는 실행하지 않았다. 출력은 51,669 bytes·SHA
+`8fe2f805f467c153f1b243c3f47ca38cc905555f075c7bec81b6c16641f45c4e`다.
+
+실제 task type은 `net.fabricmc.loom.task.RunGameTask_Decorated`이면서 JavaExec이고,
+main은 `net.fabricmc.devlaunchinjector.Main`이다. classpath는 directory 2개·ordinary
+file 128개이며 직접 dependency task 5개의 경로를 관측했다. 이 시점의 JavaExec
+working directory는 checkout의 `jvm/fabric-host`였다. 추적 runDir 선언과 최종 실행
+시 적용되는 경계를 아직 같은 것으로 볼 수 없으므로 이 hint를 최종 game cwd·EULA
+위치 또는 완성된 direct Java launch spec으로 사용하지 않는다. metadata 전후 동일은
+불변 file identity·내용 검증·SourceAdmission·사용 권한을 발급하지 않는다.
+
+같은 Windows 빌드에서 실제 task 목록을 확인한 뒤 `:fabric-host:jar`를 실행했다.
+command 0·9,319 ms·자연 종료, 10 actionable tasks 중 2 executed·8 up-to-date다.
+생성된 호스트 JAR은 3,509,931 bytes·SHA
+`ef3949b84b24fa686a65eeb8c5698aac8005bbaffdedb13a45399c28acb224b7`이며 별도 실제
+archive producer가 complete true·members 108·directories 7·decoded 4,185,463 bytes를
+확인했다. producer 내부 71 ms·전체 command 165 ms를 구분한다. 부모의 Windows
+read handle에서 write/delete 공유를 닫은 동안 producer digest와 전후 held digest가
+일치했다. 선택한 세 metadata member만 8 KiB씩 제한해 읽었으며 manifest의 mapping
+namespace `official`·게임 26.3·Loom 1.17.21·Gradle 9.6.0·loader 0.19.5를 관측했다.
+내장 Mixin JSON digest는 현재 source와 같고 required/defaultRequire 1을 유지한다.
+이는 JAR 생성과 정적 입력 검증이며 실제 loader 설치·Mixin 양성·pairing·SourceAdmission
+또는 세 OS에서 배포할 동일 파일의 인수를 의미하지 않는다.
+
+관련 실행의 drain·출력·export·scratch 정리·lease 해제와 supervisor/cleanup 오류 0을
+확인했다. game root와 정상 stop 제어를 준비하는 동안에도 실제 게임은 미실행이며
+world/config 보존, 실제 관리자 연결과 최종 배포 인수는 별도 단계로 남긴다.
+
+[공식 Fabric server launcher 페이지](https://fabricmc.net/use/?page=server)가 제시한
+26.3 / loader 0.19.5 / launcher 1.1.2의 고정 HTTPS 입력을 별도 관리 실행에서
+다운로드만 했다. 실제 입력은 181,838 bytes·관측 SHA
+`0b56ad54d762172e8b8748e467f584f071e4dedecd93dc336cf2c68837e790be`다.
+다운로드 helper 내부 579 ms·command 0/981 ms·자연 종료이며 upstream digest 대조나
+불변 file identity·SourceAdmission·사용 권한을 발급하지 않았다. 8 MiB·원 45초,
+독립 cleanup·원 오류 및 출력 반환 뒤 기한 검사를 재리뷰하고, 외부 120초 감독과
+drain/output/export/scratch/lease를 따로 확인했다. 미실행 이전 helper 두 개도 보존했다.
+
+이 vendor launcher를 제품 archive producer에 넣은 별도 실행은
+`INPUT_ARCHIVE_PROFILE_UNSUPPORTED`·command 1/117 ms로 거절됐다. 125개 entry 중
+124개의 실제 local header가 versionNeeded 10·Deflate 8이며 central은 versionNeeded
+20이었다. 현재 producer는 Deflate에 version 20을 요구한다. 이 원 실패와 정상 drain·
+보존 결과를 유지하고 지원 profile이나 상한을 바꾸지 않았다. vendor 도구 입력 관측과
+제품 source inventory 인수는 별개다. 같은 held input의 선택한 installer 선언/bytecode를
+실제 javap로 읽은 command는 0/1,929 ms·자연 종료다. manifest의 진입점은 실제 게임을
+시작하는 ServerLauncher이며, 명시적인 Main의 server 설치 분기와 구분한다. installer 및
+그 전이 호출·실제 설치 결과는 아직 미실행이며 EULA 수락·게임 인수로 올리지 않는다.
 
 실패한 실행의 원본 판정은 유지한다. native drain과 정확한 소유 기록을 확인하고
 로그를 별도로 내보내며 digest를 대조한 경우에만 해당 실행의 알려진 임시 파일을

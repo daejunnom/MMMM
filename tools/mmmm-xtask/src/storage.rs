@@ -1,4 +1,6 @@
 //! Owned build storage. Uncertain process or filesystem state preserves the lease.
+#[path = "retained_game.rs"]
+pub mod retained_game;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
