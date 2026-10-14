@@ -6,11 +6,12 @@ use super::{
     BlobRef, DurableStore, StorageError, StorageResult, journal::pin_blob,
     project_resources::ProjectSourceRpcContext,
 };
+use mmmm_contracts::strict_json::{ControlledJsonError, parse_json_with_control};
 use mmmm_contracts::{
     ContextId, JsonLimits, ObjectId, PrincipalId, ProjectId, Sha256Digest, canonical_digest,
     encode_json, parse_json_with_limits, verify_projected_digest,
 };
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -125,14 +126,69 @@ pub fn register_owned_document(
     validate_owned_membership(&stored_project, pin)?;
     let bytes = validate_document(store, pin, document, false)?;
     let blob = store.cas.put(&bytes)?;
-    store.cas.verify(&blob)?;
+    // Keep the existing public API's encode_json bytes. The transaction helper
+    // also accepts original raw bytes already placed in CAS by native ingress.
+    let transaction =
+        Transaction::new_unchecked(&store.connection, TransactionBehavior::Immediate)?;
+    register_owned_document_blob_in(
+        store,
+        &transaction,
+        project,
+        project_revision,
+        pin,
+        &blob,
+        &mut || Ok(()),
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// One existing transaction owns history, immutable raw CAS association and
+/// retention. This helper never commits or opens another transaction. The
+/// surrounding writer must authorize current Store/Project/source access and
+/// fences. A BlobRef alone supplies no ownership: actual historical Project
+/// membership and strict raw CAS bytes are checked here before registration.
+pub(crate) fn register_owned_document_blob_in<F>(
+    store: &DurableStore,
+    transaction: &Transaction<'_>,
+    project: &ProjectId,
+    project_revision: &Sha256Digest,
+    pin: &OwnedDocumentPin,
+    blob: &BlobRef,
+    check: &mut F,
+) -> StorageResult<()>
+where
+    F: FnMut() -> StorageResult<()>,
+{
+    check()?;
+    if !std::ptr::eq(&**transaction, &store.connection) {
+        return Err(StorageError::Conflict(
+            "Owned source transaction belongs to another Store",
+        ));
+    }
+    if blob.byte_length == 0 || blob.byte_length > MAX_OWNED_DOCUMENT_BYTES {
+        return Err(StorageError::InvalidInput(
+            "Owned document raw CAS byte budget".into(),
+        ));
+    }
+    let stored_project = load_project_revision_checked(store, project, project_revision, check)?;
+    validate_owned_membership(&stored_project, pin)?;
+    let raw = store
+        .cas
+        .read_verified_document(blob, MAX_OWNED_DOCUMENT_BYTES, &mut *check)?;
+    let document =
+        parse_json_with_control(&raw, JsonLimits::default(), &mut *check).map_err(|cause| {
+            match cause {
+                ControlledJsonError::Control(cause) => cause,
+                ControlledJsonError::Json(cause) => StorageError::Contract(cause.to_string()),
+            }
+        })?;
+    validate_document(store, pin, &document, false)?;
+    check()?;
     let owner = canonical_digest(&json!({
         "projectId":project,"kind":pin.kind,"objectId":pin.object_id,"revision":pin.revision,
     }))
     .map_err(|e| StorageError::Contract(e.to_string()))?;
-    let transaction = store
-        .connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(REGISTRY_SCHEMA)?;
     let old: Option<(String, i64)> = transaction.query_row(
         "SELECT blob_digest,byte_length FROM owned_documents WHERE project_id=?1 AND kind=?2 AND object_id=?3 AND revision=?4",
@@ -168,7 +224,7 @@ pub fn register_owned_document(
             "Immutable owned-document provenance",
         ));
     }
-    pin_blob(&transaction, "owned_document", owner.as_str(), &blob)?;
+    pin_blob(transaction, "owned_document", owner.as_str(), blob)?;
     transaction.execute(
         "INSERT OR IGNORE INTO owned_documents(project_id,kind,object_id,revision,blob_digest,byte_length) VALUES(?1,?2,?3,?4,?5,?6)",
         params![project.as_str(), pin.kind.as_str(), pin.object_id.as_str(), pin.revision.as_str(), blob.digest.as_str(), blob.byte_length as i64],
@@ -177,7 +233,7 @@ pub fn register_owned_document(
         "INSERT OR IGNORE INTO owned_document_provenance(project_id,project_revision,kind,object_id,revision) VALUES(?1,?2,?3,?4,?5)",
         params![project.as_str(), project_revision.as_str(), pin.kind.as_str(), pin.object_id.as_str(), pin.revision.as_str()],
     )?;
-    transaction.commit()?;
+    check()?;
     Ok(())
 }
 
@@ -496,7 +552,7 @@ where
     ))
 }
 
-fn validate_document(
+pub(crate) fn validate_document(
     store: &DurableStore,
     pin: &OwnedDocumentPin,
     document: &Value,

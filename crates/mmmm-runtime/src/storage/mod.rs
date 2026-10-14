@@ -13,6 +13,7 @@ pub mod artifact;
 pub mod authored_projection;
 pub mod bootstrap;
 pub mod host_setup;
+pub mod native_owned_sources;
 pub mod owned_documents;
 pub mod project_resources;
 pub mod result_binding;

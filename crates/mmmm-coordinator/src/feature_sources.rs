@@ -403,6 +403,75 @@ impl ManualSceneData {
     }
 }
 impl PlanningDataPort for ManualSceneData {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Forward the actual Store and unchanged authenticated state-source inputs to the delegate"
+    )]
+    fn state_snapshot_with_store(
+        &mut self,
+        store: &PlanningStore<'_>,
+        principal: &PrincipalId,
+        project: &ProjectCatalog,
+        instance: &Value,
+        definition: &Value,
+        context: &Value,
+        budget: &RequestBudget,
+    ) -> AppResult<ObservedStateSnapshot> {
+        self.delegate
+            .try_borrow_mut()
+            .map_err(|_| busy())?
+            .state_snapshot_with_store(
+                store, principal, project, instance, definition, context, budget,
+            )
+    }
+    fn scene_source_with_store(
+        &mut self,
+        store: &PlanningStore<'_>,
+        principal: &PrincipalId,
+        project: &ProjectCatalog,
+        patch: &Value,
+        context: &Value,
+        budget: &RequestBudget,
+    ) -> AppResult<SceneSource> {
+        if self
+            .record(principal, project, patch, context, budget)?
+            .is_some()
+        {
+            return self.scene_source(principal, project, patch, context, budget);
+        }
+        self.delegate
+            .try_borrow_mut()
+            .map_err(|_| busy())?
+            .scene_source_with_store(store, principal, project, patch, context, budget)
+    }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Forward the original decoded source and current authorization with the same Store"
+    )]
+    fn validate_scene_provenance_with_store(
+        &mut self,
+        store: &PlanningStore<'_>,
+        principal: &PrincipalId,
+        project: &ProjectCatalog,
+        patch: &Value,
+        source: &SceneSource,
+        context: &Value,
+        budget: &RequestBudget,
+    ) -> AppResult<()> {
+        if self
+            .record(principal, project, patch, context, budget)?
+            .is_some()
+        {
+            return self
+                .validate_scene_provenance(principal, project, patch, source, context, budget);
+        }
+        self.delegate
+            .try_borrow_mut()
+            .map_err(|_| busy())?
+            .validate_scene_provenance_with_store(
+                store, principal, project, patch, source, context, budget,
+            )
+    }
     fn state_snapshot(
         &mut self,
         principal: &PrincipalId,
@@ -1013,15 +1082,15 @@ impl FeatureSources for LocalFeatureSources {
             .insert(read.resource.resource_id.clone(), read.resource);
         Ok(MathInputs { target, symbols })
     }
-    fn pack_inputs(
+    fn pack_inputs_with_store(
         &mut self,
         access: &FeatureAccess,
         input: &Value,
-        store: &DurableStore,
+        store: &mut DurableStore,
         budget: &RequestBudget,
     ) -> Result<PackInputs, ServiceError> {
-        let (principal, mut source, project) =
-            self.source(access, PlanningStore::read(store), budget)?;
+        let frame = PlanningStore::write(store);
+        let (principal, mut source, project) = self.source(access, frame.clone(), budget)?;
         let context = access
             .context
             .as_ref()
@@ -1034,7 +1103,7 @@ impl FeatureSources for LocalFeatureSources {
         }
         let profile = project.target_profile_id();
         let mut environment = ConcretePlanningEnvironment::new(
-            PlanningStore::read(store),
+            frame,
             source.access().clone(),
             self.composition.data.clone(),
             self.composition.backend.clone(),

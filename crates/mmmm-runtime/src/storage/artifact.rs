@@ -8,7 +8,7 @@ use mmmm_contracts::{
     ContextId, ContractValidator, OperationId, PrincipalId, ProjectId, ResourceId, Sha256Digest,
     canonical_digest, encode_json, parse_json,
 };
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -133,28 +133,12 @@ fn register_resource_inner(
     owner: ResourceOwner,
     verify_bytes: bool,
 ) -> ArtifactResult<()> {
-    let (resource_id, blob) = validate_resource(&store.validator, resource)?;
-    let resource_bytes = encode_json(resource).map_err(|_| ArtifactError::invalid())?;
-    if resource_bytes.len() > MAX_RESOURCE_METADATA_BYTES {
-        return Err(ArtifactError::invalid());
-    }
-    let owner_bytes =
-        encode_json(&serde_json::to_value(&owner).map_err(|_| ArtifactError::invalid())?)
-            .map_err(|_| ArtifactError::invalid())?;
-    let resource_json = String::from_utf8(resource_bytes).map_err(|_| ArtifactError::invalid())?;
-    let owner_json = String::from_utf8(owner_bytes).map_err(|_| ArtifactError::invalid())?;
-    match &owner {
-        ResourceOwner::Operation(id) => {
-            store.operation(id)?;
-        }
-        ResourceOwner::Project(id) => {
-            store.project(id)?;
-        }
-        ResourceOwner::Principal(_) => (),
-    }
+    let prepared = prepare_resource_registration(store, resource, &owner)?;
     if verify_bytes {
-        store.cas.verify(&blob)?;
+        store.cas.verify(&prepared.blob)?;
     }
+    // Preserve the public writer's existing schema and verification order.
+    // Operation issuance uses its already retained bytes without another CAS scan.
     store
         .connection
         .execute_batch(REGISTRY_SCHEMA)
@@ -163,20 +147,117 @@ fn register_resource_inner(
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(StorageError::from)?;
+    register_prepared_resource_in(&transaction, &prepared, &mut || Ok(()))?;
+    transaction.commit().map_err(StorageError::from)?;
+    Ok(())
+}
+
+struct PreparedResourceRegistration {
+    id: ResourceId,
+    resource: Value,
+    owner: Value,
+    resource_json: String,
+    owner_json: String,
+    blob: BlobRef,
+}
+
+fn prepare_resource_registration(
+    store: &DurableStore,
+    resource: &Value,
+    owner: &ResourceOwner,
+) -> ArtifactResult<PreparedResourceRegistration> {
+    let (resource_id, blob) = validate_resource(&store.validator, resource)?;
+    let resource_bytes = encode_json(resource).map_err(|_| ArtifactError::invalid())?;
+    if resource_bytes.len() > MAX_RESOURCE_METADATA_BYTES {
+        return Err(ArtifactError::invalid());
+    }
+    let owner_value = serde_json::to_value(owner).map_err(|_| ArtifactError::invalid())?;
+    let owner_bytes = encode_json(&owner_value).map_err(|_| ArtifactError::invalid())?;
+    let resource_json = String::from_utf8(resource_bytes).map_err(|_| ArtifactError::invalid())?;
+    let owner_json = String::from_utf8(owner_bytes).map_err(|_| ArtifactError::invalid())?;
+    match owner {
+        ResourceOwner::Operation(id) => {
+            store.operation(id)?;
+        }
+        ResourceOwner::Project(id) => {
+            store.project(id)?;
+        }
+        ResourceOwner::Principal(_) => (),
+    }
+    Ok(PreparedResourceRegistration {
+        id: resource_id,
+        resource: resource.clone(),
+        owner: owner_value,
+        resource_json,
+        owner_json,
+        blob,
+    })
+}
+
+/// Native composition publishes into its one existing transaction. This helper
+/// verifies the exact CAS bytes; a caller-supplied BlobRef grants no access.
+/// The current owner/ACL/budget callback must perform only same-Store local reads.
+/// No transaction, commit, new resource identity or authority is created here.
+pub(crate) fn register_resource_blob_in<F>(
+    store: &DurableStore,
+    transaction: &Transaction<'_>,
+    resource: &Value,
+    owner: &ResourceOwner,
+    blob: &BlobRef,
+    check: &mut F,
+) -> ArtifactResult<()>
+where
+    F: FnMut() -> Result<(), StorageError>,
+{
+    check()?;
+    if !std::ptr::eq(&**transaction, &store.connection) {
+        return Err(StorageError::Conflict("Artifact transaction Store").into());
+    }
+    let prepared = prepare_resource_registration(store, resource, owner)?;
+    if &prepared.blob != blob {
+        return Err(StorageError::Conflict("Artifact ResourceRef/blob pin").into());
+    }
+    check()?;
+    // Capturing beyond the final byte retains no payload, while the same open
+    // handle hashes the entire bounded blob and checks the original callback.
+    store
+        .cas
+        .read_verified_slice::<StorageError, _>(blob, blob.byte_length, 1, &mut *check)?;
+    check()?;
+    register_prepared_resource_in(transaction, &prepared, check)?;
+    check()?;
+    Ok(())
+}
+
+fn register_prepared_resource_in<F>(
+    transaction: &Transaction<'_>,
+    prepared: &PreparedResourceRegistration,
+    check: &mut F,
+) -> ArtifactResult<()>
+where
+    F: FnMut() -> Result<(), StorageError>,
+{
+    check()?;
+    transaction
+        .execute_batch(REGISTRY_SCHEMA)
+        .map_err(StorageError::from)?;
+    let resource_id = &prepared.id;
+    let blob = &prepared.blob;
     let old: Option<(String, String, String, i64)> = transaction.query_row(
         "SELECT resource_json,owner_json,blob_digest,byte_length FROM artifact_resources WHERE resource_id=?1",
         [resource_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     ).optional().map_err(StorageError::from)?;
     if let Some((old_resource, old_owner, old_digest, old_length)) = old {
-        if parse_json(old_resource.as_bytes()).map_err(|_| ArtifactError::invalid())? != *resource
+        if parse_json(old_resource.as_bytes()).map_err(|_| ArtifactError::invalid())?
+            != prepared.resource
             || parse_json(old_owner.as_bytes()).map_err(|_| ArtifactError::invalid())?
-                != serde_json::to_value(&owner).map_err(|_| ArtifactError::invalid())?
+                != prepared.owner
             || old_digest != blob.digest.as_str()
             || old_length != blob.byte_length as i64
         {
             return Err(StorageError::Conflict("Immutable artifact resource identity").into());
         }
-        transaction.commit().map_err(StorageError::from)?;
+        check()?;
         return Ok(());
     }
     let count: i64 = transaction
@@ -190,12 +271,13 @@ fn register_resource_inner(
             "Resource registry capacity is exhausted",
         ));
     }
-    pin_blob(&transaction, "artifact", resource_id.as_str(), &blob)?;
+    check()?;
+    pin_blob(transaction, "artifact", resource_id.as_str(), blob)?;
     transaction.execute(
         "INSERT INTO artifact_resources(resource_id,resource_json,owner_json,blob_digest,byte_length) VALUES(?1,?2,?3,?4,?5)",
-        params![resource_id.as_str(), resource_json, owner_json, blob.digest.as_str(), blob.byte_length as i64],
+        params![resource_id.as_str(), prepared.resource_json, prepared.owner_json, blob.digest.as_str(), blob.byte_length as i64],
     ).map_err(StorageError::from)?;
-    transaction.commit().map_err(StorageError::from)?;
+    check()?;
     Ok(())
 }
 
@@ -346,7 +428,7 @@ impl ArtifactReader {
     }
 }
 
-fn validate_resource(
+pub(crate) fn validate_resource(
     validator: &ContractValidator,
     resource: &Value,
 ) -> ArtifactResult<(ResourceId, BlobRef)> {

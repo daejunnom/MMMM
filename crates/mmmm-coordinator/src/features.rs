@@ -178,6 +178,17 @@ pub trait FeatureSources {
     ) -> Result<PackInputs, ServiceError> {
         Err(profile_unavailable())
     }
+    /// Private preparation may retain binding/source bytes in the same Store.
+    /// It changes no authored Project head or native target before Apply.
+    fn pack_inputs_with_store(
+        &mut self,
+        access: &FeatureAccess,
+        input: &Value,
+        store: &mut DurableStore,
+        budget: &RequestBudget,
+    ) -> Result<PackInputs, ServiceError> {
+        self.pack_inputs(access, input, store, budget)
+    }
     fn catalog_access<'a>(
         &'a mut self,
         _access: &FeatureAccess,
@@ -515,9 +526,12 @@ impl FeatureExtension {
                 common_plan(context, method, &request)
             }
             "pack.build" => {
-                let inputs =
-                    self.sources
-                        .pack_inputs(access, input, context.store, context.budget)?;
+                let inputs = self.sources.pack_inputs_with_store(
+                    access,
+                    input,
+                    context.store,
+                    context.budget,
+                )?;
                 context.check(method)?;
                 let draft = mmmm_compiler::pack_build(input, &inputs.target, inputs.inputs)
                     .map_err(domain_error)?;

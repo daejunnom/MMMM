@@ -12,6 +12,7 @@ use crate::{
         SharedFeatureSymbols, SharedManualScenes, SharedResourceRights, manual_data_adapter,
     },
     native_backend::{HostNativeBackend, NativeBackendComposition, NativeReadinessRegistry},
+    owned_planning_data::OwnedPlanningData,
     planning_context::{
         RegisteredContextLocator, SharedRegisteredPlanningContexts, planning_context_adapter,
         workspace_context_resolver,
@@ -77,6 +78,7 @@ pub struct ProductionFactory {
     executable_digest: Sha256Digest,
     inputs: Option<NativeSourceInputs>,
     registries: Option<ProductionRegistries>,
+    owned_data: bool,
 }
 
 impl ProductionFactory {
@@ -87,14 +89,16 @@ impl ProductionFactory {
             executable_digest,
             inputs: Some(inputs),
             registries: None,
+            owned_data: false,
         }
     }
 
     /// Cold local startup can inspect its actual native-owned Project and run
-    /// pure functions. Missing game sources stay unavailable: this supplies no
-    /// VerifiedTarget, state snapshot, scene payload, permissions or symbols.
+    /// pure functions. Authored documents use the same actual Store after
+    /// composition. Missing game sources stay unavailable: this supplies no
+    /// VerifiedTarget, live state snapshot, native permissions or symbols.
     pub fn offline_owned(executable_digest: Sha256Digest) -> Self {
-        Self::new(
+        let mut factory = Self::new(
             executable_digest,
             NativeSourceInputs {
                 scene_registry: Rc::new(UnregisteredSceneRegistry),
@@ -105,7 +109,9 @@ impl ProductionFactory {
                 readiness: NativeReadinessRegistry::default(),
                 planner_options: PlannerOptions::default(),
             },
-        )
+        );
+        factory.owned_data = true;
+        factory
     }
 
     pub fn registries(&self) -> Option<&ProductionRegistries> {
@@ -205,8 +211,20 @@ impl DaemonSourceFactory for ProductionFactory {
         let rights = Rc::new(RefCell::new(ResourceRightsRegistry::default()));
         let manual = Rc::new(RefCell::new(ManualSceneRegistry::default()));
         let products = Rc::new(RefCell::new(FeatureProductRegistry::default()));
+        let source_data: SharedPlanningData = if self.owned_data {
+            Rc::new(RefCell::new(Box::new(OwnedPlanningData::new(
+                handles.request.clone(),
+                handles.authority.clone(),
+                handles.hosts.clone(),
+                contexts.clone(),
+                // Actual game alias/codec observation remains unavailable.
+                None,
+            ))))
+        } else {
+            inputs.data
+        };
         let data = manual_data_adapter(
-            inputs.data,
+            source_data,
             handles.request.clone(),
             handles.authority.clone(),
             manual.clone(),

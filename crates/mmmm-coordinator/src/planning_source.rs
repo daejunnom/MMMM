@@ -510,6 +510,50 @@ pub trait PlanningDataPort {
         context: &Value,
         budget: &RequestBudget,
     ) -> AppResult<()>;
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The same call-scoped Store is distinct from unchanged source identity and current authorization inputs"
+    )]
+    fn state_snapshot_with_store(
+        &mut self,
+        _store: &PlanningStore<'_>,
+        principal: &PrincipalId,
+        project: &ProjectCatalog,
+        instance: &Value,
+        definition: &Value,
+        context: &Value,
+        budget: &RequestBudget,
+    ) -> AppResult<ObservedStateSnapshot> {
+        self.state_snapshot(principal, project, instance, definition, context, budget)
+    }
+    fn scene_source_with_store(
+        &mut self,
+        _store: &PlanningStore<'_>,
+        principal: &PrincipalId,
+        project: &ProjectCatalog,
+        patch: &Value,
+        context: &Value,
+        budget: &RequestBudget,
+    ) -> AppResult<SceneSource> {
+        self.scene_source(principal, project, patch, context, budget)
+    }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Revalidation needs the original source and all existing authorization inputs alongside the same Store"
+    )]
+    fn validate_scene_provenance_with_store(
+        &mut self,
+        _store: &PlanningStore<'_>,
+        principal: &PrincipalId,
+        project: &ProjectCatalog,
+        patch: &Value,
+        source: &SceneSource,
+        context: &Value,
+        budget: &RequestBudget,
+    ) -> AppResult<()> {
+        self.validate_scene_provenance(principal, project, patch, source, context, budget)
+    }
 }
 pub type SharedPlanningData = Rc<RefCell<Box<dyn PlanningDataPort>>>;
 
@@ -1273,7 +1317,8 @@ impl ProjectSourcePort for BorrowedProjectSource<'_> {
             .data
             .try_borrow_mut()
             .map_err(|_| source_busy())?
-            .state_snapshot(
+            .state_snapshot_with_store(
+                &self.store,
                 principal,
                 project,
                 instance,
@@ -1348,7 +1393,14 @@ impl ProjectSourcePort for BorrowedProjectSource<'_> {
             .data
             .try_borrow_mut()
             .map_err(|_| source_busy())?
-            .scene_source(principal, project, patch, context, self.access.budget())?;
+            .scene_source_with_store(
+                &self.store,
+                principal,
+                project,
+                patch,
+                context,
+                self.access.budget(),
+            )?;
         if mmmm_contracts::parse_json(&artifact_bytes.bytes).map_err(|_| source_budget())?
             != source.artifact
             || mmmm_contracts::parse_json(&map_bytes.bytes).map_err(|_| source_budget())?
@@ -1383,7 +1435,8 @@ impl ProjectSourcePort for BorrowedProjectSource<'_> {
         self.data
             .try_borrow_mut()
             .map_err(|_| source_busy())?
-            .validate_scene_provenance(
+            .validate_scene_provenance_with_store(
+                &self.store,
                 principal,
                 project,
                 patch,
