@@ -126,6 +126,8 @@ struct State {
     bad_resource: bool,
     next_id: usize,
     cancel_after_reads: Option<usize>,
+    cancel_host: Option<bool>,
+    cancel_source: Option<(String, bool)>,
 }
 fn state() -> Rc<RefCell<State>> {
     let grant = grant();
@@ -162,6 +164,8 @@ fn state() -> Rc<RefCell<State>> {
         bad_resource: false,
         next_id: 0,
         cancel_after_reads: None,
+        cancel_host: None,
+        cancel_source: None,
     }))
 }
 struct Host(Rc<RefCell<State>>);
@@ -178,6 +182,9 @@ impl HostRegistryTransport for Host {
             state.grant.execution_context["contextId"]
         );
         state.host_calls += 1;
+        if let Some(causal) = state.cancel_host {
+            return Err(cancellation_error(causal));
+        }
         if state.raw.len() > max_bytes {
             return Err(CatalogError::InputLimit);
         }
@@ -228,6 +235,11 @@ impl CatalogCaptureBackend for Backend {
     ) -> Result<CapturedSourceBytes, CatalogError> {
         let mut state = self.0.borrow_mut();
         state.reads += 1;
+        if let Some((id, causal)) = &state.cancel_source
+            && source.source["sourceId"] == id.as_str()
+        {
+            return Err(cancellation_error(*causal));
+        }
         let bytes = state
             .files
             .get(source.source["sourceId"].as_str().unwrap())
@@ -295,6 +307,70 @@ fn capture(
             deadline: Instant::now() + Duration::from_secs(5),
         },
     )
+}
+
+fn cancellation_error(causal: bool) -> CatalogError {
+    if causal {
+        CatalogError::caused_by(
+            CatalogError::Cancelled,
+            std::io::Error::from_raw_os_error(5),
+        )
+    } else {
+        CatalogError::Cancelled
+    }
+}
+
+#[test]
+fn bare_and_causal_host_cancellation_keep_the_same_no_observation_failure() {
+    for causal in [false, true] {
+        let (mut catalog, mut source, state) = setup();
+        state.borrow_mut().cancel_host = Some(causal);
+        let input = request(&state.borrow().grant);
+        let error = capture(&mut catalog, &mut source, &input, &Allow { deny: None }).unwrap_err();
+        assert_eq!(error.code(), "CANCELLED");
+        assert_eq!(std::error::Error::source(&error).is_some(), causal);
+        let state = state.borrow();
+        assert_eq!(state.host_calls, 1);
+        assert_eq!(state.reads, 0);
+        assert!(state.retained.is_empty());
+    }
+}
+
+#[test]
+fn bare_and_causal_optional_source_cancellation_keep_the_same_identity_complete_partial_snapshot() {
+    let mut expected = None;
+    for causal in [false, true] {
+        let (mut catalog, mut source, state) = setup();
+        {
+            let mut state = state.borrow_mut();
+            state
+                .grant
+                .sources
+                .push(approved_source("optional-source", false));
+            state.files.insert(
+                "optional-source".into(),
+                b"actual optional fixture bytes".to_vec(),
+            );
+            state.cancel_source = Some(("optional-source".into(), causal));
+        }
+        let input = request(&state.borrow().grant);
+        let snapshot = capture(&mut catalog, &mut source, &input, &Allow { deny: None }).unwrap();
+        assert_eq!(snapshot["coverage"]["status"], "partial");
+        let state = state.borrow();
+        assert_eq!(state.reads, 6);
+        assert_eq!(state.retained.len(), 6);
+        assert!(
+            state
+                .retained
+                .iter()
+                .all(|(source, _)| source["sourceId"] != "optional-source")
+        );
+        if let Some(expected) = &expected {
+            assert_eq!(&snapshot, expected);
+        } else {
+            expected = Some(snapshot);
+        }
+    }
 }
 
 #[test]

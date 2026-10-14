@@ -10,7 +10,7 @@ use mmmm_contracts::{
     ContextId, ContractError, ContractValidator, JsonLimits, PrincipalId, Sha256Digest, SnapshotId,
 };
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
 
 #[derive(Debug)]
 pub enum CatalogError {
@@ -23,6 +23,12 @@ pub enum CatalogError {
     StaleCursor,
     InputLimit,
     Cancelled,
+    /// Local diagnostic ownership only. Public classification and formatting
+    /// remain exactly those of the original catalog failure.
+    Causal {
+        primary: Arc<CatalogError>,
+        source: Box<dyn Error + Send + Sync>,
+    },
 }
 
 impl CatalogError {
@@ -36,6 +42,13 @@ impl CatalogError {
             Self::StaleCursor => "STALE_CURSOR",
             Self::InputLimit => "INPUT_LIMIT",
             Self::Cancelled => "CANCELLED",
+            Self::Causal { primary, .. } => primary.code(),
+        }
+    }
+    pub fn caused_by(primary: CatalogError, source: impl Error + Send + Sync + 'static) -> Self {
+        Self::Causal {
+            primary: Arc::new(primary),
+            source: Box::new(source),
         }
     }
     pub(crate) fn codec(error: serde_json::Error) -> Self {
@@ -59,6 +72,7 @@ impl From<ContractError> for CatalogError {
 impl fmt::Display for CatalogError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Causal { primary, .. } => fmt::Display::fmt(primary.as_ref(), f),
             Self::Contract(error) => write!(f, "{}: {error}", self.code()),
             Self::SchemaUnsupported(message) | Self::SourceUnavailable(message) => {
                 write!(f, "{}: {message}", self.code())
@@ -67,7 +81,14 @@ impl fmt::Display for CatalogError {
         }
     }
 }
-impl Error for CatalogError {}
+impl Error for CatalogError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Causal { source, .. } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 /// Supplied by the authenticated Coordinator, never decoded from CatalogQuery.
 #[derive(Clone, Debug)]
@@ -75,6 +96,59 @@ pub struct ReadPrincipal {
     pub principal_id: PrincipalId,
     /// Includes current role, permission and context authority revision.
     pub permission_scope_digest: Sha256Digest,
+}
+
+#[cfg(test)]
+mod causal_error_tests {
+    use super::*;
+
+    #[test]
+    fn causal_error_preserves_every_original_code_and_display_and_exposes_its_source() {
+        let errors = [
+            CatalogError::Contract(
+                ContractValidator::shared()
+                    .unwrap()
+                    .validate("SourceRef", &json!({}))
+                    .unwrap_err(),
+            ),
+            CatalogError::SchemaUnsupported("original schema rejection".into()),
+            CatalogError::SourceUnavailable("original source rejection".into()),
+            CatalogError::PermissionRequired,
+            CatalogError::SnapshotNotFound,
+            CatalogError::SnapshotConflict,
+            CatalogError::StaleCursor,
+            CatalogError::InputLimit,
+            CatalogError::Cancelled,
+        ];
+        for primary in errors {
+            let code = primary.code();
+            let display = primary.to_string();
+            let error = CatalogError::caused_by(primary, std::io::Error::from_raw_os_error(5));
+            assert_eq!(error.code(), code);
+            assert_eq!(error.to_string(), display);
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(5)
+            );
+            let nested = CatalogError::caused_by(error, std::io::Error::from_raw_os_error(13));
+            assert_eq!(nested.code(), code);
+            assert_eq!(nested.to_string(), display);
+            assert_eq!(
+                nested
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(13)
+            );
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

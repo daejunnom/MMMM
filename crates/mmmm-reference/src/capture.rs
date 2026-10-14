@@ -342,6 +342,7 @@ impl<T: HostRegistryTransport, B: CatalogCaptureBackend> SnapshotSource
         let mut total_bytes = 0usize;
         let mut native = None;
         let mut interrupted = false;
+        let mut interruption = None;
         let mut ordered = grant.sources.iter().collect::<Vec<_>>();
         // Required fingerprints precede optional assets. Pack priority remains
         // the separately attested array order, never this I/O schedule.
@@ -374,8 +375,9 @@ impl<T: HostRegistryTransport, B: CatalogCaptureBackend> SnapshotSource
                     remaining.min(MAX_NATIVE_REGISTRY_BYTES),
                 ) {
                     Ok(value) => value,
-                    Err(CatalogError::Cancelled) => {
+                    Err(error) if error.code() == "CANCELLED" => {
                         interrupted = true;
+                        interruption = Some(error);
                         break;
                     }
                     Err(error) => return Err(error),
@@ -404,8 +406,9 @@ impl<T: HostRegistryTransport, B: CatalogCaptureBackend> SnapshotSource
                         .read_approved_source(principal, &grant, approved, remaining, control)
                     {
                         Ok(value) => value,
-                        Err(CatalogError::Cancelled) => {
+                        Err(error) if error.code() == "CANCELLED" => {
                             interrupted = true;
+                            interruption = Some(error);
                             break;
                         }
                         Err(error) => return Err(error),
@@ -461,11 +464,11 @@ impl<T: HostRegistryTransport, B: CatalogCaptureBackend> SnapshotSource
                     serde_json::to_value(source.layer).ok().as_ref() == Some(&request["kind"])
                 }))
         {
-            return Err(CatalogError::Cancelled);
+            return Err(interruption.unwrap_or(CatalogError::Cancelled));
         }
         let identity = match environment_identity(&grant, &acquired, native.as_ref()) {
             Ok(identity) => identity,
-            Err(_) if interrupted => return Err(CatalogError::Cancelled),
+            Err(_) if interrupted => return Err(interruption.unwrap_or(CatalogError::Cancelled)),
             Err(error) => return Err(error),
         };
         let fingerprint = captured_environment_fingerprint(&identity)?;

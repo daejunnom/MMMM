@@ -943,6 +943,22 @@ impl FeatureSources for LocalFeatureSources {
             .policy_revision(actual.principal(), project.project_id())
             .map_err(service)?;
         let read_principal = if method.starts_with("catalog.") {
+            if let Some(context) = context.as_ref()
+                && context["environment"]["kind"] == "game"
+            {
+                crate::native_catalog::NativeCatalogAdmission {
+                    request: &self.composition.request,
+                    authority: &self.composition.authority,
+                    hosts: &self.composition.hosts,
+                    sources: self
+                        .composition
+                        .catalog
+                        .as_ref()
+                        .ok_or_else(|| service(unavailable()))?,
+                }
+                .ensure(&actual, context, store, budget)
+                .map_err(|cause| ServiceError::caused_by(cause.code, cause.message, cause))?;
+            }
             self.composition
                 .catalog
                 .as_ref()

@@ -4,6 +4,7 @@
 *.rs text eol=lf
 *.toml text eol=lf
 *.java text eol=lf
+*.c text eol=lf
 *.cs text eol=lf
 *.gradle text eol=lf
 *.kts text eol=lf

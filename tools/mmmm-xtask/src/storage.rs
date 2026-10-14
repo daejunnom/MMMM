@@ -7,12 +7,17 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SCHEMA: &str = "mmmm-managed-build/1";
 const RECORD_LIMIT: u64 = 8 * 1024;
 const MAX_DEPTH: usize = 64;
 const MAX_ENTRIES: usize = 100_000;
+const MAX_RETRY_RECORDS: usize = 64;
+const MAX_RETRY_LOG_BYTES: usize = 128 * 1024;
+const MAX_EXTRA_METADATA_CALLS: usize = 16;
+const MAX_RETRY_WAIT: Duration = Duration::from_millis(32);
+const MAX_RETRY_WALL: Duration = Duration::from_millis(100);
 static TOKEN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
@@ -146,10 +151,104 @@ pub struct Measurement {
     pub within_budget: bool,
 }
 
+/// Nonfatal recovery facts are separate from supervisor_errors. A record is
+/// retained even when a later checkpoint fails. This is build evidence only.
+#[derive(Debug, Default, Serialize)]
+pub struct ObservationRetryLog {
+    records: Vec<ObservationRetryRecord>,
+}
+#[derive(Clone, Debug, Serialize)]
+struct NativeIoDiagnostic {
+    kind: String,
+    raw_os_error: Option<i32>,
+}
+impl NativeIoDiagnostic {
+    fn from_error(error: &std::io::Error) -> Self {
+        Self {
+            kind: format!("{:?}", error.kind()),
+            raw_os_error: error.raw_os_error(),
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize)]
+struct ObservationRetryRecord {
+    stage: &'static str,
+    first: NativeIoDiagnostic,
+    attempts: u8,
+    elapsed_ms: u64,
+    final_observation: RetryFinalObservation,
+    generated_relative: String,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum RetryFinalObservation {
+    Pending,
+    Present {
+        file_type: &'static str,
+        byte_length: u64,
+    },
+    MissingValidated {
+        last: NativeIoDiagnostic,
+    },
+    Failed {
+        category: &'static str,
+        final_io: Option<NativeIoDiagnostic>,
+        last_metadata_io: Option<NativeIoDiagnostic>,
+    },
+}
+impl ObservationRetryLog {
+    pub fn encoded_evidence(&self) -> Result<Vec<u8>, StorageError> {
+        let value = serde_json::json!({
+            "schema":"mmmm-managed-observation-retries/1", "records":self.records,
+        });
+        let mut encoded = serde_json::to_vec_pretty(&value).map_err(|_| {
+            StorageError::new("retry_evidence", "serialize observation retry evidence")
+        })?;
+        encoded.push(b'\n');
+        if encoded.len() > MAX_RETRY_LOG_BYTES {
+            return Err(StorageError::new(
+                "retry_evidence",
+                "observation retry evidence byte limit exceeded",
+            ));
+        }
+        Ok(encoded)
+    }
+    #[cfg(test)]
+    fn evidence(&self) -> Result<serde_json::Value, StorageError> {
+        serde_json::from_slice(&self.encoded_evidence()?).map_err(|_| {
+            StorageError::new("retry_evidence", "decode observation retry test evidence")
+        })
+    }
+    pub fn summary(&self) -> serde_json::Value {
+        serde_json::json!({
+            "companion":"observation-retries.json", "records":self.records.len(),
+            "recovered_present":self.records.iter().filter(|record| matches!(record.final_observation, RetryFinalObservation::Present { .. })).count(),
+            "recovered_missing":self.records.iter().filter(|record| matches!(record.final_observation, RetryFinalObservation::MissingValidated { .. })).count(),
+            "first":self.records.first(), "last":self.records.last(),
+        })
+    }
+    fn retain(&mut self, record: ObservationRetryRecord) -> Result<(), StorageError> {
+        if self.records.len() >= MAX_RETRY_RECORDS {
+            return Err(StorageError::new(
+                "retry_evidence",
+                "observation retry record limit exceeded",
+            ));
+        }
+        self.records.push(record);
+        if let Err(error) = self.encoded_evidence() {
+            self.records.pop();
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct StorageError {
     pub kind: &'static str,
     pub message: String,
+    cause: Option<Box<StorageError>>,
+    native_io: Option<NativeIoDiagnostic>,
 }
 
 impl StorageError {
@@ -157,10 +256,14 @@ impl StorageError {
         Self {
             kind,
             message: message.into(),
+            cause: None,
+            native_io: None,
         }
     }
     fn io(context: &str, error: std::io::Error) -> Self {
-        Self::new("io", format!("{context}: {error}"))
+        let mut result = Self::new("io", format!("{context}: {error}"));
+        result.native_io = Some(NativeIoDiagnostic::from_error(&error));
+        result
     }
 }
 
@@ -169,7 +272,13 @@ impl fmt::Display for StorageError {
         write!(f, "{}: {}", self.kind, self.message)
     }
 }
-impl std::error::Error for StorageError {}
+impl std::error::Error for StorageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cause
+            .as_deref()
+            .map(|cause| cause as &(dyn std::error::Error + 'static))
+    }
+}
 
 pub struct ManagedBuild {
     config: StorageConfig,
@@ -585,6 +694,30 @@ impl ManagedBuild {
         self.measure_observed(|_| {}, progress)
     }
 
+    /// Explicit Running-only opt-in. Existing pre-spawn, finish and other
+    /// callers retain one-attempt observation. Extra target metadata calls are
+    /// bounded across this complete measurement; ancestry/owner checks retain
+    /// their existing finite traversal limits and caller checkpoints.
+    pub fn measure_with_progress_and_diagnostics(
+        &self,
+        progress: &mut dyn FnMut() -> Result<(), String>,
+        diagnostics: &mut ObservationRetryLog,
+    ) -> Result<Measurement, StorageError> {
+        let owner = || self.verify_ownership();
+        let mut metadata = |path: &Path| fs::symlink_metadata(path);
+        let mut wait = std::thread::sleep;
+        let clock = Instant::now;
+        let mut retry = MetadataReobservation::new(
+            diagnostics,
+            &owner,
+            &mut metadata,
+            &mut wait,
+            cfg!(windows),
+            &clock,
+        );
+        self.measure_observed_retry(|_| {}, progress, Some(&mut retry))
+    }
+
     fn measure_with(
         &self,
         before_metadata: impl FnMut(&Path),
@@ -596,6 +729,15 @@ impl ManagedBuild {
         &self,
         mut before_metadata: impl FnMut(&Path),
         progress: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<Measurement, StorageError> {
+        self.measure_observed_retry(&mut before_metadata, progress, None)
+    }
+
+    fn measure_observed_retry(
+        &self,
+        mut before_metadata: impl FnMut(&Path),
+        progress: &mut dyn FnMut() -> Result<(), String>,
+        mut retry: Option<&mut MetadataReobservation<'_>>,
     ) -> Result<Measurement, StorageError> {
         observation_checkpoint(progress)?;
         self.verify_ownership()?;
@@ -611,12 +753,13 @@ impl ManagedBuild {
         for (path, record) in slots {
             observation_checkpoint(progress)?;
             let size = if record.slot_id == self.slot.slot_id && record.state == SlotState::Active {
-                tree_bytes_observed_with_progress(
+                tree_bytes_observed_with_retry(
                     &path,
                     &path,
                     &observation_roots,
                     &mut before_metadata,
                     progress,
+                    retry.as_deref_mut(),
                 )?
             } else {
                 tree_bytes_observed_with_progress(&path, &path, &[], |_| {}, progress)?
@@ -1510,12 +1653,353 @@ fn observation_checkpoint(
     progress().map_err(|cause| StorageError::new("observation_failed", cause))
 }
 
+struct MetadataReobservation<'a> {
+    diagnostics: &'a mut ObservationRetryLog,
+    owner: &'a dyn Fn() -> Result<(), StorageError>,
+    metadata: &'a mut dyn FnMut(&Path) -> std::io::Result<fs::Metadata>,
+    wait: &'a mut dyn FnMut(Duration),
+    windows_native5: bool,
+    clock: &'a dyn Fn() -> Instant,
+    extra_calls: usize,
+    planned_wait: Duration,
+    spent: Duration,
+}
+impl<'a> MetadataReobservation<'a> {
+    fn new(
+        diagnostics: &'a mut ObservationRetryLog,
+        owner: &'a dyn Fn() -> Result<(), StorageError>,
+        metadata: &'a mut dyn FnMut(&Path) -> std::io::Result<fs::Metadata>,
+        wait: &'a mut dyn FnMut(Duration),
+        windows_native5: bool,
+        clock: &'a dyn Fn() -> Instant,
+    ) -> Self {
+        Self {
+            diagnostics,
+            owner,
+            metadata,
+            wait,
+            windows_native5,
+            clock,
+            extra_calls: 0,
+            planned_wait: Duration::ZERO,
+            spent: Duration::ZERO,
+        }
+    }
+    fn checkpoint(
+        &self,
+        progress: &mut dyn FnMut() -> Result<(), String>,
+        started: Instant,
+    ) -> Result<(), StorageError> {
+        observation_checkpoint(progress)?;
+        if self
+            .spent
+            .saturating_add((self.clock)().saturating_duration_since(started))
+            >= MAX_RETRY_WALL
+        {
+            return Err(StorageError::new(
+                "retry_budget",
+                "metadata reobservation wall budget exceeded",
+            ));
+        }
+        Ok(())
+    }
+    fn guard(
+        &self,
+        path: &Path,
+        root: &Path,
+        progress: &mut dyn FnMut() -> Result<(), String>,
+        started: Instant,
+    ) -> Result<(), StorageError> {
+        self.checkpoint(progress, started)?;
+        (self.owner)()?;
+        self.checkpoint(progress, started)?;
+        verify_retry_ancestry(path, root, progress)?;
+        self.checkpoint(progress, started)?;
+        (self.owner)()?;
+        self.checkpoint(progress, started)
+    }
+    fn observe(
+        &mut self,
+        path: &Path,
+        boundary: &Path,
+        roots: &[PathBuf],
+        progress: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<Option<fs::Metadata>, StorageError> {
+        // Preserve the existing directory namespace policy (for example a
+        // public source namespace named Credentials). Lexically secret paths
+        // are rejected before the first metadata call; ambiguous reserved leaf
+        // names are never admitted to the new reobservation path.
+        reject_secret_path(path)?;
+        let first = match (self.metadata)(path) {
+            Ok(metadata) => return Ok(Some(metadata)),
+            Err(error) => error,
+        };
+        let root = roots
+            .iter()
+            .find(|root| path != root.as_path() && path.starts_with(root));
+        // Native Win32 5 has PermissionDenied semantics on Windows. Tests may
+        // inject that native code on another OS without changing production.
+        if !self.windows_native5 || first.raw_os_error() != Some(5) || root.is_none() {
+            if vanished_ephemeral_entry(path, &first, roots)? {
+                return Ok(None);
+            }
+            return Err(measurement_io_error(
+                "managed entry metadata",
+                path,
+                boundary,
+                first,
+            ));
+        }
+        let root = root.expect("strict descendant was selected above");
+        let started = (self.clock)();
+        let mut record = ObservationRetryRecord {
+            stage: "entry_metadata",
+            first: NativeIoDiagnostic::from_error(&first),
+            attempts: 1,
+            elapsed_ms: 0,
+            final_observation: RetryFinalObservation::Pending,
+            generated_relative: generated_entry_context(String::new(), path, boundary),
+        };
+        let mut last_io = Some(record.first.clone());
+        let result = if self.diagnostics.records.len() >= MAX_RETRY_RECORDS {
+            Err(StorageError::new(
+                "retry_evidence",
+                "observation retry record limit exceeded",
+            ))
+        } else {
+            self.reobserve(path, root, progress, started, &mut record, &mut last_io)
+        };
+        let elapsed = (self.clock)().saturating_duration_since(started);
+        self.spent = self.spent.saturating_add(elapsed);
+        record.elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        if let Err(error) = &result {
+            record.final_observation = RetryFinalObservation::Failed {
+                category: error.kind,
+                final_io: error.native_io.clone(),
+                last_metadata_io: last_io,
+            };
+        }
+        if let Err(error) = self.diagnostics.retain(record.clone()) {
+            let cause = match result {
+                Ok(_) => error,
+                Err(primary) => StorageError {
+                    kind: primary.kind,
+                    message: format!("retry diagnostic retention failed: {}", error.kind),
+                    native_io: primary.native_io.clone(),
+                    cause: Some(Box::new(primary)),
+                },
+            };
+            return Err(retry_failure(&record, cause));
+        }
+        result.map_err(|error| retry_failure(&record, error))
+    }
+    fn reobserve(
+        &mut self,
+        path: &Path,
+        root: &Path,
+        progress: &mut dyn FnMut() -> Result<(), String>,
+        started: Instant,
+        record: &mut ObservationRetryRecord,
+        last_io: &mut Option<NativeIoDiagnostic>,
+    ) -> Result<Option<fs::Metadata>, StorageError> {
+        for delay in [Duration::from_millis(2), Duration::from_millis(4)] {
+            if self.extra_calls >= MAX_EXTRA_METADATA_CALLS
+                || self.planned_wait.saturating_add(delay) > MAX_RETRY_WAIT
+            {
+                return Err(StorageError::new(
+                    "retry_budget",
+                    "metadata reobservation call or planned wait limit exceeded",
+                ));
+            }
+            self.guard(path, root, progress, started)?;
+            self.planned_wait += delay;
+            (self.wait)(delay);
+            self.guard(path, root, progress, started)?;
+            self.extra_calls += 1;
+            record.attempts += 1;
+            let observed = (self.metadata)(path);
+            if let Err(error) = &observed {
+                *last_io = Some(NativeIoDiagnostic::from_error(error));
+            }
+            self.checkpoint(progress, started)?;
+            self.guard(path, root, progress, started)?;
+            match observed {
+                Ok(metadata) => {
+                    if is_link(&metadata) || (!metadata.is_file() && !metadata.is_dir()) {
+                        return Err(StorageError::new(
+                            "file_type",
+                            "reobserved entry is not an ordinary file or directory",
+                        ));
+                    }
+                    record.final_observation = RetryFinalObservation::Present {
+                        file_type: native_file_kind(&metadata),
+                        byte_length: metadata.len(),
+                    };
+                    return Ok(Some(metadata));
+                }
+                Err(error) => {
+                    // This is a newly observed NotFound, never a conversion
+                    // of the original native 5 into a vanished allowance.
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && vanished_ephemeral_entry_with_progress(
+                            path,
+                            &error,
+                            &[root.to_path_buf()],
+                            progress,
+                        )?
+                    {
+                        self.guard(path, root, progress, started)?;
+                        record.final_observation = RetryFinalObservation::MissingValidated {
+                            last: NativeIoDiagnostic::from_error(&error),
+                        };
+                        return Ok(None);
+                    }
+                    if error.raw_os_error() != Some(5) || record.attempts == 3 {
+                        return Err(measurement_io_error(
+                            "managed entry metadata",
+                            path,
+                            root,
+                            error,
+                        ));
+                    }
+                }
+            }
+        }
+        Err(StorageError::new(
+            "retry_budget",
+            "metadata reobservation attempt limit exceeded",
+        ))
+    }
+}
+
+fn retry_failure(record: &ObservationRetryRecord, cause: StorageError) -> StorageError {
+    let last_io = match &record.final_observation {
+        RetryFinalObservation::Failed { final_io, .. } => final_io.as_ref(),
+        RetryFinalObservation::MissingValidated { last } => Some(last),
+        _ => None,
+    };
+    // Preserve the final original error behind source(), but do not copy an
+    // arbitrary checkpoint/path message into shared evidence or diagnostics.
+    let message = format!(
+        "metadata reobservation; first_kind={}; first_raw_os_error={:?}; attempts={}; final_kind={}; final_raw_os_error={:?}; generated_relative={}",
+        record.first.kind,
+        record.first.raw_os_error,
+        record.attempts,
+        cause.kind,
+        last_io.and_then(|last| last.raw_os_error),
+        record.generated_relative
+    );
+    StorageError {
+        kind: cause.kind,
+        message,
+        native_io: cause.native_io.clone(),
+        cause: Some(Box::new(cause)),
+    }
+}
+
+/// Only the known ephemeral strict descendant may be retried. Surviving
+/// ancestors are ordinary directories; a missing ancestor is checked again by
+/// the eventual NotFound/vanished proof. No target contents or link targets are
+/// opened. This preserves the existing cooperative path-check guarantees.
+fn verify_retry_ancestry(
+    path: &Path,
+    root: &Path,
+    progress: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), StorageError> {
+    reject_secret_leaf_file(path)?;
+    observation_checkpoint(progress)?;
+    verify_directory(root)?;
+    observation_checkpoint(progress)?;
+    let physical_root =
+        fs::canonicalize(root).map_err(|error| StorageError::io("resolve retry root", error))?;
+    if path_identity(&physical_root) != path_identity(root) {
+        return Err(StorageError::new(
+            "ownership",
+            "retry root physical identity changed",
+        ));
+    }
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| StorageError::new("path_escape", "retry left owned root"))?;
+    let components: Vec<_> = relative.components().collect();
+    if components.is_empty()
+        || components.len() > MAX_DEPTH
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(StorageError::new(
+            "path_escape",
+            "retry requires a finite strict owned descendant",
+        ));
+    }
+    let mut current = root.to_path_buf();
+    for component in &components[..components.len() - 1] {
+        observation_checkpoint(progress)?;
+        current.push(component.as_os_str());
+        reject_secret_path(&current)?;
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(StorageError::io("inspect retry ancestry", error)),
+        };
+        if is_link(&metadata) || !metadata.is_dir() {
+            return Err(StorageError::new(
+                "link",
+                "retry ancestry is not an ordinary directory",
+            ));
+        }
+        observation_checkpoint(progress)?;
+        let physical = match fs::canonicalize(&current) {
+            Ok(physical) => physical,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(StorageError::io("resolve retry ancestry", error)),
+        };
+        if !physical.starts_with(&physical_root) {
+            return Err(StorageError::new(
+                "link_escape",
+                "retry ancestry left owned root",
+            ));
+        }
+        observation_checkpoint(progress)?;
+    }
+    verify_directory(root)?;
+    observation_checkpoint(progress)?;
+    let after =
+        fs::canonicalize(root).map_err(|error| StorageError::io("reverify retry root", error))?;
+    if path_identity(&after) != path_identity(&physical_root) {
+        return Err(StorageError::new(
+            "ownership",
+            "retry root physical identity changed",
+        ));
+    }
+    Ok(())
+}
+
 fn tree_bytes_observed_with_progress(
     path: &Path,
     boundary: &Path,
     ephemeral_roots: &[PathBuf],
     mut before_metadata: impl FnMut(&Path),
     progress: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<u64, StorageError> {
+    tree_bytes_observed_with_retry(
+        path,
+        boundary,
+        ephemeral_roots,
+        &mut before_metadata,
+        progress,
+        None,
+    )
+}
+
+fn tree_bytes_observed_with_retry(
+    path: &Path,
+    boundary: &Path,
+    ephemeral_roots: &[PathBuf],
+    mut before_metadata: impl FnMut(&Path),
+    progress: &mut dyn FnMut() -> Result<(), String>,
+    mut retry: Option<&mut MetadataReobservation<'_>>,
 ) -> Result<u64, StorageError> {
     observation_checkpoint(progress)?;
     let boundary =
@@ -1536,16 +2020,23 @@ fn tree_bytes_observed_with_progress(
         reject_secret_path(&path)?;
         before_metadata(&path);
         observation_checkpoint(progress)?;
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if vanished_ephemeral_entry(&path, &error, ephemeral_roots)? => continue,
-            Err(error) => {
-                return Err(measurement_io_error(
-                    "managed entry metadata",
-                    &path,
-                    &boundary,
-                    error,
-                ));
+        let metadata = if let Some(retry) = retry.as_deref_mut() {
+            match retry.observe(&path, &boundary, ephemeral_roots, progress)? {
+                Some(metadata) => metadata,
+                None => continue,
+            }
+        } else {
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if vanished_ephemeral_entry(&path, &error, ephemeral_roots)? => continue,
+                Err(error) => {
+                    return Err(measurement_io_error(
+                        "managed entry metadata",
+                        &path,
+                        &boundary,
+                        error,
+                    ));
+                }
             }
         };
         observation_checkpoint(progress)?;
@@ -1707,6 +2198,15 @@ fn vanished_ephemeral_entry(
     error: &std::io::Error,
     roots: &[PathBuf],
 ) -> Result<bool, StorageError> {
+    vanished_ephemeral_entry_with_progress(path, error, roots, &mut || Ok(()))
+}
+
+fn vanished_ephemeral_entry_with_progress(
+    path: &Path,
+    error: &std::io::Error,
+    roots: &[PathBuf],
+    progress: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<bool, StorageError> {
     if error.kind() != std::io::ErrorKind::NotFound {
         return Ok(false);
     }
@@ -1716,7 +2216,9 @@ fn vanished_ephemeral_entry(
     else {
         return Ok(false);
     };
+    observation_checkpoint(progress)?;
     verify_directory(root)?;
+    observation_checkpoint(progress)?;
     let physical_root = fs::canonicalize(root)
         .map_err(|e| StorageError::io("verify vanished-entry fixed root", e))?;
     if path_identity(&physical_root) != path_identity(root) {
@@ -1741,6 +2243,7 @@ fn vanished_ephemeral_entry(
     }
     let mut current = root.clone();
     for (index, component) in components.iter().enumerate() {
+        observation_checkpoint(progress)?;
         current.push(component.as_os_str());
         reject_secret_path(&current)?;
         let metadata = match fs::symlink_metadata(&current) {
@@ -1753,6 +2256,7 @@ fn vanished_ephemeral_entry(
                 ));
             }
         };
+        observation_checkpoint(progress)?;
         if is_link(&metadata) {
             return Err(StorageError::new(
                 "link",
@@ -1780,6 +2284,7 @@ fn vanished_ephemeral_entry(
                 ));
             }
         };
+        observation_checkpoint(progress)?;
         if !physical.starts_with(&physical_root) {
             return Err(StorageError::new(
                 "link_escape",
@@ -1787,7 +2292,9 @@ fn vanished_ephemeral_entry(
             ));
         }
     }
+    observation_checkpoint(progress)?;
     verify_directory(root)?;
+    observation_checkpoint(progress)?;
     let after = fs::canonicalize(root)
         .map_err(|e| StorageError::io("reverify vanished-entry fixed root", e))?;
     if path_identity(&after) != path_identity(&physical_root) {

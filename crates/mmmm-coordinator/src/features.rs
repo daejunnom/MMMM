@@ -1455,9 +1455,10 @@ fn domain_error(error: mmmm_domain::DomainError) -> ServiceError {
     )
 }
 fn catalog_error(error: mmmm_reference::CatalogError) -> ServiceError {
-    ServiceError::new(
+    ServiceError::caused_by(
         error.code(),
         "Catalog source, current access or immutable snapshot verification rejected the request",
+        error,
     )
 }
 fn shape_error(error: mmmm_reference::ShapeError) -> ServiceError {

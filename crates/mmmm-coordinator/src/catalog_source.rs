@@ -7,6 +7,7 @@ use crate::{
     authority::LocalAuthority,
     features::{CaptureInputs, FeatureAccess},
     host::HostBridge,
+    native_catalog::{NativeCatalogAdmission, NativeCatalogCheckpoint, NativeCatalogHostFailure},
     planning_source::{LocalPlanningAccess, PlanningStore, SharedPlanningContexts},
     service::{RequestBudget, RequestContextSlot, ServiceError},
 };
@@ -35,7 +36,7 @@ use mmmm_runtime::storage::{
     },
 };
 use serde_json::{Value, json};
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
 
 const MAX_SOURCES: usize = 256;
 const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
@@ -118,6 +119,27 @@ struct InstalledEnvironment {
     revision: Sha256Digest,
 }
 #[derive(Clone)]
+enum CatalogPublisher {
+    Explicit,
+    NativeObservation {
+        proof: Sha256Digest,
+        receipt: Rc<()>,
+    },
+}
+/// An exact in-process publication owner, never a source or wire capability.
+/// A failed admission may remove only this native publisher's current element.
+#[derive(Clone)]
+pub(crate) struct NativeCatalogPublication {
+    key: (PrincipalId, ContextId),
+    revision: Sha256Digest,
+    receipt: Rc<()>,
+}
+pub(crate) enum NativeCatalogAdmissionState {
+    Explicit,
+    Missing,
+    Native(NativeCatalogPublication),
+}
+#[derive(Clone)]
 struct CaptureAuthorityReceipt {
     context: ContextId,
     binding_revision: Sha256Digest,
@@ -156,6 +178,7 @@ pub struct RegisteredCatalogSourceIdentity {
 #[derive(Default)]
 struct CatalogRegistrations {
     environments: BTreeMap<(PrincipalId, ContextId), InstalledEnvironment>,
+    native_publishers: BTreeMap<(PrincipalId, ContextId), (Sha256Digest, Rc<()>)>,
     captures: BTreeMap<SnapshotId, CaptureAuthorityReceipt>,
     pending_captures: BTreeMap<SnapshotId, CaptureAuthorityReceipt>,
 }
@@ -192,6 +215,23 @@ impl RegisteredCatalogSources {
         budget: &RequestBudget,
         store: &DurableStore,
         registration: CatalogEnvironmentRegistration,
+    ) -> AppResult<Sha256Digest> {
+        self.register_with_publisher(
+            authenticated,
+            budget,
+            store,
+            registration,
+            CatalogPublisher::Explicit,
+        )
+    }
+
+    fn register_with_publisher(
+        &self,
+        authenticated: &AuthenticatedPrincipal,
+        budget: &RequestBudget,
+        store: &DurableStore,
+        registration: CatalogEnvironmentRegistration,
+        publisher: CatalogPublisher,
     ) -> AppResult<Sha256Digest> {
         budget.check().map_err(service_app)?;
         if !authenticated.permits("catalog.capture")
@@ -401,17 +441,144 @@ impl RegisteredCatalogSources {
             revision: binding_revision.clone(),
         };
         let mut state = self.state.try_borrow_mut().map_err(|_| busy())?;
-        if state.environments.len() >= MAX_BINDINGS
-            && !state
-                .environments
-                .contains_key(&(authenticated.principal().clone(), context_id.clone()))
+        let key = (authenticated.principal().clone(), context_id);
+        if state.environments.contains_key(&key)
+            && (state.native_publishers.contains_key(&key)
+                || matches!(publisher, CatalogPublisher::NativeObservation { .. }))
         {
+            // Explicit source composition retains its existing replacement
+            // policy. A lazy native publisher cannot replace it, or vice versa.
+            return Err(error(
+                "SOURCE_CONFLICT",
+                "Catalog source publisher already owns this context",
+            ));
+        }
+        if state.environments.len() >= MAX_BINDINGS && !state.environments.contains_key(&key) {
             return Err(budget_error());
         }
-        state
-            .environments
-            .insert((authenticated.principal().clone(), context_id), installed);
+        if let CatalogPublisher::NativeObservation { proof, receipt } = publisher {
+            state
+                .native_publishers
+                .insert(key.clone(), (proof, receipt));
+        }
+        state.environments.insert(key, installed);
         Ok(binding_revision)
+    }
+
+    /// Selection only; current request, native owner and actual source facts
+    /// are checked by the native consumer before either issuance or reuse.
+    pub(crate) fn native_admission_state(
+        &self,
+        authenticated: &AuthenticatedPrincipal,
+        context: &Value,
+    ) -> AppResult<NativeCatalogAdmissionState> {
+        let id = context_id(context)?;
+        if !authenticated.is_current() || !authenticated.permits_context(id.as_str()) {
+            return Err(forbidden());
+        }
+        let key = (authenticated.principal().clone(), id);
+        let state = self.state.try_borrow().map_err(|_| busy())?;
+        let Some(installed) = state.environments.get(&key) else {
+            return Ok(NativeCatalogAdmissionState::Missing);
+        };
+        match state.native_publishers.get(&key) {
+            None => Ok(NativeCatalogAdmissionState::Explicit),
+            Some((_, receipt)) => Ok(NativeCatalogAdmissionState::Native(
+                NativeCatalogPublication {
+                    key,
+                    revision: installed.revision.clone(),
+                    receipt: receipt.clone(),
+                },
+            )),
+        }
+    }
+
+    /// Only the actual completed-pairing consumer constructs this opaque
+    /// observation. DTOs, policy records and hashes have no issuance entry.
+    pub(crate) fn register_native_observation(
+        &self,
+        authenticated: &AuthenticatedPrincipal,
+        budget: &RequestBudget,
+        store: &DurableStore,
+        observation: crate::native_catalog::NativeCatalogObservation,
+    ) -> AppResult<NativeCatalogPublication> {
+        let (registration, proof, method) = observation.into_parts();
+        budget.check().map_err(service_app)?;
+        let id = context_id(&registration.context)?;
+        if !authenticated.is_current()
+            || !authenticated.permits(&method)
+            || !authenticated.permits_context(id.as_str())
+        {
+            return Err(forbidden());
+        }
+        let key = (authenticated.principal().clone(), id);
+        {
+            let state = self.state.try_borrow().map_err(|_| busy())?;
+            if let Some(previous) = state.environments.get(&key) {
+                let Some((original, receipt)) = state.native_publishers.get(&key) else {
+                    return Err(error(
+                        "SOURCE_CONFLICT",
+                        "Explicit catalog sources already own this context",
+                    ));
+                };
+                if original != &proof || previous.registration.context != registration.context {
+                    return Err(error(
+                        "TARGET_DRIFT",
+                        "Actual native catalog source identity changed",
+                    ));
+                }
+                // Search/describe may reuse an existing source after the same
+                // actual admission checks, but cannot create a missing grant.
+                return Ok(NativeCatalogPublication {
+                    key,
+                    revision: previous.revision.clone(),
+                    receipt: receipt.clone(),
+                });
+            }
+        }
+        if method != "catalog.capture" {
+            return Err(forbidden());
+        }
+        let receipt = Rc::new(());
+        let revision = self.register_with_publisher(
+            authenticated,
+            budget,
+            store,
+            registration,
+            CatalogPublisher::NativeObservation {
+                proof,
+                receipt: receipt.clone(),
+            },
+        )?;
+        Ok(NativeCatalogPublication {
+            key,
+            revision,
+            receipt,
+        })
+    }
+
+    /// Pure exact-owner retirement. A replacement, explicit publisher or
+    /// missing element is left untouched; registry contention is not hidden.
+    pub(crate) fn retire_native_publication(
+        &self,
+        publication: &NativeCatalogPublication,
+    ) -> AppResult<()> {
+        let mut state = self.state.try_borrow_mut().map_err(|_| busy())?;
+        let matches = state
+            .environments
+            .get(&publication.key)
+            .is_some_and(|current| {
+                current.revision == publication.revision
+                    && state
+                        .native_publishers
+                        .get(&publication.key)
+                        .is_some_and(|(_, receipt)| Rc::ptr_eq(receipt, &publication.receipt))
+            });
+        if matches {
+            state.environments.remove(&publication.key);
+            state.native_publishers.remove(&publication.key);
+        }
+        Ok(())
     }
 
     pub fn revoke(&self, authenticated: &AuthenticatedPrincipal, id: &ContextId) -> AppResult<()> {
@@ -419,11 +586,10 @@ impl RegisteredCatalogSources {
         {
             return Err(forbidden());
         }
-        self.state
-            .try_borrow_mut()
-            .map_err(|_| busy())?
-            .environments
-            .remove(&(authenticated.principal().clone(), id.clone()));
+        let mut state = self.state.try_borrow_mut().map_err(|_| busy())?;
+        let key = (authenticated.principal().clone(), id.clone());
+        state.environments.remove(&key);
+        state.native_publishers.remove(&key);
         Ok(())
     }
 
@@ -520,6 +686,7 @@ impl RegisteredCatalogSources {
             budget: budget.clone(),
             read_principal: self.read_principal(authenticated, &id)?,
             installed,
+            native_checkpoint: None,
         };
         call.local()?;
         let registered = call
@@ -598,6 +765,14 @@ impl RegisteredCatalogSources {
         {
             return Err(service_forbidden());
         }
+        let native_checkpoint = NativeCatalogAdmission {
+            request: slot,
+            authority: &self.authority,
+            hosts: &self.hosts,
+            sources: self,
+        }
+        .checkpoint(&authenticated, context, store, &actual_budget)
+        .map_err(|cause| ServiceError::caused_by(cause.code, cause.message, cause))?;
         let shared = PlanningStore::write(store);
         let call = CatalogCall {
             sources: self.clone(),
@@ -605,6 +780,7 @@ impl RegisteredCatalogSources {
             budget: actual_budget,
             installed,
             read_principal: expected,
+            native_checkpoint,
         };
         call.fresh().map_err(app_service)?;
         let backend = BorrowedCatalogBackend {
@@ -656,6 +832,7 @@ impl RegisteredCatalogSources {
             budget: actual_budget,
             installed,
             read_principal: expected,
+            native_checkpoint: None,
         };
         call.fresh().map_err(app_service)?;
         Ok(Box::new(CatalogAccess(call, false)))
@@ -699,6 +876,7 @@ impl RegisteredCatalogSources {
             budget: budget.clone(),
             read_principal: self.read_principal(authenticated, &context_id)?,
             installed,
+            native_checkpoint: None,
         };
         call.fresh()?;
         let receipt = self
@@ -753,6 +931,7 @@ impl RegisteredCatalogSources {
                 budget: actual_budget,
                 installed,
                 read_principal: expected,
+                native_checkpoint: None,
             },
             snapshot,
             catalog,
@@ -1027,6 +1206,7 @@ impl RegisteredCatalogSources {
             budget: budget.clone(),
             installed,
             read_principal: self.read_principal(authenticated, &id)?,
+            native_checkpoint: None,
         };
         call.fresh()?;
         self.verify_capture_manifest(&call, &snapshot_id, &capture, store)?;
@@ -1105,8 +1285,25 @@ struct CatalogCall {
     budget: RequestBudget,
     installed: InstalledEnvironment,
     read_principal: ReadPrincipal,
+    native_checkpoint: Option<Rc<dyn NativeCatalogCheckpoint>>,
 }
 impl CatalogCall {
+    fn check_native_source(&self, store: &PlanningStore<'_>) -> AppResult<()> {
+        self.local()?;
+        match self
+            .sources
+            .native_admission_state(&self.authenticated, &self.installed.registration.context)?
+        {
+            NativeCatalogAdmissionState::Explicit => Ok(()),
+            NativeCatalogAdmissionState::Missing => Err(forbidden()),
+            NativeCatalogAdmissionState::Native(_) => {
+                let checkpoint = self.native_checkpoint.as_ref().ok_or_else(forbidden)?;
+                // This is an immutable short Store borrow, not a transaction.
+                // It ends before any host/native transport call is issued.
+                store.with_read(|store| checkpoint.check(store))
+            }
+        }
+    }
     /// Pure current ACL checks are also used after cancellation. They never
     /// restart a read or call a host. The active source binding is independent
     /// from source evidence and is checked on each hit/read/final return.
@@ -1767,6 +1964,62 @@ fn host_inspection(
 ) -> Result<Value, CatalogError> {
     stopped(control)?;
     call.fresh().map_err(app_catalog)?;
+    call.check_native_source(store).map_err(app_catalog)?;
+    let output = observed_host_inspection(store, call, selector, control);
+    finish_native_inspection(output, call.check_native_source(store))
+}
+
+/// Both immutable causes survive without changing the original catalog
+/// classification or printing a response body or native ownership details.
+pub(crate) struct NativeCatalogInspectionFailure {
+    pub(crate) primary: Arc<CatalogError>,
+    pub(crate) checkpoint: AppError,
+}
+impl std::fmt::Debug for NativeCatalogInspectionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeCatalogInspectionFailure")
+            .field("primary_code", &self.primary.code())
+            .field("checkpoint_code", &self.checkpoint.code)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for NativeCatalogInspectionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Native catalog inspection and current source checkpoint both failed")
+    }
+}
+impl std::error::Error for NativeCatalogInspectionFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.primary.as_ref())
+    }
+}
+fn finish_native_inspection<T>(
+    output: Result<T, CatalogError>,
+    checkpoint: AppResult<()>,
+) -> Result<T, CatalogError> {
+    match (output, checkpoint) {
+        (Ok(output), Ok(())) => Ok(output),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(cause)) => Err(app_catalog(cause)),
+        (Err(primary), Err(checkpoint)) => {
+            let primary = Arc::new(primary);
+            Err(CatalogError::Causal {
+                primary: primary.clone(),
+                source: Box::new(NativeCatalogInspectionFailure {
+                    primary,
+                    checkpoint,
+                }),
+            })
+        }
+    }
+}
+
+fn observed_host_inspection(
+    store: &PlanningStore<'_>,
+    call: &CatalogCall,
+    selector: &str,
+    control: &CaptureControl<'_>,
+) -> Result<Value, CatalogError> {
     let id = context_id(&call.installed.registration.context).map_err(app_catalog)?;
     let response = call
         .sources
@@ -1793,7 +2046,7 @@ fn host_inspection(
         let code = response["error"]["code"]
             .as_str()
             .unwrap_or("HOST_REQUEST_FAILED");
-        return Err(if code == "CANCELLED" {
+        let primary = if code == "CANCELLED" {
             CatalogError::Cancelled
         } else if code == "PERMISSION_REQUIRED" {
             CatalogError::PermissionRequired
@@ -1801,7 +2054,11 @@ fn host_inspection(
             CatalogError::SourceUnavailable(format!(
                 "Original host inspection failed: {code}; complete response retained"
             ))
-        });
+        };
+        return Err(CatalogError::caused_by(
+            primary,
+            NativeCatalogHostFailure { response },
+        ));
     }
     stopped(control)?;
     response
@@ -2650,12 +2907,13 @@ fn service_unavailable() -> ServiceError {
     )
 }
 fn app_catalog(e: AppError) -> CatalogError {
-    match e.code {
+    let primary = match e.code {
         "PERMISSION_REQUIRED" => CatalogError::PermissionRequired,
         "CANCELLED" | "TIME_BUDGET_EXCEEDED" => CatalogError::Cancelled,
         "INPUT_LIMIT" => CatalogError::InputLimit,
         _ => CatalogError::SourceUnavailable(e.to_string()),
-    }
+    };
+    CatalogError::caused_by(primary, e)
 }
 fn app_storage(e: AppError) -> StorageError {
     StorageError::InvalidTransition(e.to_string())

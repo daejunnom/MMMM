@@ -224,6 +224,7 @@ impl Fixture {
                 .sources
                 .read_principal(&self.authenticated, &id)
                 .unwrap(),
+            native_checkpoint: None,
         }
     }
     fn request(&self, kind: &str) -> Value {
@@ -462,16 +463,16 @@ fn current_scope_and_source_revocation_apply_to_catalog_cache_reads() {
             &context_id(&fixture.context).unwrap(),
         )
         .unwrap();
-    assert!(matches!(
-        access.authorize_snapshot(&call.read_principal, &snapshot),
-        Err(CatalogError::PermissionRequired)
-    ));
+    let error = access
+        .authorize_snapshot(&call.read_principal, &snapshot)
+        .unwrap_err();
+    assert_eq!(error.code(), "PERMISSION_REQUIRED");
+    assert!(std::error::Error::source(&error).unwrap().is::<AppError>());
     // Raw historical evidence remains retained. Reading it through the
     // owning catalog still requires the current binding, including cache hits.
-    assert!(matches!(
-        catalog.describe(&json!({"snapshotId":snapshot["snapshotId"],"contextId":fixture.context["contextId"],"kind":"minecraft:model","resourceId":"example:offset"}),&call.read_principal,&access),
-        Err(CatalogError::PermissionRequired)
-    ));
+    let error = catalog.describe(&json!({"snapshotId":snapshot["snapshotId"],"contextId":fixture.context["contextId"],"kind":"minecraft:model","resourceId":"example:offset"}),&call.read_principal,&access).unwrap_err();
+    assert_eq!(error.code(), "PERMISSION_REQUIRED");
+    assert!(std::error::Error::source(&error).unwrap().is::<AppError>());
     let snapshot_id = SnapshotId::new(snapshot["snapshotId"].as_str().unwrap()).unwrap();
     let retained = fixture.sources.state.borrow().captures[&snapshot_id].clone();
     assert_eq!(
@@ -523,7 +524,16 @@ fn cancelled_retained_authority_requires_current_session_and_full_scope_without_
     let translated = rpc.storage_error(rpc.check().unwrap_err());
     assert_eq!(translated.code, "CANCELLED");
     assert!(std::error::Error::source(&translated).is_some());
-    assert!(matches!(app_catalog(translated), CatalogError::Cancelled));
+    let translated = app_catalog(translated);
+    assert_eq!(translated.code(), "CANCELLED");
+    assert_eq!(
+        std::error::Error::source(&translated)
+            .unwrap()
+            .downcast_ref::<AppError>()
+            .unwrap()
+            .code,
+        "CANCELLED"
+    );
     fixture.sessions.revoke_all();
     assert!(call.local().is_err());
 }
@@ -1271,4 +1281,102 @@ fn inactive_request_slot_and_direct_decoded_runtime_source_cannot_install_author
             ..
         })
     ));
+}
+
+#[test]
+fn native_source_io_without_a_current_call_checkpoint_is_denied_while_explicit_is_unchanged() {
+    let root = TestRoot::new();
+    let mut store = root.open();
+    let project = project(&["catalog-json"]);
+    store.save_project(&project, None).unwrap();
+    let id = ProjectId::new(project["projectId"].as_str().unwrap()).unwrap();
+    let resource = put_resource(&mut store, &id, "catalog-json", b"{}", "application/json");
+    let fixture = Fixture::new(&project, &[]);
+    fixture.install(
+        &store,
+        fixture.registration(vec![source(
+            CatalogSourceBacking::ProjectResource(resource),
+            "source-json",
+        )]),
+    );
+    let call = fixture.call();
+    let shared = PlanningStore::read(&store);
+    call.check_native_source(&shared).unwrap();
+    // Negative publisher metadata is injected only to verify default denial.
+    // No completed pairing, native owner, source grant or checkpoint is made.
+    let key = (
+        fixture.authenticated.principal().clone(),
+        context_id(&fixture.context).unwrap(),
+    );
+    fixture
+        .sources
+        .state
+        .borrow_mut()
+        .native_publishers
+        .insert(key, (raw_digest(b"negative native origin"), Rc::new(())));
+    assert_eq!(
+        call.check_native_source(&shared).unwrap_err().code,
+        "PERMISSION_REQUIRED"
+    );
+}
+
+#[test]
+fn exact_native_retirement_contention_preserves_both_failure_causes_and_the_owned_element() {
+    let root = TestRoot::new();
+    let mut store = root.open();
+    let project = project(&["catalog-json"]);
+    store.save_project(&project, None).unwrap();
+    let id = ProjectId::new(project["projectId"].as_str().unwrap()).unwrap();
+    let resource = put_resource(&mut store, &id, "catalog-json", b"{}", "application/json");
+    let fixture = Fixture::new(&project, &[]);
+    fixture.install(
+        &store,
+        fixture.registration(vec![source(
+            CatalogSourceBacking::ProjectResource(resource),
+            "source-json",
+        )]),
+    );
+    let key = (
+        fixture.authenticated.principal().clone(),
+        context_id(&fixture.context).unwrap(),
+    );
+    fixture.sources.state.borrow_mut().native_publishers.insert(
+        key.clone(),
+        (raw_digest(b"negative native origin"), Rc::new(())),
+    );
+    let NativeCatalogAdmissionState::Native(publication) = fixture
+        .sources
+        .native_admission_state(&fixture.authenticated, &fixture.context)
+        .unwrap()
+    else {
+        panic!("native element required for negative retirement test");
+    };
+    let held = fixture.sources.state.borrow();
+    let cleanup = fixture.sources.retire_native_publication(&publication);
+    assert_eq!(cleanup.as_ref().unwrap_err().code, "SOURCE_BUSY");
+    let primary = CatalogError::caused_by(
+        CatalogError::SourceUnavailable("original source failure".into()),
+        AppError::new("ORIGINAL_SOURCE_FAILURE", "Original source read failed"),
+    );
+    let error = finish_native_inspection::<()>(Err(primary), cleanup).unwrap_err();
+    assert_eq!(error.code(), "SOURCE_UNAVAILABLE");
+    assert_eq!(
+        error.to_string(),
+        "SOURCE_UNAVAILABLE: original source failure"
+    );
+    let both = std::error::Error::source(&error)
+        .unwrap()
+        .downcast_ref::<NativeCatalogInspectionFailure>()
+        .unwrap();
+    assert_eq!(both.checkpoint.code, "SOURCE_BUSY");
+    assert_eq!(
+        std::error::Error::source(both.primary.as_ref())
+            .unwrap()
+            .downcast_ref::<AppError>()
+            .unwrap()
+            .code,
+        "ORIGINAL_SOURCE_FAILURE"
+    );
+    assert!(held.environments.contains_key(&key));
+    assert!(held.native_publishers.contains_key(&key));
 }

@@ -1,5 +1,6 @@
 use mmmm_xtask::{definition_startup, policy, process, storage};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -168,16 +169,21 @@ fn run_managed(
     spec.timeout = Duration::from_secs(timeout);
     spec.tail_policy = tail_policy;
     spec.resource_policy = resource_policy;
-    let result = process::supervise_with_progress(&spec, &cancellation, |checkpoint| {
-        let measurement = build
-            .measure_with_progress(checkpoint)
+    let mut observation_retries = storage::ObservationRetryLog::default();
+    let result =
+        process::supervise_with_progress_phased(&spec, &cancellation, |phase, checkpoint| {
+            let measurement = match phase {
+                process::ObservationPhase::PreSpawn => build.measure_with_progress(checkpoint),
+                process::ObservationPhase::Running => build
+                    .measure_with_progress_and_diagnostics(checkpoint, &mut observation_retries),
+            }
             .map_err(|error| error.to_string())?;
-        if !measurement.within_budget {
-            return Err("managed disk budget exceeded".into());
-        }
-        Ok(())
-    });
-    let (command_exit, drained, mut supervisor_errors, command_success, report) = match result {
+            if !measurement.within_budget {
+                return Err("managed disk budget exceeded".into());
+            }
+            Ok(())
+        });
+    let (command_exit, drained, mut supervisor_errors, command_success, mut report) = match result {
         Ok(outcome) => {
             let success = outcome.command_exit == Some(0)
                 && outcome.drained
@@ -199,9 +205,17 @@ fn run_managed(
             serde_json::json!({"kind": error.kind, "message": error.message, "drained": error.drained}),
         ),
     };
+    let (retry_summary, retry_export) =
+        export_observation_retries(&build.paths().evidence, &observation_retries);
+    report["storage_observation_retries"] = retry_summary;
+    if let Err(error) = &retry_export {
+        // Preserve this independent failure even if process.json also fails.
+        supervisor_errors.push(format!("retry companion export: {error}"));
+    }
     let mut exported = false;
     let export = (|| -> Result<(), Box<dyn std::error::Error>> {
         write_new_json(&build.paths().evidence.join("process.json"), &report)?;
+        retry_export?;
         if !drained {
             return Err("unconfirmed drain prevents command log export and cleanup".into());
         }
@@ -242,6 +256,118 @@ fn run_managed(
         && receipt.cleanup_errors.is_empty();
     println!("{}", serde_json::to_string_pretty(&receipt)?);
     Ok(if success { 0 } else { 1 })
+}
+
+fn export_observation_retries(
+    evidence: &Path,
+    retries: &storage::ObservationRetryLog,
+) -> (serde_json::Value, Result<(), Box<dyn std::error::Error>>) {
+    // Required companion, even when empty. A failed write remains an export
+    // failure and cannot authorize finish/cleanup. First/last facts also stay
+    // in process.json if this independent evidence destination fails.
+    let mut summary = retries.summary();
+    summary["write_confirmed"] = false.into();
+    let encoded = match retries.encoded_evidence() {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            summary["status"] = "encoding_failed".into();
+            summary["byte_length"] = serde_json::Value::Null;
+            summary["sha256"] = serde_json::Value::Null;
+            return (summary, Err(Box::new(error)));
+        }
+    };
+    // Encode once including newline; the digest and CreateNew writer use this
+    // exact buffer. Pins describe this buffer; only write_confirmed certifies
+    // that the complete companion was written, flushed and synced.
+    summary["byte_length"] = encoded.len().into();
+    summary["sha256"] = format!("{:x}", Sha256::digest(&encoded)).into();
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(evidence.join("observation-retries.json"))?;
+        file.write_all(&encoded)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    summary["write_confirmed"] = result.is_ok().into();
+    summary["status"] = if result.is_ok() {
+        "created"
+    } else {
+        "write_unconfirmed"
+    }
+    .into();
+    (summary, result)
+}
+
+#[cfg(test)]
+mod observation_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn required_retry_companion_failure_preserves_the_owned_lease_and_scratch() {
+        let parent = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = parent.join(format!("mmmm-retry-export-{}-{stamp}", std::process::id()));
+        assert!(root.is_absolute() && !root.exists());
+        fs::create_dir(&root).unwrap();
+        let checkout = root.join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let build = storage::ManagedBuild::acquire(
+            storage::StorageConfig {
+                output_root: Some(root.join("output")),
+                evidence_root: root.join("evidence"),
+                purpose: "retry-export-fixture".into(),
+                budgets: storage::Budgets::default(),
+            },
+            &checkout,
+        )
+        .unwrap();
+        let paths = build.paths().clone();
+        let retries = storage::ObservationRetryLog::default();
+        let (summary, exported) = export_observation_retries(&paths.evidence, &retries);
+        exported.unwrap();
+        let bytes = fs::read(paths.evidence.join("observation-retries.json")).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(report["schema"], "mmmm-managed-observation-retries/1");
+        assert_eq!(report["records"], serde_json::json!([]));
+        assert_eq!(summary["records"], 0);
+        assert_eq!(summary["write_confirmed"], true);
+        assert_eq!(summary["byte_length"], bytes.len());
+        assert_eq!(summary["sha256"], format!("{:x}", Sha256::digest(&bytes)));
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        let (failed, result) = export_observation_retries(&paths.evidence, &retries);
+        let error = result.unwrap_err();
+        assert_eq!(failed["write_confirmed"], false);
+        assert_eq!(failed["status"], "write_unconfirmed");
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            fs::read(paths.evidence.join("observation-retries.json")).unwrap(),
+            bytes
+        );
+        let finish = build
+            .finish(storage::FinishOutcome {
+                command_exit: Some(0),
+                drained: true,
+                evidence_exported: false,
+                supervisor_errors: vec!["required retry evidence export failed".into()],
+            })
+            .unwrap_err();
+        assert_eq!(finish.kind, "evidence");
+        assert!(paths.catalog.join("lease.json").exists() && paths.scratch.exists());
+        // This is a newly owned outer test fixture, not general build cleanup.
+        let physical = fs::canonicalize(&root).unwrap();
+        assert_eq!(physical.parent(), Some(parent.as_path()));
+        assert!(!is_link(&fs::symlink_metadata(&root).unwrap()));
+        fs::remove_dir_all(physical).unwrap();
+    }
 }
 
 fn run_definition_startup(

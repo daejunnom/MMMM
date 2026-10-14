@@ -310,12 +310,22 @@ impl MacExec {
 
     fn exec(&self) -> std::io::Result<()> {
         // Exactly the four roles prepared for inheritance are inspected here.
-        // There is no retry, allocation, flag mutation or descriptor fallback.
-        // A syscall error is captured before any other native call. The parent
-        // retains its original deadline; these five cooperative kernel calls
-        // provide no hard interruption bound for a delayed pre-exec syscall.
+        // SETEXEC's exec-table clone drops CLOEXEC descriptors before its
+        // inherit actions run. Clear only that bit for these same four roles
+        // in this forked child; preserve every other original descriptor flag.
+        // There is no retry, allocation or descriptor fallback. A syscall
+        // error is captured before any other native call. The parent retains
+        // its original deadline; these five checks and at most four F_SETFD
+        // calls provide no hard interruption bound for a delayed syscall.
         for &(stage, fd) in &self.descriptors {
-            if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags == -1 {
+                let error = std::io::Error::last_os_error();
+                return Err(spawn_stage_error(stage, error));
+            }
+            if flags & libc::FD_CLOEXEC != 0
+                && unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } == -1
+            {
                 let error = std::io::Error::last_os_error();
                 return Err(spawn_stage_error(stage, error));
             }

@@ -415,8 +415,505 @@ fn public_api_source_namespace_is_not_misclassified_as_a_credential_file() {
     fs::create_dir_all(&namespace).unwrap();
     fs::write(namespace.join("mod.rs"), b"pub struct PublicApi;").unwrap();
     assert!(build.measure().unwrap().within_budget);
+    assert!(
+        build
+            .measure_with_progress_and_diagnostics(
+                &mut || Ok(()),
+                &mut ObservationRetryLog::default()
+            )
+            .unwrap()
+            .within_budget
+    );
     let receipt = build.finish(outcome(0)).unwrap();
     assert!(receipt.lease_released);
+}
+
+// Actual owned roots/files retain the production ownership and ancestry
+// checks. Only the selected metadata call and retry clock/wait are injected;
+// no scheduler timing, ACL relaxation or secret fixture is required.
+fn retry_measurement(
+    build: &ManagedBuild,
+    diagnostics: &mut ObservationRetryLog,
+    metadata: &mut dyn FnMut(&Path) -> std::io::Result<fs::Metadata>,
+    wait: &mut dyn FnMut(Duration),
+    progress: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<Measurement, StorageError> {
+    let owner = || build.verify_ownership();
+    let now = Instant::now();
+    let clock = || now;
+    let mut retry = MetadataReobservation::new(diagnostics, &owner, metadata, wait, true, &clock);
+    build.measure_observed_retry(|_| {}, progress, Some(&mut retry))
+}
+
+#[test]
+fn running_metadata_recovery_retains_first_native_error_and_verified_present_or_missing() {
+    use std::cell::Cell;
+    for remove in [false, true] {
+        let fixture = Fixture::new("metadata-recovery");
+        let build = fixture.acquire();
+        let leaf = build.paths().cargo_target.join("transient-output");
+        fs::write(&leaf, b"bounded output").unwrap();
+        let calls = Cell::new(0);
+        let mut metadata = |path: &Path| {
+            if path == leaf {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    return Err(std::io::Error::from_raw_os_error(5));
+                }
+            }
+            fs::symlink_metadata(path)
+        };
+        let mut delays = Vec::new();
+        let mut wait = |delay| {
+            delays.push(delay);
+            if remove {
+                fs::remove_file(&leaf).unwrap();
+            }
+        };
+        let mut diagnostics = ObservationRetryLog::default();
+        assert!(
+            retry_measurement(
+                &build,
+                &mut diagnostics,
+                &mut metadata,
+                &mut wait,
+                &mut || Ok(())
+            )
+            .unwrap()
+            .within_budget
+        );
+        assert_eq!(calls.get(), 2);
+        assert_eq!(delays, [Duration::from_millis(2)]);
+        let record = &diagnostics.records[0];
+        assert_eq!(record.first.raw_os_error, Some(5));
+        assert_eq!(record.attempts, 2);
+        assert!(
+            !record
+                .generated_relative
+                .contains(fixture.root.to_string_lossy().as_ref())
+        );
+        if remove {
+            assert!(matches!(
+                record.final_observation,
+                RetryFinalObservation::MissingValidated { .. }
+            ));
+        } else {
+            assert!(matches!(
+                record.final_observation,
+                RetryFinalObservation::Present {
+                    byte_length: 14,
+                    ..
+                }
+            ));
+        }
+        build.finish(outcome(0)).unwrap();
+    }
+}
+
+#[test]
+fn repeated_native5_and_other_errno_remain_fatal_with_first_and_final_codes() {
+    use std::cell::Cell;
+    for last in [5, 32] {
+        let fixture = Fixture::new("metadata-denial");
+        let build = fixture.acquire();
+        let leaf = build.paths().scratch.join("transient-output");
+        fs::write(&leaf, b"unchanged").unwrap();
+        let calls = Cell::new(0);
+        let mut metadata = |path: &Path| {
+            if path == leaf {
+                calls.set(calls.get() + 1);
+                return Err(std::io::Error::from_raw_os_error(if calls.get() == 1 {
+                    5
+                } else {
+                    last
+                }));
+            }
+            fs::symlink_metadata(path)
+        };
+        let mut delays = Vec::new();
+        let mut diagnostics = ObservationRetryLog::default();
+        let error = retry_measurement(
+            &build,
+            &mut diagnostics,
+            &mut metadata,
+            &mut |delay| delays.push(delay),
+            &mut || Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, "io");
+        assert!(error.message.contains("first_raw_os_error=Some(5)"));
+        assert!(
+            error
+                .message
+                .contains(&format!("final_raw_os_error=Some({last})"))
+        );
+        assert_eq!(calls.get(), if last == 5 { 3 } else { 2 });
+        assert_eq!(delays.len(), calls.get() - 1);
+        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(fs::read(&leaf).unwrap(), b"unchanged");
+        build.finish(outcome(0)).unwrap();
+    }
+}
+
+#[test]
+fn retry_wait_checkpoint_failure_keeps_original_native5_and_original_cause() {
+    use std::cell::Cell;
+    let fixture = Fixture::new("metadata-cancel");
+    let build = fixture.acquire();
+    let leaf = build.paths().scratch.join("transient-output");
+    fs::write(&leaf, b"unchanged").unwrap();
+    let stopped = Cell::new(false);
+    let calls = Cell::new(0);
+    let mut metadata = |path: &Path| {
+        if path == leaf {
+            calls.set(calls.get() + 1);
+            return Err(std::io::Error::from_raw_os_error(5));
+        }
+        fs::symlink_metadata(path)
+    };
+    let mut diagnostics = ObservationRetryLog::default();
+    let error = retry_measurement(
+        &build,
+        &mut diagnostics,
+        &mut metadata,
+        &mut |_| stopped.set(true),
+        &mut || {
+            if stopped.get() {
+                Err("original managed deadline expired".into())
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .unwrap_err();
+    assert_eq!(calls.get(), 1);
+    assert_eq!(error.kind, "observation_failed");
+    assert!(error.message.contains("first_raw_os_error=Some(5)"));
+    assert_eq!(
+        std::error::Error::source(&error).unwrap().to_string(),
+        "observation_failed: original managed deadline expired"
+    );
+    assert!(matches!(
+        diagnostics.records[0].final_observation,
+        RetryFinalObservation::Failed {
+            category: "observation_failed",
+            ..
+        }
+    ));
+    build.finish(outcome(0)).unwrap();
+}
+
+#[test]
+fn retry_global_call_wait_wall_and_record_budgets_fail_without_unbounded_work() {
+    use std::cell::Cell;
+    for two_retries in [false, true] {
+        let fixture = Fixture::new("metadata-budget");
+        let build = fixture.acquire();
+        let leaf = build.paths().scratch.join("transient-output");
+        fs::write(&leaf, b"owned").unwrap();
+        let calls = Cell::new(0usize);
+        let period = if two_retries { 3 } else { 2 };
+        let mut metadata = |path: &Path| {
+            calls.set(calls.get() + 1);
+            if calls.get().is_multiple_of(period) {
+                fs::symlink_metadata(path)
+            } else {
+                Err(std::io::Error::from_raw_os_error(5))
+            }
+        };
+        let owner = || build.verify_ownership();
+        let now = Instant::now();
+        let clock = || now;
+        let mut wait = |_| {};
+        let mut diagnostics = ObservationRetryLog::default();
+        let mut retry = MetadataReobservation::new(
+            &mut diagnostics,
+            &owner,
+            &mut metadata,
+            &mut wait,
+            true,
+            &clock,
+        );
+        let mut failure = None;
+        for _ in 0..18 {
+            if let Err(error) = retry.observe(
+                &leaf,
+                &build.paths().slot,
+                &build.observation_roots(),
+                &mut || Ok(()),
+            ) {
+                failure = Some(error);
+                break;
+            }
+        }
+        assert_eq!(failure.unwrap().kind, "retry_budget");
+        assert_eq!(retry.planned_wait, MAX_RETRY_WAIT);
+        assert!(retry.extra_calls <= MAX_EXTRA_METADATA_CALLS);
+        if !two_retries {
+            assert_eq!(retry.extra_calls, MAX_EXTRA_METADATA_CALLS);
+        }
+        let record = diagnostics.records[0].clone();
+        let mut byte_limited = ObservationRetryLog::default();
+        let mut oversized = record.clone();
+        oversized.generated_relative = "x".repeat(MAX_RETRY_LOG_BYTES);
+        assert!(byte_limited.retain(oversized).is_err());
+        assert!(byte_limited.records.is_empty());
+        while diagnostics.records.len() < MAX_RETRY_RECORDS {
+            diagnostics.retain(record.clone()).unwrap();
+        }
+        let before = diagnostics.evidence().unwrap();
+        assert!(diagnostics.retain(record).is_err());
+        assert_eq!(diagnostics.evidence().unwrap(), before);
+        calls.set(0);
+        let mut retry = MetadataReobservation::new(
+            &mut diagnostics,
+            &owner,
+            &mut metadata,
+            &mut wait,
+            true,
+            &clock,
+        );
+        let error = retry
+            .observe(
+                &leaf,
+                &build.paths().slot,
+                &build.observation_roots(),
+                &mut || Ok(()),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, "retry_evidence");
+        assert_eq!(retry.extra_calls, 0);
+        assert_eq!(diagnostics.records.len(), MAX_RETRY_RECORDS);
+        build.finish(outcome(0)).unwrap();
+    }
+    let fixture = Fixture::new("metadata-wall");
+    let build = fixture.acquire();
+    let leaf = build.paths().scratch.join("transient-output");
+    fs::write(&leaf, b"owned").unwrap();
+    let now = Cell::new(Instant::now());
+    let clock = || now.get();
+    let owner = || build.verify_ownership();
+    let mut metadata = |_: &Path| Err(std::io::Error::from_raw_os_error(5));
+    let mut wait = |_| now.set(now.get() + MAX_RETRY_WALL);
+    let mut diagnostics = ObservationRetryLog::default();
+    let mut retry = MetadataReobservation::new(
+        &mut diagnostics,
+        &owner,
+        &mut metadata,
+        &mut wait,
+        true,
+        &clock,
+    );
+    let error = retry
+        .observe(
+            &leaf,
+            &build.paths().slot,
+            &build.observation_roots(),
+            &mut || Ok(()),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind, "retry_budget");
+    assert_eq!(retry.extra_calls, 0);
+    build.finish(outcome(0)).unwrap();
+}
+
+#[test]
+fn retry_refuses_fixed_foreign_disabled_and_secret_selectors() {
+    use std::cell::Cell;
+    let fixture = Fixture::new("metadata-selector");
+    let build = fixture.acquire();
+    let owner = || build.verify_ownership();
+    let calls = Cell::new(0);
+    let mut metadata = |_: &Path| {
+        calls.set(calls.get() + 1);
+        Err(std::io::Error::from_raw_os_error(5))
+    };
+    let now = Instant::now();
+    let clock = || now;
+    let mut wait = |_| panic!("non-admitted selector must not wait or retry");
+    let mut diagnostics = ObservationRetryLog::default();
+    for path in [
+        build.paths().scratch.clone(),
+        build.paths().slot.join("owner.json"),
+        fixture.checkout.join("ordinary-original"),
+    ] {
+        let mut retry = MetadataReobservation::new(
+            &mut diagnostics,
+            &owner,
+            &mut metadata,
+            &mut wait,
+            true,
+            &clock,
+        );
+        assert!(
+            retry
+                .observe(
+                    &path,
+                    &build.paths().slot,
+                    &build.observation_roots(),
+                    &mut || Ok(())
+                )
+                .is_err()
+        );
+        assert_eq!(retry.extra_calls, 0);
+    }
+    let leaf = build.paths().scratch.join("ordinary-output");
+    let mut disabled = MetadataReobservation::new(
+        &mut diagnostics,
+        &owner,
+        &mut metadata,
+        &mut wait,
+        false,
+        &clock,
+    );
+    assert!(
+        disabled
+            .observe(
+                &leaf,
+                &build.paths().slot,
+                &build.observation_roots(),
+                &mut || Ok(())
+            )
+            .is_err()
+    );
+    let before = calls.get();
+    // Pure selectors only: never create, probe, hash or remove secret paths.
+    for name in [
+        ".env",
+        ".env.test",
+        "service-account.json",
+        "api-key.json",
+        ".ssh/id_rsa",
+    ] {
+        let selected = build.paths().scratch.join(name);
+        let mut retry = MetadataReobservation::new(
+            &mut diagnostics,
+            &owner,
+            &mut metadata,
+            &mut wait,
+            true,
+            &clock,
+        );
+        assert_eq!(
+            error_kind(retry.observe(
+                &selected,
+                &build.paths().slot,
+                &build.observation_roots(),
+                &mut || Ok(())
+            )),
+            "secret_path"
+        );
+    }
+    assert_eq!(calls.get(), before);
+    assert!(diagnostics.records.is_empty());
+    build.finish(outcome(0)).unwrap();
+}
+
+#[test]
+fn retry_rechecks_owner_and_rejects_parent_link_before_another_target_lookup() {
+    use std::cell::Cell;
+    for owner_removed in [false, true] {
+        let fixture = Fixture::new("metadata-boundary");
+        let build = fixture.acquire();
+        let nested = build.paths().scratch.join("nested");
+        let moved = build.paths().scratch.join("original-nested");
+        fs::create_dir(&nested).unwrap();
+        let leaf = nested.join("ordinary-output");
+        fs::write(&leaf, b"owned original").unwrap();
+        let outside = fixture.root.join("outside-original");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"unchanged outside").unwrap();
+        let calls = Cell::new(0);
+        let mut metadata = |path: &Path| {
+            if path == leaf {
+                calls.set(calls.get() + 1);
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            fs::symlink_metadata(path)
+        };
+        let mut wait = |_| {
+            if owner_removed {
+                fs::remove_file(build.paths().slot.join("owner.json")).unwrap();
+            } else {
+                fs::rename(&nested, &moved).unwrap();
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&outside, &nested).unwrap();
+                #[cfg(windows)]
+                create_junction(&nested, &outside);
+            }
+        };
+        let mut diagnostics = ObservationRetryLog::default();
+        let error = retry_measurement(
+            &build,
+            &mut diagnostics,
+            &mut metadata,
+            &mut wait,
+            &mut || Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(error.kind, if owner_removed { "io" } else { "link" });
+        assert!(error.message.contains("first_raw_os_error=Some(5)"));
+        assert_eq!(
+            fs::read(outside.join("keep")).unwrap(),
+            b"unchanged outside"
+        );
+        assert!(build.paths().catalog.join("lease.json").exists());
+        if !owner_removed {
+            #[cfg(windows)]
+            fs::remove_dir(&nested).unwrap();
+            #[cfg(unix)]
+            fs::remove_file(&nested).unwrap();
+            build.finish(outcome(0)).unwrap();
+        }
+    }
+}
+
+#[test]
+fn retry_rejects_reparse_leaf_even_after_a_successful_metadata_call() {
+    use std::cell::Cell;
+    let fixture = Fixture::new("metadata-leaf-type");
+    let build = fixture.acquire();
+    let leaf = build.paths().scratch.join("ordinary-output");
+    let moved = build.paths().scratch.join("original-output");
+    let outside = fixture.root.join("outside-directory");
+    fs::create_dir(&outside).unwrap();
+    fs::write(&leaf, b"owned original").unwrap();
+    let calls = Cell::new(0);
+    let mut metadata = |path: &Path| {
+        if path == leaf {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+        }
+        fs::symlink_metadata(path)
+    };
+    let mut wait = |_| {
+        fs::rename(&leaf, &moved).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &leaf).unwrap();
+        #[cfg(windows)]
+        create_junction(&leaf, &outside);
+    };
+    let mut diagnostics = ObservationRetryLog::default();
+    let error = retry_measurement(
+        &build,
+        &mut diagnostics,
+        &mut metadata,
+        &mut wait,
+        &mut || Ok(()),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind, "file_type");
+    assert_eq!(calls.get(), 2);
+    assert!(error.message.contains("first_raw_os_error=Some(5)"));
+    assert_eq!(fs::read(&moved).unwrap(), b"owned original");
+    #[cfg(windows)]
+    fs::remove_dir(&leaf).unwrap();
+    #[cfg(unix)]
+    fs::remove_file(&leaf).unwrap();
+    build.finish(outcome(0)).unwrap();
 }
 
 #[test]

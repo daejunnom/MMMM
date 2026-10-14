@@ -106,6 +106,14 @@ pub enum TerminationReason {
     SupervisorFailure,
 }
 
+/// Only Running observations have the original active command checkpoints.
+/// PreSpawn retains strict storage observation without recovery waits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObservationPhase {
+    PreSpawn,
+    Running,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ProcessOutcome {
     pub command_exit: Option<i32>,
@@ -370,8 +378,31 @@ pub fn supervise_with_progress_captured(
     cancellation: &AtomicBool,
     mut observe: impl FnMut(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String>,
 ) -> Result<CapturedProcessOutcome, ProcessError> {
+    supervise_with_progress_captured_phased(spec, cancellation, |_, checkpoint| observe(checkpoint))
+}
+
+pub fn supervise_with_progress_phased(
+    spec: &ProcessSpec,
+    cancellation: &AtomicBool,
+    observe: impl FnMut(ObservationPhase, &mut dyn FnMut() -> Result<(), String>) -> Result<(), String>,
+) -> Result<ProcessOutcome, ProcessError> {
+    supervise_with_progress_captured_phased(spec, cancellation, observe)
+        .map(CapturedProcessOutcome::into_outcome)
+}
+
+fn supervise_with_progress_captured_phased(
+    spec: &ProcessSpec,
+    cancellation: &AtomicBool,
+    mut observe: impl FnMut(
+        ObservationPhase,
+        &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String>,
+) -> Result<CapturedProcessOutcome, ProcessError> {
     validate(spec)?;
-    run_observation(&mut observe, || Ok(()))?;
+    run_observation(
+        &mut |checkpoint| observe(ObservationPhase::PreSpawn, checkpoint),
+        || Ok(()),
+    )?;
     let started = Instant::now();
     let mut stdout_log = create_log(&spec.stdout_log)?;
     let mut stderr_log = create_log(&spec.stderr_log)?;
@@ -509,11 +540,14 @@ pub fn supervise_with_progress_captured(
         if failure_checks_active(&outcome, stopping_at)
             && last_observation.elapsed() >= spec.observation_interval
         {
-            let observation = run_observation(&mut observe, || {
-                #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-                progress_sample(&mut process, spec, cancellation, started)?;
-                Ok(())
-            });
+            let observation = run_observation(
+                &mut |checkpoint| observe(ObservationPhase::Running, checkpoint),
+                || {
+                    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+                    progress_sample(&mut process, spec, cancellation, started)?;
+                    Ok(())
+                },
+            );
             last_observation = Instant::now();
             record_resource_evidence(&process, &mut outcome);
             if let Err(error) = observation {
@@ -735,9 +769,78 @@ fn run_observation(
     // A callback must not hide a native failure by wrapping its text or
     // ignoring it. Keep the original error kind for termination and evidence.
     match first_failure {
-        Some(error) => Err(error),
+        Some(mut error) => {
+            if let Err(context) = observation {
+                // Only the storage retry formatter's path-safe native facts
+                // may be attached. An arbitrary observer string can contain a
+                // private path and must not enter the shared primary message.
+                if let Some(safe) = safe_retry_observation_context(&context) {
+                    error.message.push_str("; observer_context=");
+                    error.message.push_str(&safe);
+                }
+            }
+            Err(error)
+        }
         None => observation.map_err(|error| ProcessError::new("observation", error)),
     }
+}
+
+fn safe_retry_observation_context(context: &str) -> Option<String> {
+    // Copy only fixed/numeric fields before generated_relative. The companion
+    // record separately retains the existing escaped/withheld relative label.
+    let (_, context) = context.split_once(": metadata reobservation; ")?;
+    let (facts, _) = context.split_once("; generated_relative=")?;
+    let mut safe = String::new();
+    let mut seen = 0u8;
+    for field in facts.split("; ") {
+        let (name, value) = field.split_once('=')?;
+        let (bit, valid) = match name {
+            "first_kind" => (1, value == "PermissionDenied"),
+            "final_kind" => (
+                2,
+                matches!(
+                    value,
+                    "io" | "observation_failed"
+                        | "retry_budget"
+                        | "retry_evidence"
+                        | "ownership"
+                        | "link"
+                        | "link_escape"
+                        | "file_type"
+                        | "path_escape"
+                        | "secret_path"
+                        | "path"
+                        | "record"
+                        | "record_limit"
+                        | "schema"
+                ),
+            ),
+            "attempts" => (4, matches!(value, "1" | "2" | "3")),
+            "first_raw_os_error" => (8, value == "Some(5)"),
+            "final_raw_os_error" => (
+                16,
+                value == "None"
+                    || value
+                        .strip_prefix("Some(")
+                        .and_then(|value| value.strip_suffix(')'))
+                        .is_some_and(|number| {
+                            !number.is_empty()
+                                && number.len() <= 11
+                                && number.parse::<i32>().is_ok()
+                        }),
+            ),
+            _ => return None,
+        };
+        if !valid || seen & bit != 0 || safe.len() + field.len() + 2 > 2048 {
+            return None;
+        }
+        seen |= bit;
+        if !safe.is_empty() {
+            safe.push_str("; ");
+        }
+        safe.push_str(field);
+    }
+    (seen == 31).then_some(safe)
 }
 
 fn failure_checks_active(outcome: &ProcessOutcome, stopping_at: Option<Instant>) -> bool {
@@ -2252,6 +2355,35 @@ mod tests {
     use std::sync::{Arc, atomic::AtomicU64};
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     #[test]
+    fn retry_observer_context_keeps_typed_primary_drain_and_private_paths_out() {
+        for kind in ["command_cancelled", "command_timeout", "resource_budget"] {
+            let error = run_observation(&mut |checkpoint| {
+                assert!(checkpoint().is_err());
+                Err("observation_failed: metadata reobservation; first_kind=PermissionDenied; first_raw_os_error=Some(5); attempts=2; final_kind=observation_failed; final_raw_os_error=Some(5); generated_relative=C:\\private-original\\untrusted\nlabel".into())
+            }, || {
+                let mut error = ProcessError::new(kind, "original primary error");
+                error.drained = false;
+                Err(error)
+            }).unwrap_err();
+            assert_eq!(error.kind, kind);
+            assert!(!error.drained);
+            assert!(
+                error
+                    .message
+                    .starts_with("original primary error; observer_context=")
+            );
+            assert!(error.message.contains("first_raw_os_error=Some(5)"));
+            assert!(!error.message.contains("private-original") && !error.message.contains('\n'));
+            assert!(error.message.len() < 2048);
+        }
+        for context in [
+            "untrusted C:\\private-original",
+            "io: metadata reobservation; first_kind=C:\\private; generated_relative=safe",
+        ] {
+            assert!(safe_retry_observation_context(context).is_none());
+        }
+    }
+    #[test]
     fn observation_progress_keeps_the_first_native_failure() {
         let mut samples = 0;
         let error = run_observation(
@@ -2912,6 +3044,40 @@ mod tests {
             TerminationReason::ObservationFailure
         );
         assert!(result.drained);
+        run.cleanup(result.drained);
+    }
+    #[test]
+    fn phased_observation_identifies_pre_spawn_and_running_without_changing_drain() {
+        let mut run = TestRun::new("hold");
+        run.spec.observation_interval = Duration::from_millis(100);
+        let mut phases = Vec::new();
+        let result = supervise_with_progress_phased(
+            &run.spec,
+            &AtomicBool::new(false),
+            |phase, checkpoint| {
+                phases.push(phase);
+                checkpoint()?;
+                if phase == ObservationPhase::Running {
+                    Err("bounded running observation fixture".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(phases.first(), Some(&ObservationPhase::PreSpawn));
+        assert!(
+            phases
+                .iter()
+                .skip(1)
+                .all(|phase| *phase == ObservationPhase::Running)
+        );
+        assert!(phases.contains(&ObservationPhase::Running));
+        assert_eq!(
+            result.termination_reason,
+            TerminationReason::ObservationFailure
+        );
+        assert!(result.drained && result.output_complete);
         run.cleanup(result.drained);
     }
     #[cfg(any(windows, target_os = "linux"))]
