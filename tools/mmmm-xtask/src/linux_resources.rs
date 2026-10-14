@@ -75,6 +75,35 @@ impl StatState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IdentityMatches {
+    pid: bool,
+    start_ticks: bool,
+    group: bool,
+    session: bool,
+}
+
+impl IdentityMatches {
+    fn observed(original: Identity, observed: Identity) -> Self {
+        Self {
+            pid: original.pid == observed.pid,
+            start_ticks: original.start_ticks == observed.start_ticks,
+            group: original.group == observed.group,
+            session: original.session == observed.session,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PidfdBindingState {
+    NotRequiredBySample,
+    NotAttempted,
+    BoundValidated,
+    Unavailable,
+    OriginalGone,
+    Failed,
+}
+
 /// Diagnostic-only facts from reads the observer already performed. No native
 /// identity values, path, comm or original procfs tokens are retained here.
 /// Missing observations stay absent and grant no exit or drain authority.
@@ -84,9 +113,16 @@ pub(super) struct StatDiagnostic {
     before_state: Option<StatState>,
     before_threads: Option<u64>,
     before_original_identity_match: Option<bool>,
+    before_identity_matches: Option<IdentityMatches>,
     after_state: Option<StatState>,
     after_threads: Option<u64>,
     after_original_identity_match: Option<bool>,
+    after_identity_matches: Option<IdentityMatches>,
+    after_group_detached_sentinel: Option<bool>,
+    after_session_detached_sentinel: Option<bool>,
+    pidfd_binding: PidfdBindingState,
+    pidfd_binding_observation: Option<PidfdDiagnostic>,
+    pidfd_terminal_observation: Option<PidfdDiagnostic>,
 }
 
 impl StatDiagnostic {
@@ -95,16 +131,47 @@ impl StatDiagnostic {
         original: Identity,
         before: Option<Stat>,
         after: Option<Stat>,
+        include_rss: bool,
     ) -> Self {
         Self {
             role,
             before_state: before.and_then(|stat| StatState::observed(stat.state)),
             before_threads: before.map(|stat| stat.threads),
             before_original_identity_match: before.map(|stat| stat.identity == original),
+            before_identity_matches: before
+                .map(|stat| IdentityMatches::observed(original, stat.identity)),
             after_state: after.and_then(|stat| StatState::observed(stat.state)),
             after_threads: after.map(|stat| stat.threads),
             after_original_identity_match: after.map(|stat| stat.identity == original),
+            after_identity_matches: after
+                .map(|stat| IdentityMatches::observed(original, stat.identity)),
+            after_group_detached_sentinel: after.map(|stat| stat.identity.group == -1),
+            after_session_detached_sentinel: after.map(|stat| stat.identity.session == -1),
+            pidfd_binding: if include_rss {
+                PidfdBindingState::NotAttempted
+            } else {
+                PidfdBindingState::NotRequiredBySample
+            },
+            pidfd_binding_observation: None,
+            pidfd_terminal_observation: None,
         }
+    }
+
+    fn record_stats(&mut self, original: Identity, before: Option<Stat>, after: Option<Stat>) {
+        // Updating the existing stat facts must not erase a binding or poll
+        // that the same observation already performed. No new proof is made.
+        *self = Self {
+            pidfd_binding: self.pidfd_binding,
+            pidfd_binding_observation: self.pidfd_binding_observation,
+            pidfd_terminal_observation: self.pidfd_terminal_observation,
+            ..Self::observed(
+                self.role,
+                original,
+                before,
+                after,
+                self.pidfd_binding != PidfdBindingState::NotRequiredBySample,
+            )
+        };
     }
 }
 
@@ -112,15 +179,35 @@ impl fmt::Display for StatDiagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "linux_stat_observation(process_role={}; before_state={:?}; before_threads={:?}; before_original_identity_match={:?}; after_state={:?}; after_threads={:?}; after_original_identity_match={:?})",
+            "linux_stat_observation(process_role={}; before_state={:?}; before_threads={:?}; before_original_identity_match={:?}; before_identity_matches={:?}; after_state={:?}; after_threads={:?}; after_original_identity_match={:?}; after_identity_matches={:?}; after_group_detached_sentinel={:?}; after_session_detached_sentinel={:?}; pidfd_binding={:?}",
             self.role.label(),
             self.before_state,
             self.before_threads,
             self.before_original_identity_match,
+            self.before_identity_matches,
             self.after_state,
             self.after_threads,
             self.after_original_identity_match,
-        )
+            self.after_identity_matches,
+            self.after_group_detached_sentinel,
+            self.after_session_detached_sentinel,
+            self.pidfd_binding,
+        )?;
+        for (label, observation) in [
+            ("pidfd_binding_observation", self.pidfd_binding_observation),
+            (
+                "pidfd_terminal_observation",
+                self.pidfd_terminal_observation,
+            ),
+        ] {
+            write!(f, "; {label}=")?;
+            if let Some(observation) = observation {
+                write!(f, "Some({observation})")?;
+            } else {
+                write!(f, "None")?;
+            }
+        }
+        write!(f, ")")
     }
 }
 
@@ -686,7 +773,8 @@ mod native {
         } else {
             ProcessRole::OwnedMember
         };
-        let mut diagnostic = StatDiagnostic::observed(role, process.initial.identity, None, None);
+        let mut diagnostic =
+            StatDiagnostic::observed(role, process.initial.identity, None, None, include_rss);
         observe_member_with_facts(root, process, include_rss, is_leader, &mut diagnostic)
             .map_err(|error| error.with_linux_stat_diagnostic(diagnostic))
     }
@@ -707,7 +795,7 @@ mod native {
         let Some(before) = read_stat(&mut process.stat, pid, role)? else {
             return unavailable_member(is_leader);
         };
-        *diagnostic = StatDiagnostic::observed(role, process.initial.identity, Some(before), None);
+        diagnostic.record_stats(process.initial.identity, Some(before), None);
         verify_identity(process.initial, before)?;
         if before.definitely_exited() {
             return Ok(None);
@@ -723,15 +811,28 @@ mod native {
                 &mut process.stat,
                 before,
                 |file| read_stat(file, pid, role),
-            )? {
-                pidfd::Binding::Bound(bound) => Some(bound),
-                pidfd::Binding::Unavailable(reason) => {
+            ) {
+                Ok(pidfd::Binding::Bound(bound)) => {
+                    diagnostic.pidfd_binding = PidfdBindingState::BoundValidated;
+                    Some(bound)
+                }
+                Ok(pidfd::Binding::Unavailable(reason)) => {
                     // Keep the closed reason distinct inside the producer;
                     // it is not a replacement for the actual RSS failure.
-                    pidfd_diagnostic = Some(reason.diagnostic());
+                    let observation = reason.diagnostic();
+                    diagnostic.pidfd_binding = PidfdBindingState::Unavailable;
+                    diagnostic.pidfd_binding_observation = Some(observation);
+                    pidfd_diagnostic = Some(observation);
                     None
                 }
-                pidfd::Binding::OriginalGone => return unavailable_member(is_leader),
+                Ok(pidfd::Binding::OriginalGone) => {
+                    diagnostic.pidfd_binding = PidfdBindingState::OriginalGone;
+                    return unavailable_member(is_leader);
+                }
+                Err(error) => {
+                    diagnostic.pidfd_binding = PidfdBindingState::Failed;
+                    return Err(error);
+                }
             }
         } else {
             None
@@ -742,7 +843,7 @@ mod native {
             None
         };
         let after = read_stat(&mut process.stat, pid, role)?;
-        *diagnostic = StatDiagnostic::observed(role, process.initial.identity, Some(before), after);
+        diagnostic.record_stats(process.initial.identity, Some(before), after);
         if let Some(after) = after {
             verify_identity(before, after)?;
         }
@@ -752,6 +853,7 @@ mod native {
         let terminal = match (&memory, after, bound.as_ref()) {
             (Some(Err(_)), Some(after), Some(bound)) if !after.definitely_exited() => {
                 let check = bound.check_terminal_after(after.identity);
+                diagnostic.pidfd_terminal_observation = Some(check.diagnostic);
                 pidfd_diagnostic = Some(check.diagnostic);
                 check.witness
             }
@@ -1064,6 +1166,7 @@ mod tests {
             before.identity,
             Some(before),
             Some(after),
+            false,
         );
         assert_eq!(diagnostic.before_state, Some(StatState::Sleeping));
         assert_eq!(diagnostic.before_threads, Some(5));
@@ -1073,24 +1176,34 @@ mod tests {
         assert_eq!(diagnostic.after_original_identity_match, Some(true));
         assert_eq!(
             diagnostic.to_string(),
-            "linux_stat_observation(process_role=reserved_leader; before_state=Some(Sleeping); before_threads=Some(5); before_original_identity_match=Some(true); after_state=Some(Zombie); after_threads=Some(2); after_original_identity_match=Some(true))",
+            "linux_stat_observation(process_role=reserved_leader; before_state=Some(Sleeping); before_threads=Some(5); before_original_identity_match=Some(true); before_identity_matches=Some(IdentityMatches { pid: true, start_ticks: true, group: true, session: true }); after_state=Some(Zombie); after_threads=Some(2); after_original_identity_match=Some(true); after_identity_matches=Some(IdentityMatches { pid: true, start_ticks: true, group: true, session: true }); after_group_detached_sentinel=Some(false); after_session_detached_sentinel=Some(false); pidfd_binding=NotRequiredBySample; pidfd_binding_observation=None; pidfd_terminal_observation=None)",
         );
 
         let missing =
-            StatDiagnostic::observed(ProcessRole::OwnedMember, before.identity, None, None);
+            StatDiagnostic::observed(ProcessRole::OwnedMember, before.identity, None, None, false);
         assert_eq!(missing.before_state, None);
         assert_eq!(missing.before_threads, None);
         assert_eq!(missing.before_original_identity_match, None);
+        assert_eq!(missing.before_identity_matches, None);
         assert_eq!(missing.after_state, None);
         assert_eq!(missing.after_threads, None);
         assert_eq!(missing.after_original_identity_match, None);
+        assert_eq!(missing.after_identity_matches, None);
+        assert_eq!(missing.after_group_detached_sentinel, None);
+        assert_eq!(missing.after_session_detached_sentinel, None);
+        assert_eq!(
+            missing.pidfd_binding,
+            PidfdBindingState::NotRequiredBySample
+        );
+        assert_eq!(missing.pidfd_binding_observation, None);
+        assert_eq!(missing.pidfd_terminal_observation, None);
         assert!(missing.to_string().contains("process_role=owned_member;"));
     }
 
     #[test]
     fn stat_diagnostic_compares_each_original_identity_component_without_printing_it() {
-        let before = parse_stat(&stat('S', 2), 123).unwrap();
-        for identity in [
+        let before = parse_stat(&stat('Z', 3), 123).unwrap();
+        for (index, identity) in [
             Identity {
                 pid: 124,
                 ..before.identity
@@ -1107,20 +1220,168 @@ mod tests {
                 session: 124,
                 ..before.identity
             },
-        ] {
-            let changed = Stat { identity, ..before };
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let changed = Stat {
+                identity,
+                state: b'X',
+                threads: 0,
+                ..before
+            };
             let diagnostic = StatDiagnostic::observed(
                 ProcessRole::ReservedLeader,
                 before.identity,
+                Some(before),
                 Some(changed),
-                Some(changed),
+                false,
             );
-            assert_eq!(diagnostic.before_original_identity_match, Some(false));
+            assert_eq!(diagnostic.before_original_identity_match, Some(true));
             assert_eq!(diagnostic.after_original_identity_match, Some(false));
+            assert_eq!(diagnostic.after_state, Some(StatState::Dead));
+            assert_eq!(diagnostic.after_threads, Some(0));
+            let expected = IdentityMatches {
+                pid: index != 0,
+                start_ticks: index != 1,
+                group: index != 2,
+                session: index != 3,
+            };
+            assert_eq!(diagnostic.after_identity_matches, Some(expected));
+            let changed_before = StatDiagnostic::observed(
+                ProcessRole::OwnedMember,
+                before.identity,
+                Some(changed),
+                None,
+                false,
+            );
+            assert_eq!(changed_before.before_identity_matches, Some(expected));
+            assert_eq!(changed_before.after_identity_matches, None);
             let text = diagnostic.to_string();
-            for absent in ["123", "124", "456", "457", "start_ticks", "native ) comm"] {
+            for absent in ["123", "124", "456", "457", "native ) comm"] {
                 assert!(!text.contains(absent));
             }
+        }
+    }
+
+    #[test]
+    fn dead_stat_sentinels_are_closed_facts_and_never_repair_an_identity_failure() {
+        let before = parse_stat(&stat('Z', 3), 123).unwrap();
+        for (group, session, group_detached, session_detached) in [
+            (-1, 123, true, false),
+            (123, -1, false, true),
+            (-1, -1, true, true),
+            (124, 124, false, false),
+        ] {
+            let after = Stat {
+                identity: Identity {
+                    group,
+                    session,
+                    ..before.identity
+                },
+                state: b'X',
+                threads: 0,
+                ..before
+            };
+            let diagnostic = StatDiagnostic::observed(
+                ProcessRole::OwnedMember,
+                before.identity,
+                Some(before),
+                Some(after),
+                false,
+            );
+            assert_eq!(
+                diagnostic.after_group_detached_sentinel,
+                Some(group_detached)
+            );
+            assert_eq!(
+                diagnostic.after_session_detached_sentinel,
+                Some(session_detached)
+            );
+            assert_eq!(
+                diagnostic.pidfd_binding,
+                PidfdBindingState::NotRequiredBySample
+            );
+            assert_eq!(diagnostic.pidfd_terminal_observation, None);
+            let mut original = settle_member(before, Some(after), None, false)
+                .expect_err("a dead stat cannot hide a changed original identity");
+            original.drained = false;
+            let original_message = original.message.clone();
+            let actual = original.with_linux_stat_diagnostic(diagnostic);
+            assert_eq!(actual.kind, "process_identity");
+            assert_eq!(actual.message, original_message);
+            assert!(!actual.drained);
+            assert_eq!(
+                actual.to_string(),
+                format!("process_identity: {original_message}; {diagnostic}"),
+            );
+        }
+    }
+
+    #[test]
+    fn stat_updates_preserve_sample_mode_and_only_the_recorded_pidfd_facts() {
+        let before = parse_stat(&stat('S', 2), 123).unwrap();
+        let after = parse_stat(&stat('Z', 2), 123).unwrap();
+        let mut count_only =
+            StatDiagnostic::observed(ProcessRole::OwnedMember, before.identity, None, None, false);
+        count_only.record_stats(before.identity, Some(before), Some(after));
+        assert_eq!(
+            count_only.pidfd_binding,
+            PidfdBindingState::NotRequiredBySample
+        );
+        assert_eq!(count_only.pidfd_binding_observation, None);
+        assert_eq!(count_only.pidfd_terminal_observation, None);
+
+        let mut rss = StatDiagnostic::observed(
+            ProcessRole::ReservedLeader,
+            before.identity,
+            None,
+            None,
+            true,
+        );
+        assert_eq!(rss.pidfd_binding, PidfdBindingState::NotAttempted);
+        assert_eq!(rss.before_identity_matches, None);
+        rss.record_stats(before.identity, Some(before), None);
+        assert_eq!(rss.pidfd_binding, PidfdBindingState::NotAttempted);
+        assert_eq!(rss.after_identity_matches, None);
+        assert_eq!(rss.pidfd_binding_observation, None);
+        assert_eq!(rss.pidfd_terminal_observation, None);
+
+        // These are diagnostic values only. No test-created value can produce
+        // a BoundPidfd, TerminalWitness, native call or successful settlement.
+        let binding_observation = PidfdDiagnostic::new(
+            pidfd::DiagnosticPhase::PidfdOpen,
+            pidfd::DiagnosticCategory::Unsupported,
+            Some(38),
+        );
+        let terminal_observation = PidfdDiagnostic::new(
+            pidfd::DiagnosticPhase::TerminalPoll,
+            pidfd::DiagnosticCategory::NotReady,
+            None,
+        );
+        for (state, binding, terminal) in [
+            (
+                PidfdBindingState::BoundValidated,
+                None,
+                Some(terminal_observation),
+            ),
+            (
+                PidfdBindingState::Unavailable,
+                Some(binding_observation),
+                None,
+            ),
+            (PidfdBindingState::OriginalGone, None, None),
+            (PidfdBindingState::Failed, None, None),
+        ] {
+            let mut recorded = rss;
+            recorded.pidfd_binding = state;
+            recorded.pidfd_binding_observation = binding;
+            recorded.pidfd_terminal_observation = terminal;
+            recorded.record_stats(before.identity, Some(before), Some(after));
+            assert_eq!(recorded.pidfd_binding, state);
+            assert_eq!(recorded.pidfd_binding_observation, binding);
+            assert_eq!(recorded.pidfd_terminal_observation, terminal);
+            assert_eq!(recorded.after_original_identity_match, Some(true));
         }
     }
 
@@ -1128,15 +1389,26 @@ mod tests {
     fn stat_diagnostic_text_has_a_closed_state_set_and_a_fixed_bound() {
         for state in b"RSDZTXxtKWPI" {
             let before = parse_stat(&stat(*state as char, u64::MAX), 123).unwrap();
-            let diagnostic = StatDiagnostic::observed(
+            let mut diagnostic = StatDiagnostic::observed(
                 ProcessRole::ReservedLeader,
                 before.identity,
                 Some(before),
                 Some(before),
+                true,
             );
+            // Exercise the closed maximum-width facts without creating any
+            // native binding, poll, descriptor or authority in this pure test.
+            let widest = PidfdDiagnostic::new(
+                pidfd::DiagnosticPhase::ProcessDirectoryFilesystem,
+                pidfd::DiagnosticCategory::UnexpectedPollEvents,
+                Some(i32::MIN),
+            );
+            diagnostic.pidfd_binding = PidfdBindingState::Unavailable;
+            diagnostic.pidfd_binding_observation = Some(widest);
+            diagnostic.pidfd_terminal_observation = Some(widest);
             let text = diagnostic.to_string();
             assert!(diagnostic.before_state.is_some());
-            assert!(text.len() < 384);
+            assert!(text.len() < 1280);
             assert!(text.is_ascii());
             assert!(
                 !text
@@ -1173,8 +1445,10 @@ mod tests {
                 pidfd::DiagnosticCategory::NotReady,
                 None,
             );
-            let diagnostic =
-                StatDiagnostic::observed(role, before.identity, Some(before), Some(after));
+            let mut diagnostic =
+                StatDiagnostic::observed(role, before.identity, Some(before), Some(after), true);
+            diagnostic.pidfd_binding = PidfdBindingState::BoundValidated;
+            diagnostic.pidfd_terminal_observation = Some(pidfd);
             let actual = settle_member(before, Some(after), Some(Err(original)), is_leader)
                 .expect_err("stat diagnostics cannot settle the live original RSS failure")
                 .with_linux_pidfd_diagnostic(pidfd)
@@ -1184,6 +1458,7 @@ mod tests {
                     before.identity,
                     None,
                     None,
+                    true,
                 ));
             assert_eq!(actual.kind, "resource_observation");
             assert_eq!(actual.message, original_message);

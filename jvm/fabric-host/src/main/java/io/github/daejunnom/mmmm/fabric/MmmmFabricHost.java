@@ -74,9 +74,7 @@ public final class MmmmFabricHost implements ModInitializer {
     private String epoch;
     private String worldId;
     private long registryGeneration;
-    private volatile DefinitionCollection definitionCollection;
-    private record DefinitionCollection(HostSession owner, String contextId, String contextDigest,
-                                        String epoch, long generation, NativeDefinitionCollector.Snapshot snapshot) { }
+    private final NativeDefinitionSlot definitionCollection = new NativeDefinitionSlot();
 
     public static MmmmFabricHost instance() {
         if (instance == null) throw new ContractException("HOST_NOT_LOADED", "Fabric host has not initialized");
@@ -112,11 +110,12 @@ public final class MmmmFabricHost implements ModInitializer {
     }
 
     private void newGeneration() {
-        if (registryGeneration == Long.MAX_VALUE) throw new ContractException("GENERATION_EXHAUSTED", "Host registry generation exhausted");
-        registryGeneration++;
-        definitionCollection = null;
+        String nextEpoch = "epoch-" + UUID.randomUUID();
+        synchronized (definitionCollection) {
+            if (registryGeneration == Long.MAX_VALUE) throw new ContractException("GENERATION_EXHAUSTED", "Host registry generation exhausted");
+            registryGeneration++; epoch = nextEpoch; definitionCollection.retireAll();
+        }
         tombstones.clear();
-        epoch = "epoch-" + UUID.randomUUID();
     }
 
     /** Non-secret facts for a trusted launcher/pairing installer. No network listener is started here. */
@@ -180,11 +179,18 @@ public final class MmmmFabricHost implements ModInitializer {
         return offer;
     }
     void revokePairing(String installedEpoch) {
-        HostSession current = session;
-        if (installedEpoch != null && current != null && installedEpoch.equals(current.epoch())) {
-            definitionCollection = null;
-            current.close(); PairedLoopbackServer listener = endpoint; if (listener != null) listener.close();
+        final HostSession current; final SessionRoute route;
+        synchronized (routes) {
+            current = session;
+            if (installedEpoch == null || current == null || !installedEpoch.equals(current.epoch())) return;
+            route = routes.get(current);
+            if (route == null) return;
+            // 확인한 원래 owner의 route만 분리하며 이후 새 publication은 변경하지 않는다.
+            current.close();
+            session = null;
+            if (endpoint == route.endpoint()) endpoint = null;
         }
+        route.endpoint().close();
     }
 
     private record SessionRoute(PairedLoopbackServer endpoint, NativePlanApproval approval,
@@ -210,6 +216,7 @@ public final class MmmmFabricHost implements ModInitializer {
         }
         HostSession candidateSession = new HostSession(principalRef, epoch, gameInstanceId, "server",
                 pairedPlayer, permissions, exactWriteProfileVerified);
+        candidateSession.whenClosed(() -> definitionCollection.retire(candidateSession));
         contexts.forEach(context -> candidateSession.installContext(contracts, context));
         Map<String, String> admittedBindings = new HashMap<>();
         Set<String> acceptedActions = Set.copyOf(approvedActions);
@@ -236,6 +243,7 @@ public final class MmmmFabricHost implements ModInitializer {
                 throw new ContractException("ACTION_UNAPPROVED", "Action contract does not match the pairing authority's approved digest");
             }
         }, Clock.systemUTC());
+        PairedLoopbackServer listener = null;
         try {
             String hostDigest = artifactDigest(container("mmmm_host"));
             String nativeBinding = "binding-" + UUID.randomUUID();
@@ -254,15 +262,24 @@ public final class MmmmFabricHost implements ModInitializer {
                     @Override public void undoAction(String sourceActionId, String undoActionId) { candidate.registerUndo(binding, sourceActionId, undoActionId); }
                 });
             }
-            runtime = candidate; session = candidateSession;
             HostDispatcher dispatcher = new HostDispatcher(contracts, candidate, this::inspect, Clock.systemUTC());
-            endpoint = new PairedLoopbackServer(candidateSession, dispatcher, asciiBearer);
-            installedSources = acceptedSources; installedActions = acceptedActions;
-            installedContexts = contexts.stream().map(ObjectNode::deepCopy).toList();
-            synchronized (routes) { routes.put(candidateSession, new SessionRoute(endpoint, null, null, null)); routeOrder.add(candidateSession); }
-            return endpoint.endpoint();
+            listener = new PairedLoopbackServer(candidateSession, dispatcher, asciiBearer);
+            List<ObjectNode> admittedContexts = contexts.stream().map(ObjectNode::deepCopy).toList();
+            synchronized (routes) {
+                candidateSession.checkOpen();
+                routes.put(candidateSession, new SessionRoute(listener, null, null, null)); routeOrder.add(candidateSession);
+                installedSources = acceptedSources; installedActions = acceptedActions; installedContexts = admittedContexts;
+                runtime = candidate; session = candidateSession; endpoint = listener;
+            }
+            return listener.endpoint();
         } catch (IOException | RuntimeException exception) {
-            candidate.close(); candidateSession.close(); runtime = null; session = null;
+            synchronized (routes) {
+                routes.remove(candidateSession); routeOrder.remove(candidateSession);
+                if (session == candidateSession) {
+                    session = null; if (endpoint == listener) endpoint = null; if (runtime == candidate) runtime = null;
+                }
+            }
+            if (listener != null) listener.close(); candidate.close(); candidateSession.close();
             throw exception;
         }
     }
@@ -295,10 +312,16 @@ public final class MmmmFabricHost implements ModInitializer {
     /** Authority-approved new capability route; the runtime, binding IDs and old routes are retained. */
     String installApproval(UUID playerId, ObjectNode offer, ObjectNode authority, byte[] asciiBearer) throws IOException {
         requireServerThread(); HostSession previous = requireSession();
+        final HostRuntime currentRuntime;
+        synchronized (routes) {
+            previous.checkOpen();
+            if (session != previous || runtime == null || !routes.containsKey(previous)) throw new ContractException("SESSION_EXPIRED", "Original approval route is no longer installed");
+            currentRuntime = runtime;
+        }
         HostDispatcher.exactFields(authority, Set.of("kind", "protocolVersion", "nonce", "contexts", "approvedSources", "approvedActions", "permissions", "manifest", "profileEvidence"));
         if (!"host_apply_approval_authority".equals(authority.path("kind").asText())
                 || !ContractJson.VERSION.equals(authority.path("protocolVersion").asText())
-                || !offer.path("nonce").equals(authority.path("nonce")) || !offer.path("hostHello").equals(runtime.hello())
+                || !offer.path("nonce").equals(authority.path("nonce")) || !offer.path("hostHello").equals(currentRuntime.hello())
                 || !playerId.equals(previous.playerId()) || !previous.principalRef().equals(offer.path("principalId").asText())
                 || player(previous).createCommandSourceStack().getPermissionContext().permissionLevel() != PermissionLevel.ADMINS) throw authorityInvalid();
         synchronized (routes) { if (routes.size() >= 8) throw new ContractException("SESSION_LIMIT", "Immutable route retention limit reached"); }
@@ -321,7 +344,7 @@ public final class MmmmFabricHost implements ModInitializer {
         authority.path("permissions").forEach(value -> { if (!value.isTextual() || !nativePermissions.contains(value.asText()) || !permissions.add(value.asText())) throw authorityInvalid(); });
         ObjectNode facts = NativeSourceFacts.observe(server, Long.toString(registryGeneration), environment());
         ObjectNode profileEvidence = ContractJson.object(authority.get("profileEvidence")).deepCopy();
-        NativeProfileAdmission.require(contracts, profileEvidence, runtime.hello(), facts, artifactDigest(container("mmmm_host")), Long.toString(registryGeneration));
+        NativeProfileAdmission.require(contracts, profileEvidence, currentRuntime.hello(), facts, artifactDigest(container("mmmm_host")), Long.toString(registryGeneration));
         if (!NativeProfileAdmission.sourceDigest(facts).equals(NativeProfileAdmission.sourceDigest(ContractJson.object(offer.get("runtimeSourceFacts"))))) {
             throw new ContractException("TARGET_DRIFT", "Observed runtime sources changed while plan approval was pending");
         }
@@ -331,13 +354,19 @@ public final class MmmmFabricHost implements ModInitializer {
                 || !offer.path("principalId").equals(manifest.path("principalId"))
                 || !installedContexts.getFirst().path("projectId").equals(manifest.path("projectId"))) throw authorityInvalid();
         HostSession approved = new HostSession(previous.principalRef(), previous.epoch(), previous.gameInstanceId(), previous.side(), playerId, permissions, true);
+        approved.whenClosed(() -> definitionCollection.retire(approved));
         freshContexts.forEach(context -> approved.installContext(contracts, context));
         grant.checkSession(approved);
         PairedLoopbackServer listener = null;
         try {
-            listener = new PairedLoopbackServer(approved, new HostDispatcher(contracts, runtime, this::inspect, Clock.systemUTC()), asciiBearer);
-            synchronized (routes) { routes.put(approved, new SessionRoute(listener, grant, facts.deepCopy(), profileEvidence)); routeOrder.add(approved); }
-            session = approved; endpoint = listener; return listener.endpoint();
+            listener = new PairedLoopbackServer(approved, new HostDispatcher(contracts, currentRuntime, this::inspect, Clock.systemUTC()), asciiBearer);
+            synchronized (routes) {
+                previous.checkOpen(); approved.checkOpen();
+                if (session != previous || runtime != currentRuntime || !routes.containsKey(previous)) throw new ContractException("SESSION_EXPIRED", "Original approval runtime is no longer installed");
+                routes.put(approved, new SessionRoute(listener, grant, facts.deepCopy(), profileEvidence)); routeOrder.add(approved);
+                session = approved; endpoint = listener;
+            }
+            return listener.endpoint();
         } catch (IOException | RuntimeException exception) { if (listener != null) listener.close(); approved.close(); throw exception; }
     }
 
@@ -660,7 +689,8 @@ public final class MmmmFabricHost implements ModInitializer {
 
     private ObjectNode collectRegistryDefinitions(HostSession paired, ObjectNode context,
                                                  HostDispatcher.InspectionControl control, CompletableFuture<ObjectNode> response) {
-        MinecraftServer currentServer = server; long generation = registryGeneration; String currentEpoch = epoch;
+        final MinecraftServer currentServer; final long generation; final String currentEpoch;
+        synchronized (definitionCollection) { currentServer = server; generation = registryGeneration; currentEpoch = epoch; }
         String contextId = HostDispatcher.string(context, "contextId"); String contextDigest = HostDispatcher.string(context, "contextDigest");
         NativeDefinitionCollector.Checkpoint checkpoint = () -> {
             control.checkpoint(); paired.checkOpen();
@@ -671,6 +701,13 @@ public final class MmmmFabricHost implements ModInitializer {
         };
         checkpoint.check();
         if (!paired.context(contextId).equals(context)) throw new ContractException("STALE_CONTEXT", "Registry observation context differs from its installed owner");
+        final NativeDefinitionSlot.Ticket ticket;
+        synchronized (definitionCollection) {
+            if (server != currentServer || registryGeneration != generation || !java.util.Objects.equals(epoch, currentEpoch)) {
+                throw new ContractException("SESSION_EPOCH_MISMATCH", "Registry observation generation ended before collection");
+            }
+            ticket = definitionCollection.begin(paired, currentServer, contextId, contextDigest, currentEpoch, generation);
+        }
         NativeDefinitionCollector collector = NativeDefinitionCollector.production(checkpoint);
         try {
             ObjectNode observation = NativeRegistry.observe(collector);
@@ -682,19 +719,22 @@ public final class MmmmFabricHost implements ModInitializer {
         } catch (RuntimeException failure) {
             collector.stopped(failure); throw failure;
         } finally {
-            definitionCollection = new DefinitionCollection(paired, contextId, contextDigest, currentEpoch, generation, collector.snapshot());
+            NativeDefinitionCollector.Snapshot observed = collector.snapshot();
+            synchronized (definitionCollection) {
+                if (server == currentServer && registryGeneration == generation && java.util.Objects.equals(epoch, currentEpoch)) {
+                    definitionCollection.publish(ticket, observed);
+                } else definitionCollection.retire(ticket);
+            }
         }
     }
 
     private String definitionAdmissionReason(HostSession paired, ObjectNode context) {
-        DefinitionCollection collected = definitionCollection;
         // 실제 원자료 수집 여부만 진단한다. 최종 변환/실행 경로 승인으로 승격하지 않는다.
-        if (collected != null && collected.owner() == paired && !paired.closed()
-                && collected.generation() == registryGeneration && java.util.Objects.equals(collected.epoch(), epoch)
-                && collected.contextId().equals(context.path("contextId").asText())
-                && collected.contextDigest().equals(context.path("contextDigest").asText())
-                && collected.snapshot().completed() && collected.snapshot().hasRawObservation()) {
-            return "LOADED_DEFINITION_FINALITY_UNVERIFIED";
+        synchronized (definitionCollection) {
+            if (definitionCollection.hasRawObservation(paired, server, context.path("contextId").asText(),
+                    context.path("contextDigest").asText(), epoch, registryGeneration)) {
+                return "LOADED_DEFINITION_FINALITY_UNVERIFIED";
+            }
         }
         return "LOADED_DEFINITION_UNAVAILABLE";
     }
@@ -871,8 +911,11 @@ public final class MmmmFabricHost implements ModInitializer {
     }
 
     private HostSession requireSession() {
-        if (session == null) throw new ContractException("SESSION_EXPIRED", "No paired session is installed");
-        session.checkOpen(); return session;
+        synchronized (routes) {
+            HostSession current = session;
+            if (current == null) throw new ContractException("SESSION_EXPIRED", "No paired session is installed");
+            current.checkOpen(); return current;
+        }
     }
     private ServerPlayer player(HostSession paired) {
         ServerPlayer player = server.getPlayerList().getPlayer(paired.playerId());
@@ -971,13 +1014,20 @@ public final class MmmmFabricHost implements ModInitializer {
         if (server == null || reloading || !server.isSameThread()) throw new ContractException("HOST_NOT_READY", "This operation requires the active ready server thread");
     }
     private void disconnect() {
-        definitionCollection = null;
-        synchronized (routes) { routes.forEach((paired, route) -> { route.endpoint().close(); paired.close(); }); routes.clear(); routeOrder.clear(); nativeHistory.clear(); nativeHistoryCount = 0; nativeHistoryBytes = 0; }
-        invocationRoutes.clear(); installedSources = Map.of(); installedActions = Set.of(); installedContexts = List.of();
-        if (endpoint != null) endpoint.close();
-        if (runtime != null) runtime.close();
-        if (session != null) session.close();
-        endpoint = null; runtime = null; session = null;
+        definitionCollection.retireAll();
+        final List<HostSession> owners; final List<SessionRoute> retired;
+        final PairedLoopbackServer oldEndpoint; final HostRuntime oldRuntime; final HostSession oldSession;
+        synchronized (routes) {
+            owners = List.copyOf(routes.keySet()); retired = List.copyOf(routes.values());
+            oldEndpoint = endpoint; oldRuntime = runtime; oldSession = session;
+            owners.forEach(HostSession::close); if (oldSession != null) oldSession.close();
+            routes.clear(); routeOrder.clear(); nativeHistory.clear(); nativeHistoryCount = 0; nativeHistoryBytes = 0;
+            invocationRoutes.clear(); installedSources = Map.of(); installedActions = Set.of(); installedContexts = List.of();
+            endpoint = null; runtime = null; session = null;
+        }
+        retired.forEach(route -> route.endpoint().close());
+        if (oldEndpoint != null) oldEndpoint.close();
+        if (oldRuntime != null) oldRuntime.close();
     }
     private static ModContainer container(String id) {
         return FabricLoader.getInstance().getModContainer(id).orElseThrow(() -> new ContractException("ARTIFACT_MISSING", "Pinned platform artifact is not loaded"));

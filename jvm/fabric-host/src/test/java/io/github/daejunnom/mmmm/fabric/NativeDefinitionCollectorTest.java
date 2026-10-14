@@ -4,6 +4,8 @@ import io.github.daejunnom.mmmm.host.HostSession;
 import io.github.daejunnom.mmmm.sdk.ContractException;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
@@ -110,5 +112,61 @@ final class NativeDefinitionCollectorTest {
                 () -> { if (checks.incrementAndGet() == 2) throw original; }, new Port());
         assertSame(original, assertThrows(ContractException.class, () -> collector.observe(getClass(), BLOCK)));
         assertEquals("DEADLINE_EXCEEDED", collector.snapshot().stopReason()); assertFalse(collector.snapshot().completed());
+    }
+    // 기존 raw port fixture를 실제 publication slot과 연결한다. 네이티브 관측을 발급하지 않는다.
+    private static HostSession owner(NativeDefinitionSlot slot) {
+        HostSession owner = new HostSession("fixture", "fixture", "fixture", "server", UUID.randomUUID(), Set.of(), false);
+        owner.whenClosed(() -> slot.retire(owner)); return owner;
+    }
+    private static NativeDefinitionCollector.Snapshot completedRaw() {
+        NativeDefinitionCollector collector = new NativeDefinitionCollector(new NativeDefinitionCollector.Limits(2, 8), () -> { }, new Port());
+        collector.observe(NativeDefinitionCollectorTest.class, BLOCK); collector.finish(); return collector.snapshot();
+    }
+    @Test void retiredCollectorCannotPublishAfterClearOrDeleteANewerOwnersSnapshot() {
+        NativeDefinitionSlot slot = new NativeDefinitionSlot(); Object server = new Object();
+        HostSession oldOwner = owner(slot); HostSession newOwner = owner(slot);
+        var observed = completedRaw();
+        var old = slot.begin(oldOwner, server, "context", "digest", "epoch", 1);
+        slot.retireAll(); assertFalse(slot.publish(old, observed)); assertEquals(0, slot.retainedBytes());
+        var superseded = slot.begin(newOwner, server, "context", "digest", "epoch", 2);
+        var fresh = slot.begin(newOwner, server, "context", "digest", "epoch", 2);
+        assertTrue(slot.publish(fresh, observed));
+        assertFalse(slot.publish(superseded, observed)); slot.retire(superseded);
+        slot.retire(old); oldOwner.close(); assertFalse(slot.publish(old, observed));
+        assertTrue(slot.hasRawObservation(newOwner, server, "context", "digest", "epoch", 2));
+        assertFalse(slot.hasRawObservation(oldOwner, server, "context", "digest", "epoch", 1));
+        assertEquals(observed.retainedBytes(), slot.retainedBytes()); newOwner.close(); assertEquals(0, slot.retainedBytes());
+    }
+    @Test void independentSessionCloseReleasesAnAlreadyPublishedRawSnapshot() {
+        NativeDefinitionSlot slot = new NativeDefinitionSlot(); Object server = new Object(); HostSession owner = owner(slot);
+        var ticket = slot.begin(owner, server, "context", "digest", "epoch", 1);
+        assertTrue(slot.publish(ticket, completedRaw())); assertEquals(3, slot.retainedBytes());
+        owner.close(); owner.close(); assertEquals(0, slot.retainedBytes());
+        assertFalse(slot.publish(ticket, completedRaw()));
+        assertFalse(slot.hasRawObservation(owner, server, "context", "digest", "epoch", 1));
+        assertThrows(ContractException.class, () -> slot.begin(owner, server, "context", "digest", "epoch", 1));
+    }
+    @Test void failedPendingCollectorsFinallyCannotResurrectItsRetiredRawCandidate() {
+        NativeDefinitionSlot slot = new NativeDefinitionSlot(); Object server = new Object(); HostSession owner = owner(slot);
+        var ticket = slot.begin(owner, server, "context", "digest", "epoch", 1);
+        NativeDefinitionCollector collector = new NativeDefinitionCollector(new NativeDefinitionCollector.Limits(2, 8), owner::checkOpen, new Port());
+        collector.observe(getClass(), BLOCK); owner.close();
+        ContractException failure = assertThrows(ContractException.class, collector::finish);
+        collector.stopped(failure); var failed = collector.snapshot();
+        assertEquals("SESSION_EXPIRED", failed.stopReason()); assertFalse(failed.completed()); assertTrue(failed.hasRawObservation());
+        assertFalse(slot.publish(ticket, failed)); assertEquals(0, slot.retainedBytes());
+    }
+    @Test void concurrentCloseAndPublicationAlwaysRetireTheSameOwnersRaw() throws Exception {
+        var observed = completedRaw();
+        for (int attempt = 0; attempt < 16; attempt++) {
+            NativeDefinitionSlot slot = new NativeDefinitionSlot(); Object server = new Object(); HostSession owner = owner(slot);
+            var ticket = slot.begin(owner, server, "context", "digest", "epoch", 1);
+            CompletableFuture<Void> start = new CompletableFuture<>();
+            var publish = start.thenRunAsync(() -> slot.publish(ticket, observed));
+            var close = start.thenRunAsync(owner::close);
+            start.complete(null); CompletableFuture.allOf(publish, close).get(5, TimeUnit.SECONDS);
+            assertTrue(owner.closed()); assertEquals(0, slot.retainedBytes());
+            assertFalse(slot.hasRawObservation(owner, server, "context", "digest", "epoch", 1));
+        }
     }
 }

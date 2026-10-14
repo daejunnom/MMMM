@@ -5,9 +5,11 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.daejunnom.mmmm.sdk.ContractException;
 import io.github.daejunnom.mmmm.sdk.ContractJson;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** Created only by trusted, out-of-band pairing. No RPC method can create a session or context. */
 public final class HostSession {
@@ -20,6 +22,8 @@ public final class HostSession {
     private final boolean verifiedWriteProfile;
     private final Map<String, ObjectNode> contexts = new java.util.HashMap<>();
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final AtomicBoolean closeHookRegistered = new AtomicBoolean();
+    private final AtomicReference<Runnable> closeHook = new AtomicReference<>();
     private int contextBytes;
 
     public HostSession(String principalRef, String epoch, String gameInstanceId, String side,
@@ -79,7 +83,22 @@ public final class HostSession {
         if (context == null) throw new ContractException("CONTEXT_UNKNOWN", "Context is not installed for this session");
         return context.deepCopy();
     }
-    public synchronized void close() { closed.set(true); contexts.clear(); contextBytes = 0; }
+    /** Trusted composition installs one resource-owner cleanup; no request receives this hook. */
+    public void whenClosed(Runnable ownerClose) {
+        Objects.requireNonNull(ownerClose);
+        if (!closeHookRegistered.compareAndSet(false, true)) throw new IllegalStateException("Session owner close hook already registered");
+        closeHook.set(ownerClose);
+        if (closed.get()) runCloseHook();
+    }
+    public void close() {
+        synchronized (this) { contexts.clear(); contextBytes = 0; closed.set(true); }
+        // Callback may retire a host-owned slot or reenter close. Never hold the session monitor here.
+        runCloseHook();
+    }
+    private void runCloseHook() {
+        Runnable ownerClose = closeHook.getAndSet(null);
+        if (ownerClose != null) ownerClose.run();
+    }
     public void checkOpen() {
         if (closed()) throw new ContractException("SESSION_EXPIRED", "The paired host session has ended");
     }

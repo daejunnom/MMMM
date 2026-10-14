@@ -313,7 +313,7 @@ pub struct ProcessError {
     #[cfg(any(target_os = "linux", test))]
     linux_pidfd_diagnostic: Option<linux_resources::PidfdDiagnostic>,
     #[cfg(any(target_os = "linux", test))]
-    linux_stat_diagnostic: Option<linux_resources::StatDiagnostic>,
+    linux_stat_diagnostic: Option<Box<linux_resources::StatDiagnostic>>,
 }
 impl ProcessError {
     fn new(kind: &'static str, message: impl Into<String>) -> Self {
@@ -341,7 +341,7 @@ impl ProcessError {
         // Closed stat facts supplement, never replace, the original error or
         // the separately retained pidfd observation.
         if self.linux_stat_diagnostic.is_none() {
-            self.linux_stat_diagnostic = Some(diagnostic);
+            self.linux_stat_diagnostic = Some(Box::new(diagnostic));
         }
         self
     }
@@ -357,7 +357,7 @@ impl fmt::Display for ProcessError {
             write!(f, "; {diagnostic}")?;
         }
         #[cfg(any(target_os = "linux", test))]
-        if let Some(diagnostic) = self.linux_stat_diagnostic {
+        if let Some(diagnostic) = self.linux_stat_diagnostic.as_ref() {
             write!(f, "; {diagnostic}")?;
         }
         Ok(())
