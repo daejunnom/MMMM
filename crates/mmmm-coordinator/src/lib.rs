@@ -5,6 +5,7 @@ pub mod auth;
 pub mod authority;
 pub mod bootstrap;
 pub mod catalog_source;
+pub mod catalog_source_use;
 pub mod client;
 pub mod composite;
 pub mod credential;

@@ -4,6 +4,7 @@
 
 use crate::{
     CoordinatorClient,
+    catalog_source_use::{LocalCatalogSourceUseAction, manage_catalog_source_use},
     daemon::{DaemonError, PreparedDaemon},
     daemon_launch::{self, DaemonLaunchError, NativeDaemonLocator},
     host_read_policy::selected_host_read_policy,
@@ -22,11 +23,14 @@ use crate::{
     stdio_io::{NativeStdioPort, StdioError, StdioLimits},
 };
 use mmmm_contracts::{
-    ContextId, JsonLimits, ProjectId, Sha256Digest, TargetProfileId, encode_json,
-    parse_json_with_limits,
+    ContextId, JsonLimits, ProjectId, ResourceId, ResourceLocation, Sha256Digest, TargetProfileId,
+    encode_json, parse_json_with_limits,
 };
 use mmmm_runtime::storage::{
     StoreConfig,
+    catalog_source_use::{
+        CatalogSourceUseRole, CatalogSourceUseSelection, CatalogSourceUseSnapshot,
+    },
     host_setup::{HostReadPolicy, HostReadPolicyRecord},
     native_owned_sources::NativeOwnedSourceCommitReceipt,
 };
@@ -55,6 +59,8 @@ pub enum EntryError {
     Arguments,
     HostReadPolicyArguments,
     SourceArguments,
+    CatalogSourceArguments,
+    CatalogSourceRequest(mmmm_application::AppError),
     SourceRequest(ServiceError),
     SourceFile(ImportFileError),
     Deadline,
@@ -87,6 +93,10 @@ pub enum EntryError {
         record: Box<HostReadPolicyRecord>,
         delivery: Box<EntryError>,
     },
+    CatalogSourceUsesCommitted {
+        snapshot: Box<CatalogSourceUseSnapshot>,
+        delivery: Box<EntryError>,
+    },
     Shutdown {
         primary: Option<Box<EntryError>>,
         cleanup: CoordinatorError,
@@ -98,6 +108,8 @@ impl std::fmt::Display for EntryError {
             Self::Arguments => f.write_str("Native command arguments are invalid"),
             Self::HostReadPolicyArguments => f.write_str("Host setup read policy requires unique --shape-mode survival|creative|adventure|spectator selections and optional --native-observation user_local_only; absent selections grant no corresponding source access"),
             Self::SourceArguments => f.write_str("Native source import requires at least one document or raw resource pair and at most 256 combined document/resource inputs: --document <kind>:<JSON>, --document-file <kind>:<absolute JSON path>, and adjacent --resource-descriptor-file/--resource-bytes-file paths; kinds are prefab|instance|clip and OS argv limits may be smaller"),
+            Self::CatalogSourceArguments => f.write_str("Catalog source use requires --mode inspect or replace; replace needs --expected-state-digest and a complete set selected by --game-artifact <resourceId>/repeated --mod <canonicalId>,<nativeId>,<resourceId>, or explicit --withdraw true with no selections; <=256 selections, <=64 KiB selector metadata, user_local_only only"),
+            Self::CatalogSourceRequest(error) => write!(f, "{}: Cold native catalog source use could not continue", error.code),
             Self::SourceRequest(error) => write!(f, "{}: Native source request could not continue", error.code),
             Self::SourceFile(error) => error.fmt(f),
             Self::Deadline => f.write_str("Native command startup or delivery deadline reached"),
@@ -120,6 +132,9 @@ impl std::fmt::Display for EntryError {
             Self::HostReadPolicyCommitted { record, delivery } => write!(f,
                 "Host read policy {} for Project {} was committed and retained; result delivery failed: {delivery}",
                 record.policy_digest(), record.project_id()),
+            Self::CatalogSourceUsesCommitted { snapshot, delivery } => write!(f,
+                "Catalog source use {} at generation {} for Project {} was committed and retained; result delivery failed: {delivery}",
+                snapshot.state_digest(), snapshot.generation(), snapshot.project_id()),
             Self::Shutdown { .. } => f.write_str("Coordinator shutdown is unresolved; durable data and discovery requiring cleanup are retained"),
         }
     }
@@ -129,6 +144,7 @@ impl std::error::Error for EntryError {
         match self {
             Self::Daemon(e) => Some(e),
             Self::SourceRequest(e) => Some(e),
+            Self::CatalogSourceRequest(e) => Some(e),
             Self::SourceFile(e) => Some(e),
             Self::Launch(e) => Some(e),
             Self::Setup(e) => Some(e),
@@ -141,6 +157,7 @@ impl std::error::Error for EntryError {
             Self::Initialized { delivery, .. } => Some(delivery.as_ref()),
             Self::SourcesCommitted { delivery, .. } => Some(delivery.as_ref()),
             Self::HostReadPolicyCommitted { delivery, .. } => Some(delivery.as_ref()),
+            Self::CatalogSourceUsesCommitted { delivery, .. } => Some(delivery.as_ref()),
             Self::Shutdown { cleanup, .. } => Some(cleanup),
             _ => None,
         }
@@ -177,6 +194,12 @@ enum Command {
         documents: Vec<CommandDocument>,
         document_files: Vec<CommandDocumentFile>,
         raw_resources: Vec<CommandRawFiles>,
+    },
+    CatalogSourceUse {
+        root: PathBuf,
+        project: ProjectId,
+        expected_revision: Sha256Digest,
+        action: LocalCatalogSourceUseAction,
     },
     HostBridge,
     Owned(Vec<String>),
@@ -372,6 +395,45 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
                 )?;
             }
         }
+        Command::CatalogSourceUse {
+            root,
+            project,
+            expected_revision,
+            action,
+        } => {
+            let budget =
+                RequestBudget::until(started + SOURCE_IMPORT, Arc::new(AtomicBool::new(false)))
+                    .map_err(EntryError::SourceRequest)?;
+            let replaces = matches!(&action, LocalCatalogSourceUseAction::Replace { .. });
+            let snapshot = manage_catalog_source_use(
+                StoreConfig::new(root),
+                &project,
+                &expected_revision,
+                action,
+                &budget,
+            )
+            .map_err(EntryError::CatalogSourceRequest)?;
+            if replaces {
+                deliver_catalog_source_uses(
+                    snapshot,
+                    &expected_revision,
+                    &budget,
+                    |value, deadline| {
+                        output_with_limit(value, deadline, MAX_SOURCE_OUTPUT, budget.cancellation())
+                    },
+                )?;
+            } else {
+                let value = catalog_source_use_value(&snapshot, &expected_revision, false);
+                budget.check().map_err(EntryError::SourceRequest)?;
+                output_with_limit(
+                    &value,
+                    budget.deadline(),
+                    MAX_SOURCE_OUTPUT,
+                    budget.cancellation(),
+                )?;
+                budget.check().map_err(EntryError::SourceRequest)?;
+            }
+        }
         Command::SourceImport {
             root,
             project,
@@ -466,7 +528,7 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
     }
     if !matches!(
         command,
-        "init" | "daemon" | "start" | "host-setup" | "source-import"
+        "init" | "daemon" | "start" | "host-setup" | "source-import" | "catalog-source-use"
     ) {
         return Ok(None);
     }
@@ -477,6 +539,8 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
     let mut pending_descriptor = None;
     let mut source_total = 0usize;
     let mut shape_modes = Vec::new();
+    let mut catalog_mods = Vec::new();
+    let mut catalog_selector_bytes = 0usize;
     for pair in args[1..].chunks(2) {
         if pair.len() != 2 {
             return Err(EntryError::Arguments);
@@ -486,6 +550,17 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
                 return Err(EntryError::HostReadPolicyArguments);
             }
             shape_modes.push(pair[1].clone());
+            continue;
+        }
+        if command == "catalog-source-use" && pair[0] == "--mod" {
+            catalog_selector_bytes = catalog_selector_bytes
+                .checked_add(pair[1].len())
+                .filter(|size| *size <= 65_536)
+                .ok_or(EntryError::CatalogSourceArguments)?;
+            if catalog_mods.len() >= 256 {
+                return Err(EntryError::CatalogSourceArguments);
+            }
+            catalog_mods.push(catalog_mod_selector(&pair[1])?);
             continue;
         }
         if command == "source-import" {
@@ -636,12 +711,142 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
                 raw_resources,
             }
         }
+        "catalog-source-use" => {
+            let project = ProjectId::new(options.remove("--project").ok_or(EntryError::Arguments)?)
+                .map_err(|_| EntryError::Arguments)?;
+            let expected_revision = Sha256Digest::new(
+                options
+                    .remove("--expected-revision")
+                    .ok_or(EntryError::Arguments)?,
+            )
+            .map_err(|_| EntryError::Arguments)?;
+            let mode = options
+                .remove("--mode")
+                .ok_or(EntryError::CatalogSourceArguments)?;
+            let expected_state = options.remove("--expected-state-digest");
+            let withdraw = options.remove("--withdraw");
+            let game = options.remove("--game-artifact");
+            let action = match mode {
+                "inspect"
+                    if expected_state.is_none()
+                        && withdraw.is_none()
+                        && game.is_none()
+                        && catalog_mods.is_empty() =>
+                {
+                    LocalCatalogSourceUseAction::Inspect
+                }
+                "replace" => {
+                    let expected_state_digest = Sha256Digest::new(
+                        expected_state.ok_or(EntryError::CatalogSourceArguments)?,
+                    )
+                    .map_err(|_| EntryError::CatalogSourceArguments)?;
+                    if withdraw.is_some() {
+                        if withdraw != Some("true") || game.is_some() || !catalog_mods.is_empty() {
+                            return Err(EntryError::CatalogSourceArguments);
+                        }
+                    } else {
+                        if let Some(game) = game {
+                            catalog_mods.push(CatalogSourceUseSelection {
+                                resource_id: ResourceId::new(game)
+                                    .map_err(|_| EntryError::CatalogSourceArguments)?,
+                                role: CatalogSourceUseRole::GameArtifact,
+                            });
+                        }
+                        if catalog_mods.is_empty() || catalog_mods.len() > 256 {
+                            return Err(EntryError::CatalogSourceArguments);
+                        }
+                    }
+                    LocalCatalogSourceUseAction::Replace {
+                        expected_state_digest,
+                        selections: catalog_mods,
+                    }
+                }
+                _ => return Err(EntryError::CatalogSourceArguments),
+            };
+            Command::CatalogSourceUse {
+                root,
+                project,
+                expected_revision,
+                action,
+            }
+        }
         _ => return Err(EntryError::Arguments),
     };
     if !options.is_empty() {
         return Err(EntryError::Arguments);
     }
     Ok(Some(parsed))
+}
+
+fn catalog_mod_selector(value: &str) -> Result<CatalogSourceUseSelection, EntryError> {
+    if value.len() > 1024 {
+        return Err(EntryError::CatalogSourceArguments);
+    }
+    let mut fields = value.split(',');
+    let canonical = fields.next().ok_or(EntryError::CatalogSourceArguments)?;
+    let native = fields.next().ok_or(EntryError::CatalogSourceArguments)?;
+    let resource = fields.next().ok_or(EntryError::CatalogSourceArguments)?;
+    if fields.next().is_some()
+        || native.is_empty()
+        || native.len() > 128
+        || !native
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-.".contains(&byte))
+    {
+        return Err(EntryError::CatalogSourceArguments);
+    }
+    Ok(CatalogSourceUseSelection {
+        resource_id: ResourceId::new(resource).map_err(|_| EntryError::CatalogSourceArguments)?,
+        role: CatalogSourceUseRole::Mod {
+            canonical_id: ResourceLocation::new(canonical)
+                .map_err(|_| EntryError::CatalogSourceArguments)?,
+            native_id: native.to_owned(),
+        },
+    })
+}
+
+fn catalog_source_use_value(
+    snapshot: &CatalogSourceUseSnapshot,
+    revision: &Sha256Digest,
+    replaced: bool,
+) -> Value {
+    let selected = snapshot
+        .selections()
+        .iter()
+        .map(|pin| {
+            json!({
+                "resourceId":pin.selection().resource_id,"role":pin.selection().role,
+                "resource":pin.resource(),"blob":pin.blob(),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"kind":if replaced {"catalog_source_uses_replaced"} else {"catalog_source_use_state"},
+        "projectId":snapshot.project_id(),"currentProjectRevision":revision,
+        "approvedProjectRevision":snapshot.approved_project_revision(),
+        "generation":snapshot.generation(),"stateDigest":snapshot.state_digest(),
+        "rights":snapshot.rights(),"selectionCount":selected.len(),"selections":selected})
+}
+
+fn deliver_catalog_source_uses(
+    snapshot: CatalogSourceUseSnapshot,
+    revision: &Sha256Digest,
+    budget: &RequestBudget,
+    deliver: impl FnOnce(&Value, Instant) -> Result<(), EntryError>,
+) -> Result<(), EntryError> {
+    let result = budget
+        .check()
+        .map_err(EntryError::SourceRequest)
+        .and_then(|()| {
+            deliver(
+                &catalog_source_use_value(&snapshot, revision, true),
+                budget.deadline(),
+            )
+        })
+        .and_then(|()| budget.check().map_err(EntryError::SourceRequest));
+    result.map_err(|delivery| EntryError::CatalogSourceUsesCommitted {
+        snapshot: Box::new(snapshot),
+        delivery: Box::new(delivery),
+    })
 }
 
 fn deliver_host_read_policy(
@@ -1985,5 +2190,10 @@ mod tests {
         assert_eq!(fs::read(selected).unwrap(), original);
         assert!(!root.0.join("missing-clip.json").exists());
         assert!(!root.0.join("runtime").exists());
+    }
+
+    // Cold source 사용 관리는 같은 실제 보호 Project/import fixture를 재사용한다.
+    mod catalog_source_use_tests {
+        include!("catalog_source_use_tests.rs");
     }
 }

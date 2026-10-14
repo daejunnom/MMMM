@@ -130,6 +130,17 @@ struct DefinitionRecord {
     bytes: usize,
 }
 
+/// 같은 잠금 안에서 인코딩한 실제 기록에만 결합되는 비공개 발급 표식이다.
+/// 외부 정수나 디코딩한 frame으로 생성하지 않으며 실행 권한을 부여하지 않는다.
+pub(crate) struct EvidenceStamp {
+    issuer_epoch: u64,
+    class_id: u64,
+    generation: u64,
+    attempt_id: AttemptId,
+    loader_id: u64,
+    kind: DefinitionKind,
+}
+
 pub(crate) struct RecordingCore {
     issuer_epoch: u64,
     next_attempt: u64,
@@ -687,6 +698,37 @@ impl RecordingCore {
             })
     }
 
+    /// 반환한 표식은 JNI 배열 생성 뒤 같은 현재 기록인지 재확인할 때만 쓴다.
+    pub(crate) fn encode_evidence_with_stamp(
+        &self,
+        actual_class_id: u64,
+    ) -> Result<(Vec<u8>, EvidenceStamp), RecordingError> {
+        let bytes = self.encode_evidence(actual_class_id)?;
+        let record = self
+            .current_record(actual_class_id)
+            .ok_or(RecordingError::Unavailable)?;
+        let stamp = EvidenceStamp {
+            issuer_epoch: self.issuer_epoch,
+            class_id: record.id,
+            generation: record.generation,
+            attempt_id: record.attempt_id,
+            loader_id: record.loader_id,
+            kind: record.kind,
+        };
+        Ok((bytes, stamp))
+    }
+
+    pub(crate) fn evidence_stamp_is_current(&self, stamp: &EvidenceStamp) -> bool {
+        self.issuer_epoch == stamp.issuer_epoch
+            && self.current_record(stamp.class_id).is_some_and(|record| {
+                record.id == stamp.class_id
+                    && record.generation == stamp.generation
+                    && record.attempt_id == stamp.attempt_id
+                    && record.loader_id == stamp.loader_id
+                    && record.kind == stamp.kind
+            })
+    }
+
     /// 내부 JNI bridge가 호출한다. SHA나 caller receipt를 받지 않고
     /// 저장한 실제 버퍼를 반환한다. target profile의 권한을 부여하지 않는다.
     pub(crate) fn encode_evidence(&self, actual_class_id: u64) -> Result<Vec<u8>, RecordingError> {
@@ -734,11 +776,9 @@ impl RecordingCore {
                 .map_or(0, |recipe| recipe.lookup_class_id)
                 .to_be_bytes(),
         )?;
-        writer.raw(
-            &recipe
-                .map_or(0, |recipe| recipe.defining_loader_id)
-                .to_be_bytes(),
-        )?;
+        // 일반/hidden 모두 실제 정의 시도와 Class 관측에서 대조한 loader다.
+        // 0은 실제 bootstrap loader이며 recipe 부재를 나타내는 값이 아니다.
+        writer.raw(&record.loader_id.to_be_bytes())?;
         writer.sized(recipe.map_or(&[], |recipe| recipe.requested_name_mutf8.as_slice()))?;
         let snapshot = record.snapshot.as_ref();
         writer.raw(

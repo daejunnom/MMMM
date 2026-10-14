@@ -47,6 +47,8 @@
 
 | MMMM-D035 | Catalog의 whole-container 사용 선택은 실제 native Project owner의 별도 보호 집합으로 보존하고, import와 host 관측 정책에서 추정하지 않는다. | 입력은 기존 resource ID·닫힌 게임 artifact 또는 mod 역할·기대 Project revision·기대 상태 digest뿐이다. 같은 Store의 현재 owner·Project·Policy와 checked reader에서 원본 및 현재 resource 연결·전체 CAS를 검사해 `user_local_only` pin을 도출한다. 한 Immediate transaction에서 단조 generation과 이전 상태 digest를 포함한 집합을 교체하며, 명시적 빈 집합도 tombstone으로 보존한다. 현재 또는 직전 상태에서 같은 선택을 재전송한 경우만 재사용하고, 철회 후 오래된 상태로 승인을 되살리지 않는다. 실제 cold owner는 과거 source의 읽기 권한이 사라져도 현재 관리 권한 아래 상태를 조회해 철회를 요청할 수 있지만, 철회에도 기존 미해결 durable write의 full-Project fence를 적용한다. snapshot·digest는 bearer 권한이 아니며 consumer의 현재 요청·권한 검사를 대신하지 않는다. 256개 선택·64 KiB metadata·4,096개 집합과 기존 64 MiB source·8 MiB Project 상한을 유지한다. CLI 관리 adapter와 native publisher의 연결, 게임·loaded-definition admission은 별도로 구현·검증한다. |
 
+| MMMM-D036 | Darwin의 원래 예약 leader에서 확인한 INEXIT 전이는 불완전 관측으로 보존하고, 성공 표본·empty·drain으로 사용하지 않는다. | 원 PID·UID·PGID·birth의 before/after 일치와 유효한 reservation을 요구한다. session 경로는 실제 getsid ESRCH, memory 경로는 실제 typed TaskInfo/Rusage Exited를 요구하고 후속 BSD의 non-SZOMB·[공개 INEXIT flag](https://github.com/apple-oss-distributions/xnu/blob/xnu-11417.140.69/bsd/sys/proc_info.h#L95-L99)를 검사한다. 다른 member는 기존의 동일 신원 native zombie만 인정한다. 부분 표본은 성공 수·peak·성공 시각을 갱신하지 않으며 알려진 부분 예산 초과는 계속 실패한다. 별도 시도 시각은 원래 100 ms cadence만 유지하고 1초 성공 gap·기한·native 호출 수·retry·sleep·자원 상한은 늘리지 않는다. 확정 identity mismatch/ECHILD는 signal 권한을 닫고 다시 열지 않는다. 원 session errno 또는 typed memory stage/result/errno, 실제 leader/member 역할과 닫힌 BSD 사실을 실패·첫/마지막 bounded 관측에 보존한다. CI28은 원 memory 숫자와 역할을 잃었으므로 이 수정으로 과거 분기나 실제 macOS 성공을 소급 확정하지 않는다. |
+
 ## 구현 전에 확인할 항목
 
 - 원본 계약과 예제 패키지의 내용, 버전 및 digest.

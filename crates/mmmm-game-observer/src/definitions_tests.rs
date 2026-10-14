@@ -83,6 +83,10 @@ fn ordinary_requires_exact_return_identity_and_prepare_even_after_native_return(
         core.encode_evidence(CLASS),
         Err(RecordingError::NotPrepared)
     );
+    assert!(matches!(
+        core.encode_evidence_with_stamp(CLASS),
+        Err(RecordingError::NotPrepared)
+    ));
     core.class_prepare(99, CLASS, LOADER, b"sample.A".to_vec(), None)
         .unwrap();
     let encoded = core.encode_evidence(CLASS).unwrap();
@@ -99,7 +103,120 @@ fn ordinary_requires_exact_return_identity_and_prepare_even_after_native_return(
         token.raw()
     );
     assert_eq!(u64::from_be_bytes(encoded[36..44].try_into().unwrap()), 7);
+    let mut cursor = 44;
+    assert_eq!(read_sized(&encoded, &mut cursor), b"sample.A");
+    assert_eq!(read_sized(&encoded, &mut cursor), &[1, 2, 3]);
+    assert!(read_sized(&encoded, &mut cursor).is_empty());
+    assert_eq!(read_u32(&encoded, &mut cursor), 0);
+    assert_eq!(&encoded[cursor..cursor + 4], &[0, 0, 0, 0]);
+    cursor += 4;
+    assert_eq!(read_u64(&encoded, &mut cursor), 0);
+    assert_eq!(read_u64(&encoded, &mut cursor), LOADER);
+    assert!(read_sized(&encoded, &mut cursor).is_empty());
     assert!(!core.needs_snapshot(CLASS));
+}
+
+#[test]
+fn ordinary_same_name_definitions_preserve_distinct_and_bootstrap_loader_identities() {
+    let mut core = RecordingCore::new(7);
+    for (class, loader) in [
+        (CLASS, LOADER),
+        (CLASS + 1, LOADER + 1),
+        (CLASS + 2, 0),
+        (CLASS + 3, u64::MAX),
+    ] {
+        let token = core
+            .begin(
+                THREAD,
+                loader,
+                Some(b"sample/A".to_vec()),
+                DefinitionKind::Ordinary,
+                None,
+                false,
+            )
+            .unwrap();
+        core.terminal_hook(THREAD, loader, Some(b"sample/A"), vec![1])
+            .unwrap();
+        core.class_load(THREAD, class, loader, b"sample.A".to_vec())
+            .unwrap();
+        core.finish(THREAD, token, Some(class), false).unwrap();
+        core.class_prepare(99, class, loader, b"sample.A".to_vec(), None)
+            .unwrap();
+        let encoded = core.encode_evidence(class).unwrap();
+        assert_eq!(
+            u64::from_be_bytes(encoded[12..20].try_into().unwrap()),
+            class
+        );
+        assert_eq!(u64::from_be_bytes(encoded[20..28].try_into().unwrap()), 1);
+        let mut cursor = 44;
+        assert_eq!(read_sized(&encoded, &mut cursor), b"sample.A");
+        assert_eq!(read_sized(&encoded, &mut cursor), &[1]);
+        assert!(read_sized(&encoded, &mut cursor).is_empty());
+        assert_eq!(read_u32(&encoded, &mut cursor), 0);
+        cursor += 4;
+        assert_eq!(read_u64(&encoded, &mut cursor), 0);
+        assert_eq!(read_u64(&encoded, &mut cursor), loader);
+        assert_eq!(core.ordinary_generation(class), Some(1));
+    }
+}
+
+#[test]
+fn issued_evidence_stamp_rejects_redefinition_after_encoding() {
+    let mut core = RecordingCore::new(7);
+    ready_ordinary(&mut core, CLASS);
+    let (encoded, stamp) = core.encode_evidence_with_stamp(CLASS).unwrap();
+    assert_eq!(encoded, core.encode_evidence(CLASS).unwrap());
+    assert!(core.evidence_stamp_is_current(&stamp));
+    core.invalidate_class(CLASS);
+    assert!(!core.evidence_stamp_is_current(&stamp));
+    assert_eq!(core.records[&CLASS].generation, 2);
+    assert!(matches!(
+        core.encode_evidence_with_stamp(CLASS),
+        Err(RecordingError::Invalidated)
+    ));
+}
+
+#[test]
+fn issued_evidence_stamp_binds_issuer_class_attempt_and_loader() {
+    fn recorded(epoch: u64, class: u64, loader: u64, earlier_attempt: bool) -> RecordingCore {
+        let mut core = RecordingCore::new(epoch);
+        if earlier_attempt {
+            let token = core
+                .begin(THREAD, loader, None, DefinitionKind::Ordinary, None, false)
+                .unwrap();
+            assert!(core.finish(THREAD, token, None, true).is_err());
+        }
+        let token = core
+            .begin(
+                THREAD,
+                loader,
+                Some(b"sample/A".to_vec()),
+                DefinitionKind::Ordinary,
+                None,
+                false,
+            )
+            .unwrap();
+        core.terminal_hook(THREAD, loader, Some(b"sample/A"), vec![1])
+            .unwrap();
+        core.class_load(THREAD, class, loader, b"sample.A".to_vec())
+            .unwrap();
+        core.finish(THREAD, token, Some(class), false).unwrap();
+        core.class_prepare(99, class, loader, b"sample.A".to_vec(), None)
+            .unwrap();
+        core
+    }
+
+    let core = recorded(7, CLASS, LOADER, false);
+    let (_, stamp) = core.encode_evidence_with_stamp(CLASS).unwrap();
+    assert!(core.evidence_stamp_is_current(&stamp));
+    for changed in [
+        recorded(8, CLASS, LOADER, false),
+        recorded(7, CLASS + 1, LOADER, false),
+        recorded(7, CLASS, LOADER + 1, false),
+        recorded(7, CLASS, LOADER, true),
+    ] {
+        assert!(!changed.evidence_stamp_is_current(&stamp));
+    }
 }
 
 #[test]
@@ -155,6 +272,11 @@ fn hidden_prepare_before_load_keeps_recipe_and_vm_snapshot_separate() {
         assert_eq!(read_sized(&encoded, &mut cursor), bytes.as_slice());
     }
     assert_eq!(cursor, encoded.len());
+    let (stamped, stamp) = core.encode_evidence_with_stamp(CLASS).unwrap();
+    assert_eq!(stamped, encoded);
+    assert!(core.evidence_stamp_is_current(&stamp));
+    core.invalidate_class(CLASS);
+    assert!(!core.evidence_stamp_is_current(&stamp));
 }
 
 #[test]
@@ -424,8 +546,11 @@ fn hidden_context_requires_current_prepared_actual_identity() {
 fn resource_exhaustion_revokes_generation_and_context_queries() {
     let mut core = RecordingCore::new(1);
     ready_ordinary(&mut core, CLASS);
+    let (_, stamp) = core.encode_evidence_with_stamp(CLASS).unwrap();
+    assert!(core.evidence_stamp_is_current(&stamp));
     assert_eq!(core.ordinary_generation(CLASS), Some(1));
     core.exhausted = true;
+    assert!(!core.evidence_stamp_is_current(&stamp));
     assert_eq!(core.ordinary_generation(CLASS), None);
     assert_eq!(core.class_generation(CLASS), None);
     assert_eq!(core.hidden_context(CLASS), None);

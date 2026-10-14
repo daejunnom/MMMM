@@ -272,6 +272,32 @@ impl OwnerSourceAccess {
     }
 }
 struct OwnerResourceAuthority(Arc<OwnerSourceAccess>);
+/// Cold native 관리용 좁은 reader다. workspace/context/grant를 설치하지 않는다.
+/// 실제 owner witness와 명시적으로 선택한 IDs만 사용하며 membership/provenance/
+/// CAS는 기존 ProjectResourceReader가 검사한다. caller는 원래 budget과 등록된
+/// Project owner를 이 reader 호출 전후에 계속 확인해야 한다.
+pub(crate) fn native_owner_resource_reader(
+    owner: &NativeOwnerWitness,
+    project: &ProjectId,
+    revision: &Sha256Digest,
+    resources: BTreeSet<ResourceId>,
+    ceiling: u64,
+) -> StorageResult<ProjectResourceReader> {
+    owner.check()?;
+    if resources.len() > MAX_ITEMS {
+        return Err(budget());
+    }
+    ProjectResourceReader::new(
+        Box::new(OwnerResourceAuthority(Arc::new(OwnerSourceAccess {
+            witness: owner.clone(),
+            project: project.clone(),
+            revision: revision.clone(),
+            resources,
+            documents: BTreeSet::new(),
+        }))),
+        ceiling,
+    )
+}
 impl ProjectResourceAuthority for OwnerResourceAuthority {
     fn authorize_project_read(
         &mut self,

@@ -312,6 +312,8 @@ pub struct ProcessError {
     pub drained: bool,
     #[cfg(any(target_os = "linux", test))]
     linux_pidfd_diagnostic: Option<linux_resources::PidfdDiagnostic>,
+    #[cfg(any(target_os = "linux", test))]
+    linux_stat_diagnostic: Option<linux_resources::StatDiagnostic>,
 }
 impl ProcessError {
     fn new(kind: &'static str, message: impl Into<String>) -> Self {
@@ -321,6 +323,8 @@ impl ProcessError {
             drained: true,
             #[cfg(any(target_os = "linux", test))]
             linux_pidfd_diagnostic: None,
+            #[cfg(any(target_os = "linux", test))]
+            linux_stat_diagnostic: None,
         }
     }
     #[cfg(any(target_os = "linux", test))]
@@ -329,6 +333,15 @@ impl ProcessError {
         // native error, including its kind, message and drain fact.
         if self.linux_pidfd_diagnostic.is_none() {
             self.linux_pidfd_diagnostic = Some(diagnostic);
+        }
+        self
+    }
+    #[cfg(any(target_os = "linux", test))]
+    fn with_linux_stat_diagnostic(mut self, diagnostic: linux_resources::StatDiagnostic) -> Self {
+        // Closed stat facts supplement, never replace, the original error or
+        // the separately retained pidfd observation.
+        if self.linux_stat_diagnostic.is_none() {
+            self.linux_stat_diagnostic = Some(diagnostic);
         }
         self
     }
@@ -341,6 +354,10 @@ impl fmt::Display for ProcessError {
         write!(f, "{}: {}", self.kind, self.message)?;
         #[cfg(any(target_os = "linux", test))]
         if let Some(diagnostic) = self.linux_pidfd_diagnostic {
+            write!(f, "; {diagnostic}")?;
+        }
+        #[cfg(any(target_os = "linux", test))]
+        if let Some(diagnostic) = self.linux_stat_diagnostic {
             write!(f, "; {diagnostic}")?;
         }
         Ok(())
@@ -1631,7 +1648,7 @@ mod native {
         reaped: bool,
         reservation_valid: bool,
         #[cfg(target_os = "macos")]
-        mac_leader_identity: Option<(u64, u64)>,
+        mac_leader_identity: Option<darwin_resources::LeaderIdentity>,
         #[cfg(target_os = "macos")]
         resources: darwin_resources::Tracker,
         #[cfg(target_os = "linux")]
@@ -1645,7 +1662,8 @@ mod native {
             let mut resources = {
                 let pid = unsafe { libc::getpid() };
                 let before = mac_bsd_info(pid, false)?;
-                let memory = darwin_resources::memory(pid)?;
+                let memory =
+                    darwin_resources::memory(pid).map_err(darwin_resources::native_error)?;
                 let after = mac_bsd_info(pid, false)?;
                 verify_memory_identity(before.as_ref(), after.as_ref(), pid)?;
                 darwin_resources::Tracker::new(memory)?
@@ -1785,9 +1803,10 @@ mod native {
                 });
                 match identity {
                     Ok(info) if info.pid == pid as u32 && info.pgid == pid as u32 => {
-                        process.mac_leader_identity = Some((info.start_sec, info.start_usec));
+                        process.mac_leader_identity = Some(info.observation().identity);
                     }
                     Ok(_) => {
+                        process.reservation_valid = false;
                         let mut error = ProcessError::new(
                             "process_identity",
                             "new macOS leader has inconsistent process-group identity",
@@ -1847,34 +1866,54 @@ mod native {
         }
         pub(super) fn scope_empty(&mut self) -> Result<bool, ProcessError> {
             #[cfg(target_os = "linux")]
-            let members = self.linux_sample(false)?.live_processes;
+            {
+                Ok(self.linux_sample(false)?.live_processes == 0)
+            }
             #[cfg(target_os = "macos")]
-            let members = live_group_members(
-                self.pid,
-                self.mac_leader_identity.ok_or_else(|| {
-                    ProcessError::new("process_identity", "missing reserved macOS leader identity")
-                })?,
-                None,
-            )?;
-            Ok(members == 0)
+            {
+                self.mac_group_observation(None)
+                    .map(darwin_resources::GroupObservation::scope_empty)
+                    .map_err(|error| self.resources.with_pending_diagnostics(error))
+            }
         }
         #[cfg(target_os = "macos")]
-        pub(super) fn observe_resources(&mut self) -> Result<(), ProcessError> {
-            if self.resources.begin()?.is_some() {
+        fn mac_group_observation(
+            &mut self,
+            resources: Option<&mut darwin_resources::Sample>,
+        ) -> Result<darwin_resources::GroupObservation, ProcessError> {
+            let Some(identity) = self.mac_leader_identity else {
+                self.reservation_valid = false;
+                return Err(ProcessError::new(
+                    "process_identity",
+                    "missing reserved macOS leader identity",
+                ));
+            };
+            let mut memory_exits = None;
+            let result = live_group_members(
+                self.pid,
+                identity,
+                &mut self.reservation_valid,
+                resources,
+                &mut memory_exits,
+            );
+            // Retain native exit facts even if a later member/identity check
+            // fails before this partial group sample can be completed.
+            self.resources.record_memory_exits(memory_exits);
+            result
+        }
+        #[cfg(target_os = "macos")]
+        pub(super) fn observe_resources(
+            &mut self,
+        ) -> Result<darwin_resources::ResourceObservation, ProcessError> {
+            let result = (|| {
+                if self.resources.begin()?.is_none() {
+                    return Ok(darwin_resources::ResourceObservation::NotDue);
+                }
                 let mut sample = darwin_resources::Sample::default();
-                live_group_members(
-                    self.pid,
-                    self.mac_leader_identity.ok_or_else(|| {
-                        ProcessError::new(
-                            "process_identity",
-                            "missing reserved macOS leader identity",
-                        )
-                    })?,
-                    Some(&mut sample),
-                )?;
-                self.resources.finish(sample)?;
-            }
-            Ok(())
+                let observation = self.mac_group_observation(Some(&mut sample))?;
+                self.resources.finish_observation(observation, sample)
+            })();
+            result.map_err(|error| self.resources.with_pending_diagnostics(error))
         }
         #[cfg(target_os = "macos")]
         pub(super) fn resource_evidence(&self) -> darwin_resources::Evidence {
@@ -1916,6 +1955,10 @@ mod native {
             self.resources.evidence()
         }
         pub(super) fn terminate(&mut self) -> Result<(), ProcessError> {
+            #[cfg(target_os = "macos")]
+            if self.mac_leader_identity.is_none() {
+                self.reservation_valid = false;
+            }
             if self.reaped || !self.reservation_valid {
                 return Err(ProcessError::new(
                     "identity",
@@ -2041,6 +2084,22 @@ mod native {
         start_usec: u64,
     }
     #[cfg(target_os = "macos")]
+    impl BsdInfo {
+        fn observation(&self) -> darwin_resources::LeaderBsd {
+            darwin_resources::LeaderBsd {
+                identity: darwin_resources::LeaderIdentity {
+                    pid: self.pid,
+                    uid: self.uid,
+                    pgid: self.pgid,
+                    start_sec: self.start_sec,
+                    start_usec: self.start_usec,
+                },
+                status: self.status,
+                flags: self.flags,
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
     fn mac_bsd_info(pid: i32, include_zombie: bool) -> Result<Option<BsdInfo>, ProcessError> {
         #[link(name = "proc")]
         unsafe extern "C" {
@@ -2080,9 +2139,11 @@ mod native {
     #[cfg(target_os = "macos")]
     fn live_group_members(
         group: libc::pid_t,
-        leader_identity: (u64, u64),
+        leader_identity: darwin_resources::LeaderIdentity,
+        reservation_valid: &mut bool,
         mut resources: Option<&mut darwin_resources::Sample>,
-    ) -> Result<usize, ProcessError> {
+        memory_exits: &mut Option<darwin_resources::ExitObservationEvidence>,
+    ) -> Result<darwin_resources::GroupObservation, ProcessError> {
         #[link(name = "proc")]
         unsafe extern "C" {
             fn proc_listpids(
@@ -2126,120 +2187,245 @@ mod native {
         };
         let mut members = 0;
         let mut leader_seen = false;
-        for pid in pids.into_iter().filter(|p| *p > 0) {
-            if pid == group {
-                // Darwin getsid cannot find a zombie. proc_pidinfo arg=1
-                // explicitly includes it; WNOWAIT still reserves its identity.
-                let before = mac_bsd_info(pid, true)?.ok_or_else(|| {
-                    ProcessError::new("process_identity", "reserved macOS leader missing")
-                })?;
-                let memory = if resources.is_some()
-                    && before.status != 5
-                    && live_leader_session_or_confirmed_zombie(pid, &before)?
-                {
-                    memory_or_confirmed_zombie(pid, &before)?
+        let mut pending = None;
+        let result = (|| {
+            for pid in pids.into_iter().filter(|p| *p > 0) {
+                if pid == group {
+                    // Darwin getsid cannot find a zombie. proc_pidinfo arg=1
+                    // explicitly includes it; WNOWAIT still reserves its identity.
+                    let before = mac_bsd_info(pid, true)
+                        .map_err(|error| {
+                            darwin_resources::LeaderDiagnostic::observe(
+                                leader_identity,
+                                None,
+                                None,
+                                darwin_resources::LeaderPhase::GroupIdentity,
+                                darwin_resources::LeaderSession::NotObserved,
+                            )
+                            .attach(error)
+                        })?
+                        .ok_or_else(|| {
+                            darwin_resources::LeaderDiagnostic::observe(
+                                leader_identity,
+                                None,
+                                None,
+                                darwin_resources::LeaderPhase::GroupIdentity,
+                                darwin_resources::LeaderSession::NotObserved,
+                            )
+                            .attach(ProcessError::new(
+                                "process_identity",
+                                "reserved macOS leader missing",
+                            ))
+                        })?;
+                    darwin_resources::verify_reserved_identity(
+                        leader_identity,
+                        Some(before.observation()),
+                        Some(before.observation()),
+                        darwin_resources::LeaderPhase::GroupIdentity,
+                        reservation_valid,
+                    )?;
+                    let memory = if resources.is_some() && before.status != darwin_resources::SZOMB
+                    {
+                        match live_leader_session_or_confirmed_zombie(
+                            pid,
+                            leader_identity,
+                            &before,
+                            darwin_resources::LeaderPhase::BeforeMemory,
+                            reservation_valid,
+                        )? {
+                            darwin_resources::LeaderObservation::Live => {
+                                match memory_or_confirmed_zombie(
+                                    pid,
+                                    &before,
+                                    Some((leader_identity, &mut *reservation_valid)),
+                                )? {
+                                    darwin_resources::MemoryObservation::Measured(memory) => {
+                                        Some(memory)
+                                    }
+                                    darwin_resources::MemoryObservation::Zombie(diagnostic) => {
+                                        darwin_resources::ExitObservationEvidence::record(
+                                            memory_exits,
+                                            diagnostic,
+                                        );
+                                        None
+                                    }
+                                    darwin_resources::MemoryObservation::Pending(diagnostic) => {
+                                        darwin_resources::ExitObservationEvidence::record(
+                                            memory_exits,
+                                            diagnostic,
+                                        );
+                                        pending = Some(diagnostic);
+                                        None
+                                    }
+                                }
+                            }
+                            darwin_resources::LeaderObservation::Zombie => None,
+                            darwin_resources::LeaderObservation::Pending(diagnostic) => {
+                                pending = Some(diagnostic);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let after = mac_bsd_info(pid, true)
+                        .map_err(|error| {
+                            darwin_resources::LeaderDiagnostic::observe(
+                                leader_identity,
+                                Some(before.observation()),
+                                None,
+                                darwin_resources::LeaderPhase::GroupIdentity,
+                                darwin_resources::LeaderSession::NotObserved,
+                            )
+                            .attach(error)
+                        })?
+                        .ok_or_else(|| {
+                            darwin_resources::LeaderDiagnostic::observe(
+                                leader_identity,
+                                Some(before.observation()),
+                                None,
+                                darwin_resources::LeaderPhase::GroupIdentity,
+                                darwin_resources::LeaderSession::NotObserved,
+                            )
+                            .attach(ProcessError::new(
+                                "process_identity",
+                                "reserved macOS leader disappeared",
+                            ))
+                        })?;
+                    darwin_resources::verify_reserved_identity(
+                        leader_identity,
+                        Some(before.observation()),
+                        Some(after.observation()),
+                        darwin_resources::LeaderPhase::GroupIdentity,
+                        reservation_valid,
+                    )?;
+                    leader_seen = true;
+                    if after.status != darwin_resources::SZOMB {
+                        if let Some(sample) = resources.as_deref_mut() {
+                            if pending.is_some() {
+                                continue;
+                            }
+                            if let Some(memory) = memory {
+                                verify_memory_identity(Some(&before), Some(&after), pid)?;
+                                match live_leader_session_or_confirmed_zombie(
+                                    pid,
+                                    leader_identity,
+                                    &after,
+                                    darwin_resources::LeaderPhase::AfterMemory,
+                                    reservation_valid,
+                                )? {
+                                    darwin_resources::LeaderObservation::Live => {
+                                        members += 1;
+                                        sample.push(memory)?;
+                                    }
+                                    darwin_resources::LeaderObservation::Zombie => (),
+                                    darwin_resources::LeaderObservation::Pending(diagnostic) => {
+                                        pending = Some(diagnostic)
+                                    }
+                                }
+                            } else {
+                                return Err(ProcessError::new(
+                                    "resource_observation",
+                                    "live macOS leader has no verified resource sample",
+                                ));
+                            }
+                        } else {
+                            members += 1;
+                        }
+                    }
+                    continue;
+                }
+                let session = unsafe { libc::getsid(pid) };
+                if session == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::ESRCH) {
+                        continue;
+                    }
+                    return Err(ProcessError::io("observe macOS process session", error));
+                }
+                if session != group {
+                    continue;
+                }
+                let Some(before) = mac_bsd_info(pid, false)? else {
+                    continue;
+                };
+                let memory = if resources.is_some() && before.status != 5 {
+                    match memory_or_confirmed_zombie(pid, &before, None)? {
+                        darwin_resources::MemoryObservation::Measured(memory) => Some(memory),
+                        darwin_resources::MemoryObservation::Zombie(diagnostic) => {
+                            darwin_resources::ExitObservationEvidence::record(
+                                memory_exits,
+                                diagnostic,
+                            );
+                            None
+                        }
+                        darwin_resources::MemoryObservation::Pending(diagnostic) => {
+                            return Err(diagnostic.attach(ProcessError::new(
+                                "resource_observation",
+                                "unreserved macOS member cannot defer a native memory failure",
+                            )));
+                        }
+                    }
                 } else {
                     None
                 };
-                let after = mac_bsd_info(pid, true)?.ok_or_else(|| {
-                    ProcessError::new("process_identity", "reserved macOS leader disappeared")
-                })?;
-                if before.pid != group as u32
-                    || after.pid != group as u32
-                    || before.pgid != group as u32
-                    || after.pgid != group as u32
-                    || (before.start_sec, before.start_usec) != leader_identity
-                    || (after.start_sec, after.start_usec) != leader_identity
+                let session_after = unsafe { libc::getsid(pid) };
+                if session_after == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    continue;
+                }
+                let Some(after) = mac_bsd_info(pid, false)? else {
+                    continue;
+                };
+                if session_after != group
+                    || before.pid != pid as u32
+                    || after.pid != pid as u32
+                    || before.start_sec != after.start_sec
+                    || before.start_usec != after.start_usec
+                    || before.pgid != after.pgid
                 {
                     return Err(ProcessError::new(
                         "process_identity",
-                        "reserved macOS leader identity changed",
+                        "macOS native identity changed during session observation",
                     ));
                 }
-                leader_seen = true;
-                if after.status != 5 {
-                    if let Some(sample) = resources.as_deref_mut() {
-                        if let Some(memory) = memory {
-                            verify_memory_identity(Some(&before), Some(&after), pid)?;
-                            if live_leader_session_or_confirmed_zombie(pid, &after)? {
-                                members += 1;
-                                sample.push(memory)?;
-                            }
-                        } else {
-                            return Err(ProcessError::new(
-                                "resource_observation",
-                                "live macOS leader has no verified resource sample",
-                            ));
+                if after.pgid != group as u32 && after.status != 5 {
+                    return Err(ProcessError::new(
+                        "scope_escape",
+                        "owned macOS session member changed process group; drain cannot be certified",
+                    ));
+                }
+                if after.pgid == group as u32 && after.status != 5 {
+                    members += 1;
+                    if let Some(memory) = memory {
+                        verify_memory_identity(Some(&before), Some(&after), pid)?;
+                        if let Some(sample) = resources.as_deref_mut() {
+                            sample.push(memory)?;
                         }
-                    } else {
-                        members += 1;
                     }
                 }
-                continue;
             }
-            let session = unsafe { libc::getsid(pid) };
-            if session == -1 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ESRCH) {
-                    continue;
-                }
-                return Err(ProcessError::io("observe macOS process session", error));
-            }
-            if session != group {
-                continue;
-            }
-            let Some(before) = mac_bsd_info(pid, false)? else {
-                continue;
-            };
-            let memory = if resources.is_some() && before.status != 5 {
-                memory_or_confirmed_zombie(pid, &before)?
-            } else {
-                None
-            };
-            let session_after = unsafe { libc::getsid(pid) };
-            if session_after == -1
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            {
-                continue;
-            }
-            let Some(after) = mac_bsd_info(pid, false)? else {
-                continue;
-            };
-            if session_after != group
-                || before.pid != pid as u32
-                || after.pid != pid as u32
-                || before.start_sec != after.start_sec
-                || before.start_usec != after.start_usec
-                || before.pgid != after.pgid
-            {
+            if !leader_seen {
                 return Err(ProcessError::new(
                     "process_identity",
-                    "macOS native identity changed during session observation",
+                    "reserved macOS group leader missing from native snapshot",
                 ));
             }
-            if after.pgid != group as u32 && after.status != 5 {
-                return Err(ProcessError::new(
-                    "scope_escape",
-                    "owned macOS session member changed process group; drain cannot be certified",
-                ));
+            Ok(())
+        })();
+        if let Err(mut error) = result {
+            if let Some(diagnostic) = pending {
+                error
+                    .message
+                    .push_str(&format!("; pending_before_failure=[{diagnostic}]"));
             }
-            if after.pgid == group as u32 && after.status != 5 {
-                members += 1;
-                if let Some(memory) = memory {
-                    verify_memory_identity(Some(&before), Some(&after), pid)?;
-                    if let Some(sample) = resources.as_deref_mut() {
-                        sample.push(memory)?;
-                    }
-                }
-            }
+            return Err(error);
         }
-        if !leader_seen {
-            return Err(ProcessError::new(
-                "process_identity",
-                "reserved macOS group leader missing from native snapshot",
-            ));
-        }
-        Ok(members)
+        Ok(match pending {
+            Some(diagnostic) => darwin_resources::GroupObservation::Pending(diagnostic),
+            None => darwin_resources::GroupObservation::Complete(members),
+        })
     }
     #[cfg(target_os = "macos")]
     fn verify_memory_identity(
@@ -2267,45 +2453,105 @@ mod native {
     fn memory_or_confirmed_zombie(
         pid: i32,
         before: &BsdInfo,
-    ) -> Result<Option<darwin_resources::Memory>, ProcessError> {
-        match darwin_resources::memory(pid) {
-            Ok(memory) => Ok(Some(memory)),
-            Err(error) if error.kind == "resource_process_exit" => {
-                let after = mac_bsd_info(pid, true)?;
-                verify_memory_identity(Some(before), after.as_ref(), pid)?;
-                if after.is_none_or(|info| info.status != 5) {
-                    return Err(ProcessError::new(
-                        "resource_observation",
-                        "Darwin resource process exit not confirmed by native zombie identity",
-                    ));
-                }
-                // A reserved group ID with unchanged start/PGID identifies the
-                // departed member; it is omitted, never replaced by zero usage.
-                Ok(None)
-            }
-            Err(error) => Err(error),
+        reserved: Option<(darwin_resources::LeaderIdentity, &mut bool)>,
+    ) -> Result<darwin_resources::MemoryObservation, ProcessError> {
+        let native = match darwin_resources::memory(pid) {
+            Ok(memory) => return Ok(darwin_resources::MemoryObservation::Measured(memory)),
+            Err(native) => native,
+        };
+        let anchor = reserved
+            .as_ref()
+            .map(|(anchor, _)| *anchor)
+            .unwrap_or(before.observation().identity);
+        let is_reserved = reserved.is_some();
+        let diagnostic = |after: Option<&BsdInfo>| {
+            darwin_resources::LeaderDiagnostic::observe(
+                anchor,
+                Some(before.observation()),
+                after.map(BsdInfo::observation),
+                darwin_resources::LeaderPhase::MemoryResult,
+                darwin_resources::LeaderSession::NotObserved,
+            )
+            .with_memory_error(native, is_reserved)
+        };
+        if native.failure != mmmm_native_process::darwin::NativeResourceFailure::Exited {
+            // Other native failures do not authorize another BSD lookup.
+            return Err(diagnostic(None).attach(darwin_resources::native_error(native)));
         }
+        let after = mac_bsd_info(pid, true).map_err(|error| diagnostic(None).attach(error))?;
+        // The typed native result and actual same-birth BSD facts are both
+        // retained. Classification can close a definitively lost reservation
+        // before the original current-UID sandwich returns its primary error.
+        let classified = darwin_resources::classify_memory_exit(
+            reserved,
+            before.observation(),
+            after.as_ref().map(BsdInfo::observation),
+            native,
+        );
+        verify_memory_identity(Some(before), after.as_ref(), pid)
+            .map_err(|error| diagnostic(after.as_ref()).attach(error))?;
+        classified
     }
     #[cfg(target_os = "macos")]
     fn live_leader_session_or_confirmed_zombie(
         pid: i32,
+        anchor: darwin_resources::LeaderIdentity,
         before: &BsdInfo,
-    ) -> Result<bool, ProcessError> {
+        phase: darwin_resources::LeaderPhase,
+        reservation_valid: &mut bool,
+    ) -> Result<darwin_resources::LeaderObservation, ProcessError> {
         let session = unsafe { libc::getsid(pid) };
-        if session == pid {
-            return Ok(true);
+        let session = if session == pid {
+            darwin_resources::LeaderSession::Expected
+        } else if session == -1 {
+            // Capture errno before the existing follow-up libproc call.
+            darwin_resources::LeaderSession::NativeFailure(
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            )
+        } else {
+            darwin_resources::LeaderSession::Mismatch
+        };
+        if session == darwin_resources::LeaderSession::NativeFailure(libc::ESRCH) {
+            let after = mac_bsd_info(pid, true).map_err(|error| {
+                darwin_resources::LeaderDiagnostic::observe(
+                    anchor,
+                    Some(before.observation()),
+                    None,
+                    phase,
+                    session,
+                )
+                .attach(error)
+            })?;
+            // Classify before the existing UID/current-process sandwich so a
+            // definitive anchor mismatch closes signal rights. The original
+            // native identity error stays primary if that sandwich fails.
+            let diagnostic = darwin_resources::LeaderDiagnostic::observe(
+                anchor,
+                Some(before.observation()),
+                after.as_ref().map(BsdInfo::observation),
+                phase,
+                session,
+            );
+            let classified = darwin_resources::classify_leader_session(
+                anchor,
+                before.observation(),
+                after.as_ref().map(BsdInfo::observation),
+                phase,
+                session,
+                reservation_valid,
+            );
+            verify_memory_identity(Some(before), after.as_ref(), pid)
+                .map_err(|error| diagnostic.attach(error))?;
+            return classified;
         }
-        if session == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-            let after = mac_bsd_info(pid, true)?;
-            verify_memory_identity(Some(before), after.as_ref(), pid)?;
-            if after.is_some_and(|info| info.status == 5) {
-                return Ok(false);
-            }
-        }
-        Err(ProcessError::new(
-            "process_identity",
-            "reserved macOS leader session unavailable or changed without native zombie proof",
-        ))
+        darwin_resources::classify_leader_session(
+            anchor,
+            before.observation(),
+            None,
+            phase,
+            session,
+            reservation_valid,
+        )
     }
 }
 

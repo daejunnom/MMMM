@@ -21,6 +21,11 @@ const USAGE: &str = "Usage:\n\
     Prefab, Clip and new raw resources can share one atomic batch; raw resource pairs can also be imported alone. The data root must contain an initialized Project and have no active daemon owner.\n\
     Select regular files directly. Links, hardlinks, special files and known secret paths are refused; source files are read without replacement or deletion.\n\
   mmmm call <function.name> --data-root <absolute root> [--json|--summary] < request.json\n\
+  mmmm catalog-source-use --data-root <absolute root> --project <projectId> --expected-revision <sha256> --mode inspect\n\
+  mmmm catalog-source-use --data-root <absolute root> --project <projectId> --expected-revision <sha256> --mode replace --expected-state-digest <sha256> [--game-artifact <resourceId>] [--mod <canonicalId>,<nativeId>,<resourceId> ...]\n\
+    Replace selects the complete new set of existing whole Project resource containers for user_local_only catalog use. At most 256 selections and 64 KiB metadata; original source bytes, Project revision and game state are retained.\n\
+    To withdraw the complete set explicitly, use replace with --withdraw true and no resource selectors. Inspect supplies the current state digest; stale state is refused and withdrawal retains a new generation.\n\
+    This cold owner command requires an initialized data root with no active daemon. Import, host setup and native observation opt-in do not select container use. Game/native target verification remains separate.\n\
   mmmm mcp --data-root <absolute root>\n\
   mmmm --version\n";
 
@@ -103,6 +108,14 @@ impl fmt::Display for PublicEntryError<'_> {
                 "Host read policy {} for Project {} was committed and retained; result delivery failed: {}",
                 record.policy_digest(),
                 record.project_id(),
+                PublicEntryError(delivery)
+            ),
+            EntryError::CatalogSourceUsesCommitted { snapshot, delivery } => write!(
+                f,
+                "Catalog source use {} at generation {} for Project {} was committed and retained; result delivery failed: {}",
+                snapshot.state_digest(),
+                snapshot.generation(),
+                snapshot.project_id(),
                 PublicEntryError(delivery)
             ),
             // EntryError's other diagnostics contain fixed text, public pins,

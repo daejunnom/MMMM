@@ -113,6 +113,7 @@ fn test_definition(identity: u64, kind: u8, name: String, requested: &[u8]) -> T
 fn test_frame() -> TestFrame {
     let mut ordinary = test_definition(1, 1, TEST_PROBE_DOT.to_owned(), &[]);
     ordinary.method_name = b"lambda$ownedRunnable$0".to_vec();
+    ordinary.loader = 5;
     let samless = test_definition(
         2,
         2,
@@ -129,7 +130,7 @@ fn test_frame() -> TestFrame {
     positive.hidden_flags = 7;
     positive.initialize = 1;
     positive.lookup = ordinary.identity;
-    positive.loader = 5;
+    positive.loader = ordinary.loader;
     positive.method_name = b"run".to_vec();
     positive.method_modifiers = 1;
     TestFrame {
@@ -693,7 +694,7 @@ fn abi2_rejects_inconsistent_ordinary_and_hidden_fields() {
     value.ordinary.hidden = b"unexpected hidden recipe".to_vec();
     test_rejected(&value);
     value = test_frame();
-    value.ordinary.loader = 1;
+    value.ordinary.loader = 0;
     test_rejected(&value);
     value = test_frame();
     value.ordinary.lookup = 1;
@@ -751,16 +752,19 @@ fn abi2_requires_pinned_positive_hidden_flags() {
 }
 
 #[test]
-fn abi2_requires_positive_lookup_identity_and_nonbootstrap_loader() {
+fn abi2_requires_positive_lookup_identity_and_same_nonbootstrap_loader() {
     for lookup in [0, 2, u64::MAX] {
         let mut value = test_frame();
         value.positive.lookup = lookup;
         test_rejected(&value);
     }
+    for loader in [0, 1, u64::MAX] {
+        let mut value = test_frame();
+        value.positive.loader = loader;
+        test_rejected(&value);
+    }
     let mut value = test_frame();
-    value.positive.loader = 0;
-    test_rejected(&value);
-    value = test_frame();
+    value.ordinary.loader = u64::MAX;
     value.positive.loader = u64::MAX;
     let summary = test_decode(&value);
     assert_eq!(summary.positive_hidden.class_identity, "3");

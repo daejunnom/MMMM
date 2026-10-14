@@ -1514,7 +1514,7 @@ fn definition(bytes: &[u8], kind: u8) -> Result<Definition<'_>, DefinitionStartu
                 && hidden_flags == 0
                 && initialize == 0
                 && lookup == 0
-                && loader == 0
+                && loader != 0
                 && requested.is_empty()
                 && name == PROBE,
         )?;
@@ -1628,6 +1628,7 @@ fn decode_abi2(bytes: &[u8]) -> Result<DefinitionFixtureSummary, DefinitionStart
             && positive.initialize
             && positive.lookup == ordinary.id
             && positive.loader != 0
+            && positive.loader == ordinary.loader
             && samless.input == ordinary.ordinary
             && positive.input != ordinary.ordinary
             && samless.requested.replace('.', "/") == OWNER

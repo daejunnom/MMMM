@@ -1250,7 +1250,8 @@ unsafe extern "C" fn define_class_0(
 
 pub(crate) fn evidence(env: *mut JNIEnv, actual: jclass) -> jbyteArray {
     let result = catch_unwind(AssertUnwindSafe(|| -> Result<jbyteArray> {
-        if actual.is_null() || status() < 0 || status() & VM_LIVE == 0 {
+        let initial_status = status();
+        if actual.is_null() || initial_status < 0 || initial_status & VM_LIVE == 0 {
             return Ok(ptr::null_mut());
         }
         let _operation =
@@ -1263,11 +1264,30 @@ pub(crate) fn evidence(env: *mut JNIEnv, actual: jclass) -> jbyteArray {
         };
         // The exact incoming actual Class is compared to issuer-held globals;
         // no resource lookup, caller source, caller digest, or integer receipt.
-        let bytes = core(|core| core.encode_evidence(id))?;
-        if status() < 0 {
+        let (bytes, stamp) = core(|core| core.encode_evidence_with_stamp(id))?;
+        if !core(|core| Ok(core.evidence_stamp_is_current(&stamp) && status() == initial_status))? {
             return Ok(ptr::null_mut());
         }
-        Ok(unsafe { ffi::byte_array(env, &bytes)? })
+        let output = unsafe { ffi::byte_array(env, &bytes)? };
+        // 배열 생성 중 재정의나 VM 전이가 있었으면 이 발급 참조만 폐기한다.
+        // 마지막 JNI 호출 뒤 현재 기록/status를 순수 Rust로 대조한다.
+        let current = (|| -> Result<bool> {
+            if unsafe { ffi::exception(env)? } {
+                return Err(FfiError::PendingException.into());
+            }
+            core(|core| Ok(core.evidence_stamp_is_current(&stamp) && status() == initial_status))
+        })();
+        match current {
+            Ok(true) => Ok(output),
+            Ok(false) => {
+                unsafe { ffi::delete_local(env, output)? };
+                Ok(ptr::null_mut())
+            }
+            Err(error) => {
+                unsafe { ffi::delete_local(env, output)? };
+                Err(error)
+            }
+        }
     }));
     match result {
         Ok(Ok(value)) => value,
