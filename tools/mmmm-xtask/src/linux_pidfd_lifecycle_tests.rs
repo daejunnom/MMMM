@@ -356,7 +356,7 @@ fn actual_live_child_binds_then_same_held_pidfd_becomes_terminal() -> TestResult
     let mut member = Member::capture(&fixture)?;
     let bound = member.bind()?;
     assert_eq!(
-        super::super::native::poll_once(&bound.descriptor),
+        super::super::native::poll_once(&bound.descriptor).observation,
         PollObservation::NotReady
     );
     let after = member.read()?.ok_or("live fixture stat absent")?;
@@ -393,7 +393,7 @@ fn actual_leader_exit_preserves_rss_error_until_last_worker_exits() -> TestResul
     verify_identity(before, after).map_err(|error| native_failure("worker_identity", error))?;
     assert!(!after.definitely_exited());
     assert_eq!(
-        super::super::native::poll_once(&bound.descriptor),
+        super::super::native::poll_once(&bound.descriptor).observation,
         PollObservation::NotReady
     );
     assert!(bound.terminal_after(after.identity).is_none());

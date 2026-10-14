@@ -449,6 +449,11 @@ fn host_response_fixture(
                     Err(_) => return Err("host fixture accept failed"),
                 }
             };
+            // Accepted sockets may inherit the listener's nonblocking mode.
+            // The fixture uses bounded blocking reads, not an async I/O loop.
+            stream
+                .set_nonblocking(false)
+                .map_err(|_| "fixture blocking mode")?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             stream
                 .set_read_timeout(Some(remaining))

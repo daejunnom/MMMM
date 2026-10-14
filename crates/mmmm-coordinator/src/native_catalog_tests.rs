@@ -171,6 +171,11 @@ impl Peer {
                     }
                     Err(_) => return Err("host fixture accept"),
                 };
+                // Windows and Darwin can inherit nonblocking listener state;
+                // read_exact below requires the original bounded blocking mode.
+                stream
+                    .set_nonblocking(false)
+                    .map_err(|_| "host fixture blocking mode")?;
                 let request = read_request(&mut stream, deadline)?;
                 let body = &request["params"];
                 let state = shared.lock().map_err(|_| "host fixture state")?;

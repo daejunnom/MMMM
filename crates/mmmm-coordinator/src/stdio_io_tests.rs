@@ -301,7 +301,8 @@ fn actual_native_startup_rejection_preserves_admission_or_verified_drain() {
     );
     assert!(
         error.drained,
-        "native failure must preserve a verified drain result"
+        "native failure must preserve a verified drain result; code={}; native={:?}; native_unknown={}; drained={}",
+        error.code, error.native_code, error.native_code_unknown, error.drained,
     );
     assert!(started.elapsed() < Duration::from_secs(12));
 }

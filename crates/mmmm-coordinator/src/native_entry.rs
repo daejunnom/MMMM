@@ -97,7 +97,7 @@ impl std::fmt::Display for EntryError {
         match self {
             Self::Arguments => f.write_str("Native command arguments are invalid"),
             Self::HostReadPolicyArguments => f.write_str("Host setup read policy requires unique --shape-mode survival|creative|adventure|spectator selections and optional --native-observation user_local_only; absent selections grant no corresponding source access"),
-            Self::SourceArguments => f.write_str("Native source import requires at least one document and at most 256 combined document/resource inputs: --document <kind>:<JSON>, --document-file <kind>:<absolute JSON path>, and adjacent --resource-descriptor-file/--resource-bytes-file paths; kinds are prefab|instance|clip and OS argv limits may be smaller"),
+            Self::SourceArguments => f.write_str("Native source import requires at least one document or raw resource pair and at most 256 combined document/resource inputs: --document <kind>:<JSON>, --document-file <kind>:<absolute JSON path>, and adjacent --resource-descriptor-file/--resource-bytes-file paths; kinds are prefab|instance|clip and OS argv limits may be smaller"),
             Self::SourceRequest(error) => write!(f, "{}: Native source request could not continue", error.code),
             Self::SourceFile(error) => error.fmt(f),
             Self::Deadline => f.write_str("Native command startup or delivery deadline reached"),
@@ -618,7 +618,7 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
             }
         }
         "source-import" => {
-            if documents.is_empty() && document_files.is_empty() {
+            if documents.is_empty() && document_files.is_empty() && raw_resources.is_empty() {
                 return Err(EntryError::SourceArguments);
             }
             Command::SourceImport {
@@ -1707,7 +1707,134 @@ mod tests {
             "--resource-bytes-file".into(),
             bytes.to_string_lossy().into_owned(),
         ]);
-        assert!(matches!(parse(&raw_only), Err(EntryError::SourceArguments)));
+        let Some(Command::SourceImport {
+            documents,
+            document_files,
+            raw_resources,
+            ..
+        }) = parse(&raw_only).unwrap()
+        else {
+            panic!("resource-only source batch not selected");
+        };
+        assert!(documents.is_empty() && document_files.is_empty());
+        assert_eq!(raw_resources.len(), 1);
+        assert_eq!(raw_resources[0].descriptor, descriptor);
+        assert_eq!(raw_resources[0].bytes, bytes);
+    }
+
+    #[test]
+    fn cold_resource_only_files_commit_without_catalog_or_game_grants() {
+        let root = ImportRoot::new();
+        let initialized = root.initialize();
+        let before = root.open().project(&initialized.project_id).unwrap();
+        let (budget, _) = import_budget();
+        let raw_bytes = b"whole selected container bytes remain opaque\n";
+        let descriptor = json!({"resourceId":"resource-container-only","sha256":raw_digest(raw_bytes),
+            "mediaType":"application/octet-stream","sizeBytes":raw_bytes.len()});
+        let descriptor_bytes = encode_json(&descriptor).unwrap();
+        let descriptor_file = root.selection("container-reference.json");
+        let content_file = root.selection("selected-container.bin");
+        fs::write(&descriptor_file, &descriptor_bytes).unwrap();
+        fs::write(&content_file, raw_bytes).unwrap();
+        let digest = daemon_launch::current_executable_digest(budget.deadline()).unwrap();
+        let mut factory = ProductionFactory::offline_owned(digest);
+        let prepared = PreparedDaemon::open_for_native_source_import(
+            StoreConfig::new(root.0.clone()),
+            initialized.project_id.clone(),
+            &mut factory,
+            &budget,
+        )
+        .unwrap();
+        // Retain the actual composition's shared registry across consumption
+        // of its sole Store. A separate empty registry would prove nothing.
+        let registries = factory.registries().unwrap().clone();
+        let handles = prepared.handles().clone();
+        let workspace = handles.workspace.as_ref().unwrap();
+        let context_id = ContextId::new(workspace.context["contextId"].as_str().unwrap()).unwrap();
+        let principal = workspace.witness.principal().clone();
+        assert_eq!(workspace.context["environment"]["kind"], "offline");
+        // Authentication gives this assertion method/context access only; no
+        // source, host route, pairing or rights registration is installed.
+        let mut sessions = crate::auth::SessionAuthority::new(1).unwrap();
+        let token = sessions
+            .install(crate::auth::SessionPolicy {
+                principal: principal.clone(),
+                allowed_methods: ["catalog.capture".into()].into(),
+                allowed_contexts: [context_id.clone()].into(),
+                lifetime: SOURCE_IMPORT,
+            })
+            .unwrap();
+        let authenticated = sessions.authenticate_token(&token).unwrap();
+        let loaded = load_native_inputs(
+            &prepared,
+            &initialized.project_id,
+            &initialized.project_revision,
+            Vec::new(),
+            &[],
+            &[CommandRawFiles {
+                descriptor: descriptor_file.clone(),
+                bytes: content_file.clone(),
+            }],
+            &budget,
+        )
+        .unwrap();
+        assert!(loaded.documents.is_empty());
+        assert_eq!(loaded.resources.len(), 1);
+        assert_eq!(loaded.resources[0].metadata, descriptor_bytes);
+        assert_eq!(loaded.resources[0].bytes, raw_bytes);
+        let resources = [NativeRawSourceResource {
+            metadata: &loaded.resources[0].metadata,
+            bytes: &loaded.resources[0].bytes,
+        }];
+        let receipt = prepared
+            .import_native_sources(&NativeSourceInput {
+                project: &initialized.project_id,
+                expected_revision: &initialized.project_revision,
+                documents: &[],
+                retained_resources: &[],
+                raw_resources: &resources,
+            })
+            .unwrap();
+        assert!(receipt.documents.is_empty());
+        assert_eq!(receipt.resources.len(), 1);
+        assert_eq!(receipt.base_revision, initialized.project_revision);
+        assert_ne!(receipt.project_revision, receipt.base_revision);
+        let stored = root.open();
+        let mut expected = before.clone();
+        expected["resourceIds"]
+            .as_array_mut()
+            .unwrap()
+            .push(descriptor["resourceId"].clone());
+        expected["revision"] = json!(receipt.project_revision);
+        assert_eq!(stored.project(&initialized.project_id).unwrap(), expected);
+        assert_eq!(
+            stored
+                .project_revision(&initialized.project_id, &receipt.base_revision)
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            stored.read_blob(&receipt.resources[0].1).unwrap(),
+            raw_bytes
+        );
+        assert_eq!(receipt.resources[0].1.digest, raw_digest(raw_bytes));
+        assert_eq!(
+            registries
+                .catalog
+                .read_principal(&authenticated, &context_id)
+                .unwrap_err()
+                .code,
+            "SOURCE_UNAVAILABLE"
+        );
+        assert_eq!(
+            handles.authority.current_context_ids(&principal).unwrap(),
+            std::collections::BTreeSet::from([context_id.clone()])
+        );
+        assert!(handles.hosts.context(&principal, &context_id).is_err());
+        assert!(source_receipt_value(&receipt).get("source").is_none());
+        assert_eq!(fs::read(descriptor_file).unwrap(), descriptor_bytes);
+        assert_eq!(fs::read(content_file).unwrap(), raw_bytes);
+        assert!(!root.0.join("runtime").exists());
     }
 
     #[test]

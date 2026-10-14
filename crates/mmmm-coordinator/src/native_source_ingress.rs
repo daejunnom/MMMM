@@ -990,13 +990,12 @@ fn validate_clip_owner(clip: &AnimationClip, prefab: &Prefab) -> AppResult<()> {
 }
 
 fn check_input_budget(input: &NativeSourceInput<'_>) -> AppResult<()> {
-    if input.documents.is_empty()
-        || input
-            .documents
-            .len()
-            .checked_add(input.retained_resources.len())
-            .and_then(|n| n.checked_add(input.raw_resources.len()))
-            .is_none_or(|n| n > MAX_ITEMS)
+    if input
+        .documents
+        .len()
+        .checked_add(input.retained_resources.len())
+        .and_then(|n| n.checked_add(input.raw_resources.len()))
+        .is_none_or(|n| n == 0 || n > MAX_ITEMS)
     {
         return Err(budget_error());
     }

@@ -15,10 +15,10 @@ const USAGE: &str = "Usage:\n\
   mmmm host-setup --data-root <absolute root> --project <projectId> --host-jar <absolute jar> --output <absolute config> --scope-json <json> [--shape-mode survival|creative|adventure|spectator ...] [--native-observation user_local_only]\n\
     Shape modes are explicit unique selections. Native observations need their own opt-in; absent policy flags leave the corresponding sources unavailable. The same protected Store retains immutable policy; mmmm-host.json contains public locators only.\n\
     A changed policy for the same native owner/Project/host artifact is refused. An existing public config is preserved; a policy committed before config/output failure remains retained and is reported by digest.\n\
-  mmmm source-import --data-root <absolute root> --project <projectId> --expected-revision <sha256> --document <prefab|instance|clip>:<JSON> [--document <kind>:<JSON> ...]\n\
+  mmmm source-import --data-root <absolute root> --project <projectId> --expected-revision <sha256> <source inputs>\n\
     Inputs may instead use repeated --document-file <kind>:<absolute JSON path> and adjacent --resource-descriptor-file <absolute JSON path> --resource-bytes-file <absolute content path> pairs.\n\
-    Source import is a cold native management command: at least one document, <=256 combined document/resource inputs, each document <=8 MiB, descriptors <=16 KiB, documents+descriptors <=32 MiB, raw content <=128 MiB total; actual OS argv limits may be smaller.\n\
-    Prefab, Clip and new raw resources can share one atomic batch. The data root must contain an initialized Project and have no active daemon owner.\n\
+    Source import is a cold native management command: at least one --document <prefab|instance|clip>:<JSON>, document file or raw resource pair, <=256 combined document/resource inputs, each document <=8 MiB, descriptors <=16 KiB, documents+descriptors <=32 MiB, raw content <=128 MiB total; actual OS argv limits may be smaller.\n\
+    Prefab, Clip and new raw resources can share one atomic batch; raw resource pairs can also be imported alone. The data root must contain an initialized Project and have no active daemon owner.\n\
     Select regular files directly. Links, hardlinks, special files and known secret paths are refused; source files are read without replacement or deletion.\n\
   mmmm call <function.name> --data-root <absolute root> [--json|--summary] < request.json\n\
   mmmm mcp --data-root <absolute root>\n\

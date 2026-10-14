@@ -743,6 +743,56 @@ fn raw_source_metadata_and_content_are_strict_bounded_and_not_self_authorizing()
 }
 
 #[test]
+fn resource_only_input_rejects_empty_batch_and_mismatched_raw_bytes() {
+    let fixture = Fixture::new();
+    let before = fixture.store.project(&fixture.project).unwrap();
+    assert_eq!(
+        fixture.prepare(&[], &[]).err().unwrap().code,
+        "BUDGET_EXCEEDED"
+    );
+    let bytes = b"exact retained container input\n";
+    let metadata = json!({"resourceId":"resource-only-denied","sha256":raw_digest(bytes),
+        "mediaType":"application/octet-stream","sizeBytes":bytes.len()});
+    let metadata_bytes = encode_json(&metadata).unwrap();
+    let mut altered = bytes.to_vec();
+    altered[0] ^= 1;
+    assert_eq!(
+        fixture
+            .prepare_raw(
+                &[],
+                &[],
+                &[NativeRawSourceResource {
+                    metadata: &metadata_bytes,
+                    bytes: &altered,
+                }],
+            )
+            .err()
+            .unwrap()
+            .code,
+        "INPUT_DIGEST_MISMATCH"
+    );
+    let mut wrong_length = metadata;
+    wrong_length["sizeBytes"] = json!(bytes.len() + 1);
+    let wrong_length = encode_json(&wrong_length).unwrap();
+    assert_eq!(
+        fixture
+            .prepare_raw(
+                &[],
+                &[],
+                &[NativeRawSourceResource {
+                    metadata: &wrong_length,
+                    bytes,
+                }],
+            )
+            .err()
+            .unwrap()
+            .code,
+        "INPUT_DIGEST_MISMATCH"
+    );
+    assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
+}
+
+#[test]
 fn same_batch_clip_is_order_independent_preserves_raw_bytes_and_survives_head_carry() {
     let mut fixture = Fixture::new();
     let (owner, clip) = clip_owner();
