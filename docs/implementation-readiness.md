@@ -211,6 +211,66 @@ Windows의 빌드 관리 도구 bootstrap은 실제로 통과했으며, 제품 �
 | 스물아홉 번째 JVM CI의 3개 OS 실제 검증 | 같은 source의 세 job·집계 성공과 세 원본 archive의 실행·digest 연결 대조 | source `80e5a221f8fa3eb3068d5fe9b0f12934fed922e9`, [JVM run](https://github.com/daejunnom/MMMM/actions/runs/38615047111). Windows 350,947 bytes·SHA `0ccb6fbd8a5e570135ce5724d565db0770ac2887be2d91d6d4db9b3b27e4c019`, Linux 1,862,465 bytes·SHA `91ad2d7b137488ae5e6ad7111707f05265a8f6d1b8c38e62c840c4effe82a2ac`, macOS 536,746 bytes·SHA `01fd98018f2517057a4df141f9deedf252ecd93bc5331d3f18908cbd067b000f`의 source·expected·PR head를 대조했다. 세 OS 각각 7모듈 326개·필수 11 executed tasks·실패/오류/skip 0이며 observer 9 receipt·prior JVM 5개·manifest·실제 ABI/stdout·startup pin 연결이 일치했다. Linux의 중복 제외 선택 입력 201개는 해당 SHA의 Git blob 길이·SHA와도 일치했다. Header pin 8개, startup acquired/pre/post 12개·13 phases 완료이며 네 managed 단계는 세 OS에서 모두 자연 완료·exit 0·drain·출력·export·scratch 정리·lease 해제·오류 0이다. Windows discovery는 전체 1,674 ms·prespawn 566 ms로 6단계가 원 5초 안에 완료됐다. Linux는 RSS 708 samples·incomplete 0인 별도 성공이며 CI27의 간헐 실패 해결이나 아직 source에 없는 D046의 검증이 아니다. 개발 fixture의 ABI/startup 성공과 실제 게임·SourceAdmission·target policy·whole JDK image·출시 인수를 구분한다. |
 | 서른여덟 번째 Rust CI의 macOS stderr 전달량 전제 실패 | Windows·Linux job 성공, macOS·집계 실패; 실제 macOS archive 및 exact source 대조 | 같은 source의 [foundation run](https://github.com/daejunnom/MMMM/actions/runs/38615047112). macOS archive 32,954 bytes·SHA `c56df3d2caf538de1a3c12f3970f44affdd7b98d7b11a27b2706f2e4a0e5acb0`의 source·expected·PR head가 일치했다. 컴파일 오류 없이 실패 전 6개 libtest binary 합계 525개·Coordinator 326개가 통과했고 D045 새 순수 검사와 이전 startup 거절 검사도 ok다. 이후 별도 native_stdio의 blocked raw stderr 검사에서 1 MiB/200 ms의 deadline·실제 drain·EOF를 확인한 뒤 전달량이 양의 부분 길이라는 복합 assertion이 실패했다. 실제 길이는 기록이 없어 0과 전량을 구분할 수 없으며 command 101은 test panic으로 이전 worker exit 101과 다르다. 마지막 native record는 child admitted true·parent confirmed-zombie 1·pending 0·resource failure 없음이며 D045 신호 생략 분기 자체와 group empty는 미관측이다. D043 pending·memory exit도 null이며 해당 도구 검사는 Cargo 중단 뒤 실행되지 않았다. Outer test 101·252,788 ms·자연 drain·출력·export·scratch 정리·lease 해제·오류 0을 확인했다. 원 조건·200 ms·읽기/정리 순서를 유지하고 실패 메시지에 실제 delivered/requested bytes·오류 code를 추가했다. 이 진단 소스의 Windows native_stdio는 command 0·39,290 ms·명시 owned-tail 정리·drain·출력·export·정리·lease 해제·오류 0이며 실제 Mac 길이 관측은 후속이다. Ready의 전체 외부 write/flush ACK 보장과 deadline에서 양의 부분 효과가 보장된다는 fixture 전제를 구분하며 조건이나 기한을 조용히 완화하지 않았다. |
 
+### 후속 CI와 native stderr 준비 조건
+
+source `a7e647b4510bee4da7d131abff1f637bf01a277a`의
+[서른한 번째 JVM CI](https://github.com/daejunnom/MMMM/actions/runs/38619727400)는
+세 OS와 집계가 성공했다. 실제 archive는 Windows 350,986 bytes·SHA
+`043931ef659929554cd1d19eed35eee7b9c778fbeb605b1232c3836ce8ce2deb`,
+Linux 1,862,876 bytes·SHA
+`4ea17cb02df6bc8f43a420b81669b4888798558d8d6f23b861ede6db1b8e4c89`,
+macOS 536,708 bytes·SHA
+`28a9500e81f2747e6078a0dcd629ad99d05063d4812f8dd6fc909a2337aa3fd4`다.
+각 context의 source·expected·PR head와 7모듈 326개 검사·필수 11 executed tasks,
+observer 3단계의 영수증 9개와 prior JVM 5개 digest 연결을 대조했다.
+Header pin 8개, startup acquired/pre/post 12개와 13 phases가 완료됐다.
+Windows의 native/header는 명시 owned-tail 정리를 거쳤고 나머지 Windows 단계와
+Linux·macOS 네 단계는 자연 완료다. 모두 command 0·drain·출력·export·scratch
+정리·lease 해제·supervisor/cleanup 오류 0이다. Windows discovery의 실제 전체
+571 ms·prespawn 176 ms와 6개 완료 단계도 원 5초 안이다.
+
+같은 Linux archive의 header-managed 실행에서 D046의 실제 조건부 Pending을
+한 번 관측했다. 원 RSS Open/ESRCH 3, 양쪽 reserved leader Zombie·threads 2,
+고정 PID/start/group/session 일치와 BoundValidated pidfd의 실제
+TerminalPoll/NotReady·errno 없음이 first/last/count에 보존됐다. 완전 표본 16개와
+불완전 표본 1개는 별도이고 max observed sample gap은 223 ms다.
+`pending_leader_complete_gap_limit_ms=1000`은 정책값이며 해당 Pending의 실제
+경과 시간이 아니다. 개별 시작·회복 시각은 기록하지 않았다. 현재 소스의 정상
+완료 guard와 성공 영수증에 따르면 이후 완전 표본으로 해소된 실행으로 해석할 수
+있으나 간헐 실패 전체의 해결로 확대하지 않는다. macOS의 D043 Pending과 native
+memory exit 필드는 모두 null이다. 개발 fixture의 ABI/startup 관측은 계속 실제
+게임·SourceAdmission·target policy·whole JDK image·출시 인수와 구분한다.
+
+같은 source의 [마흔 번째 Rust CI](https://github.com/daejunnom/MMMM/actions/runs/38619727495)는
+Windows·Linux job 성공, macOS·집계 실패다. macOS archive 32,878 bytes·SHA
+`c3e26db3b6817ce6fbc00c69a88098ac65f3a16b4c5973007d249eb4726428a8`의 실제
+context와 실패 전 6개 libtest binary 합계 525개·Coordinator 326개 통과를 대조했다.
+그 뒤 custom native stdio의 새 진단은 요청 1,048,576 bytes·전달 0 bytes·deadline
+200 ms·drain 완료를 기록했다. Parent가 64 KiB씩 보내고 worker가 전체 payload를
+받은 뒤 외부 쓰기를 시작하므로, 양의 부분전달이 200 ms 안에 발생한다는 전제가
+성립하지 않을 수 있다. 정확한 worker 내부 진행 위치는 미관측이다. Outer test
+101·238,564 ms·자연 drain·출력·export·scratch 정리·lease 해제·오류 0을
+제품 ACK 실패나 이전 worker exit 101과 구분하며 원 실패를 보존한다.
+
+후속 fixture는 같은 1 MiB 요청의 준비를 원 15초 owner 안의 최대 2초로 한정하고,
+Unix FIONREAD/Windows PeekNamedPipe로 파이프를 소비하지 않고 양의 실제 진행을
+확인한 시각부터 기존 deadline을 최대 200 ms로 단축한다. 관측 후 같은 시각으로
+기한과 elapsed를 계산하며 원 기한이 지난 관측은 준비 성공으로 채택하지 않는다.
+준비 미관측·query 오류·예상 밖 Ready도 명시 drain·EOF 확인 뒤 실패한다.
+종료 후 양의 부분전달·원 byte pattern과 deadline 오류를 요구하며 생산의 전체
+external write/flush ACK 조건은 그대로다. 실제 kernel thread 상태나 파이프의
+정확한 용량을 관측했다고 주장하지 않는다.
+
+첫 Windows 검사는 live available 8,192 bytes가 종료 뒤 retained 4,096 bytes
+이하이어야 한다는 새 가정에서 실패했다. 두 관측 사이 수량 순서 보장이 없음을
+확인해 그 순서 조건만 제거하고 양쪽의 실제 양수·최종 부분전달은 유지했다.
+독립 리뷰의 늦은 준비 관측 경계도 수정했으며 추가 확정 finding은 없었다.
+최종 Windows native stdio는 같은 관측 8,192/4,096 bytes·진행 시각 94 ms와
+deadline·drain을 확인해 command 0·12,116 ms·명시 owned-tail 정리·완전한 출력·
+export·scratch 정리·lease 해제·오류 0으로 완료했다. 해당 integration target의
+strict Clippy도 command 0·20,820 ms·자연 종료·동일 정리 조건으로 완료했다.
+새 Unix query의 실제 Linux/macOS 실행은 후속 CI에서 확인해야 한다.
+
 실패한 실행의 원본 판정은 유지한다. native drain과 정확한 소유 기록을 확인하고
 로그를 별도로 내보내며 digest를 대조한 경우에만 해당 실행의 알려진 임시 파일을
 정리했다. 원래 자동 export 실패와 수동 보존 성공을 같은 결과로 기록하지 않는다.

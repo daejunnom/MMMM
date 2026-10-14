@@ -38,11 +38,11 @@ fn main() {
     held_raw_payload_deadline();
     blocked_raw_stdout_never_acknowledges();
     raw_stderr_roundtrip();
-    blocked_raw_stderr_never_acknowledges();
+    unread_raw_stderr_deadline_after_observed_progress();
     #[cfg(target_os = "macos")]
     descriptor_above_lowered_soft_limit_is_not_inherited();
     eprintln!(
-        "native stdio acceptance: line and raw roundtrip, raw stderr, EOF, truncated raw capability, held input deadline/cancel, blocked stdout/stderr and verified drain passed"
+        "native stdio acceptance: line and raw roundtrip, raw stderr, EOF, truncated raw capability, held input deadline/cancel, blocked stdout, observed raw stderr progress/deadline and verified drain passed"
     );
 }
 
@@ -494,24 +494,81 @@ fn raw_stderr_roundtrip() {
     assert!(tail.is_empty());
 }
 
-fn blocked_raw_stderr_never_acknowledges() {
-    // Keep the actual kernel stderr pipe unread until after cancellation.
-    // Private socket acceptance cannot acknowledge a blocked external sink.
+fn unread_raw_stderr_deadline_after_observed_progress() {
+    // First observe bytes from this exact request without consuming the sink.
+    // The old 200 ms included seventeen private-channel send polls and could
+    // expire before any external write. Preparation has its own finite bound;
+    // actual progress only shortens that original deadline to at most 200 ms.
+    // This observes partial delivery and no ACK on an unread sink, not the
+    // worker's native scheduling state or the pipe's byte-exact capacity.
     let mut scenario = Scenario::start_output(true, StdioOutput::Stderr);
     let bytes = vec![0x5Au8; 1_048_576];
-    let error = raw_write(&scenario.port, &bytes, Duration::from_millis(200)).unwrap_err();
-    assert_eq!(error.code, "deadline");
+    let started = Instant::now();
+    let preparation_deadline = (started + Duration::from_secs(2)).min(scenario.owner_deadline);
+    let mut deadline = preparation_deadline;
+    let cancel = AtomicBool::new(false);
+    let mut progress = None;
+    let mut observation_error = None;
+    let result = loop {
+        match scenario.port.poll_write_raw(&bytes, deadline, &cancel) {
+            Ok(Poll::Pending) => {
+                if progress.is_none() {
+                    match redirect::available(&scenario.output) {
+                        Ok(available) if available > 0 => {
+                            let observed_at = Instant::now();
+                            if observed_at < deadline {
+                                progress = Some((available, observed_at.duration_since(started)));
+                                deadline = deadline.min(observed_at + Duration::from_millis(200));
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            observation_error = Some(error.kind());
+                            break None;
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            terminal => break Some(terminal),
+        }
+    };
+    // Keep ownership cleanup explicit even if observation fails or Ready is
+    // unexpectedly returned. No reader participates before confirmed drain.
     scenario.drain();
     let mut delivered = Vec::new();
     output_eof(&mut scenario.output, &mut delivered);
+    assert_eq!(observation_error, None, "stderr progress query failed");
+    let error = result
+        .expect("stderr progress query must complete")
+        .unwrap_err();
+    assert_eq!(error.code, "deadline");
+    let (observed_bytes, progress_elapsed) = progress.unwrap_or_else(|| {
+        panic!(
+            "raw stderr preparation did not observe this request: delivered_bytes={}; requested_bytes={}; preparation_limit_ms=2000; write_error={}; drain_completed=true",
+            delivered.len(), bytes.len(), error.code,
+        )
+    });
+    // Live availability and bytes retained after termination are separate
+    // observations. Require positive partial delivery from both without
+    // assuming an ordering between their lengths.
     assert!(
         !delivered.is_empty() && delivered.len() < bytes.len(),
-        "blocked raw stderr delivery witness: delivered_bytes={}; requested_bytes={}; write_error={}; write_deadline_ms=200; drain_completed=true",
+        "unread raw stderr delivery witness: observed_bytes={}; progress_elapsed_ms={}; delivered_bytes={}; requested_bytes={}; write_error={}; post_progress_limit_ms=200; drain_completed=true",
+        observed_bytes,
+        progress_elapsed.as_millis(),
         delivered.len(),
         bytes.len(),
         error.code,
     );
     assert!(delivered.iter().all(|b| *b == 0x5A));
+    eprintln!(
+        "unread raw stderr delivery witness: observed_bytes={observed_bytes}; progress_elapsed_ms={}; delivered_bytes={}; requested_bytes={}; post_progress_limit_ms=200; write_error={}; drain_completed=true",
+        progress_elapsed.as_millis(),
+        delivered.len(),
+        bytes.len(),
+        error.code,
+    );
 }
 
 #[cfg(unix)]
@@ -558,6 +615,15 @@ mod redirect {
             }
             Err(error) => Err(error),
         }
+    }
+    pub(super) fn available(output: &File) -> std::io::Result<usize> {
+        let mut available: libc::c_int = 0;
+        if unsafe { libc::ioctl(output.as_raw_fd(), libc::FIONREAD, &mut available) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        usize::try_from(available).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "negative pipe bytes")
+        })
     }
     pub(super) fn spawn(
         limits: StdioLimits,
@@ -643,7 +709,7 @@ mod redirect {
             assert_ne!(unsafe { SetStdHandle(self.sink, self.output) }, 0);
         }
     }
-    pub(super) fn poll_read(output: &mut File, bytes: &mut [u8]) -> std::io::Result<Option<usize>> {
+    pub(super) fn available(output: &File) -> std::io::Result<usize> {
         let mut available = 0u32;
         if unsafe {
             PeekNamedPipe(
@@ -656,20 +722,25 @@ mod redirect {
             )
         } == 0
         {
-            let error = std::io::Error::last_os_error();
-            return if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
-                Ok(Some(0))
-            } else {
-                Err(error)
-            };
+            return Err(std::io::Error::last_os_error());
         }
+        Ok(available as usize)
+    }
+    pub(super) fn poll_read(output: &mut File, bytes: &mut [u8]) -> std::io::Result<Option<usize>> {
+        let available = match available(output) {
+            Ok(available) => available,
+            Err(error) if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) => {
+                return Ok(Some(0));
+            }
+            Err(error) => return Err(error),
+        };
         if available == 0 {
             return Ok(None);
         }
         // This fresh pipe has exactly one reader owned by the fixture. The
         // requested range is already present, so this synchronous read cannot
         // wait for another writer or steal data from another reader.
-        let n = bytes.len().min(available as usize);
+        let n = bytes.len().min(available);
         output.read(&mut bytes[..n]).map(Some)
     }
     pub(super) fn spawn(
