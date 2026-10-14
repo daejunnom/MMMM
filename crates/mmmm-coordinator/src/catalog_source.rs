@@ -40,6 +40,8 @@ use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
 
 #[path = "catalog_input_archive.rs"]
 mod input_archive;
+#[path = "catalog_pack_facts.rs"]
+mod pack_facts;
 
 const MAX_SOURCES: usize = 256;
 const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
@@ -2233,6 +2235,8 @@ pub(crate) fn validate_source_facts(facts: &Value, context: &Value) -> AppResult
             ));
         }
     }
+    let mut pack_work = 0;
+    let mut private_packs_present = false;
     for (index, pack) in facts["serverPacks"].as_array().unwrap().iter().enumerate() {
         if pack["packIndex"].as_u64() != Some(index as u64)
             || pack["packSourceCompleteness"] != "unknown"
@@ -2243,6 +2247,23 @@ pub(crate) fn validate_source_facts(facts: &Value, context: &Value) -> AppResult
                 "Current native pack codec does not attest exhaustive content",
             ));
         }
+        if let Some(private) = pack.get("privatePackFacts") {
+            private_packs_present = true;
+            pack_facts::validate(private, &ids, &mut pack_work)?;
+        }
+    }
+    // Old host fixtures may omit the private field. A present observation uses
+    // the producer's shared work counter, which also includes non-graph work
+    // and work discarded when a graph becomes unknown; equality is not valid.
+    if private_packs_present
+        && facts["entryCount"]
+            .as_u64()
+            .is_none_or(|count| count > MAX_SOURCES as u64 || count < pack_work as u64)
+    {
+        return Err(error(
+            "SOURCE_INVALID",
+            "Private native pack work exceeds the source receipt count",
+        ));
     }
     Ok(())
 }

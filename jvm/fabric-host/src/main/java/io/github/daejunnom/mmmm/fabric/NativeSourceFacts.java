@@ -10,6 +10,7 @@ import net.fabricmc.loader.api.ModContainer;
 import net.fabricmc.loader.api.metadata.ModOrigin;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.packs.PackResources;
+import net.minecraft.server.packs.resources.ResourceManager;
 
 import java.io.IOException;
 import java.net.JarURLConnection;
@@ -18,6 +19,7 @@ import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
@@ -25,6 +27,7 @@ import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.text.Normalizer;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -131,16 +134,23 @@ final class NativeSourceFacts {
         result.set("platformReadAccess", NativePlatformReadFacts.observe(server, codeSource(NativePlatformReadFacts.class)));
         checkDeadline();
         ArrayNode packs = result.putArray("serverPacks");
+        var manager = server.getResourceManager();
+        List<PackResources> actualPacks = new ArrayList<>();
         // The stream's observed order is retained, including hidden native packs.
         // Closing the stream does not close the manager-owned PackResources elements.
-        try (var stream = server.getResourceManager().listPacks()) {
+        try (var stream = manager.listPacks()) {
             var iterator = stream.iterator();
             int ordinal = 0;
             while (true) {
                 checkDeadline(); boolean next = iterator.hasNext(); checkDeadline();
                 if (!next) break;
                 tick();
-                packs.add(pack(iterator.next(), ordinal++));
+                PackResources actual = iterator.next();
+                actualPacks.add(actual);
+                ObjectNode pack = pack(actual, ordinal++);
+                // 최소 unknown envelope의 공간부터 확보한다. 더 큰 graph는 기존 결과 상한 안에서만 교체한다.
+                pack.set("privatePackFacts", NativePackFacts.unknown("PACK_IMPLEMENTATION_UNSUPPORTED"));
+                packs.add(pack);
                 checkDeadline();
             }
         }
@@ -149,12 +159,107 @@ final class NativeSourceFacts {
         result.put("clientPackObservation", "not_observed");
         revalidateArchives();
         result.set("archives", archives);
-        result.put("bytesRead", bytesRead).put("entryCount", entries);
+        result.put("bytesRead", bytesRead).put("entryCount", MAX_ENTRIES);
+        checkDeadline();
+        int encodedBytes = ContractJson.bytes(result).length;
+        checkDeadline();
+        if (encodedBytes > MAX_RESULT_BYTES) throw limit();
+        List<NativePackFacts.Observation> packObservations = new ArrayList<>();
+        checkPackView(server, manager, actualPacks);
+        for (int i = 0; i < actualPacks.size(); i++) {
+            checkDeadline();
+            ObjectNode pack = (ObjectNode) packs.get(i);
+            int previous = ContractJson.bytes(pack.get("privatePackFacts")).length;
+            checkDeadline();
+            NativePackFacts.Observation observed = NativePackFacts.observe(actualPacks.get(i), this::checkDeadline,
+                    this::packRoot, MAX_ENTRIES - entries, MAX_RESULT_BYTES - encodedBytes + previous);
+            entries += observed.entries();
+            packObservations.add(observed);
+            checkDeadline(); int current = ContractJson.bytes(observed.facts()).length; checkDeadline();
+            encodedBytes += current - previous;
+            if (encodedBytes > MAX_RESULT_BYTES) throw limit();
+            pack.set("privatePackFacts", observed.facts());
+        }
+        checkPackView(server, manager, actualPacks);
+        for (NativePackFacts.Observation observation : packObservations) { checkDeadline(); observation.revalidate().run(); }
+        revalidateArchives();
+        result.put("entryCount", entries);
         checkDeadline();
         byte[] encoded = ContractJson.bytes(result);
         checkDeadline();
         if (encoded.length > MAX_RESULT_BYTES) throw limit();
+        for (NativePackFacts.Observation observation : packObservations) { checkDeadline(); observation.revalidate().run(); }
+        checkPackView(server, manager, actualPacks);
+        revalidateArchives();
+        checkDeadline();
         return result;
+    }
+
+    private void checkPackView(MinecraftServer server, ResourceManager manager, List<PackResources> expected) {
+        checkDeadline();
+        if (server.getResourceManager() != manager) throw packDrift();
+        try (var stream = manager.listPacks()) {
+            var iterator = stream.iterator();
+            for (PackResources pack : expected) {
+                checkDeadline(); boolean next = iterator.hasNext(); checkDeadline();
+                if (!next || iterator.next() != pack) throw packDrift();
+                checkDeadline();
+            }
+            checkDeadline(); boolean extra = iterator.hasNext(); checkDeadline();
+            if (extra) throw packDrift();
+        }
+        checkDeadline();
+        if (server.getResourceManager() != manager) throw packDrift();
+    }
+
+    private static ContractException packDrift() {
+        return new ContractException("SOURCE_FACTS_DRIFT", "현재 manager의 실제 pack 객체 또는 순서가 바뀌었습니다");
+    }
+
+    private NativePackFacts.RootLink packRoot(Path root) {
+        checkDeadline();
+        try {
+            if (!root.isAbsolute() || !"jar".equalsIgnoreCase(root.getFileSystem().provider().getScheme())) {
+                return NativePackFacts.RootLink.unknown("PACK_ROOT_NOT_ZIPFS");
+            }
+            if (!root.normalize().equals(root)) return NativePackFacts.RootLink.unknown("PACK_ROOT_PREFIX_UNSAFE");
+            String absolute = root.toString();
+            if (!absolute.startsWith("/")) return NativePackFacts.RootLink.unknown("PACK_ROOT_PREFIX_UNSAFE");
+            String prefix = absolute.substring(1);
+            if (!safePackPrefix(prefix)) return NativePackFacts.RootLink.unknown("PACK_ROOT_PREFIX_UNSAFE");
+            URI uri = root.toUri();
+            checkDeadline();
+            if (!"jar".equalsIgnoreCase(uri.getScheme())) return NativePackFacts.RootLink.unknown("PACK_ROOT_NOT_ZIPFS");
+            // 기존 receipt 조회만 한다. realpath·archive open·hash·member I/O를 추가하지 않는다.
+            Path outer = archivePath(uri);
+            checkDeadline();
+            CachedArchive cached = outer == null ? null : pathReceipts.get(outer);
+            if (cached == null) return NativePackFacts.RootLink.unknown("PACK_ROOT_UNMAPPED");
+            return new NativePackFacts.RootLink(cached.receipt().path("sourceId").asText(), prefix, null);
+        } catch (IOException | IllegalArgumentException | SecurityException failure) {
+            checkAfterFailure(failure);
+            return NativePackFacts.RootLink.unknown("PACK_ROOT_UNMAPPED");
+        } finally { checkDeadline(); }
+    }
+
+    private static boolean safePackPrefix(String prefix) {
+        if (prefix.length() > 1024 || prefix.getBytes(StandardCharsets.UTF_8).length > 1024 || !Normalizer.isNormalized(prefix, Normalizer.Form.NFC)
+                || prefix.indexOf('\\') >= 0 || prefix.indexOf(':') >= 0
+                || prefix.indexOf('<') >= 0 || prefix.indexOf('>') >= 0 || prefix.indexOf('"') >= 0
+                || prefix.indexOf('|') >= 0 || prefix.indexOf('?') >= 0 || prefix.indexOf('*') >= 0
+                || prefix.codePoints().anyMatch(Character::isISOControl)) return false;
+        if (prefix.isEmpty()) return true;
+        for (String part : prefix.split("/", -1)) {
+            String lower = part.toLowerCase(Locale.ROOT);
+            String device = lower.split("\\.", 2)[0];
+            if (part.isEmpty() || part.equals(".") || part.equals("..") || part.endsWith(".") || part.endsWith(" ")
+                    || device.matches("con|prn|aux|nul|com[1-9]|lpt[1-9]")
+                    || lower.equals(".env") || lower.startsWith(".env.") || lower.contains("credential")
+                    || lower.equals(".ssh") || lower.equals("id_rsa") || lower.equals("id_ecdsa") || lower.equals("id_ed25519")
+                    || lower.contains("service-account") || lower.contains("service_account")
+                    || lower.contains("api-key") || lower.contains("api_key") || lower.contains("ssh-key")) return false;
+        }
+        return true;
     }
 
     private ObjectNode mod(ModContainer container) {

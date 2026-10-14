@@ -367,6 +367,66 @@ terminal·normal reap·drain을 발급하지 않으며 원 native 호출·poll·
 실패 후 물리 drain을 유지한다. Linux/Darwin 전용 native 분기의 새 실행 성공은
 Windows 순수 검사로 대신하지 않으며 후속 CI에서 별도로 검증한다.
 
+### 같은 공유 SHA의 3개 OS 기반 검증
+
+source `0def2d60beb73e92fd6a6c2de78d76d035a3669b`의
+[Rust CI44](https://github.com/daejunnom/MMMM/actions/runs/38629700909)와
+[JVM CI35](https://github.com/daejunnom/MMMM/actions/runs/38629700919)는 세 OS job과
+각 집계가 모두 성공했다. 실제 여섯 원본 archive의 bytes·digest와 source·expected·
+PR head를 대조했으며 별도 event merge SHA와 구분했다.
+
+Rust archive는 Windows 50,186 bytes·SHA
+`8c03853a30be666690f33f0a71ea34273e842ff923862410993a7dfd50e476a0`,
+Linux 50,448 bytes·SHA
+`e2550297a28b08edb64603d7377624595119ff89874e4b2302a61e76905f05bd`,
+macOS 52,654 bytes·SHA
+`150e13bff09ccf5d289eaa4d7cf22682d78ca605b9910b6590120575767b325f`다.
+표준 unit/bin 16개와 doc 14개, 별도 harness-free native stdio를 구분했다.
+
+| OS | unit/bin PASS | doc PASS | ignored | native stdio |
+|---|---:|---:|---:|---|
+| Windows | 1,132 | 1 | 2 | PASS, 진행 8,192 bytes·92 ms·retained 4,096 bytes |
+| Linux | 1,144 | 1 | 4 | PASS, 진행 65,536 bytes·88 ms·retained 65,536 bytes |
+| macOS | 1,141 | 1 | 1 | PASS, 진행 65,536 bytes·491 ms·retained 65,536 bytes |
+
+세 stdio 실행은 같은 1 MiB 요청·진행 후 최대 200 ms·deadline 오류·drain을 확인했다.
+Reference 55개와 native process 5개, 도구의 해당 OS 순수 검사가 통과했다. 세 OS의
+format·저장소 458개/위반 0·strict Clippy도 성공이다. macOS test는 308,577 ms,
+strict는 67,798 ms·자연 종료다. D043 member TaskInfo Exited/result 0/ESRCH 3·양쪽
+INEXIT/status 2·동일 anchor를 한 번 보존했고 test command 0·drain까지 완료했다.
+TaskInfo partial과 rusage timestamps는 null이므로 D048의 새 Rusage 분기는 미관측이다.
+특정 Pending 뒤 complete의 개별 시각도 기록하지 않았다. native 호출·worker 상한을
+유지한 순수 검사 성공과 실제 상한 발동을 구분한다. Windows test에는 D033의 실제
+PermissionDenied/raw 5 → 2 attempts·19 ms → missing_validated 1회가 companion의
+원 오류·digest와 함께 보존됐고, 이번 실행은 정상 종료했다.
+
+JVM archive는 Windows 350,977 bytes·SHA
+`05a21d97bd594f925d0fc3cc2f2853e3ee2185c834658417d490f8b5dbae26b0`,
+Linux 1,862,927 bytes·SHA
+`00302f1cee57efe7e3d1610c3351589328508048a67eb96aa64aa2ddb176a261`,
+macOS 536,728 bytes·SHA
+`d7fc78ca70b2da4ed9b302aed859f00488a60e662d41fb1f48bd3fec73f0ebf2`다.
+각 OS의 7모듈 327개·실패/오류/skip 0·필수 11 executed tasks, observer 영수증 9개와
+prior JVM 5개 digest 연결을 확인했다. manifest 53개 입력과 ABI source 및 native
+library·JAR·JDK pin 간 연결이 일치했고, Windows·Linux의 53개 선택 source는 고정
+Git blob 1,427,518 bytes 전체와도 일치했다. Header 8 pins와 startup acquire/pre/post
+각 12 pins·13 phases가 완료됐다. Windows discovery의 6단계는 prespawn 173 ms·
+전체 546 ms로 원 5초 안이며 해당 실행의 강제 종료 분기는 미발동이다.
+
+Linux header에서는 D047의 실제 owned member RSS Open/ESRCH 3·양쪽 Zombie·
+threads 2·원 네 identity 일치·실제 BoundValidated pidfd TerminalPoll/NotReady를
+한 번 보존했다. incomplete 1개·complete 15개·max complete gap 231 ms이며 wrapper
+0·1,842 ms·자연 종료다. 정상 완료 guard와 성공 기록에 따른 회복 해석을 개별 Pending의
+미기록 age나 전체 간헐 실패 해결로 확대하지 않는다. macOS JVM35의 Pending 및
+native memory exit는 네 단계 모두 null이다.
+
+Rust와 JVM의 관측한 managed 실행은 모두 exit 0·drain·완전한 출력·export·scratch
+정리·lease 해제·supervisor/cleanup 오류 0이다. Windows Rust test/strict와 JVM의
+native/header는 명시 owned-tail 정리를 거쳤고 다른 해당 단계는 자연 완료다.
+이 결과는 고정 source의 기반 및 development fixture 검증이다. SourceAdmission·
+target policy·whole JDK image와 실제 게임·릴리스 인수는 계속 미검증이며, 이어 작성한
+private pack collector의 새 source를 이 성공에 합산하지 않는다.
+
 ### 실제 게임 입력의 archive 관측
 
 로컬의 실제 Minecraft merged JAR 관측은 처음에
@@ -406,6 +466,46 @@ effective pack fingerprint·SourceAdmission을 구분하며 게임 코드를 실
 기록하지 않는다. 모든 관련 실행의 drain·출력·export·scratch 정리·lease 해제와
 supervisor/cleanup 오류 0을 확인했다. 원본 JAR·probe·raw logs는 Git에 넣지 않았으며
 실패한 이전 binary와 원 증거도 별도 보존했다.
+
+### Private pack root와 active overlay 관측
+
+D049의 Java collector는 실제 FixedPathPackResources·ModNioPackResources·
+OverlayedPackResources와 설치된 정확한 read accessor만 읽는다. actual manager·pack
+객체 순서·root/type/primary/stack을 전후 대조하고, actual stack을 정렬하거나 overlay를
+새로 생성하지 않는다. metadata root와 type별 resource root의 의미를 구분하며
+같은 관측의 기존 ordinary archive receipt에만 literal ZipFS member prefix를 연결한다.
+새 파일 open/hash·realpath·디렉터리 순회·resource/metadata supplier 실행은 없다.
+최소 unknown envelope 공간을 먼저 확보하고 기존 256-entry·256 KiB·5초와 원 control을
+공유한다. 한 graph가 상한·cycle·미지원 경계에 닿으면 빈 nodes·null root의 정확한
+unknown이 되며 부분 graph를 observed로 게시하지 않는다.
+
+Rust의 private validator는 닫힌 필드와 reason, root 0·ordinal·참조·acyclic/reachable
+DAG·scope·prefix의 UTF-8 1,024 bytes/NFC·경로 및 secret/device 규칙과 같은 archives
+참조만 검사한다. 전체 node/root/edge work는 256 이하이면서 실제 entryCount 이하여야
+한다. legacy의 private field 부재는 unknown으로 허용하고 present null은 거절한다.
+공통 pin은 계속 observedAt만 제외하므로 새 graph·prefix·reason·실제 순서가 현재성에
+포함된다. 검증 결과는 권한 없는 `()`이며 server/client pack identity는 계속 None이다.
+기존 workspace Unicode dependency edge 한 개를 재사용했고 Cargo.lock은 같은 edge만
+추가됐으며 package·version·feature·network 입력은 늘지 않았다.
+
+Java/Rust 독립 리뷰의 확정 finding은 없었다. 기존 source 정의 port로는 exact pack
+type/accessor 거절을 검증할 수 없어 한 JUnit 파일에 6개 경계 검사를 추가했다.
+Windows의 전체 JVM 검사는 333개·실패/오류/skip 0·29 actionable tasks 모두 executed,
+command 0·35,576 ms·자연 종료다. Rust는 기존 source identity와 pin 검사 두 개를
+확장하여 세 node 종류·reason·wrong source·prefix/NFC·DAG/순환/분리·256/257 및
+팩 간 합계 경계를 확인했고, Coordinator lib 325 PASS·1 ignored다. command
+0·59,714 ms·명시 owned-tail 정리 및 locked all-targets strict Clippy
+0·7,570 ms·자연 종료를 확인했다. metadata의 완료 전에 요청한 formatting 한 번은
+catalog busy로 pre-admission 거절돼 자식이 실행되지 않았고, 원 실행의 정상 종료·
+lease 반환 뒤 직렬 formatting을 완료했다. 실제 실행의 drain·출력·export·scratch
+정리·lease 해제와 오류 0을 보존했다.
+
+실제 Mixin이 설치된 graph 양성·mutable graph drift·게임 manager 양성은 미검증이다.
+filter·client active stack·pack completeness·loaded definition·SourceAdmission 및
+사용 권한은 unknown/미발급을 유지한다. headless 게임 시작만으로 실제 접속 관리자와
+완료 pairing을 요구하는 runtime_sources 양성을 증명하지 않는다. 실제 게임 준비는
+build scratch와 별개로 world/EULA/config를 보존할 root 및 실제 runtime launcher
+관측이 필요하며, 현재 Gradle dev run 경로를 출시용 launcher로 보고하지 않는다.
 
 실패한 실행의 원본 판정은 유지한다. native drain과 정확한 소유 기록을 확인하고
 로그를 별도로 내보내며 digest를 대조한 경우에만 해당 실행의 알려진 임시 파일을

@@ -22,6 +22,7 @@ mmmm-runtime = { path = "../mmmm-runtime" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+unicode-normalization.workspace = true
 getrandom = "=0.4.3"
 zeroize = "=1.8.2"
 time = { version = "=0.3.44", features = ["parsing", "formatting"] }

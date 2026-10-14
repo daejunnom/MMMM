@@ -696,6 +696,279 @@ fn native_source_receipts_never_fill_unknown_pack_or_client_identity() {
         "originalInputGameJars":[{"status":"observed","sourceId":format!("archive-sha256-{sha}"),"sha256":sha,"sizeBytes":archive.len(),"scope":"original_game_input_container","inputIndex":0}],
         "serverPacks":[{"packIndex":0,"packSourceCompleteness":"unknown","resourceContentObservation":"not_enumerated","linkedRuntimeContainerSources":[]}],"clientPacks":null});
     validate_source_facts(&facts, &context).unwrap();
+    // Reuse the ordinary archive receipt above: private pack linkage adds no
+    // source approval and does not turn unknown pack/client identity into [].
+    let linked_root = json!({"scope":"pack_root","status":"observed","reason":null,
+        "sourceId":format!("archive-sha256-{sha}"),"memberPrefix":""});
+    let unknown_root = json!({"scope":"type_root","status":"unknown","reason":"PACK_ROOT_NOT_ZIPFS",
+        "sourceId":null,"memberPrefix":null});
+    let mut typed_root = linked_root.clone();
+    typed_root["scope"] = json!("type_root");
+    typed_root["memberPrefix"] = json!("data/예제");
+    let private = json!({"format":"mmmm.native.pack-facts/1","status":"observed","reason":null,"rootNode":0,
+        "nodes":[
+            {"nodeIndex":0,"kind":"overlayed","primaryNode":1,"resourceStack":[2,1,2]},
+            {"nodeIndex":1,"kind":"fixed_path","packRoots":[linked_root.clone()],"typeRoots":[
+                {"packType":"client_resources","roots":[unknown_root]},
+                {"packType":"server_data","roots":[typed_root]}]},
+            {"nodeIndex":2,"kind":"mod_nio","packType":"server_data","roots":[linked_root]}],
+        "filter":{"status":"unknown","reason":"NATIVE_FILTER_MAPPING_UNOBSERVED"}});
+    let mut with_private = facts.clone();
+    // Three nodes, four roots and four edges; repeated/shared children count
+    // as edges but do not imply duplicate nodes or an invalid DAG.
+    with_private["entryCount"] = json!(11);
+    with_private["serverPacks"][0]["privatePackFacts"] = private.clone();
+    validate_source_facts(&with_private, &context).unwrap();
+    let mut consumed_elsewhere = with_private.clone();
+    consumed_elsewhere["entryCount"] = json!(12);
+    validate_source_facts(&consumed_elsewhere, &context).unwrap();
+    let reject = |candidate: &Value| {
+        assert_eq!(
+            validate_source_facts(candidate, &context).unwrap_err().code,
+            "SOURCE_INVALID"
+        );
+    };
+    for (path, bad) in [
+        ("/serverPacks/0/privatePackFacts", Value::Null),
+        (
+            "/serverPacks/0/privatePackFacts/format",
+            json!("mmmm.native.pack-facts/2"),
+        ),
+        ("/serverPacks/0/privatePackFacts/status", json!("complete")),
+        (
+            "/serverPacks/0/privatePackFacts/reason",
+            json!("PACK_FACTS_LIMIT"),
+        ),
+        ("/serverPacks/0/privatePackFacts/rootNode", json!(1)),
+        ("/serverPacks/0/privatePackFacts/rootNode", json!(0.0)),
+        (
+            "/serverPacks/0/privatePackFacts/filter/status",
+            json!("observed"),
+        ),
+        (
+            "/serverPacks/0/privatePackFacts/filter/reason",
+            json!("PACK_FACTS_LIMIT"),
+        ),
+        (
+            "/serverPacks/0/privatePackFacts/nodes/0/nodeIndex",
+            json!(1),
+        ),
+        (
+            "/serverPacks/0/privatePackFacts/nodes/2/nodeIndex",
+            json!(1),
+        ),
+        (
+            "/serverPacks/0/privatePackFacts/nodes/0/primaryNode",
+            json!(0),
+        ),
+        (
+            "/serverPacks/0/privatePackFacts/nodes/0/primaryNode",
+            json!(3),
+        ),
+        (
+            "/serverPacks/0/privatePackFacts/nodes/0/resourceStack",
+            json!([2.0, 1, 2]),
+        ),
+        (
+            "/serverPacks/0/privatePackFacts/nodes/0/resourceStack",
+            json!([3, 1, 2]),
+        ),
+        (
+            "/serverPacks/0/privatePackFacts/nodes/0/resourceStack",
+            json!([1]),
+        ),
+        (
+            "/serverPacks/0/privatePackFacts/nodes/1/typeRoots",
+            json!([
+            {"packType":"server_data","roots":[]},{"packType":"client_resources","roots":[]}]),
+        ),
+        (
+            "/serverPacks/0/privatePackFacts/nodes/1/typeRoots",
+            json!([
+            {"packType":"server_data","roots":[]},{"packType":"server_data","roots":[]}]),
+        ),
+        (
+            "/serverPacks/0/privatePackFacts/nodes/1/packRoots/0/scope",
+            json!("type_root"),
+        ),
+        (
+            "/serverPacks/0/privatePackFacts/nodes/1/packRoots/0/sourceId",
+            json!("source-game"),
+        ),
+        (
+            "/serverPacks/0/privatePackFacts/nodes/1/packRoots/0/reason",
+            json!("PACK_ROOT_UNMAPPED"),
+        ),
+        (
+            "/serverPacks/0/privatePackFacts/nodes/1/typeRoots/0/roots/0/reason",
+            json!("PACK_FACTS_LIMIT"),
+        ),
+        (
+            "/serverPacks/0/privatePackFacts/nodes/1/typeRoots/0/roots/0/sourceId",
+            json!("unmapped"),
+        ),
+        (
+            "/serverPacks/0/privatePackFacts/nodes/2/packType",
+            json!("future_type"),
+        ),
+        ("/entryCount", json!(10)),
+        ("/entryCount", json!(11.0)),
+        ("/entryCount", json!(257)),
+        ("/clientPacks", json!([])),
+        ("/serverPacks/0/packSourceCompleteness", json!("complete")),
+    ] {
+        let mut candidate = with_private.clone();
+        *candidate.pointer_mut(path).unwrap() = bad;
+        reject(&candidate);
+    }
+    for object in [
+        "",
+        "/filter",
+        "/nodes/0",
+        "/nodes/1",
+        "/nodes/2",
+        "/nodes/1/typeRoots/0",
+        "/nodes/1/packRoots/0",
+    ] {
+        let path = format!("/serverPacks/0/privatePackFacts{object}");
+        let mut candidate = with_private.clone();
+        candidate
+            .pointer_mut(&path)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("extra".into(), Value::Null);
+        reject(&candidate);
+        let mut candidate = with_private.clone();
+        let object = candidate
+            .pointer_mut(&path)
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        let first = object.keys().next().unwrap().clone();
+        object.remove(&first);
+        reject(&candidate);
+    }
+    let mut absent_count = with_private.clone();
+    absent_count.as_object_mut().unwrap().remove("entryCount");
+    reject(&absent_count);
+    for prefix in [
+        "/data",
+        "data/",
+        "data//x",
+        "data/./x",
+        "data/../x",
+        "data\\x",
+        "a:b",
+        "x<y",
+        "x>y",
+        "x\"y",
+        "x|y",
+        "x?y",
+        "x*y",
+        "data/x.",
+        "data/x ",
+        "x\u{7f}",
+        "e\u{301}",
+        "CON.txt",
+        "lPt9",
+        ".ENV",
+        ".env.test",
+        ".ssh",
+        "id_rsa",
+        "id_ecdsa",
+        "id_ed25519",
+        "credentials.json",
+        "service-account.json",
+        "service_account.json",
+        "api-key",
+        "API_KEY",
+        "ssh-key",
+    ] {
+        let mut candidate = with_private.clone();
+        candidate["serverPacks"][0]["privatePackFacts"]["nodes"][1]["packRoots"][0]["memberPrefix"] =
+            json!(prefix);
+        reject(&candidate);
+    }
+    for prefix in [
+        "",
+        "data/예제",
+        "é",
+        "data/.env-example",
+        "com0",
+        "com10",
+        "ordinary.pem",
+    ] {
+        let mut candidate = with_private.clone();
+        candidate["serverPacks"][0]["privatePackFacts"]["nodes"][1]["packRoots"][0]["memberPrefix"] =
+            json!(prefix);
+        validate_source_facts(&candidate, &context).unwrap();
+    }
+    for (prefix, accepted) in [("가".repeat(341), true), ("가".repeat(342), false)] {
+        let mut candidate = with_private.clone();
+        candidate["serverPacks"][0]["privatePackFacts"]["nodes"][1]["packRoots"][0]["memberPrefix"] =
+            json!(prefix);
+        assert_eq!(
+            validate_source_facts(&candidate, &context).is_ok(),
+            accepted
+        );
+    }
+    for reason in [
+        "PACK_ROOT_NOT_ZIPFS",
+        "PACK_ROOT_UNMAPPED",
+        "PACK_ROOT_PREFIX_UNSAFE",
+    ] {
+        let mut candidate = with_private.clone();
+        candidate["serverPacks"][0]["privatePackFacts"]["nodes"][1]["typeRoots"][0]["roots"][0]["reason"] =
+            json!(reason);
+        validate_source_facts(&candidate, &context).unwrap();
+    }
+    let unknown = json!({"format":"mmmm.native.pack-facts/1","status":"unknown","reason":"PACK_FACTS_LIMIT",
+        "rootNode":null,"nodes":[],"filter":{"status":"unknown","reason":"NATIVE_FILTER_MAPPING_UNOBSERVED"}});
+    for reason in [
+        "PACK_IMPLEMENTATION_UNSUPPORTED",
+        "NATIVE_PACK_ACCESS_UNAVAILABLE",
+        "PACK_FACTS_LIMIT",
+        "PACK_GRAPH_CYCLE",
+        "PACK_TYPE_UNSUPPORTED",
+        "PACK_FACTS_UNAVAILABLE",
+    ] {
+        let mut candidate = with_private.clone();
+        candidate["entryCount"] = json!(0);
+        candidate["serverPacks"][0]["privatePackFacts"] = unknown.clone();
+        candidate["serverPacks"][0]["privatePackFacts"]["reason"] = json!(reason);
+        validate_source_facts(&candidate, &context).unwrap();
+        candidate["serverPacks"][0]["privatePackFacts"]["rootNode"] = json!(0);
+        reject(&candidate);
+    }
+    let mut bad_unknown = with_private.clone();
+    bad_unknown["serverPacks"][0]["privatePackFacts"] = unknown.clone();
+    bad_unknown["serverPacks"][0]["privatePackFacts"]["reason"] = json!("FUTURE_REASON");
+    reject(&bad_unknown);
+    bad_unknown["serverPacks"][0]["privatePackFacts"] = unknown;
+    bad_unknown["serverPacks"][0]["privatePackFacts"]["nodes"] = private["nodes"].clone();
+    reject(&bad_unknown);
+    // Work is shared across packs, and repeated root slots cannot bypass it.
+    let mut crowded = with_private.clone();
+    crowded["entryCount"] = json!(256);
+    let mut repeated_pack = crowded["serverPacks"][0].clone();
+    let mut packs = Vec::new();
+    for index in 0..24 {
+        repeated_pack["packIndex"] = json!(index);
+        packs.push(repeated_pack.clone());
+    }
+    crowded["serverPacks"] = json!(packs);
+    reject(&crowded);
+    crowded["serverPacks"] = with_private["serverPacks"].clone();
+    crowded["serverPacks"][0]["privatePackFacts"]["nodes"] = json!([
+        {"nodeIndex":0,"kind":"mod_nio","packType":"server_data",
+            "roots":vec![private["nodes"][1]["packRoots"][0].clone(); 255]}]);
+    validate_source_facts(&crowded, &context).unwrap();
+    crowded["serverPacks"][0]["privatePackFacts"]["nodes"][0]["roots"]
+        .as_array_mut()
+        .unwrap()
+        .push(private["nodes"][1]["packRoots"][0].clone());
+    reject(&crowded);
     let registration = CatalogEnvironmentRegistration {
         context: context.clone(),
         game_version: Some("26.3".into()),
@@ -747,6 +1020,13 @@ fn native_source_receipts_never_fill_unknown_pack_or_client_identity() {
         grant.artifact_source,
         Some(SourceId::new("source-game").unwrap())
     );
+    apply_actual_source_identity(&mut grant, &installed, &with_private).unwrap();
+    assert!(grant.server_pack_sources.is_none());
+    assert!(grant.client_pack_sources.is_none());
+    assert_eq!(
+        grant.artifact_source,
+        Some(SourceId::new("source-game").unwrap())
+    );
     let canonical_mod = ResourceLocation::new("example:canonical_mod").unwrap();
     let mod_source_id = SourceId::new("source-mod").unwrap();
     let mut mod_source = installed.sources[&SourceId::new("source-game").unwrap()].clone();
@@ -791,6 +1071,40 @@ fn private_source_facts_pin_excludes_only_observation_time() {
     let mut different_unknown = facts;
     different_unknown["extensionUnknown"]["observed"] = json!(false);
     assert_ne!(source_facts_pin(&different_unknown).unwrap(), pin);
+    let mut private = different_unknown.clone();
+    private["serverPacks"] = json!([{"privatePackFacts":{"rootNode":0,"nodes":[
+        {"nodeIndex":0,"kind":"overlayed","primaryNode":1,"resourceStack":[1,2,1]},
+        {"nodeIndex":1,"kind":"mod_nio","packType":"server_data","roots":[
+            {"scope":"pack_root","status":"observed","reason":null,"sourceId":"archive-observed","memberPrefix":"data"}]},
+        {"nodeIndex":2,"kind":"fixed_path","packRoots":[],"typeRoots":[]}],
+        "filter":{"status":"unknown","reason":"NATIVE_FILTER_MAPPING_UNOBSERVED"}}}]);
+    let private_pin = source_facts_pin(&private).unwrap();
+    for (path, changed) in [
+        (
+            "/serverPacks/0/privatePackFacts/nodes/0/resourceStack",
+            json!([2, 1, 1]),
+        ),
+        (
+            "/serverPacks/0/privatePackFacts/nodes/1/roots/0/sourceId",
+            json!("archive-other"),
+        ),
+        (
+            "/serverPacks/0/privatePackFacts/nodes/1/roots/0/memberPrefix",
+            json!("assets"),
+        ),
+        (
+            "/serverPacks/0/privatePackFacts/nodes/1/roots/0/scope",
+            json!("type_root"),
+        ),
+        (
+            "/serverPacks/0/privatePackFacts/filter/reason",
+            json!("different_unknown"),
+        ),
+    ] {
+        let mut changed_facts = private.clone();
+        *changed_facts.pointer_mut(path).unwrap() = changed;
+        assert_ne!(source_facts_pin(&changed_facts).unwrap(), private_pin);
+    }
 }
 
 #[test]

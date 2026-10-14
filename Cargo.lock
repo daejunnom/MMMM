@@ -731,6 +731,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "time",
+ "unicode-normalization",
  "windows-sys",
  "zeroize",
 ]
