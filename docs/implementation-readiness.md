@@ -1041,8 +1041,15 @@ Compatibility 승인 저장은 기존 보호 Store에 actual native owner·Proje
 ResourceRef raw SHA와 별도의 profile/artifact/interface pin·현재 Policy/local-use scope를
 보존한다. 같은 ref의 exact replay만 허용하고 다른 pin은 충돌한다. cold CLI 선택,
 FN19와 inventory의 같은 canonical binder, 원 bootstrap의 유한 map 전달을 연결 중이다.
-Java helper의 실제 resolver가 없는 상태는 명시적으로 unavailable이며, 메타데이터
-탐지나 승인 저장을 실행 가능한 adapter 또는 실제 AD01/AD02 인수로 표시하지 않는다.
+Java의 metadata resolver는 실제 Fabric 단일 일반 JAR·mod 버전·현재 loader에 연결했다.
+초기화를 요청하지 않고 정확한 public static signature와 source 입력 pin을 확인하며,
+실제 inventory의 metadata binding도 incompatible/ready=false와 고정 실행 거절을
+유지한다. 기존 LoadedClassApproval과 executable Candidate는 별도다. snapshot과
+명시적 파일 I/O는 각각 64 MiB 안으로 제한하고 caller의 원 크기 예약을 payload 읽기
+전에 대조한다. classloader 내부 I/O는 이 명시적 counter의 측정 범위 밖이다.
+source 실패와 동시 취소·기한 원인을 보존한다. 원 connect 기한·취소를 install까지
+유지하며 전체 사전 검사 뒤에만 metadata 등록을 시작한다. 현재 source의 Java 통합
+검사는 별도 수행 전이고 실제 게임 AD01/AD02 및 FN33 실행 인수는 미완료다.
 
 Windows 관리 실행 `implementation-checks-20261014-330`은 새 compiler 오류 반환의
 타입 불일치로 컴파일 exit 101이었다. 이를 수정한 `332`는 compiler 89개와 runtime
@@ -1108,6 +1115,17 @@ lease 해제를 확인했다. D055에 따라 상한은 그대로 두고 Cargo �
 7개·최대 표본 간격 147 ms였고 출력·drain·export·scratch·lease를 정상 완료했다.
 `356`의 같은 package/all-target strict Clippy도 exit 0과 정상 정리를 확인했다.
 두 실행은 아직 실제 게임이나 후속 Compatibility resolver 검증의 근거가 아니다.
+
+실제 원본 26.3 JAR을 held read와 전후 digest로 고정한 static API·bytecode 검사
+`348`–`350`에서 함수 실행의 preseed 관측 시점과 반환 callback 부재 분기를 확인했다.
+클래스 초기화·게임·world/config 읽기는 수행하지 않았다. D056의 두 private v2
+codec은 관측되지 않은 반환을 null로 보존하고, 선택 source와 독립 readback의
+null/Int32를 정확히 비교한다. `359`는 집중 unit 13개가 통과했지만 필터 인수가 별도
+harness-free native fixture에도 전달되어 명령 전체는 exit 101이었다. 올바른 `--lib`
+선택의 `360`은 같은 unit 13개 통과와 정상 정리를 확인했고 `361`의 같은 package
+all-target strict Clippy도 exit 0이었다. 기존 검사만 확장했으며 새 fixture는 없다.
+실제 calibration runner·ADMIN 전용 bootstrap permit·issuer/provenance 연결과
+47개 case의 실제 게임 실행은 이 codec 수정으로 완료되지 않는다.
 
 고정 `b854b617846036bcb09058ca7da3eed303a1e680`의 Rust CI 50
 (`38698720838`)과 JVM CI 41 (`38698720798`)은 세 OS 및 집계가 모두 성공했다.

@@ -17,7 +17,7 @@ import java.util.Set;
 
 /** Looks up original dispatch-issued calibration evidence; it cannot run or manufacture a calibration. */
 final class NativeCalibrationSource {
-    static final String FORMAT = "mmmm.native.calibration-run-source/1";
+    static final String FORMAT = "mmmm.native.calibration-run-source/2";
     static final String ISSUER_UNAVAILABLE = "CALIBRATION_RUN_ISSUER_UNAVAILABLE";
     private static final int MAX_BYTES = 1024 * 1024;
     private static final int MAX_COMMAND_BYTES = 16 * 1024;
@@ -134,7 +134,7 @@ final class NativeCalibrationSource {
             String source = originals.get(index); digest(text(command, "commandDigest"));
             if (!ContractJson.digest(TextNode.valueOf(source)).equals(text(command, "commandDigest"))
                     || integer(command.get("consumedUtf16")) != source.length()) throw failure("CALIBRATION_RUN_SOURCE_MISMATCH");
-            integer(command.get("nativeReturn"));
+            nullableInteger(command.get("nativeReturn"));
             ArrayNode parsers = array(command, "parserSources", 1, MAX_SOURCES), handlers = array(command, "handlerSources", 1, MAX_SOURCES);
             if ((sourceCount += parsers.size() + handlers.size()) > MAX_TOTAL_SOURCES) throw failure("CALIBRATION_RUN_SOURCE_LIMIT");
             sources(parsers, generation); sources(handlers, generation);
@@ -166,6 +166,7 @@ final class NativeCalibrationSource {
     private static void bounded(ObjectNode value) { if (ContractJson.bytes(value).length > MAX_BYTES) throw failure("CALIBRATION_RUN_SOURCE_LIMIT"); }
     private static long unsignedTick(String value) { if (!value.matches("(0|[1-9][0-9]{0,9})")) throw invalid(); try { long tick = Long.parseLong(value); if (tick > 0xffff_ffffL) throw invalid(); return tick; } catch (NumberFormatException exception) { throw invalid(); } }
     private static int integer(JsonNode value) { try { if (value == null || !value.isIntegralNumber()) throw invalid(); return value.bigIntegerValue().intValueExact(); } catch (ArithmeticException exception) { throw invalid(); } }
+    private static void nullableInteger(JsonNode value) { if (value == null) throw invalid(); if (!value.isNull()) integer(value); }
     private static ArrayNode array(ObjectNode value, String field, int minimum, int maximum) { if (!(value.get(field) instanceof ArrayNode array) || array.size() < minimum || array.size() > maximum) throw invalid(); return array; }
     private static String text(ObjectNode value, String field) { if (!value.path(field).isTextual()) throw invalid(); return value.get(field).textValue(); }
     private static void digest(String value) { if (value == null || !value.matches("[a-f0-9]{64}")) throw invalid(); }

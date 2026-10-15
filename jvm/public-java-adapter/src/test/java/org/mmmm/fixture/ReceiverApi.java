@@ -7,6 +7,7 @@ public class ReceiverApi {
     private ReceiverApi() { }
     public static ReceiverApi create() { return new ReceiverApi(); }
     public static ReceiverApi child() { return new Child(); }
+    public static int inheritedScalar() { throw new AssertionError("Inherited static metadata must not execute"); }
     public Map<String, Object> echo(String text) { return Map.of("text", "receiver:" + text); }
     public static final class Child extends ReceiverApi {
         private Child() { }

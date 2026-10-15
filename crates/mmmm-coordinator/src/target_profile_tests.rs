@@ -53,10 +53,10 @@ fn suite(profile: &Value, context: &Value) -> RuntimeSuite {
         "cases":[]})).unwrap()
 }
 fn numeric(case: &str, output: Value, success: bool) -> NumericReadback {
-    serde_json::from_value(json!({"format":"mmmm.target-case-readback/1","caseId":case,
+    serde_json::from_value(json!({"format":"mmmm.target-case-readback/2","caseId":case,
         "sourceResource":pin(b"generated original case", "case-source"),"commandStageIndex":0,
         "invocationId":"invocation-target-case","runtimeSourceFactsDigest":raw_digest(b"actual facts"),
-        "commandSuccess":success,"commandReturn":0,"okScore":if success {1} else {0},
+        "commandSuccess":success,"commandReturn":if success {json!(0)} else {Value::Null},"okScore":if success {1} else {0},
         "output":output,"scratchPresent":success,"staleOutputSeeded":true})).unwrap()
 }
 
@@ -109,8 +109,20 @@ fn zero_success_and_typed_binary32_are_distinct_from_failure_and_f64() {
         .is_err()
     );
     let mut false_success = numeric("int32_score_zero", json!({"kind":"score","value":0}), true);
+    false_success.command_return = None;
+    assert!(validate_numeric_readback(&false_success).is_err());
+    false_success.command_return = Some(Int32::new(0));
     false_success.ok_score = Int32::new(0);
     assert!(validate_numeric_readback(&false_success).is_err());
+    let mut finite_zero = numeric(
+        "float_finite_zero_guard",
+        json!({"kind":"float_tag","bits":"00000000"}),
+        true,
+    );
+    finite_zero.command_return = None;
+    assert!(validate_numeric_readback(&finite_zero).is_err());
+    finite_zero.command_return = Some(Int32::new(1));
+    assert!(validate_numeric_readback(&finite_zero).is_err());
 }
 
 #[test]
@@ -123,7 +135,11 @@ fn failure_requires_absent_output_and_complete_stale_scratch_cleanup() {
         "later_node_failure_cleanup",
     ] {
         let mut observed = numeric(case, json!({"kind":"absent"}), false);
+        assert_eq!(observed.command_return, None);
         assert!(validate_numeric_readback(&observed).is_ok());
+        observed.command_return = Some(Int32::new(0));
+        assert!(validate_numeric_readback(&observed).is_ok());
+        observed.command_return = None;
         observed.output = TypedScalar::Score {
             value: Int32::new(0),
         };
@@ -177,7 +193,9 @@ fn lazy_existing_zero_and_fraction_must_succeed_without_the_invalid_fallback() {
         true,
     );
     assert!(validate_numeric_readback(&whole_function_return).is_err());
-    whole_function_return.command_return = Int32::new(-2);
+    whole_function_return.command_return = None;
+    assert!(validate_numeric_readback(&whole_function_return).is_err());
+    whole_function_return.command_return = Some(Int32::new(-2));
     assert!(validate_numeric_readback(&whole_function_return).is_ok());
 }
 
@@ -187,12 +205,35 @@ fn public_passed_flags_and_reference_only_profiles_do_not_create_runtime_rules()
     let profile = profile();
     let original = suite(&profile, &context);
     assert!(verified_rules(&original, &BTreeMap::new()).is_err());
-    let mut value = json!({"format":"mmmm.target-case-readback/1","caseId":"int32_score_zero",
+    let mut value = json!({"format":"mmmm.target-case-readback/2","caseId":"int32_score_zero",
         "sourceResource":pin(b"source", "source"),"commandStageIndex":0,"invocationId":"invocation-case",
         "runtimeSourceFactsDigest":raw_digest(b"facts"),"commandSuccess":true,"commandReturn":0,"okScore":1,
         "output":{"kind":"score","value":0},"scratchPresent":true,"staleOutputSeeded":true});
     value["passed"] = json!(true);
-    assert!(serde_json::from_value::<NumericReadback>(value).is_err());
+    assert!(serde_json::from_value::<NumericReadback>(value.clone()).is_err());
+    value.as_object_mut().unwrap().remove("passed");
+    for returned in [Value::Null, json!(i32::MIN), json!(i32::MAX), json!(-2.0)] {
+        let mut encoded = value.clone();
+        encoded["commandReturn"] = returned;
+        assert!(serde_json::from_value::<NumericReadback>(encoded).is_ok());
+    }
+    let mut omitted = value.clone();
+    omitted.as_object_mut().unwrap().remove("commandReturn");
+    assert!(serde_json::from_value::<NumericReadback>(omitted).is_err());
+    for returned in [
+        json!(i64::from(i32::MAX) + 1),
+        json!(i64::from(i32::MIN) - 1),
+        json!(0.5),
+        json!("0"),
+        json!(false),
+    ] {
+        let mut encoded = value.clone();
+        encoded["commandReturn"] = returned;
+        assert!(serde_json::from_value::<NumericReadback>(encoded).is_err());
+    }
+    value["format"] = json!("mmmm.target-case-readback/1");
+    let legacy: NumericReadback = serde_json::from_value(value).unwrap();
+    assert!(validate_numeric_readback(&legacy).is_err());
     let reference = example("version-profile.json");
     // The reference-only VersionProfile permits a null artifactSha256. It is
     // compared with the actual non-null runtime suite, not used to fabricate one.
@@ -543,8 +584,18 @@ fn expected_output_without_the_normative_arithmetic_source_is_rejected() {
 
 #[test]
 fn issued_native_return_must_agree_with_the_independent_selected_command() {
-    let observed = [json!({"nativeReturn":0}), json!({"nativeReturn":-2})];
+    let observed = [json!({"nativeReturn":null}), json!({"nativeReturn":-2})];
     assert!(verify_issued_command_return(&observed, 1, Some(-2)).is_ok());
+    assert!(verify_issued_command_return(&observed, 0, None).is_ok());
+    assert_eq!(
+        verify_issued_command_return(&observed, 0, Some(0))
+            .unwrap_err()
+            .code,
+        "TARGET_RUNTIME_EVIDENCE_CONFLICT"
+    );
+    assert!(verify_issued_command_return(&observed, 1, None).is_err());
+    assert!(verify_issued_command_return(&[json!({"nativeReturn":0})], 0, None).is_err());
+    assert!(verify_issued_command_return(&[json!({})], 0, None).is_err());
     assert_eq!(
         verify_issued_command_return(&observed, 0, Some(-2))
             .unwrap_err()
@@ -554,6 +605,16 @@ fn issued_native_return_must_agree_with_the_independent_selected_command() {
     assert!(verify_issued_command_return(&observed, 2, Some(-2)).is_err());
     assert!(verify_issued_command_return(&[json!({"nativeReturn":-2.5})], 0, Some(-2)).is_err());
     assert!(verify_issued_command_return(&[json!({"nativeReturn":-2.0})], 0, Some(-2)).is_ok());
+    for returned in [
+        json!(i64::from(i32::MAX) + 1),
+        json!(i64::from(i32::MIN) - 1),
+        json!("0"),
+        json!(false),
+    ] {
+        assert!(
+            verify_issued_command_return(&[json!({"nativeReturn":returned})], 0, None).is_err()
+        );
+    }
 }
 
 #[test]

@@ -68,6 +68,7 @@ public final class MmmmFabricHost implements ModInitializer {
     private volatile MinecraftServer server;
     private volatile HostRuntime runtime;
     private NativeCompatibilityApprovals compatibilityApprovals;
+    private NativeCompatibilityMetadataResolver compatibilityMetadataResolver;
     private volatile HostSession session;
     private volatile PairedLoopbackServer endpoint;
     private volatile boolean reloading;
@@ -215,16 +216,42 @@ public final class MmmmFabricHost implements ModInitializer {
                           Map<String, String> approvedSources, Set<String> approvedActions,
                           boolean exactWriteProfileVerified,
                           List<NativeCompatibilityApprovals.ApprovedProfile> compatibilityProfiles) throws IOException {
+        return install(pairedPlayer, principalRef, asciiBearer, permissions, contexts, approvedSources, approvedActions,
+                exactWriteProfileVerified, compatibilityProfiles, () -> { });
+    }
+
+    /** The private bootstrap passes its original cancellation and monotonic deadline, without renewal. */
+    public String install(UUID pairedPlayer, String principalRef, byte[] asciiBearer,
+                          Set<String> permissions, List<ObjectNode> contexts,
+                          Map<String, String> approvedSources, Set<String> approvedActions,
+                          boolean exactWriteProfileVerified,
+                          List<NativeCompatibilityApprovals.ApprovedProfile> compatibilityProfiles,
+                          Runnable originalControl) throws IOException {
         requireServerThread();
+        if (originalControl == null) throw new ContractException("HOST_PAIRING_CANCELLED", "Original pairing control is required");
+        long phaseStarted = System.nanoTime();
+        Runnable installControl = () -> {
+            originalControl.run(); requireServerThread();
+            if (System.nanoTime() - phaseStarted >= java.util.concurrent.TimeUnit.SECONDS.toNanos(10)) {
+                throw new ContractException("HOST_PAIRING_TIMEOUT", "Metadata installation phase exceeded its original bounded lifetime");
+            }
+            originalControl.run();
+        };
+        installControl.run();
+        var selectedResolver = new java.util.concurrent.atomic.AtomicReference<NativeCompatibilityMetadataResolver>();
         NativeCompatibilityApprovals pending = new NativeCompatibilityApprovals(contracts, compatibilityProfiles,
                 (profile, actualEnvironment, actualGeneration) -> {
-                    throw new ContractException("COMPATIBILITY_SOURCE_UNAVAILABLE", "No actual loaded compatibility source resolver is installed");
+                    NativeCompatibilityMetadataResolver resolver = selectedResolver.get();
+                    if (resolver == null) throw new ContractException("COMPATIBILITY_SOURCE_UNAVAILABLE", "No current metadata source resolver is installed");
+                    resolver.checkApproval(profile, actualEnvironment, actualGeneration);
                 });
         try {
             return installNative(pairedPlayer, principalRef, asciiBearer, permissions, contexts, approvedSources, approvedActions,
-                    exactWriteProfileVerified, pending);
+                    exactWriteProfileVerified, pending, compatibilityProfiles, installControl, selectedResolver);
         } catch (IOException | RuntimeException failure) {
             try { pending.close(); } catch (RuntimeException cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+            NativeCompatibilityMetadataResolver resolver = selectedResolver.get();
+            if (resolver != null) try { resolver.close(); } catch (RuntimeException cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
             throw failure;
         }
     }
@@ -232,7 +259,9 @@ public final class MmmmFabricHost implements ModInitializer {
     private String installNative(UUID pairedPlayer, String principalRef, byte[] asciiBearer,
                                  Set<String> permissions, List<ObjectNode> contexts,
                                  Map<String, String> approvedSources, Set<String> approvedActions,
-                                 boolean exactWriteProfileVerified, NativeCompatibilityApprovals pendingCompatibility) throws IOException {
+                                 boolean exactWriteProfileVerified, NativeCompatibilityApprovals pendingCompatibility,
+                                 List<NativeCompatibilityApprovals.ApprovedProfile> compatibilityProfiles, Runnable installControl,
+                                 java.util.concurrent.atomic.AtomicReference<NativeCompatibilityMetadataResolver> selectedResolver) throws IOException {
         requireServerThread();
         disconnect();
         if (contexts.isEmpty() || contexts.size() > 16) throw new ContractException("CONTEXT_LIMIT", "Pairing requires a bounded nonempty immutable context set");
@@ -259,6 +288,9 @@ public final class MmmmFabricHost implements ModInitializer {
                 server.execute(action);
             }
         }, authority, (binding, descriptor) -> {
+            if (binding.startsWith("compat-")) {
+                pendingCompatibility.checkRegistration(binding, descriptor); return;
+            }
             if (descriptor.has("providerId")) {
                 String sourceId = descriptor.path("origin").path("sourceId").asText();
                 String sourceDigest = descriptor.path("origin").path("sourceDigest").asText();
@@ -272,8 +304,13 @@ public final class MmmmFabricHost implements ModInitializer {
                 throw new ContractException("ACTION_UNAPPROVED", "Action contract does not match the pairing authority's approved digest");
             }
         }, Clock.systemUTC());
+        MinecraftServer owningServer = server; long owningGeneration = registryGeneration; String owningEpoch = epoch;
+        ObjectNode owningEnvironment = environment();
+        List<ObjectNode> metadataContexts = contexts.stream().map(ObjectNode::deepCopy).toList();
+        var published = new java.util.concurrent.atomic.AtomicBoolean();
         PairedLoopbackServer listener = null;
         try {
+            installControl.run();
             String hostDigest = artifactDigest(container("mmmm_host"));
             String nativeBinding = "binding-" + UUID.randomUUID();
             candidate.registerProvider(provider("mmmm:native", "mmmm_host", version("mmmm_host"), nativeBinding, hostDigest, "builtin"));
@@ -291,6 +328,37 @@ public final class MmmmFabricHost implements ModInitializer {
                     @Override public void undoAction(String sourceActionId, String undoActionId) { candidate.registerUndo(binding, sourceActionId, undoActionId); }
                 });
             }
+            Runnable currentMetadataHost = () -> {
+                requireServerThread(); candidateSession.checkOpen();
+                if (server != owningServer || registryGeneration != owningGeneration || !java.util.Objects.equals(epoch, owningEpoch)
+                        || !owningEnvironment.equals(environment())) throw new ContractException("TARGET_DRIFT", "Actual metadata owner generation changed");
+                synchronized (routes) {
+                    if (published.get() ? runtime != candidate || !routes.containsKey(candidateSession)
+                            : runtime != null || session != null || !routes.isEmpty()) {
+                        throw new ContractException("SESSION_ROUTE_CHANGED", "Actual metadata runtime owner changed");
+                    }
+                }
+                player(candidateSession);
+                for (ObjectNode context : metadataContexts) {
+                    if (!candidateSession.context(context.path("contextId").asText()).equals(context)) throw new ContractException("STALE_CONTEXT", "Metadata issuance context changed");
+                }
+            };
+            NativeCompatibilityMetadataResolver resolver = new NativeCompatibilityMetadataResolver(contracts, compatibilityProfiles,
+                    owningEnvironment, Long.toString(owningGeneration), version("minecraft"), MmmmFabricHost.class.getClassLoader(),
+                    currentMetadataHost, installControl);
+            selectedResolver.set(resolver);
+            NativeCompatibilityApprovals.MetadataTargetResolver metadataPort = candidateSession.permits("mmmm:provider_inventory") ? resolver
+                    : new NativeCompatibilityApprovals.MetadataTargetResolver() {
+                        @Override public NativeCompatibilityApprovals.ResolvedMetadataTarget resolve(NativeCompatibilityApprovals.ApprovedProfile profile) {
+                            installControl.run(); return null;
+                        }
+                        @Override public void checkCurrentSources() { resolver.checkCurrentSources(); }
+                    };
+            resolver.inScope(installControl, () -> {
+                pendingCompatibility.registerMetadataBeforeFreeze(candidate, owningEnvironment, Long.toString(owningGeneration), metadataPort);
+                return null;
+            });
+            installControl.run();
             HostDispatcher dispatcher = new HostDispatcher(contracts, candidate, this::inspect, Clock.systemUTC());
             listener = new PairedLoopbackServer(candidateSession, dispatcher, asciiBearer);
             List<ObjectNode> admittedContexts = contexts.stream().map(ObjectNode::deepCopy).toList();
@@ -299,8 +367,11 @@ public final class MmmmFabricHost implements ModInitializer {
                 routes.put(candidateSession, new SessionRoute(listener, null, null, null)); routeOrder.add(candidateSession);
                 installedSources = acceptedSources; installedActions = acceptedActions; installedContexts = admittedContexts;
                 compatibilityApprovals = pendingCompatibility;
+                compatibilityMetadataResolver = resolver;
                 runtime = candidate; session = candidateSession; endpoint = listener;
+                published.set(true);
             }
+            installControl.run();
             return listener.endpoint();
         } catch (IOException | RuntimeException exception) {
             synchronized (routes) {
@@ -309,8 +380,11 @@ public final class MmmmFabricHost implements ModInitializer {
                     session = null; if (endpoint == listener) endpoint = null; if (runtime == candidate) runtime = null;
                 }
                 if (compatibilityApprovals == pendingCompatibility) compatibilityApprovals = null;
+                if (compatibilityMetadataResolver == selectedResolver.get()) compatibilityMetadataResolver = null;
             }
-            if (listener != null) listener.close(); candidate.close(); candidateSession.close();
+            if (listener != null) try { listener.close(); } catch (RuntimeException cleanup) { if (cleanup != exception) exception.addSuppressed(cleanup); }
+            try { candidate.close(); } catch (RuntimeException cleanup) { if (cleanup != exception) exception.addSuppressed(cleanup); }
+            try { candidateSession.close(); } catch (RuntimeException cleanup) { if (cleanup != exception) exception.addSuppressed(cleanup); }
             throw exception;
         }
     }
@@ -590,7 +664,7 @@ public final class MmmmFabricHost implements ModInitializer {
                         : Set.of("undo_registration", "undo_material", "undo_role", "undo_job", "compatibility_interface").contains(kind) ? Set.of("mmmm:provider_inventory") : Set.of("mmmm:world_read");
                 new PlatformAuthority(null).check(paired, context, required, false);
                 if ("compatibility_interface".equals(kind)) {
-                    unavailableCompatibility(paired, context, payload, control, result);
+                    result.complete(inspectCompatibility(paired, context, payload, control, result));
                 } else if ("undo_registration".equals(kind)) {
                     HostDispatcher.exactFields(payload, Set.of("kind", "bindingId", "sourceActionId"));
                     result.complete(runtime.undoRegistration(HostDispatcher.string(payload, "bindingId"), HostDispatcher.string(payload, "sourceActionId")));
@@ -732,16 +806,18 @@ public final class MmmmFabricHost implements ModInitializer {
         return result.minimalCompletionStage();
     }
 
-    /** Retained typed profiles do not become providers while the actual source resolver is absent. */
-    private void unavailableCompatibility(HostSession paired, ObjectNode context, ObjectNode payload,
+    /** Source-input and public class metadata cannot make an executable compatibility provider. */
+    private ObjectNode inspectCompatibility(HostSession paired, ObjectNode context, ObjectNode payload,
                                            HostDispatcher.InspectionControl control, CompletableFuture<ObjectNode> response) {
         MinecraftServer currentServer = server; HostRuntime currentRuntime = runtime; long generation = registryGeneration;
         String currentEpoch = epoch; SessionRoute route = sessionRoute(paired); NativeCompatibilityApprovals retained = compatibilityApprovals;
+        NativeCompatibilityMetadataResolver resolver = compatibilityMetadataResolver;
         Runnable checkpoint = () -> {
             control.checkpoint(); requireServerThread(); paired.checkOpen();
             if (response.isDone()) throw new ContractException("CANCELLATION_REQUESTED", "Compatibility inspection ended");
             if (server != currentServer || runtime != currentRuntime || registryGeneration != generation
-                    || !java.util.Objects.equals(epoch, currentEpoch) || sessionRoute(paired) != route || compatibilityApprovals != retained) {
+                    || !java.util.Objects.equals(epoch, currentEpoch) || sessionRoute(paired) != route || compatibilityApprovals != retained
+                    || compatibilityMetadataResolver != resolver) {
                 throw new ContractException("SESSION_EPOCH_MISMATCH", "Compatibility inspection owner or generation changed");
             }
             if (!paired.context(HostDispatcher.string(context, "contextId")).equals(context)) throw new ContractException("STALE_CONTEXT", "Compatibility context differs from its current owner");
@@ -750,8 +826,10 @@ public final class MmmmFabricHost implements ModInitializer {
         try {
             checkpoint.run();
             HostDispatcher.exactFields(payload, Set.of("kind", "approvedProfileRef", "profileDigest"));
-            if (retained != null) retained.inspectUnavailable(payload);
-            throw new ContractException("COMPATIBILITY_SOURCE_UNAVAILABLE", "No actual loaded compatibility source resolver is installed");
+            if (retained == null || resolver == null) throw new ContractException("COMPATIBILITY_SOURCE_UNAVAILABLE", "No current compatibility metadata resolver is installed");
+            ObjectNode observed = resolver.inScope(checkpoint,
+                    () -> retained.inspect(currentRuntime, environment(), Long.toString(generation), payload));
+            checkpoint.run(); return observed;
         } catch (RuntimeException failure) {
             try { checkpoint.run(); } catch (RuntimeException current) { if (current != failure) failure.addSuppressed(current); }
             throw failure;
@@ -1238,15 +1316,18 @@ public final class MmmmFabricHost implements ModInitializer {
         final List<HostSession> owners; final List<SessionRoute> retired;
         final PairedLoopbackServer oldEndpoint; final HostRuntime oldRuntime; final HostSession oldSession;
         final NativeCompatibilityApprovals oldCompatibility;
+        final NativeCompatibilityMetadataResolver oldMetadata;
         synchronized (routes) {
             owners = List.copyOf(routes.keySet()); retired = List.copyOf(routes.values());
             oldEndpoint = endpoint; oldRuntime = runtime; oldSession = session;
             oldCompatibility = compatibilityApprovals; compatibilityApprovals = null;
+            oldMetadata = compatibilityMetadataResolver; compatibilityMetadataResolver = null;
             owners.forEach(HostSession::close); if (oldSession != null) oldSession.close();
             routes.clear(); routeOrder.clear(); nativeHistory.clear(); nativeHistoryCount = 0; nativeHistoryBytes = 0;
             invocationRoutes.clear(); installedSources = Map.of(); installedActions = Set.of(); installedContexts = List.of();
             endpoint = null; runtime = null; session = null;
         }
+        if (oldMetadata != null) oldMetadata.close();
         if (oldCompatibility != null) oldCompatibility.close();
         retired.forEach(route -> route.endpoint().close());
         if (oldEndpoint != null) oldEndpoint.close();

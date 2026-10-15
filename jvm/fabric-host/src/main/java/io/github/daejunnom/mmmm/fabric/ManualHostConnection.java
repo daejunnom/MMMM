@@ -111,24 +111,40 @@ final class ManualHostConnection {
     }
 
     private void connect(UUID playerId) {
+        long connectStarted = System.nanoTime();
         byte[] raw = new byte[32]; new SecureRandom().nextBytes(raw);
         AtomicBoolean cancelled = new AtomicBoolean();
+        Runnable pairingControl = () -> {
+            if (cancelled.get()) throw new ContractException("HOST_PAIRING_CANCELLED", "Original pairing generation was cancelled");
+            if (System.nanoTime() - connectStarted >= java.util.concurrent.TimeUnit.SECONDS.toNanos(30)) {
+                cancelled.set(true); throw new ContractException("HOST_PAIRING_TIMEOUT", "Original pairing lifetime expired");
+            }
+        };
         java.util.concurrent.atomic.AtomicReference<String> installedEpoch = new java.util.concurrent.atomic.AtomicReference<>();
         java.util.concurrent.atomic.AtomicReference<Set<String>> installedContexts = new java.util.concurrent.atomic.AtomicReference<>(Set.of());
         try {
+            pairingControl.run();
             HostSetup setup = HostSetup.read(contracts, FabricLoader.getInstance().getGameDir().resolve("config/mmmm-host.json"));
-            ObjectNode offer = host.gameTask(() -> host.pairingOffer(playerId, setup)).toCompletableFuture()
-                    .orTimeout(10, java.util.concurrent.TimeUnit.SECONDS).join();
+            pairingControl.run();
+            long offerRemaining = java.util.concurrent.TimeUnit.SECONDS.toNanos(30) - (System.nanoTime() - connectStarted);
+            pairingControl.run();
+            ObjectNode offer = host.gameTask(() -> {
+                pairingControl.run(); ObjectNode offered = host.pairingOffer(playerId, setup); pairingControl.run(); return offered;
+            }).toCompletableFuture().orTimeout(Math.min(java.util.concurrent.TimeUnit.SECONDS.toNanos(10), offerRemaining),
+                    java.util.concurrent.TimeUnit.NANOSECONDS).join();
+            pairingControl.run();
             ObjectNode completed = AnonymousBridge.exchange(setup.executable(), setup.executableSha256(), offer, raw, (authority, capability) -> {
+                    pairingControl.run();
                     String expectedCapabilityDigest = ContractJson.sha256(capability);
                     return host.gameTask(() -> {
-                        if (cancelled.get()) throw new ContractException("HOST_PAIRING_CANCELLED", "Pairing generation was cancelled");
+                        pairingControl.run();
                         byte[] privateCapability = capability.clone();
                         if (!expectedCapabilityDigest.equals(ContractJson.sha256(privateCapability))) {
                             Arrays.fill(privateCapability, (byte) 0); throw new ContractException("HOST_PAIRING_CANCELLED", "Pairing capability lifetime ended before installation");
                         }
                         try {
                         var compatibilityApprovals = validateAuthority(offer, setup, authority);
+                        pairingControl.run();
                         var player = host.pairedCandidate(playerId);
                         if (player == null || player.createCommandSourceStack().getPermissionContext().permissionLevel() != PermissionLevel.ADMINS) {
                             throw new ContractException("PERMISSION_DENIED", "Actual paired player administrator permission ended");
@@ -143,21 +159,25 @@ final class ManualHostConnection {
                         String endpoint;
                         if (cancelled.get()) { Arrays.fill(bearer, (byte) 0); throw new ContractException("HOST_PAIRING_CANCELLED", "Pairing generation ended before listener activation"); }
                         String epoch = offer.path("hostHello").path("environment").path("sessionEpoch").asText(); installedEpoch.set(epoch);
-                        try { endpoint = host.install(playerId, offer.path("principalId").asText(), bearer, permissions, contexts, sources, actions, false, compatibilityApprovals); }
+                        try { endpoint = host.install(playerId, offer.path("principalId").asText(), bearer, permissions, contexts, sources, actions, false, compatibilityApprovals, pairingControl); }
                         catch (java.io.IOException exception) { throw new ContractException("HOST_PAIRING_FAILED", "The paired loopback listener could not be started"); }
                         finally { Arrays.fill(bearer, (byte) 0); }
-                        if (cancelled.get()) { host.revokePairing(epoch); throw new ContractException("HOST_PAIRING_CANCELLED", "Pairing generation ended during listener activation"); }
+                        try { pairingControl.run(); }
+                        catch (RuntimeException failure) { host.revokePairing(epoch); throw failure; }
                         ObjectNode installed = ContractJson.newObject().put("kind", "host_pairing_installed").put("protocolVersion", ContractJson.VERSION)
                                 .put("nonce", offer.path("nonce").asText());
                         var uri = java.net.URI.create(endpoint);
                         installed.putObject("hostEndpoint").put("address", "127.0.0.1:" + uri.getPort()).put("path", "/rpc").put("hostEpoch", epoch);
+                        pairingControl.run();
                         return installed;
                         } finally { Arrays.fill(privateCapability, (byte) 0); }
                     }); });
+            pairingControl.run();
             HostDispatcher.exactFields(completed, Set.of("kind", "protocolVersion", "nonce", "ready", "coordinatorEpoch", "hostEpoch", "contextId"));
             if (!completed.path("hostEpoch").asText().equals(installedEpoch.get())) throw new ContractException("SESSION_EPOCH_MISMATCH", "Pairing completion belongs to another host generation");
             if (!installedContexts.get().contains(completed.path("contextId").asText()) || !completed.path("coordinatorEpoch").isTextual()
                     || !completed.path("coordinatorEpoch").asText().matches("[a-z0-9][a-z0-9._:-]{0,127}")) throw invalid();
+            pairingControl.run();
         } catch (RuntimeException exception) {
             cancelled.set(true); host.revokePairing(installedEpoch.get()); throw exception;
         } finally { Arrays.fill(raw, (byte) 0); }

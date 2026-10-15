@@ -64,6 +64,15 @@ final class NativeCalibrationSourceTest {
         assertEquals(-1, result.path("commands").get(1).path("nativeReturn").intValue());
         assertEquals(COMMANDS.get(1).length(), result.path("commands").get(1).path("consumedUtf16").intValue());
         assertFalse(result.has("verified")); assertFalse(result.has("success")); assertFalse(result.toString().contains("say 😀"));
+        assertEquals("mmmm.native.calibration-run-source/2", result.path("format").asText());
+        // codec fixture는 두 ordinal의 반환 callback 부재를 그대로 보존한다.
+        // 선택한 정상 case의 실제 반환 필수 조건은 Rust 정본 검사가 별도로 확인한다.
+        for (int index = 0; index < COMMANDS.size(); index++) {
+            Inputs nullable = inputs(); ContractJson.object(nullable.response().withArray("commands").get(index)).putNull("nativeReturn");
+            ObjectNode preserved = inspect(nullable, (context, id) -> issued(nullable.response()));
+            assertEquals(nullable.response(), preserved); assertTrue(preserved.withArray("commands").get(index).has("nativeReturn"));
+            assertTrue(preserved.withArray("commands").get(index).get("nativeReturn").isNull());
+        }
     }
 
     @Test void originalReferenceAndContextNumericRepresentationsShareCanonicalIdentity() throws IOException {
@@ -93,6 +102,8 @@ final class NativeCalibrationSourceTest {
         assertThrows(ContractException.class, () -> inspect(unknown, (context, id) -> { lookups.incrementAndGet(); return issued(unknown.response()); })); assertEquals(0, lookups.get());
         Inputs large = inputs(); large.request().withObject("sourceResource").put("mediaType", "x".repeat(1024 * 1024));
         assertThrows(ContractException.class, () -> inspect(large, (context, id) -> issued(large.response())));
+        Inputs legacy = inputs(); legacy.response().put("format", "mmmm.native.calibration-run-source/1");
+        assertThrows(ContractException.class, () -> inspect(legacy, (context, id) -> issued(legacy.response())));
         for (String field : Set.of("callerVerified", "uri")) {
             Inputs inputs = inputs(); inputs.response().put(field, "invented");
             assertThrows(ContractException.class, () -> inspect(inputs, (context, id) -> issued(inputs.response())));
@@ -116,7 +127,7 @@ final class NativeCalibrationSourceTest {
     }
 
     @Test void originalCommandOrderDigestsFullUtf16AndIndexSemanticsAreRequired() throws IOException {
-        for (int kind = 0; kind < 6; kind++) {
+        for (int kind = 0; kind < 11; kind++) {
             Inputs inputs = inputs(); ObjectNode command = first(inputs.response().withArray("commands"));
             switch (kind) {
                 case 0 -> command.put("commandDigest", "f".repeat(64));
@@ -124,7 +135,12 @@ final class NativeCalibrationSourceTest {
                 case 2 -> command.put("nativeReturn", 1.0);
                 case 3 -> inputs.response().put("commandStageIndex", 2);
                 case 4 -> inputs.response().put("preseedEndIndex", 2);
-                default -> inputs.response().put("observedToTick", "6");
+                case 5 -> inputs.response().put("observedToTick", "6");
+                case 6 -> command.remove("nativeReturn");
+                case 7 -> command.put("nativeReturn", (long) Integer.MAX_VALUE + 1);
+                case 8 -> command.put("nativeReturn", (long) Integer.MIN_VALUE - 1);
+                case 9 -> command.put("nativeReturn", "0");
+                default -> inputs.response().withArray("commands").remove(0);
             }
             assertThrows(ContractException.class, () -> inspect(inputs, (context, id) -> issued(inputs.response())));
         }

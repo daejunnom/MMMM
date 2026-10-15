@@ -87,6 +87,10 @@
 
 | MMMM-D055 | Windows의 Rust 검사 빌드 동시 작업은 1개로 고정하고 기존 자원 상한을 유지한다. | 직접 블록 consumer 통합의 로컬 실행 354는 rustc 병렬 컴파일 중 실제 Job commit 2,149,158,912 bytes와 LLVM OOM으로 종료됐다. 원 실패와 drain·export·정리 결과를 보존한 뒤 Cargo `--jobs 1`만 명시한 355가 같은 2 GiB/32 process 상한에서 통과했다. Windows foundation test·Clippy에도 이 빌드 동시 작업 수를 적용한다. 테스트 thread 2개와 독립 OS matrix 병렬화, Linux/macOS Cargo 작업 2개, 기한·출력 및 슬롯 예산은 유지한다. 성공한 단일 실행이 모든 미래 빌드의 메모리 여유를 보장하지 않으므로 원시 자원 관측과 실패를 계속 보존한다. |
 
+| MMMM-D056 | Calibration의 실제 반환 부재를 0과 구분하는 private v2 관측 계약을 사용한다. | 실제 26.3 함수 실행기의 조건 불성립·오류 분기는 명령 시작 뒤 반환 callback 없이 끝날 수 있다. `mmmm.native.calibration-run-source/2`의 `nativeReturn`과 `mmmm.target-case-readback/2`의 `commandReturn`은 필수 nullable Int32이며 누락과 v1은 거절한다. 선택 stage의 두 관측은 null까지 정확히 일치해야 한다. 정본 성공 또는 명시적 기대 반환이 있는 case는 실제 Int32가 필수이고 0·-2 기대값을 유지한다. 반환 부재만으로 skipped·오류·완료를 단정하지 않는다. 원 source·전체 명령·durable operation·독립 수치 상태 검사는 유지하며 공개 저장/wire `0.2.0`과 별도 버전이다. |
+
+| MMMM-D057 | FN19의 실제 public interface metadata와 Java 실행 승인을 타입으로 분리한다. | 보호된 승인에서 실제 Fabric mod의 단일 일반 JAR·버전·loader·CodeSource와 초기화 없는 public static signature를 확인한다. metadata의 class digest는 승인 JAR 입력의 digest이며 loaded/transformed/final definition을 주장하지 않는다. 실제 inventory에는 interface_checked와 incompatible/ready=false를 등록하고 execute·prepare·read는 효과 전에 거절한다. 기존 LoadedClassApproval과 실행 Candidate로의 변환은 없다. 같은 원 기한·취소와 요청 scope 안에서 snapshot/I/O 상한·원 크기 예약·전후 source 검사를 적용한다. 등록 전 용량 초과만 전체 metadata unavailable로 남기며 current/control 오류와 commit 실패는 candidate를 폐기한다. 실제 FN33 실행·게임 인수는 별도다. |
+
 ## 구현 전에 확인할 항목
 
 - 원본 계약과 예제 패키지의 내용, 버전 및 digest.

@@ -225,6 +225,88 @@ final class PublicJavaAdapterTest {
         assertNull(System.getProperty("mmmm.javaadapter.fixture.initialized"));
     }
 
+    @Test void metadataOnlyActualRegistrationCannotInvokePrepareOrReadTheJavaApi() throws Exception {
+        ObjectNode profile = scalarProfile(); profile.withObject("action").put("planning", "pure");
+        ObjectNode environment = example("execution-context.json").withObject("environment").deepCopy();
+        MetadataAuthority metadataAuthority = new MetadataAuthority(artifact.sha256(), loader);
+        try (CompatibilityInterfaceProbe.MetadataProbe probe = metadata(profile, environment, metadataAuthority)) {
+            assertNull(System.getProperty("mmmm.javaadapter.fixture.initialized"));
+            ObjectNode provider = probe.providerDescriptor(); assertEquals("incompatible", provider.path("availability").asText());
+            assertEquals("interface_checked", provider.path("compatibilityEvidence").asText());
+            ObjectNode observed = probe.inspect(provider, environment);
+            assertFalse(observed.path("interface").path("readiness").path("ready").asBoolean());
+            assertEquals(scalarInterfaceDigest(profile), CompatibilityInterfaceProbe.interfaceDigest(observed.withObject("interface")));
+            Capture capture = new Capture();
+            probe.registerUnavailable((descriptor, handler, callbacks) -> { capture.handler = handler; capture.callbacks = callbacks; });
+            FakeContext local = context(); Invocation invocation = metadataInvocation(profile, probe);
+            assertEquals("COMPATIBILITY_EXECUTION_UNAPPROVED", assertThrows(ContractException.class,
+                    () -> capture.handler.execute(invocation, local)).code());
+            assertEquals("COMPATIBILITY_EXECUTION_UNAPPROVED", assertThrows(ContractException.class,
+                    () -> capture.callbacks.prepare().prepare(invocation, local)).code());
+            ObjectNode readWire = ContractJson.newObject().put("contextId", invocation.contextId()).put("bindingId", probe.bindingId())
+                    .put("actionId", invocation.actionId()).put("actionDigest", invocation.actionDigest()); readWire.set("arguments", invocation.arguments());
+            RegisteredActionRead read = new RegisteredActionRead(contracts, readWire);
+            assertEquals("COMPATIBILITY_EXECUTION_UNAPPROVED", assertThrows(ContractException.class,
+                    () -> capture.callbacks.read().read(read, local)).code());
+            assertFalse(local.mutation); assertTrue(local.queue.isEmpty()); assertTrue(local.handles.isEmpty());
+            assertNull(System.getProperty("mmmm.javaadapter.fixture.initialized"));
+            HostQueue queue = new HostQueue(); HostAuthority live = new HostAuthority() {
+                @Override public boolean ready() { return true; }
+                @Override public ObjectNode hello() { return ContractJson.newObject(); }
+                @Override public void check(HostSession session, ObjectNode context, Set<String> permissions, boolean write) { assertFalse(write); }
+                @Override public void checkPreconditions(HostSession session, ObjectNode context, ObjectNode arguments) { fail("Metadata cannot enter mutation"); }
+            };
+            Clock clock = Clock.fixed(Instant.parse("2026-10-13T11:59:00Z"), ZoneOffset.UTC);
+            try (HostRuntime runtime = new HostRuntime(contracts, queue, live, (binding, descriptor) -> assertEquals(probe.bindingId(), binding), clock)) {
+                runtime.registerProvider(probe.registrationDescriptor());
+                probe.registerUnavailable((descriptor, handler, callbacks) -> runtime.register(probe.bindingId(), descriptor, handler, callbacks));
+                ObjectNode registered = ContractJson.object(runtime.inventory().path("providers").get(0));
+                assertEquals(provider, registered); assertFalse(probe.inspect(registered, environment).path("interface").path("readiness").path("ready").asBoolean());
+                HostSession session = new HostSession("principal-fixture", "epoch-fixture-01", "game-fixture-01", "server", UUID.randomUUID(), Set.of("diagnostic.read"), false);
+                session.installContext(contracts, example("execution-context.json"));
+                var pending = runtime.dispatch(session, invocation); queue.drain(); ProviderResult failed = pending.toCompletableFuture().join();
+                assertEquals("failed", failed.status()); assertEquals("none", failed.effects());
+                assertEquals("COMPATIBILITY_EXECUTION_UNAPPROVED", failed.wire().path("diagnostics").path(0).path("code").asText());
+                assertNull(System.getProperty("mmmm.javaadapter.fixture.initialized"));
+            }
+        }
+    }
+
+    @Test void metadataProfilePinsAndOriginalCancellationNeverBecomeInterfaceSuccess() throws Exception {
+        ObjectNode profile = scalarProfile(); ObjectNode environment = example("execution-context.json").withObject("environment").deepCopy();
+        MetadataAuthority metadataAuthority = new MetadataAuthority(artifact.sha256(), loader);
+        assertEquals("PROFILE_UNAPPROVED", assertThrows(ContractException.class, () -> CompatibilityInterfaceProbe.inspectMetadata(contracts,
+                ContractJson.bytes(profile), ContractJson.digest(profile), "approved-fixture", "0".repeat(64), artifact, loader, TARGET, metadataAuthority, environment)).code());
+        try (CompatibilityInterfaceProbe.MetadataProbe probe = metadata(profile, environment, metadataAuthority)) {
+            metadataAuthority.enabled = false;
+            assertEquals("PROFILE_UNAPPROVED", assertThrows(ContractException.class, () -> probe.inspect(probe.providerDescriptor(), environment)).code());
+            metadataAuthority.enabled = true; metadataAuthority.cancelled = true;
+            assertEquals("CANCELLATION_REQUESTED", assertThrows(ContractException.class, () -> probe.inspect(probe.providerDescriptor(), environment)).code());
+        }
+        assertNull(System.getProperty("mmmm.javaadapter.fixture.initialized"));
+    }
+
+    @Test void inheritedPublicStaticMetadataCannotClaimAnExactDeclaringOwner() throws Exception {
+        // Existing receiver-returning methods are rejected by the scalar gate before declaring-owner lookup.
+        ObjectNode profile = scalarProfile(); ObjectNode binding = profile.withObject("binding");
+        binding.put("ownerClass", "org.mmmm.fixture.ReceiverApi$Child").put("methodName", "inheritedScalar");
+        binding.putArray("parameterTypes"); binding.putArray("arguments");
+        ObjectNode environment = example("execution-context.json").withObject("environment").deepCopy();
+        assertEquals("INTERFACE_MISMATCH", assertThrows(ContractException.class,
+                () -> metadata(profile, environment, new MetadataAuthority(artifact.sha256(), loader))).code());
+        assertNull(System.getProperty("mmmm.javaadapter.fixture.initialized"));
+    }
+
+    @Test void missingPublicStaticMetadataPreservesTheActualLookupFailureWithoutInitialization() throws Exception {
+        ObjectNode profile = scalarProfile(); profile.withObject("binding").put("methodName", "missingStaticMethod");
+        ObjectNode environment = example("execution-context.json").withObject("environment").deepCopy();
+        ContractException observed = assertThrows(ContractException.class,
+                () -> metadata(profile, environment, new MetadataAuthority(artifact.sha256(), loader)));
+        assertEquals("INTERFACE_MISMATCH", observed.code()); assertEquals(1, observed.getSuppressed().length);
+        assertTrue(observed.getSuppressed()[0] instanceof NoSuchMethodException);
+        assertNull(System.getProperty("mmmm.javaadapter.fixture.initialized"));
+    }
+
     @Test void unsupportedParameterAndUnregisteredReceiverNeverInitializeOrConstruct() throws Exception {
         ObjectNode unsupported = profile(); ObjectNode binding = unsupported.withObject("binding").put("methodName", "rejectsThread");
         binding.putArray("parameterTypes").add("java.lang.Thread");
@@ -399,6 +481,17 @@ final class PublicJavaAdapterTest {
         value.set("arguments", arguments); value.put("argumentsDigest", ContractJson.digest(arguments));
         return new Invocation(contracts, value);
     }
+    private CompatibilityInterfaceProbe.MetadataProbe metadata(ObjectNode profile, ObjectNode environment, MetadataAuthority metadataAuthority) {
+        return CompatibilityInterfaceProbe.inspectMetadata(contracts, ContractJson.bytes(profile), ContractJson.digest(profile), "approved-fixture",
+                scalarInterfaceDigest(profile), artifact, loader, TARGET, metadataAuthority, environment);
+    }
+    private Invocation metadataInvocation(ObjectNode profile, CompatibilityInterfaceProbe.MetadataProbe probe) throws IOException {
+        ObjectNode wire = example("invocation.json"); ObjectNode action = ContractJson.object(profile.get("action"));
+        wire.put("bindingId", probe.bindingId()).put("actionId", action.path("actionId").asText())
+                .put("actionDigest", ContractJson.digest(action)).put("implementationDigest", artifact.sha256());
+        ObjectNode arguments = ContractJson.newObject().put("left", 17).put("right", 25);
+        wire.set("arguments", arguments); wire.put("argumentsDigest", ContractJson.digest(arguments)); return new Invocation(contracts, wire);
+    }
     private static ObjectNode example(String name) throws IOException {
         Path root = Path.of(System.getProperty("mmmm.checkout"));
         return ContractJson.object(ContractJson.parse(Files.readAllBytes(root.resolve("examples").resolve(name))));
@@ -436,6 +529,25 @@ final class PublicJavaAdapterTest {
         @Override public void checkInterface(ObjectNode support, ApprovedArtifact.ClassObservation actual) { assertEquals(source, actual.jarSha256()); }
         @Override public void checkCurrent(String profile, String artifact, Class<?> actual) {
             if (!enabled || !source.equals(artifact)) throw new ContractException("PROFILE_UNAPPROVED", "Fixture policy revoked the source");
+        }
+    }
+    private static final class MetadataAuthority implements CompatibilityInterfaceProbe.MetadataApproval {
+        private final String source; private final ClassLoader loader; private boolean enabled = true; private boolean cancelled;
+        private MetadataAuthority(String source, ClassLoader loader) { this.source = source; this.loader = loader; }
+        @Override public void checkProfile(ObjectNode profile, String profileDigest, String artifactDigest, PublicJavaAdapter.RuntimeTarget target) {
+            checkCurrent(profileDigest, artifactDigest, null); assertEquals(ContractJson.digest(profile), profileDigest); assertEquals(TARGET, target);
+        }
+        @Override public void checkInterface(ObjectNode support, ApprovedArtifact.ClassMetadata actual) {
+            checkCurrent("metadata", actual.jarSha256(), actual.actualClass()); assertEquals(64, actual.sourceClassDigest().length());
+            assertTrue(support.path("publicLookupChecked").asBoolean()); assertFalse(support.path("initializationPerformed").asBoolean());
+        }
+        @Override public void checkCurrent(String profileDigest, String artifactDigest, Class<?> actual) {
+            checkpoint();
+            if (!enabled || !source.equals(artifactDigest)) throw new ContractException("PROFILE_UNAPPROVED", "Fixture metadata scope was revoked");
+            if (actual != null) assertEquals(loader, actual.getClassLoader());
+        }
+        @Override public void checkpoint() {
+            if (cancelled) throw new ContractException("CANCELLATION_REQUESTED", "Original fixture metadata request was cancelled");
         }
     }
     private static final class FakeContext implements LocalContext {

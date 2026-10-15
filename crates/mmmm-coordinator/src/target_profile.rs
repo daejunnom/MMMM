@@ -796,7 +796,7 @@ impl RegisteredTargetProfiles {
                 "observedAt",
             ],
         )?;
-        if payload["format"] != "mmmm.native.calibration-run-source/1"
+        if payload["format"] != "mmmm.native.calibration-run-source/2"
             || payload["protocolVersion"] != "0.2.0"
             || payload["environment"] != rpc.context["environment"]
             || payload["contextId"] != rpc.context["contextId"]
@@ -844,7 +844,7 @@ impl RegisteredTargetProfiles {
             {
                 return Err(unverified());
             }
-            integer(&receipt["nativeReturn"])?;
+            required_nullable_integer(receipt.get("nativeReturn"))?;
             for category in ["parserSources", "handlerSources"] {
                 let sources = receipt[category].as_array().ok_or_else(unverified)?;
                 if sources.is_empty() || sources.len() > 64 {
@@ -1156,11 +1156,18 @@ struct NumericReadback {
     invocation_id: InvocationId,
     runtime_source_facts_digest: Sha256Digest,
     command_success: bool,
-    command_return: Int32,
+    #[serde(deserialize_with = "deserialize_required_nullable_int32")]
+    command_return: Option<Int32>,
     ok_score: Int32,
     output: TypedScalar,
     scratch_present: bool,
     stale_output_seeded: bool,
+}
+fn deserialize_required_nullable_int32<'de, D>(deserializer: D) -> Result<Option<Int32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Int32>::deserialize(deserializer)
 }
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -1471,7 +1478,7 @@ fn verify_durable_case(
     }
     let readback: NumericReadback =
         serde_json::from_value(observation).map_err(|_| unverified())?;
-    if readback.format != "mmmm.target-case-readback/1"
+    if readback.format != "mmmm.target-case-readback/2"
         || readback.case_id != case.case_id
         || readback.source_resource != expected.source.resource
         || readback.command_stage_index != expected.program.command_stage_index()
@@ -1485,7 +1492,7 @@ fn verify_durable_case(
     Ok(DurableCaseWitness {
         invocation_digest,
         readback_source_digest,
-        selected_native_return: Some(readback.command_return.get()),
+        selected_native_return: readback.command_return.map(Int32::get),
     })
 }
 
@@ -1495,14 +1502,18 @@ fn validate_numeric_readback(readback: &NumericReadback) -> AppResult<()> {
     let expected = program.expectation();
     let output: TypedScalar = serde_json::from_value(program.expected_readback()["output"].clone())
         .map_err(|_| unverified())?;
-    if readback.command_success != expected.command_success
+    let command_return = readback.command_return.map(Int32::get);
+    if readback.format != "mmmm.target-case-readback/2"
+        || readback.command_success != expected.command_success
         || readback.ok_score.get() != expected.ok_score
         || readback.output != output
         || readback.scratch_present != expected.scratch_present
         || !readback.stale_output_seeded
+        || ((expected.command_success || expected.command_return.is_some())
+            && command_return.is_none())
         || expected
             .command_return
-            .is_some_and(|value| readback.command_return.get() != value)
+            .is_some_and(|value| command_return != Some(value))
     {
         return Err(unverified());
     }
@@ -1515,8 +1526,8 @@ fn verify_issued_command_return(
     independent_return: Option<i32>,
 ) -> AppResult<()> {
     let selected = observed.get(stage as usize).ok_or_else(unverified)?;
-    let actual = integer(&selected["nativeReturn"])?;
-    if independent_return.is_some_and(|value| actual != value) {
+    let actual = required_nullable_integer(selected.get("nativeReturn"))?;
+    if actual != independent_return {
         return Err(error(
             "TARGET_RUNTIME_EVIDENCE_CONFLICT",
             "Actual issued command return contradicts its independent retained readback",
@@ -1989,6 +2000,13 @@ fn integer(value: &Value) -> AppResult<i32> {
     serde_json::from_value::<Int32>(value.clone())
         .map(Int32::get)
         .map_err(|_| unverified())
+}
+fn required_nullable_integer(value: Option<&Value>) -> AppResult<Option<i32>> {
+    match value {
+        Some(Value::Null) => Ok(None),
+        Some(value) => integer(value).map(Some),
+        None => Err(unverified()),
+    }
 }
 fn format_pair(value: &Value) -> AppResult<[u32; 2]> {
     let values: [Int32; 2] = serde_json::from_value(value.clone()).map_err(|_| unverified())?;
