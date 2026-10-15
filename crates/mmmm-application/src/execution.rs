@@ -11,6 +11,32 @@ use mmmm_runtime::storage::{
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
+/// Both original failures survive without retaining a Store, invocation or
+/// authority. Public error code/message continue to describe the intent failure.
+pub(crate) struct IntentDiagnosticFailure {
+    pub(crate) primary: AppError,
+    pub(crate) diagnostic: AppError,
+}
+impl std::fmt::Debug for IntentDiagnosticFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IntentDiagnosticFailure")
+            .field("primary_code", &self.primary.code)
+            .field("diagnostic_code", &self.diagnostic.code)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for IntentDiagnosticFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Dispatch intent and diagnostic retention both failed")
+    }
+}
+impl std::error::Error for IntentDiagnosticFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
+    }
+}
+
 impl Application<'_> {
     pub fn plan_apply(&mut self, principal: &PrincipalId, input: &Value) -> AppResult<Value> {
         self.plan_apply_with_undo(principal, input, None)
@@ -301,13 +327,24 @@ impl Application<'_> {
                     resolution_witness.as_ref(),
                 )
             };
-            if let Err(e) = intent {
-                self.note(
-                    operation,
-                    "DISPATCH_REJECTED",
-                    "Durable runtime rejected a new dispatch intent",
-                )?;
-                return Err(e);
+            if let Err(primary) = intent {
+                return Err(
+                    match self.note(
+                        operation,
+                        "DISPATCH_REJECTED",
+                        "Durable runtime rejected a new dispatch intent",
+                    ) {
+                        Ok(()) => primary,
+                        Err(diagnostic) => AppError::caused_by(
+                            primary.code,
+                            primary.message,
+                            IntentDiagnosticFailure {
+                                primary,
+                                diagnostic,
+                            },
+                        ),
+                    },
+                );
             }
             match self.provider.dispatch_with_store(self.store, &invocation) {
                 Ok(response) => {

@@ -6,6 +6,67 @@ use super::*;
 use crate::undo_context::{UndoContextPort, UndoExecutionContext};
 use crate::undo_provider::{InspectedUndoRoles, UndoActionRole, UndoExecutionPort};
 use mmmm_runtime::storage::undo::RegisteredUndoRoute;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+const NOTE_FAILURE_MARKER: &[u8] = b"mmmm-application-note-failure\n";
+
+fn checked_note_failure_incoming(store: &DurableStore, expected_root: &Path) -> PathBuf {
+    assert!(
+        store.data_root() == expected_root,
+        "Fault belongs to this exact fixture Store"
+    );
+    assert!(
+        owned_plain_tree(expected_root, expected_root),
+        "Fault root must remain owned and link-free"
+    );
+    assert!(
+        fs::read(expected_root.join("test-owner.txt"))
+            .unwrap()
+            .as_slice()
+            == ROOT_MARKER,
+        "Only the existing marked test fixture may receive this fault"
+    );
+    expected_root.join("blobs").join("incoming")
+}
+
+fn block_note_incoming(store: &DurableStore, expected_root: &Path) {
+    let incoming = checked_note_failure_incoming(store, expected_root);
+    assert!(fs::symlink_metadata(&incoming).unwrap().is_dir());
+    assert!(fs::read_dir(&incoming).unwrap().next().is_none());
+    // This nonrecursive removal refuses any retained staging file. CreateNew
+    // cannot overwrite an unexpected replacement. Only the test-owned empty
+    // incoming entry changes; existing CAS content and SQLite remain intact.
+    fs::remove_dir(&incoming).unwrap();
+    let mut blocker = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&incoming)
+        .unwrap();
+    std::io::Write::write_all(&mut blocker, NOTE_FAILURE_MARKER).unwrap();
+}
+
+fn restore_note_incoming(store: &DurableStore, expected_root: &Path) {
+    let incoming = checked_note_failure_incoming(store, expected_root);
+    assert!(fs::symlink_metadata(&incoming).unwrap().is_file());
+    assert!(fs::read(&incoming).unwrap().as_slice() == NOTE_FAILURE_MARKER);
+    fs::remove_file(&incoming).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(&incoming).unwrap();
+    }
+    #[cfg(not(unix))]
+    fs::create_dir(&incoming).unwrap();
+    assert!(owned_plain_tree(expected_root, expected_root));
+    assert!(fs::read_dir(&incoming).unwrap().next().is_none());
+    // The test restores this exact entry before inspecting its journal. If an
+    // assertion panics earlier, existing Fixture field order closes SQLite
+    // before TestRoot Drop removes its marked plain tree and ordinary blocker.
+    // This fixture cleanup is not product rollback or permission to retry.
+}
 
 struct SealedBundleRpc {
     authenticated: TestUndoRpc,
@@ -127,6 +188,8 @@ struct BundleHostState {
     recover_observations: Cell<usize>,
     intent_calls: Cell<usize>,
     reject_intent: Cell<bool>,
+    reject_note: Cell<bool>,
+    note_failure_root: PathBuf,
     intent_operation: RefCell<Option<OperationId>>,
 }
 impl BundleHostState {
@@ -386,6 +449,9 @@ impl ProviderPort for BundleProvider<'_> {
         self.host.intent_calls.set(self.host.intent_calls.get() + 1);
         *self.host.intent_operation.borrow_mut() = Some(original_operation.clone());
         if self.host.reject_intent.get() {
+            if self.host.reject_note.get() {
+                block_note_incoming(store, &self.host.note_failure_root);
+            }
             return Err(AppError::storage(
                 "DISPATCH_REJECTED",
                 StorageError::Conflict("Fixture protected dispatch claim rejected"),
@@ -625,6 +691,8 @@ impl BundleFixture {
             recover_observations: Cell::new(0),
             intent_calls: Cell::new(0),
             reject_intent: Cell::new(false),
+            reject_note: Cell::new(false),
+            note_failure_root: fixture.root.0.clone(),
             intent_operation: RefCell::new(None),
         }));
         Self {
@@ -836,6 +904,64 @@ fn common_undo_ordinary_external_write_needs_no_game_role_or_rpc() {
     assert!(
         rejected
             .fixture
+            .store
+            .stored_invocation(&operation, &record.steps[0].step_id)
+            .is_err()
+    );
+
+    // Reuse this owned SQLite/CAS fixture and fail the actual note staging I/O
+    // only after the original intent has been rejected. No production fault port
+    // or second dispatch is introduced.
+    let mut both = BundleFixture::new(false, false);
+    let both_plan = both.plan();
+    both.approve(&both_plan);
+    both.host.0.reject_intent.set(true);
+    both.host.0.reject_note.set(true);
+    let result = both.apply(&both_plan, "bundle-intent-and-note-rejected");
+    restore_note_incoming(&both.fixture.store, &both.fixture.root.0);
+    let error = result.unwrap_err();
+    assert_eq!(error.code, "DISPATCH_REJECTED");
+    assert_eq!(
+        error.message,
+        "Durable state could not satisfy the requested operation"
+    );
+    let failures = std::error::Error::source(&error)
+        .unwrap()
+        .downcast_ref::<crate::execution::IntentDiagnosticFailure>()
+        .unwrap();
+    assert_eq!(failures.primary.code, error.code);
+    assert_eq!(failures.primary.message, error.message);
+    assert!(matches!(
+        std::error::Error::source(&failures.primary)
+            .unwrap()
+            .downcast_ref::<StorageError>(),
+        Some(StorageError::Conflict(
+            "Fixture protected dispatch claim rejected"
+        ))
+    ));
+    assert!(std::ptr::eq(
+        std::error::Error::source(failures)
+            .unwrap()
+            .downcast_ref::<AppError>()
+            .unwrap(),
+        &failures.primary,
+    ));
+    assert_eq!(failures.diagnostic.code, "OUTCOME_UNKNOWN");
+    assert!(matches!(
+        std::error::Error::source(&failures.diagnostic)
+            .unwrap()
+            .downcast_ref::<StorageError>(),
+        Some(StorageError::Io(_))
+    ));
+    assert_eq!(both.host.0.intent_calls.get(), 1);
+    assert_eq!(both.fixture.target.borrow().dispatches, 0);
+    assert_eq!(both.fixture.target.borrow().targets[TARGET], b"before");
+    let operation = both.host.0.intent_operation.borrow().clone().unwrap();
+    let record = both.fixture.store.operation(&operation).unwrap();
+    assert_eq!(record.steps[0].dispatch, DispatchEvidence::NotSent);
+    assert!(record.steps[0].invocation_id.is_none());
+    assert!(
+        both.fixture
             .store
             .stored_invocation(&operation, &record.steps[0].step_id)
             .is_err()

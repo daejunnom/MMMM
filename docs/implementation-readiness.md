@@ -1407,14 +1407,26 @@ test EXE가 실행됐으며 WSL/Ubuntu로 전환하지 않았다.
 Clippy는 exit 0이었다. 동등 표현식 정리와 format 결과로 기존 테스트를 재실행한
 것처럼 기록하지 않으며 현재 source의 전체 CI는 별도로 확인한다.
 
-기존 Application은 intent 실패 뒤 진단 note 저장도 실패하면 원 intent 오류보다 note
-오류를 반환하는 한계가 있다. 이번 hook의 신규 회귀와 구분하지만, 실제 calibration
-production 연결에서 두 실패를 함께 보존하도록 후속 보완한다. 실제 게임 runner와
-issuer/readback·최초 target profile·클라이언트 및 공개 배포 인수는 미완료다.
+Application의 기존 intent 오류 뒤 진단 note 저장도 실패하면 원 오류가 대체되던 경계는
+원 intent의 code/message와 두 typed cause를 보존하도록 보완했다. note 성공 때는 원
+AppError를 그대로 반환한다. 기존 외부 SQLite/CAS fixture의 정확한 소유 및 plain-tree
+경계를 검사하고, 비어 있는 incoming 하나에만 CreateNew blocker를 두어 실제 진단 I/O
+실패와 원복을 검사했다. 새 fixture·의존성·dispatch·재시도 권한은 추가하지 않았다.
+Windows 관리 실행 `404` format 및 `405`의 Application 56개 unit test가 통과했으며,
+동일 실행의 두 package 명령은 exit 0이었다. 원 2 GiB/32 process 상한, Job drain·완전한
+출력·export·scratch 정리·lease 반환을 확인했다. 실제 게임 runner와 issuer/readback·최초
+target profile·클라이언트 및 공개 배포 인수는 미완료다.
+같은 Application package의 all-target strict Clippy `406`도 exit 0이며 정상 정리를 확인했다.
 
 공유 `6b60643`의 Rust CI 63 (`38764462975`)은 세 OS tests·strict Clippy와 집계 성공을
 관측했고 원 ZIP 3개를 별도 보존했다. 앞서 감사한 JVM CI 54와 함께 이전 고정 source의
 검증이며, 위 미커밋 calibration 연결의 성공으로 확대하지 않는다.
+
+공유 `5d0409b`의 Rust CI 64 (`38777543185`)와 JVM CI 55 (`38777543213`)는 세 OS의
+각 실제 작업과 집계 작업이 모두 성공한 것을 별도로 조회했다. 해당 결과는 고정된
+Runtime claim·Application hook source의 CI 결과다. 이후 미커밋 Coordinator·Java 승인
+연결이나 위 진단 오류 보존 보완의 CI 성공으로 재사용하지 않는다. 이 두 실행의 원 ZIP
+감사는 아직 수행하지 않았다.
 
 ## 첫 공개 배포 인수
 
