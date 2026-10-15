@@ -115,7 +115,7 @@ public final class DefinitionObserverBridge {
             this.observation = observation; this.definingLoader = definingLoader;
         }
         public Class<?> actualClass() { return observation.actualClass(); }
-        /** Actual loader object; ordinary frame loader zero is not bootstrap evidence. */
+        /** Actual loader object; a decoded numeric loader ID alone cannot issue this view. */
         public ClassLoader definingLoader() { return definingLoader; }
         public ObservedDefinition observation() { return observation; }
         public SourceInputRole sourceInputRole() {

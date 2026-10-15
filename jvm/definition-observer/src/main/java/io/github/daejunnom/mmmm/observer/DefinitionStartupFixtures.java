@@ -65,7 +65,7 @@ public final class DefinitionStartupFixtures {
         var ordinaryObservation = ordinaryExecutable.observation();
         requireObservation(ordinaryObservation, ordinary, false);
         if (ordinaryExecutable.definingLoader() != ordinary.getClassLoader()
-                || ordinaryExecutable.definingLoader() == null || ordinaryObservation.definingLoaderIdentity() != 0
+                || ordinaryExecutable.definingLoader() == null || ordinaryObservation.definingLoaderIdentity() == 0
                 || ordinaryExecutable.sourceInputRole() != DefinitionObserverBridge.SourceInputRole.ORDINARY_HOOK_INPUT) {
             throw unavailable("ORDINARY_ACTUAL_LOADER_UNAVAILABLE");
         }

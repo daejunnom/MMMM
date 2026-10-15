@@ -1231,6 +1231,17 @@ drain·완전한 출력·export·scratch 정리·lease 해제를 확인했다. �
 검사를 실행했으며 새 코드로 부모 관리 도구를 교체했다고 기록하지 않는다. 실제
 CI의 native 5 경합 회복과 OS별 새 소스 검증은 아직 별도 결과가 필요하다.
 
+`ffb9b1b`의 JVM CI 49 (`38757755437`)는 세 OS의 378개 JVM 테스트가 성공했지만
+native observer 단계와 집계는 실패했다. 실제 ZIP 3개에서 native build와 ABI witness는
+성공했고, startup의 공통 Java 원인은 `ORDINARY_ACTUAL_LOADER_UNAVAILABLE`였다.
+새 fixture가 nonbootstrap `ProbeLoader`의 실제 loader ID에 0을 요구한 잘못된 비교다.
+현재 Rust producer는 이미 일반·hidden 모두 실제 `record.loader_id`를 기록하고 실제
+bootstrap loader만 0으로 식별한다. fixture에서 nonbootstrap ID 0을 거절하도록
+비교를 교정하며 실제 ClassLoader 객체 일치·non-null·source 역할 및 현재성 검사는
+유지한다. Mac/Linux signal 6과 Windows exit 1 및 정상 drain·출력·export·scratch·
+lease 결과를 보존한다. before/after native status 숫자는 이 실패에서 관측되지 않았고
+만들어 채우지 않는다. 후속 실제 startup 성공은 별도 확인한다.
+
 고정 `b854b617846036bcb09058ca7da3eed303a1e680`의 Rust CI 50
 (`38698720838`)과 JVM CI 41 (`38698720798`)은 세 OS 및 집계가 모두 성공했다.
 실제 ZIP 6개를 별도 보존하여 크기·SHA와 source/expected/PR head, 별도 event SHA
