@@ -6,9 +6,9 @@
 
 use crate::credential::SecretToken;
 use mmmm_contracts::{
-    ContextId, ContractValidator, JsonLimits, PrincipalId, ProjectId, RequestId, ResourceLocation,
-    SessionEpoch, Sha256Digest, SourceId, canonical_digest, parse_json_with_limits,
-    verify_projected_digest,
+    ContextId, ContractValidator, JsonLimits, PlanId, PrincipalId, ProjectId, RequestId,
+    ResourceLocation, SessionEpoch, Sha256Digest, SourceId, canonical_digest,
+    parse_json_with_limits, verify_projected_digest,
 };
 use serde_json::{Map, Value};
 use std::{
@@ -32,6 +32,7 @@ pub const NATIVE_CHUNK_BYTES: usize = 2048;
 pub const BOOTSTRAP_LIMIT: Duration = Duration::from_secs(30);
 pub const NATIVE_IO_LIMIT: Duration = Duration::from_secs(5);
 pub const APPLICATION_REPLY_LIMIT: Duration = Duration::from_secs(10);
+pub(crate) const CALIBRATION_PLAN_PURPOSE: &str = "numeric_calibration_plan_normative47/1";
 const POLL_SLICE: Duration = Duration::from_millis(20);
 const MAX_COMPATIBILITY_APPROVALS: usize = 128;
 const MAX_COMPATIBILITY_PROFILE_BYTES: usize = 65_536;
@@ -129,6 +130,17 @@ impl PublicFrame {
     pub fn kind(&self) -> ManagementKind {
         self.kind
     }
+    pub(crate) fn is_calibration_owner_selection(&self) -> bool {
+        self.value["kind"] == "native_calibration_owner_offer"
+            || self.value["kind"] == "native_calibration_owner_selected"
+    }
+    pub(crate) fn is_calibration_plan(&self) -> bool {
+        self.value["kind"] == "native_calibration_plan_offer"
+            || self.value["kind"] == "native_calibration_plan_prepared"
+    }
+    pub(crate) fn is_native_owner_command(&self) -> bool {
+        self.is_calibration_owner_selection() || self.is_calibration_plan()
+    }
     pub fn nonce(&self) -> &str {
         // validate_public proves this required nonempty stable identity.
         self.value["nonce"].as_str().unwrap_or("")
@@ -210,6 +222,70 @@ fn validate_public(value: &Value) -> Result<ManagementKind, ManagementError> {
     RequestId::new(text(value, "nonce")?).map_err(|_| ManagementError::InvalidFrame)?;
     let validator = ContractValidator::shared().map_err(|_| ManagementError::InvalidFrame)?;
     match text(value, "kind")? {
+        "native_calibration_plan_offer" => {
+            exact(
+                object,
+                &[
+                    "kind",
+                    "protocolVersion",
+                    "nonce",
+                    "purpose",
+                    "dataRoot",
+                    "projectId",
+                    "expectedRevision",
+                    "contextId",
+                ],
+            )?;
+            if text(value, "purpose")? != CALIBRATION_PLAN_PURPOSE {
+                return Err(ManagementError::InvalidFrame);
+            }
+            let root = text(value, "dataRoot")?;
+            if root.len() > 4096
+                || root.chars().any(char::is_control)
+                || !Path::new(root).is_absolute()
+            {
+                return Err(ManagementError::InvalidFrame);
+            }
+            ProjectId::new(text(value, "projectId")?).map_err(|_| ManagementError::InvalidFrame)?;
+            ContextId::new(text(value, "contextId")?).map_err(|_| ManagementError::InvalidFrame)?;
+            digest(text(value, "expectedRevision")?)?;
+            Ok(ManagementKind::Offer)
+        }
+        "native_calibration_plan_prepared" => {
+            exact(
+                object,
+                &[
+                    "kind",
+                    "protocolVersion",
+                    "nonce",
+                    "purpose",
+                    "projectId",
+                    "planId",
+                    "planHash",
+                    "outcome",
+                ],
+            )?;
+            if text(value, "purpose")? != CALIBRATION_PLAN_PURPOSE
+                || !matches!(
+                    text(value, "outcome")?,
+                    "prepared" | "committed_checkpoint_failed"
+                )
+            {
+                return Err(ManagementError::InvalidFrame);
+            }
+            ProjectId::new(text(value, "projectId")?).map_err(|_| ManagementError::InvalidFrame)?;
+            PlanId::new(text(value, "planId")?).map_err(|_| ManagementError::InvalidFrame)?;
+            digest(text(value, "planHash")?)?;
+            Ok(ManagementKind::Authority)
+        }
+        "native_calibration_owner_offer"
+        | "native_calibration_owner_selected"
+        | "host_apply_approval_offer"
+        | "host_apply_approval_authority"
+        | "host_apply_approval_installed"
+        | "host_apply_approval_complete" => {
+            crate::bootstrap::calibration_approval::validate_frame(value, validator)
+        }
         "host_pairing_offer" => {
             exact(
                 object,
@@ -572,6 +648,7 @@ pub struct BootstrapWitness {
     id: RequestId,
     nonce: RequestId,
     offer_digest: Sha256Digest,
+    calibration_plan: bool,
 }
 impl BootstrapWitness {
     pub fn id(&self) -> &RequestId {
@@ -583,23 +660,45 @@ impl BootstrapWitness {
     pub fn offer_digest(&self) -> &Sha256Digest {
         &self.offer_digest
     }
+    pub(crate) fn is_calibration_plan(&self) -> bool {
+        self.calibration_plan
+    }
 }
 
 pub struct HostOffer {
     public: PublicFrame,
-    token: SecretToken,
+    token: Option<SecretToken>,
     witness: BootstrapWitness,
 }
 impl HostOffer {
     pub fn new(public: PublicFrame, token: SecretToken) -> Result<Self, ManagementError> {
-        if public.kind() != ManagementKind::Offer {
+        if public.kind() != ManagementKind::Offer || public.is_native_owner_command() {
             return Err(ManagementError::InvalidFrame);
         }
+        Self::with_token(public, Some(token))
+    }
+    pub(crate) fn owner_selection(public: PublicFrame) -> Result<Self, ManagementError> {
+        if public.kind() != ManagementKind::Offer || !public.is_calibration_owner_selection() {
+            return Err(ManagementError::InvalidFrame);
+        }
+        Self::with_token(public, None)
+    }
+    pub(crate) fn calibration_plan(public: PublicFrame) -> Result<Self, ManagementError> {
+        if public.kind() != ManagementKind::Offer || !public.is_calibration_plan() {
+            return Err(ManagementError::InvalidFrame);
+        }
+        Self::with_token(public, None)
+    }
+    fn with_token(
+        public: PublicFrame,
+        token: Option<SecretToken>,
+    ) -> Result<Self, ManagementError> {
         let witness = BootstrapWitness {
             id: new_request_id()?,
             nonce: RequestId::new(public.nonce()).map_err(|_| ManagementError::InvalidFrame)?,
             offer_digest: canonical_digest(public.value())
                 .map_err(|_| ManagementError::InvalidFrame)?,
+            calibration_plan: public.is_calibration_plan(),
         };
         Ok(Self {
             public,
@@ -635,7 +734,7 @@ impl HostOffer {
     pub fn witness(&self) -> &BootstrapWitness {
         &self.witness
     }
-    pub(crate) fn into_parts(self) -> (PublicFrame, SecretToken, BootstrapWitness) {
+    pub(crate) fn into_parts(self) -> (PublicFrame, Option<SecretToken>, BootstrapWitness) {
         (self.public, self.token, self.witness)
     }
 }
@@ -653,6 +752,7 @@ pub struct CompletedBootstrap {
     witness: BootstrapWitness,
     delivered: bool,
     completed_at: Instant,
+    failure: Option<crate::peer::PeerError>,
 }
 impl CompletedBootstrap {
     pub fn witness(&self) -> &BootstrapWitness {
@@ -665,6 +765,9 @@ impl CompletedBootstrap {
     pub fn completed_at(&self) -> Instant {
         self.completed_at
     }
+    pub(crate) fn failure(&self) -> Option<crate::peer::PeerError> {
+        self.failure
+    }
 }
 impl ManagementRequest {
     pub fn installed(
@@ -676,7 +779,7 @@ impl ManagementRequest {
         }
         Ok(Self::Installed { public, witness })
     }
-    fn witness(&self) -> &BootstrapWitness {
+    pub(crate) fn witness(&self) -> &BootstrapWitness {
         match self {
             Self::Offer(offer) => offer.witness(),
             Self::Installed { witness, .. } => witness,
@@ -907,10 +1010,22 @@ impl ManagementSender {
         delivered: bool,
         budget: &BootstrapBudget,
     ) -> Result<(), ManagementError> {
+        self.notify_finished_with_failure(witness, delivered, budget, None)
+    }
+    pub(crate) fn notify_finished_with_failure(
+        &self,
+        witness: &BootstrapWitness,
+        delivered: bool,
+        budget: &BootstrapBudget,
+        failure: Option<crate::peer::PeerError>,
+    ) -> Result<(), ManagementError> {
         // Native worker calls only after Complete whole-write, terminal ACK
         // read and server disconnect; failed paths carry false after their drain.
         let completed_at = Instant::now();
-        let delivered = delivered && completed_at < budget.deadline() && budget.check().is_ok();
+        let delivered = delivered
+            && failure.is_none()
+            && completed_at < budget.deadline()
+            && budget.check().is_ok();
         if !delivered {
             budget.cancel();
         }
@@ -925,6 +1040,7 @@ impl ManagementSender {
             witness: witness.clone(),
             delivered,
             completed_at,
+            failure,
         });
         match self.0.try_send(ManagementEnvelope {
             request,
@@ -959,6 +1075,97 @@ impl ManagementReceiver {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn calibration_owner_selection_has_closed_locator_grammar_and_no_host_token() {
+        let planning = json!({"kind":"native_calibration_plan_offer","protocolVersion":"0.2.0","nonce":"plan-calibration",
+            "purpose":CALIBRATION_PLAN_PURPOSE,"dataRoot":std::env::temp_dir(),"projectId":"project-fixture",
+            "expectedRevision":"a".repeat(64),"contextId":"context-fixture"});
+        let plan_offer =
+            HostOffer::calibration_plan(PublicFrame::from_value(planning.clone()).unwrap())
+                .unwrap();
+        assert!(plan_offer.into_parts().1.is_none());
+        assert!(
+            HostOffer::new(
+                PublicFrame::from_value(planning.clone()).unwrap(),
+                SecretToken::generate().unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            HostOffer::owner_selection(PublicFrame::from_value(planning.clone()).unwrap()).is_err()
+        );
+        for field in [
+            "principalId",
+            "admin",
+            "plan",
+            "recipe",
+            "sources",
+            "expectedValues",
+            "verifiedWriteProfile",
+        ] {
+            let mut forged = planning.clone();
+            forged[field] = json!(true);
+            assert!(PublicFrame::from_value(forged).is_err());
+        }
+        for (field, replacement) in [
+            ("purpose", json!("world_write")),
+            ("expectedRevision", json!("A".repeat(64))),
+            ("dataRoot", json!("relative")),
+            ("contextId", json!("")),
+            ("protocolVersion", json!("0.1.0")),
+        ] {
+            let mut forged = planning.clone();
+            forged[field] = replacement;
+            assert!(PublicFrame::from_value(forged).is_err());
+        }
+        let mut prepared = json!({"kind":"native_calibration_plan_prepared","protocolVersion":"0.2.0","nonce":"plan-calibration",
+            "purpose":CALIBRATION_PLAN_PURPOSE,"projectId":"project-fixture","planId":"plan-fixture","planHash":"b".repeat(64),"outcome":"prepared"});
+        assert!(
+            PublicFrame::from_value(prepared.clone())
+                .unwrap()
+                .is_calibration_plan()
+        );
+        prepared["outcome"] = json!("committed_checkpoint_failed");
+        assert!(PublicFrame::from_value(prepared.clone()).is_ok());
+        prepared["outcome"] = json!("rollback_complete");
+        assert!(PublicFrame::from_value(prepared).is_err());
+        let value = json!({"kind":"native_calibration_owner_offer","protocolVersion":"0.2.0","nonce":"owner-calibration",
+            "purpose":crate::bootstrap::calibration_approval::PURPOSE,"dataRoot":std::env::temp_dir(),
+            "projectId":"project-fixture","planId":"plan-fixture","planHash":"a".repeat(64)});
+        let owner =
+            HostOffer::owner_selection(PublicFrame::from_value(value.clone()).unwrap()).unwrap();
+        assert!(owner.into_parts().1.is_none());
+        assert!(
+            HostOffer::new(
+                PublicFrame::from_value(value.clone()).unwrap(),
+                SecretToken::generate().unwrap()
+            )
+            .is_err()
+        );
+        for field in [
+            "principalId",
+            "admin",
+            "verifiedWriteProfile",
+            "manifest",
+            "capability",
+        ] {
+            let mut forged = value.clone();
+            forged[field] = json!(true);
+            assert!(PublicFrame::from_value(forged).is_err());
+        }
+        let mut wrong = value.clone();
+        wrong["purpose"] = json!("world_write");
+        assert!(PublicFrame::from_value(wrong).is_err());
+        let mut wrong = value.clone();
+        wrong["planHash"] = json!("A".repeat(64));
+        assert!(PublicFrame::from_value(wrong).is_err());
+        let mut wrong = value;
+        wrong["dataRoot"] = json!("relative");
+        assert!(PublicFrame::from_value(wrong).is_err());
+        let duplicate=br#"{"kind":"native_calibration_owner_offer","protocolVersion":"0.2.0","nonce":"one","nonce":"two","purpose":"numeric_calibration_normative47/1","dataRoot":"/tmp","projectId":"project-fixture","planId":"plan-fixture","planHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+        assert!(PublicFrame::decode(duplicate).is_err());
+    }
 
     fn offer(nonce: &str) -> HostOffer {
         let context =

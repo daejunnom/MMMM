@@ -147,6 +147,7 @@ fn handles(store: &mut DurableStore) -> DaemonHandles {
         hosts,
         authority,
         request: RequestContextSlot::default(),
+        calibration: crate::calibration_execution::CalibrationRegistry::default(),
         configured_project: Some(created.project_id),
         workspace: Some(workspace),
     }

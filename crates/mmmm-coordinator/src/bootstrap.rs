@@ -35,6 +35,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "calibration_approval.rs"]
+pub(crate) mod calibration_approval;
+
 const SESSION_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const MAX_PENDING: usize = 8;
 const MAX_REJECTED_COMPLETIONS: usize = 8;
@@ -420,9 +423,26 @@ pub struct HostBootstrapProcessor {
     workspace: BTreeMap<ContextId, OwnerWorkspace>,
     rejected_completions: BTreeMap<RequestId, RejectedPairingCompletion>,
     rejected_encoded_bytes: usize,
+    calibration: calibration_approval::CalibrationApprovals,
 }
 impl HostBootstrapProcessor {
+    /// The native management caller uses the same registered read-map handle
+    /// while entering the existing ApplicationService; this creates no grant.
+    pub(crate) fn calibration_planning_hosts(&self) -> HostBridge {
+        self.hosts.clone()
+    }
     pub fn new(hosts: HostBridge, authority: LocalAuthority) -> Result<Self, ManagementError> {
+        Self::with_calibration_registry(
+            hosts,
+            authority,
+            crate::calibration_execution::CalibrationRegistry::default(),
+        )
+    }
+    pub(crate) fn with_calibration_registry(
+        hosts: HostBridge,
+        authority: LocalAuthority,
+        calibration: crate::calibration_execution::CalibrationRegistry,
+    ) -> Result<Self, ManagementError> {
         Ok(Self {
             owner: local_owner_principal().map_err(|_| ManagementError::InvalidFrame)?,
             hosts,
@@ -432,6 +452,7 @@ impl HostBootstrapProcessor {
             workspace: BTreeMap::new(),
             rejected_completions: BTreeMap::new(),
             rejected_encoded_bytes: 0,
+            calibration: calibration_approval::CalibrationApprovals::with_registry(calibration),
         })
     }
     /// Trusted composition has independently verified this Project's current
@@ -526,7 +547,11 @@ impl HostBootstrapProcessor {
     ) -> Result<Option<PublicFrame>, ManagementError> {
         match request {
             ManagementRequest::Finished(receipt) => {
-                self.finish(receipt)?;
+                if self.has_calibration_witness(receipt.witness()) {
+                    self.finish_calibration(store, receipt)?;
+                } else {
+                    self.finish(receipt)?;
+                }
                 Ok(None)
             }
             ManagementRequest::Offer(offer) => {
@@ -535,18 +560,39 @@ impl HostBootstrapProcessor {
                 if Instant::now() >= reply_deadline {
                     return Err(ManagementError::Deadline);
                 }
-                self.offer(store, offer, budget).map(Some)
+                if matches!(
+                    offer.public().value()["kind"].as_str(),
+                    Some("native_calibration_owner_offer" | "host_apply_approval_offer")
+                ) {
+                    self.calibration_offer(store, offer, budget, reply_deadline)
+                        .map(Some)
+                } else {
+                    self.offer(store, offer, budget).map(Some)
+                }
             }
-            ManagementRequest::Installed { public, witness } => self
-                .installed(
-                    store,
-                    public,
-                    witness,
-                    coordinator_epoch,
-                    budget,
-                    reply_deadline,
-                )
-                .map(Some),
+            ManagementRequest::Installed { public, witness } => {
+                if self.has_calibration_witness(&witness) {
+                    self.install_calibration(
+                        store,
+                        public,
+                        witness,
+                        coordinator_epoch,
+                        budget,
+                        reply_deadline,
+                    )
+                    .map(Some)
+                } else {
+                    self.installed(
+                        store,
+                        public,
+                        witness,
+                        coordinator_epoch,
+                        budget,
+                        reply_deadline,
+                    )
+                    .map(Some)
+                }
+            }
         }
     }
     pub fn handle(
@@ -704,7 +750,7 @@ impl HostBootstrapProcessor {
             policy,
             context: Value::Null,
             hello: value["hostHello"].clone(),
-            token: Some(token),
+            token,
             route_owner: None,
             complete_issued: false,
             completion: None,
@@ -995,6 +1041,7 @@ impl HostBootstrapProcessor {
         }
     }
     pub fn cleanup_expired(&mut self) -> Result<(), ManagementError> {
+        self.cleanup_calibration(false)?;
         // Only this processor's exact expired grant/context generation is
         // retired. Durable operations, CAS, fences and principal ownership
         // remain intact; an unsuccessful cleanup keeps its ownership entry.
@@ -1056,7 +1103,7 @@ impl HostBootstrapProcessor {
     /// Drop. A failed record remains owned for a retry/report; discovery must
     /// be retained by composition whenever this method returns an error.
     pub fn shutdown(&mut self) -> Result<(), ManagementError> {
-        let mut failed = false;
+        let mut failed = self.cleanup_calibration(true).is_err();
         let pending_ids = self.pending.keys().cloned().collect::<Vec<_>>();
         for id in pending_ids {
             if let Some(pending) = self.pending.remove(&id)
@@ -1094,6 +1141,7 @@ impl HostBootstrapProcessor {
     /// another long application call cannot starve the final authority commit.
     pub fn has_pending_completion(&self) -> bool {
         self.pending.values().any(|pending| pending.complete_issued)
+            || self.has_calibration_completion()
     }
     /// Exact rollback observations and native completion truth have distinct
     /// lifetimes. Neither successful cleanup nor capacity pressure discards a

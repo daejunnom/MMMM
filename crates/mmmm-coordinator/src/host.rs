@@ -6,6 +6,7 @@ use crate::{
     authority::LocalAuthority,
     bootstrap::{CompletedPairingObservation, NativeWorkspacePermit},
     client::{ClientError, HostClientReply, HostRpcClient},
+    peer_management::BootstrapBudget,
     service::RequestContextWitness,
     workspace_bootstrap::NativeOwnerWitness,
 };
@@ -224,6 +225,490 @@ impl std::error::Error for HostReplyAcquisition {
 pub struct HostRouteOwner {
     context_id: ContextId,
     generation: [u8; 16],
+}
+/// Private calibration transport ownership, separate from the normal context
+/// map. This is neither a read/write grant nor a completed pairing receipt.
+/// Clones share retirement of this exact transport only. No bootstrap request
+/// or its cancellation callback survives in this retained route.
+#[derive(Clone)]
+pub(crate) struct CalibrationHostRoute {
+    host: Arc<Mutex<Option<PairedHost>>>,
+    // Only sticky transport attempts, never a second operation ledger or a
+    // normal read-route alias. The Runtime original claim remains authoritative.
+    attempts: Arc<Mutex<BTreeSet<OriginalInvocationKey>>>,
+    read_owner: HostContextWitness,
+    generation: [u8; 16],
+    expires: Instant,
+}
+impl CalibrationHostRoute {
+    pub(crate) fn context(&self) -> &Value {
+        self.read_owner.context()
+    }
+    pub(crate) fn lease_expires(&self) -> Instant {
+        self.expires
+    }
+    /// Local fencing for a newly entered actual request. Source rights,
+    /// approval, plan and effect admission remain the consumer's responsibility.
+    pub(crate) fn check_current(&self, request: &RequestContextWitness) -> AppResult<()> {
+        self.check_control(request.budget().deadline(), &|| {
+            request
+                .check_local()
+                .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
+            if request.authenticated().principal() != &self.read_owner.principal
+                || !request
+                    .authenticated()
+                    .permits_context(self.read_owner.context_id.as_str())
+            {
+                return Err(error(
+                    "PERMISSION_REQUIRED",
+                    "Calibration route belongs to another entered request scope",
+                ));
+            }
+            Ok(())
+        })
+    }
+    /// Non-consuming private prepare. The actual Java purpose route must check
+    /// ADMIN/source/current runner readiness; an absent runner is an error.
+    pub(crate) fn prepare(
+        &self,
+        request: &RequestContextWitness,
+        original: &Value,
+        current: &dyn Fn() -> AppResult<()>,
+    ) -> AppResult<()> {
+        self.validate_original(original)?;
+        self.request_identity(request, current)?;
+        let prepared = (|| {
+            current()?;
+            let host = self.current_request_host(request)?;
+            let expires = self.invocation_deadline(request, original, true)?;
+            current()?;
+            self.check_current(request)?;
+            let acquired = exchange_acquired(
+                &host,
+                "prepare",
+                Some(&self.read_owner.context_id),
+                original.clone(),
+                &expires,
+                request.budget().deadline(),
+            )?;
+            let ready = response_payload(acquired.into_response()?)?;
+            if !ready.is_object() {
+                return Err(error(
+                    "HOST_RESPONSE_INVALID",
+                    "Private calibration readiness is invalid",
+                ));
+            }
+            Ok(())
+        })();
+        calibration_route_finish(prepared, self.request_identity(request, current))
+    }
+    pub(crate) fn dispatch_with_store(
+        &self,
+        store: &mut DurableStore,
+        request: &RequestContextWitness,
+        original: &Value,
+        current: &dyn Fn(&DurableStore) -> AppResult<()>,
+    ) -> AppResult<Value> {
+        let result = self.durable_call(
+            store,
+            request,
+            original,
+            CalibrationMethod::Dispatch,
+            current,
+        )?;
+        validate("ProviderResult", &result)?;
+        Ok(result)
+    }
+    pub(crate) fn poll_with_store(
+        &self,
+        store: &mut DurableStore,
+        request: &RequestContextWitness,
+        original: &Value,
+        receipt: Option<&str>,
+        current: &dyn Fn(&DurableStore) -> AppResult<()>,
+    ) -> AppResult<Option<Value>> {
+        let result =
+            self.durable_call(store, request, original, CalibrationMethod::Get, current)?;
+        validate_job_observation(original, receipt, result)
+    }
+    pub(crate) fn cancel_with_store(
+        &self,
+        store: &mut DurableStore,
+        request: &RequestContextWitness,
+        original: &Value,
+        current: &dyn Fn(&DurableStore) -> AppResult<()>,
+    ) -> AppResult<()> {
+        let response =
+            self.durable_call(store, request, original, CalibrationMethod::Cancel, current)?;
+        if response["invocationId"] != original["invocationId"]
+            || response["cancellationRequested"] != true
+        {
+            return Err(error(
+                "CANCEL_UNCONFIRMED",
+                "Private original cancellation was not acknowledged",
+            ));
+        }
+        Ok(())
+    }
+    fn validate_original(&self, original: &Value) -> AppResult<()> {
+        validate("Invocation", original)?;
+        if original["context"] != self.read_owner.context
+            || original["contextDigest"] != self.read_owner.context["contextDigest"]
+        {
+            return Err(error(
+                "STALE_CONTEXT",
+                "Calibration invocation differs from its exact private route",
+            ));
+        }
+        Ok(())
+    }
+    fn current_request_host(&self, request: &RequestContextWitness) -> AppResult<PairedHost> {
+        self.check_current(request)?;
+        // Reuse the checked snapshot directly, including original control after
+        // both ownership mutex waits, rather than taking an unguarded snapshot.
+        self.checked_current_host(request.budget().deadline(), &|| {
+            request
+                .check_local()
+                .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))
+        })
+    }
+    fn request_identity(
+        &self,
+        request: &RequestContextWitness,
+        current: &dyn Fn() -> AppResult<()>,
+    ) -> AppResult<()> {
+        let control = || {
+            current()?;
+            self.check_current(request)
+        };
+        let checked = (|| {
+            self.observe_identity(
+                "hello",
+                None,
+                json!({}),
+                request.budget().deadline(),
+                &control,
+            )?;
+            self.observe_identity(
+                "inspect",
+                Some(&self.read_owner.context_id),
+                json!({"kind":"execution_context"}),
+                request.budget().deadline(),
+                &control,
+            )
+        })();
+        calibration_route_finish(checked, control())
+    }
+    fn invocation_deadline(
+        &self,
+        request: &RequestContextWitness,
+        original: &Value,
+        preserve: bool,
+    ) -> AppResult<String> {
+        let bounded = bounded_host_deadline(request.budget().deadline().min(self.expires))?;
+        if !preserve {
+            return Ok(bounded);
+        }
+        let format = &time::format_description::well_known::Rfc3339;
+        let original_at = text(original, "deadlineAt")?;
+        let parsed = time::OffsetDateTime::parse(original_at, format)
+            .map_err(|_| error("INVALID_INPUT", "Original calibration deadline is invalid"))?;
+        if parsed <= time::OffsetDateTime::now_utc() {
+            return Err(error(
+                "TIME_BUDGET_EXCEEDED",
+                "Original calibration deadline ended",
+            ));
+        }
+        let bound_at = time::OffsetDateTime::parse(&bounded, format).map_err(|_| {
+            error(
+                "HOST_UNAVAILABLE",
+                "Bounded calibration deadline is invalid",
+            )
+        })?;
+        Ok(if parsed < bound_at {
+            original_at.to_owned()
+        } else {
+            bounded
+        })
+    }
+    fn retain_attempt(&self, key: &OriginalInvocationKey, dispatch: bool) -> AppResult<()> {
+        let mut attempts = self.attempts.lock().map_err(|_| {
+            error(
+                "HOST_UNAVAILABLE",
+                "Calibration attempt ownership is unavailable",
+            )
+        })?;
+        if dispatch {
+            if attempts.contains(key) {
+                return Err(error(
+                    "DISPATCH_ALREADY_ATTEMPTED",
+                    "Original private dispatch was already attempted",
+                ));
+            }
+            if attempts.len() >= MAX_RETAINED_INVOCATIONS {
+                return Err(error(
+                    "HOST_CAPACITY",
+                    "Private dispatch retention capacity is exhausted",
+                ));
+            }
+            attempts.insert(key.clone());
+        } else if !attempts.contains(key) {
+            return Err(error(
+                "ORIGINAL_ROUTE_UNAVAILABLE",
+                "No original private dispatch attempt is retained",
+            ));
+        }
+        Ok(())
+    }
+    fn durable_call(
+        &self,
+        store: &mut DurableStore,
+        request: &RequestContextWitness,
+        original: &Value,
+        method: CalibrationMethod,
+        current: &dyn Fn(&DurableStore) -> AppResult<()>,
+    ) -> AppResult<Value> {
+        self.validate_original(original)?;
+        current(store)?;
+        let observed = (|| {
+            let key = durable_invocation_key(store, original, request.budget().deadline())?;
+            self.request_identity(request, &|| current(store))?;
+            current(store)?;
+            let host = self.current_request_host(request)?;
+            let dispatch = matches!(method, CalibrationMethod::Dispatch);
+            if dispatch {
+                let record = store
+                    .operation(&key.operation)
+                    .map_err(|cause| AppError::storage("STALE_CONTEXT", cause))?;
+                let step = record
+                    .steps
+                    .iter()
+                    .find(|step| step.step_id == key.step)
+                    .ok_or_else(|| error("STALE_CONTEXT", "Original calibration step is absent"))?;
+                if record.state != mmmm_runtime::storage::OperationState::Running
+                    || record.reconciliation_required
+                    || record.cancellation_requested
+                    || step.finished
+                    || step.dispatch != mmmm_runtime::storage::DispatchEvidence::IntentDurable
+                {
+                    return Err(error(
+                        "DISPATCH_ALREADY_ATTEMPTED",
+                        "Private durable intent is not dispatchable",
+                    ));
+                }
+            }
+            let expires = self.invocation_deadline(request, original, dispatch)?;
+            current(store)?;
+            self.check_current(request)?;
+            // Sticky before the first consuming byte. This is deliberately not
+            // placed in HostBridge's ordinary retained_routes/invocations maps.
+            self.retain_attempt(&key, dispatch)?;
+            current(store)?;
+            self.check_current(request)?;
+            let payload = if dispatch {
+                original.clone()
+            } else {
+                json!({"invocationId":original["invocationId"]})
+            };
+            let acquired = exchange_acquired(
+                &host,
+                method.wire(),
+                Some(&self.read_owner.context_id),
+                payload,
+                &expires,
+                request.budget().deadline(),
+            )?;
+            // Retain actual validated truth before late deadline/revocation
+            // checks. This adds no grant, accepted result or effect transition.
+            let acquired = retain_acquired_operation_truth(store, &key, acquired)?;
+            response_payload(acquired.into_response()?)
+        })();
+        calibration_route_finish(observed, self.request_identity(request, &|| current(store)))
+    }
+    /// Preparation and completion use the original native exchange budget,
+    /// passed by borrow rather than retained as the route's later lifetime.
+    pub(crate) fn check_bootstrap_local(&self, budget: &BootstrapBudget) -> AppResult<()> {
+        self.check_control(budget.deadline(), &|| calibration_bootstrap_check(budget))
+    }
+    pub(crate) fn check_bootstrap_current(&self, budget: &BootstrapBudget) -> AppResult<()> {
+        let control = || calibration_bootstrap_check(budget);
+        // Two bounded identity passes retain the exact hello and context. This
+        // does not dispatch or expose an arbitrary inspect/operation endpoint.
+        for _ in 0..2 {
+            self.observe_identity("hello", None, json!({}), budget.deadline(), &control)?;
+            self.observe_identity(
+                "inspect",
+                Some(&self.read_owner.context_id),
+                json!({"kind":"execution_context"}),
+                budget.deadline(),
+                &control,
+            )?;
+        }
+        self.check_control(budget.deadline(), &control)
+    }
+    /// Releases only this route's local transport reference. In-flight owned
+    /// calls must fail their postcheck; no remote listener shutdown is claimed.
+    pub(crate) fn retire(&self) -> AppResult<()> {
+        self.host
+            .lock()
+            .map_err(|_| error("HOST_UNAVAILABLE", "Calibration route state is unavailable"))?
+            .take();
+        Ok(())
+    }
+    fn current_host(&self) -> AppResult<PairedHost> {
+        self.read_owner.check_local()?;
+        let selected = self
+            .host
+            .lock()
+            .map_err(|_| error("HOST_UNAVAILABLE", "Calibration route state is unavailable"))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                error(
+                    "SESSION_ROUTE_CHANGED",
+                    "Calibration route has been retired",
+                )
+            })?;
+        if selected.generation != self.generation
+            || selected.expires != self.expires
+            || selected.principal != self.read_owner.principal
+            || selected.context != self.read_owner.context
+            || Instant::now() >= self.expires
+        {
+            return Err(error(
+                "SESSION_ROUTE_CHANGED",
+                "Calibration route ownership or finite lease changed",
+            ));
+        }
+        self.read_owner.check_local()?;
+        // A shorter private lease or retirement can change while the final
+        // normal-owner mutex is busy. Do not return the earlier slot snapshot.
+        if self
+            .host
+            .lock()
+            .map_err(|_| error("HOST_UNAVAILABLE", "Calibration route state is unavailable"))?
+            .as_ref()
+            .is_none_or(|host| host.generation != self.generation)
+        {
+            return Err(error(
+                "SESSION_ROUTE_CHANGED",
+                "Calibration route has been retired",
+            ));
+        }
+        Ok(selected)
+    }
+    fn check_control(
+        &self,
+        deadline: Instant,
+        control: &dyn Fn() -> AppResult<()>,
+    ) -> AppResult<()> {
+        self.checked_current_host(deadline, control).map(|_| ())
+    }
+    fn checked_current_host(
+        &self,
+        deadline: Instant,
+        control: &dyn Fn() -> AppResult<()>,
+    ) -> AppResult<PairedHost> {
+        let checkpoint = || {
+            control()?;
+            if crate::peer::fatal_stop_requested() {
+                return Err(error(
+                    "LOCAL_TRANSPORT_UNCERTAIN",
+                    "Native peer transport stopped",
+                ));
+            }
+            bounded_host_deadline(deadline)?;
+            if Instant::now() >= self.expires {
+                return Err(error(
+                    "SESSION_ROUTE_CHANGED",
+                    "Calibration route finite lease ended",
+                ));
+            }
+            Ok(())
+        };
+        checkpoint()?;
+        // Both local ownership locks may wait behind an existing normal RPC.
+        // Recheck the same request after that wait, including the failure path.
+        let current = self.current_host();
+        calibration_route_finish(current, checkpoint())
+    }
+    fn observe_identity(
+        &self,
+        method: &str,
+        id: Option<&ContextId>,
+        payload: Value,
+        deadline: Instant,
+        control: &dyn Fn() -> AppResult<()>,
+    ) -> AppResult<()> {
+        let host = self.checked_current_host(deadline, control)?;
+        let expires = bounded_host_deadline(deadline.min(self.expires))?;
+        let observed =
+            exchange(&host.client, method, id, payload, Some(&expires)).and_then(|actual| {
+                let expected = if method == "hello" {
+                    validate("HostHello", &actual)?;
+                    &host.hello
+                } else {
+                    validate("ExecutionContext", &actual)?;
+                    verify_projected_digest("ExecutionContext", &actual).map_err(|_| {
+                        error("STALE_CONTEXT", "Calibration context digest is invalid")
+                    })?;
+                    &host.context
+                };
+                if &actual != expected {
+                    return Err(error(
+                        "STALE_CONTEXT",
+                        "Actual calibration host identity differs from its pinned route",
+                    ));
+                }
+                Ok(())
+            });
+        let postcheck = self.check_control(deadline, control);
+        calibration_route_finish(observed, postcheck)
+    }
+}
+#[derive(Clone, Copy)]
+enum CalibrationMethod {
+    Dispatch,
+    Get,
+    Cancel,
+}
+impl CalibrationMethod {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Dispatch => "dispatch",
+            Self::Get => "operation.get",
+            Self::Cancel => "operation.cancel",
+        }
+    }
+}
+fn calibration_bootstrap_check(budget: &BootstrapBudget) -> AppResult<()> {
+    budget.check().map_err(|cause| {
+        use crate::peer_management::ManagementError;
+        let code = match &cause {
+            ManagementError::Cancelled => "CANCELLED",
+            ManagementError::Deadline => "TIME_BUDGET_EXCEEDED",
+            _ => "LOCAL_TRANSPORT_UNCERTAIN",
+        };
+        AppError::caused_by(
+            code,
+            "Original calibration bootstrap request stopped",
+            cause,
+        )
+    })
+}
+fn calibration_route_finish<T>(primary: AppResult<T>, checkpoint: AppResult<()>) -> AppResult<T> {
+    match (primary, checkpoint) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(cause), Ok(())) | (Ok(_), Err(cause)) => Err(cause),
+        (Err(primary), Err(checkpoint)) => Err(AppError::caused_by(
+            primary.code,
+            primary.message,
+            NativePairingOwnerFailure {
+                primary,
+                checkpoint,
+            },
+        )),
+    }
 }
 /// Factual delivery provenance for one currently entered request and exact
 /// route generation. It grants no read/source/target permission and cannot be
@@ -601,6 +1086,101 @@ impl HostBridge {
     /// Trusted bootstrap only. The host is independently queried before this
     /// exact immutable context becomes routable. An approval may rotate the
     /// same actual context/runtime; original dispatch routes remain read-only.
+    /// Trusted composition alone prepares a private calibration endpoint. The
+    /// existing normal read route must already own the exact context and hello;
+    /// this method never inserts a host or changes session/source permissions.
+    pub(crate) fn prepare_calibration_route(
+        &self,
+        client: HostRpcClient,
+        principal: PrincipalId,
+        contexts: Vec<Value>,
+        expected_hello: Value,
+        lease_expires: Instant,
+        budget: &BootstrapBudget,
+    ) -> AppResult<CalibrationHostRoute> {
+        calibration_bootstrap_check(budget)?;
+        // The first actual calibration slice owns one existing read context.
+        // Supporting several contexts requires its own explicit composition.
+        if contexts.len() != 1
+            || !lease_expires
+                .checked_duration_since(Instant::now())
+                .is_some_and(|remaining| {
+                    !remaining.is_zero() && remaining <= Duration::from_secs(24 * 60 * 60)
+                })
+        {
+            return Err(error(
+                "INVALID_INPUT",
+                "Calibration route context or lease exceeds its finite range",
+            ));
+        }
+        let expected_context = contexts
+            .into_iter()
+            .next()
+            .ok_or_else(|| error("INVALID_INPUT", "Calibration context is absent"))?;
+        validate("ExecutionContext", &expected_context)?;
+        validate("HostHello", &expected_hello)?;
+        verify_projected_digest("ExecutionContext", &expected_context)
+            .map_err(|_| error("STALE_CONTEXT", "Calibration context digest is invalid"))?;
+        let id = context_id(&expected_context)?;
+        if expected_context["principalRef"] != principal.as_str()
+            || expected_context["environment"] != expected_hello["environment"]
+            || expected_hello["environment"]["kind"] != "game"
+            || expected_hello["hostProtocolVersion"] != "0.2.0"
+        {
+            return Err(error(
+                "STALE_CONTEXT",
+                "Calibration route differs from its approved game identity",
+            ));
+        }
+        let (read_owner, expires) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
+            let read_host = checked_host(&state, &id, Some(&principal))?;
+            if read_host.context != expected_context || read_host.hello != expected_hello {
+                return Err(error(
+                    "STALE_CONTEXT",
+                    "Calibration route differs from the current normal read owner",
+                ));
+            }
+            (
+                HostContextWitness {
+                    state: self.state.clone(),
+                    context_id: id,
+                    principal: principal.clone(),
+                    context: expected_context.clone(),
+                    generation: read_host.generation,
+                },
+                lease_expires.min(read_host.expires),
+            )
+        };
+        calibration_bootstrap_check(budget)?;
+        let mut generation = [0u8; 16];
+        getrandom::fill(&mut generation).map_err(|_| {
+            error(
+                "HOST_UNAVAILABLE",
+                "Calibration route identity is unavailable",
+            )
+        })?;
+        let route = CalibrationHostRoute {
+            attempts: Arc::new(Mutex::new(BTreeSet::new())),
+            host: Arc::new(Mutex::new(Some(PairedHost {
+                client: Arc::new(client),
+                principal,
+                context: expected_context,
+                hello: expected_hello,
+                expires,
+                generation,
+                completed_pairing: None,
+            }))),
+            read_owner,
+            generation,
+            expires,
+        };
+        route.check_bootstrap_current(budget)?;
+        Ok(route)
+    }
     pub fn attach(
         &self,
         client: HostRpcClient,
@@ -781,6 +1361,32 @@ impl HostBridge {
             .verified_dependencies
             .insert(dependency.component.clone(), dependency);
         Ok(())
+    }
+    /// Factual bounded projection of an already protected registration. This
+    /// neither registers a source nor authorizes use of the returned pin.
+    pub(crate) fn registered_dependency_pin(&self, component: &str) -> AppResult<Value> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
+        let source = state
+            .verified_dependencies
+            .get(component)
+            .filter(|source| {
+                source.component == component
+                    && !source.contracts.is_empty()
+                    && source.contracts.len() <= 64
+            })
+            .ok_or_else(|| {
+                error(
+                    "STALE_DEPENDENCY",
+                    "Dependency has no complete protected registration",
+                )
+            })?;
+        let pin = json!({"componentId":source.component,"implementationDigest":source.digest,
+            "provenanceClass":source.provenance.wire(),"contractIds":source.contracts});
+        validate("DependencyPin", &pin)?;
+        Ok(pin)
     }
     pub fn context(&self, principal: &PrincipalId, id: &ContextId) -> AppResult<Value> {
         self.context_with_deadline(principal, id, Instant::now() + Duration::from_secs(10))
@@ -1966,6 +2572,7 @@ mod tests {
     fn completed_pairing_provenance_keeps_host_bridge_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<HostBridge>();
+        assert_send_sync::<CalibrationHostRoute>();
         assert_send_sync::<CompletedPairingObservation>();
     }
     fn local_route_witness() -> (HostBridge, HostContextWitness) {
@@ -2020,6 +2627,364 @@ mod tests {
         let (_bridge, witness) = local_route_witness();
         witness.check_local().unwrap();
         witness.clone().check_local().unwrap();
+    }
+    fn local_calibration_route(
+        bridge: &HostBridge,
+        witness: &HostContextWitness,
+    ) -> CalibrationHostRoute {
+        // Local retirement/lease fencing only; no native pairing is issued.
+        let mut host = bridge.state.lock().unwrap().hosts[&witness.context_id].clone();
+        host.generation[0] ^= 0x80;
+        CalibrationHostRoute {
+            attempts: Arc::new(Mutex::new(BTreeSet::new())),
+            generation: host.generation,
+            expires: host.expires,
+            host: Arc::new(Mutex::new(Some(host))),
+            read_owner: witness.clone(),
+        }
+    }
+    #[test]
+    fn calibration_retirement_is_exact_and_never_replaces_the_normal_read_route() {
+        let (bridge, witness) = local_route_witness();
+        let original = bridge.state.lock().unwrap().hosts[&witness.context_id].clone();
+        let old = local_calibration_route(&bridge, &witness);
+        let old_clone = old.clone();
+        let replacement = local_calibration_route(&bridge, &witness);
+        let key = route_fixture_key(&route_fixture_invocation());
+        assert_eq!(
+            old.retain_attempt(&key, false).unwrap_err().code,
+            "ORIGINAL_ROUTE_UNAVAILABLE"
+        );
+        old.retain_attempt(&key, true).unwrap();
+        // Clones retain the ambiguous first attempt. A replacement private
+        // route and the ordinary read route never inherit that association.
+        old_clone.retain_attempt(&key, false).unwrap();
+        assert_eq!(
+            old_clone.retain_attempt(&key, true).unwrap_err().code,
+            "DISPATCH_ALREADY_ATTEMPTED"
+        );
+        assert_eq!(
+            replacement.retain_attempt(&key, false).unwrap_err().code,
+            "ORIGINAL_ROUTE_UNAVAILABLE"
+        );
+        let mut changed = key.clone();
+        changed.digest = raw_digest(b"different original bytes");
+        assert_eq!(
+            old.retain_attempt(&changed, false).unwrap_err().code,
+            "ORIGINAL_ROUTE_UNAVAILABLE"
+        );
+        changed = key.clone();
+        changed.data_root = changed.data_root.join("another-store");
+        assert_eq!(
+            old.retain_attempt(&changed, false).unwrap_err().code,
+            "ORIGINAL_ROUTE_UNAVAILABLE"
+        );
+        old.retire().unwrap();
+        old.retire().unwrap();
+        assert!(old_clone.current_host().is_err());
+        assert!(replacement.current_host().is_ok());
+        let state = bridge.state.lock().unwrap();
+        assert_eq!(state.hosts.len(), 1);
+        let current = &state.hosts[&witness.context_id];
+        assert_eq!(current.generation, original.generation);
+        assert_eq!(current.context, original.context);
+        assert_eq!(current.expires, original.expires);
+        assert!(Arc::ptr_eq(&current.client, &original.client));
+        assert!(state.retained_routes.is_empty());
+        assert!(state.invocations.is_empty());
+    }
+    #[test]
+    fn calibration_route_requires_the_original_read_generation_and_its_own_finite_lease() {
+        let (bridge, witness) = local_route_witness();
+        let route = local_calibration_route(&bridge, &witness);
+        let cancelled = BootstrapBudget::new();
+        cancelled.cancel();
+        assert_eq!(
+            route.check_bootstrap_local(&cancelled).unwrap_err().code,
+            "CANCELLED"
+        );
+        // A later call supplies its own actual control. The completed/expired
+        // bootstrap callback is never retained as a permanent route lifetime.
+        assert!(route.current_host().is_ok());
+        let expired = BootstrapBudget::with_deadline(Instant::now());
+        assert_eq!(
+            route.check_bootstrap_local(&expired).unwrap_err().code,
+            "TIME_BUDGET_EXCEEDED"
+        );
+        assert!(route.check_bootstrap_local(&BootstrapBudget::new()).is_ok());
+        bridge
+            .state
+            .lock()
+            .unwrap()
+            .hosts
+            .get_mut(&witness.context_id)
+            .unwrap()
+            .generation[0] ^= 1;
+        assert_eq!(
+            route.current_host().err().unwrap().code,
+            "SESSION_ROUTE_CHANGED"
+        );
+        let (bridge, witness) = local_route_witness();
+        let mut route = local_calibration_route(&bridge, &witness);
+        route.expires = Instant::now();
+        route.host.lock().unwrap().as_mut().unwrap().expires = route.expires;
+        assert_eq!(
+            route.current_host().err().unwrap().code,
+            "SESSION_ROUTE_CHANGED"
+        );
+        witness.check_local().unwrap();
+        let (bridge, witness) = local_route_witness();
+        let mut route = local_calibration_route(&bridge, &witness);
+        route.expires = Instant::now() + Duration::from_millis(100);
+        route.host.lock().unwrap().as_mut().unwrap().expires = route.expires;
+        let checks = std::cell::Cell::new(0);
+        let budget = BootstrapBudget::new();
+        let failure = route
+            .check_control(budget.deadline(), &|| {
+                calibration_bootstrap_check(&budget)?;
+                checks.set(checks.get() + 1);
+                if checks.get() == 2 {
+                    // Only the private lease expires during this final gate; the
+                    // normal owner and original request budgets stay live.
+                    std::thread::sleep(
+                        route.expires.saturating_duration_since(Instant::now())
+                            + Duration::from_millis(1),
+                    );
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(failure.code, "SESSION_ROUTE_CHANGED");
+        assert_eq!(checks.get(), 2);
+        witness.check_local().unwrap();
+        calibration_bootstrap_check(&budget).unwrap();
+        // The normal bridge can hold this mutex during its own bounded RPC.
+        // End the original control only after its precheck has succeeded while
+        // the calibration lookup is fenced behind that exact held mutex.
+        for replace_read_owner in [false, true] {
+            let (bridge, witness) = local_route_witness();
+            let route = local_calibration_route(&bridge, &witness);
+            let budget = BootstrapBudget::new();
+            let worker_budget = budget.clone();
+            let mut state = bridge.state.lock().unwrap();
+            let (started, reached) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let first = std::cell::Cell::new(true);
+                route.check_control(worker_budget.deadline(), &|| {
+                    let checked = calibration_bootstrap_check(&worker_budget);
+                    if first.replace(false) {
+                        started.send(()).unwrap();
+                    }
+                    checked
+                })
+            });
+            reached.recv_timeout(Duration::from_secs(2)).unwrap();
+            budget.cancel();
+            if replace_read_owner {
+                state.hosts.get_mut(&witness.context_id).unwrap().generation[0] ^= 1;
+            }
+            drop(state);
+            let failure = worker.join().unwrap().unwrap_err();
+            if replace_read_owner {
+                let paired = std::error::Error::source(&failure)
+                    .unwrap()
+                    .downcast_ref::<NativePairingOwnerFailure>()
+                    .unwrap();
+                assert_eq!(paired.primary.code, "SESSION_ROUTE_CHANGED");
+                assert_eq!(paired.checkpoint.code, "CANCELLED");
+            } else {
+                assert_eq!(failure.code, "CANCELLED");
+                witness.check_local().unwrap();
+            }
+        }
+    }
+    fn calibration_identity_endpoint(
+        replies: Vec<Value>,
+        cancel: Option<BootstrapBudget>,
+    ) -> (HostRpcClient, std::thread::JoinHandle<()>) {
+        calibration_protocol_endpoint(
+            replies
+                .into_iter()
+                .enumerate()
+                .map(|(index, payload)| {
+                    (
+                        if index % 2 == 0 { "hello" } else { "inspect" },
+                        Ok(payload),
+                    )
+                })
+                .collect(),
+            cancel,
+            None,
+        )
+    }
+    fn calibration_protocol_endpoint(
+        replies: Vec<(&'static str, Result<Value, &'static str>)>,
+        cancel: Option<BootstrapBudget>,
+        signal: Option<(usize, Arc<std::sync::atomic::AtomicBool>)>,
+    ) -> (HostRpcClient, std::thread::JoinHandle<()>) {
+        // The existing one-reply acquisition fixture cannot exercise the two
+        // identity passes or simultaneous host/control failure. This endpoint
+        // handles only those bounded protocol replies, never a real game.
+        use std::io::{Read, Write};
+        assert!(!replies.is_empty() && replies.len() <= 5);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            for (index, (method, payload)) in replies.into_iter().enumerate() {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(cause) if cause.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "bounded calibration identity accept"
+                            );
+                            std::thread::yield_now();
+                        }
+                        Err(cause) => panic!("calibration identity accept: {cause}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let raw = crate::http::read_header(
+                    &mut stream,
+                    deadline,
+                    &std::sync::atomic::AtomicBool::new(false),
+                )
+                .unwrap();
+                let (_, headers) =
+                    crate::http::parse_headers(std::str::from_utf8(&raw).unwrap()).unwrap();
+                let length = crate::http::content_length(&headers).unwrap();
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).unwrap();
+                let request = mmmm_contracts::parse_json(&body).unwrap();
+                assert_eq!(request["params"]["method"], method);
+                if method == "inspect" {
+                    assert_eq!(request["params"]["payload"]["kind"], "execution_context");
+                }
+                let mut response = json!({"protocolVersion":"0.2.0","requestId":request["params"]["requestId"],"eventSequence":"0"});
+                match payload {
+                    Ok(payload) => {
+                        response["status"] = json!("ok");
+                        response["payload"] = payload;
+                    }
+                    Err(code) => {
+                        response["status"] = json!("error");
+                        response["error"] = json!({"code":code,
+                        "message":"Bounded private transport fixture rejection", "subjectId":null,
+                        "retry":"never","effects":"none_confirmed","evidenceRefs":[]});
+                    }
+                }
+                let bytes =
+                    encode_json(&json!({"jsonrpc":"2.0","id":request["id"],"result":response}))
+                        .unwrap();
+                if let Some(cancel) = &cancel {
+                    cancel.cancel();
+                }
+                if let Some((selected, signal)) = &signal
+                    && *selected == index
+                {
+                    signal.store(true, std::sync::atomic::Ordering::Release);
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                );
+                stream.write_all(header.as_bytes()).unwrap();
+                stream.write_all(&bytes).unwrap();
+                stream.shutdown(std::net::Shutdown::Both).unwrap();
+            }
+        });
+        let client = HostRpcClient::paired(
+            crate::endpoint::EndpointRecord {
+                schema_version: 1,
+                contract_version: "0.2.0".into(),
+                address,
+                path: "/rpc".into(),
+                coordinator_epoch: "calibration-identity-fixture".into(),
+                credential_ref: "MMMM.coordinator.calibration-fixture".into(),
+            },
+            crate::credential::SecretToken::generate().unwrap(),
+        )
+        .unwrap();
+        (client, server)
+    }
+    #[test]
+    fn actual_calibration_identity_passes_preserve_normal_route_and_bound_retained_lease() {
+        let (bridge, witness) = local_route_witness();
+        let original = bridge.state.lock().unwrap().hosts[&witness.context_id].clone();
+        let (client, server) = calibration_identity_endpoint(
+            vec![
+                original.hello.clone(),
+                original.context.clone(),
+                original.hello.clone(),
+                original.context.clone(),
+            ],
+            None,
+        );
+        let route = bridge
+            .prepare_calibration_route(
+                client,
+                witness.principal.clone(),
+                vec![witness.context.clone()],
+                original.hello.clone(),
+                original.expires + Duration::from_secs(30),
+                &BootstrapBudget::new(),
+            )
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(route.context(), &original.context);
+        assert_eq!(route.lease_expires(), original.expires);
+        route.retire().unwrap();
+        witness.check_local().unwrap();
+        let state = bridge.state.lock().unwrap();
+        assert_eq!(
+            state.hosts[&witness.context_id].generation,
+            original.generation
+        );
+        assert!(Arc::ptr_eq(
+            &state.hosts[&witness.context_id].client,
+            &original.client
+        ));
+    }
+    #[test]
+    fn calibration_host_identity_failure_and_original_cancellation_both_survive() {
+        let (bridge, witness) = local_route_witness();
+        let original = bridge.state.lock().unwrap().hosts[&witness.context_id].clone();
+        let mut changed = original.hello.clone();
+        changed["hostBuild"] = json!("changed-fixture-only");
+        let budget = BootstrapBudget::new();
+        let (client, server) = calibration_identity_endpoint(vec![changed], Some(budget.clone()));
+        let failure = bridge
+            .prepare_calibration_route(
+                client,
+                witness.principal.clone(),
+                vec![witness.context.clone()],
+                original.hello,
+                original.expires,
+                &budget,
+            )
+            .err()
+            .unwrap();
+        server.join().unwrap();
+        let paired = std::error::Error::source(&failure)
+            .unwrap()
+            .downcast_ref::<NativePairingOwnerFailure>()
+            .unwrap();
+        assert_eq!(paired.primary.code, "STALE_CONTEXT");
+        assert_eq!(paired.checkpoint.code, "CANCELLED");
+        witness.check_local().unwrap();
+        assert_eq!(
+            bridge.state.lock().unwrap().hosts[&witness.context_id].generation,
+            original.generation
+        );
     }
     #[test]
     fn same_context_and_principal_do_not_revive_a_replaced_route() {
@@ -2076,6 +3041,22 @@ mod tests {
         pin["provenanceClass"] = json!("owned_domain");
         pin["contractIds"] = json!(["FN18"]);
         assert!(!dependency.matches(&pin));
+        let bridge = HostBridge::default();
+        assert_eq!(
+            bridge
+                .registered_dependency_pin("mmmm.planner")
+                .unwrap_err()
+                .code,
+            "STALE_DEPENDENCY"
+        );
+        bridge.register_verified_dependency(dependency).unwrap();
+        let registered = bridge.registered_dependency_pin("mmmm.planner").unwrap();
+        assert_eq!(registered["componentId"], "mmmm.planner");
+        assert_eq!(registered["implementationDigest"], digest.as_str());
+        assert_eq!(registered["provenanceClass"], "owned_domain");
+        assert_eq!(registered["contractIds"], json!(["FN09", "FN15"]));
+        assert_eq!(bridge.state.lock().unwrap().verified_dependencies.len(), 1);
+        assert!(bridge.state.lock().unwrap().hosts.is_empty());
     }
     #[test]
     fn valid_failed_registered_read_preserves_native_reason_without_resending() {
@@ -2358,5 +3339,417 @@ mod tests {
             "received-fixture-truth"
         );
         assert!(!format!("{error:?}").contains("received-fixture-truth"));
+    }
+
+    // The earlier local map and one-response fixtures cannot enter the private
+    // durable call or inspect real operation evidence. This small harness uses
+    // the actual service request slot, SQLite/CAS and the same bounded protocol
+    // endpoint. It issues no calibration registry entry, ADMIN or game grant.
+    struct TransportRoot(PathBuf);
+    impl TransportRoot {
+        fn new() -> Self {
+            let parent = std::fs::canonicalize(
+                std::env::var_os("MMMM_TEST_DATA_ROOT")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir),
+            )
+            .unwrap();
+            let mut random = [0; 16];
+            getrandom::fill(&mut random).unwrap();
+            let path = parent.join(format!(
+                "mmmm-private-transport-{}",
+                &raw_digest(&random).as_str()[..24]
+            ));
+            let checkout =
+                std::fs::canonicalize(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+                    .unwrap();
+            assert!(path.is_absolute() && !path.starts_with(checkout) && !path.exists());
+            // DurableStore creates and protects this exact fresh directory.
+            let store =
+                DurableStore::open(mmmm_runtime::storage::StoreConfig::new(path.clone())).unwrap();
+            std::fs::write(
+                path.join("transport-test-owner.txt"),
+                b"mmmm-private-transport-test\n",
+            )
+            .unwrap();
+            drop(store);
+            Self(path)
+        }
+    }
+    impl Drop for TransportRoot {
+        fn drop(&mut self) {
+            let mut pending = vec![self.0.clone()];
+            let mut count = 0;
+            while let Some(path) = pending.pop() {
+                count += 1;
+                if count > 512 || !path.starts_with(&self.0) {
+                    return;
+                }
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                    return;
+                };
+                if meta.file_type().is_symlink() {
+                    return;
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    if meta.file_attributes() & 0x400 != 0 {
+                        return;
+                    }
+                }
+                if meta.is_dir() {
+                    let Ok(entries) = std::fs::read_dir(&path) else {
+                        return;
+                    };
+                    for entry in entries {
+                        if count + pending.len() >= 512 {
+                            return;
+                        }
+                        let Ok(entry) = entry else {
+                            return;
+                        };
+                        pending.push(entry.path());
+                    }
+                } else if !meta.is_file() {
+                    return;
+                }
+            }
+            if std::fs::canonicalize(&self.0).ok().as_ref() == Some(&self.0)
+                && std::fs::read(self.0.join("transport-test-owner.txt"))
+                    .ok()
+                    .as_deref()
+                    == Some(b"mmmm-private-transport-test\n")
+            {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+    struct NoTransportPlanning;
+    impl mmmm_application::PlanningPort for NoTransportPlanning {
+        fn inspect_project(
+            &mut self,
+            _: &PrincipalId,
+            _: &Value,
+        ) -> AppResult<mmmm_application::ProjectInspection> {
+            panic!("transport fixture cannot plan")
+        }
+        fn prepare(
+            &mut self,
+            _: &PrincipalId,
+            _: &Value,
+            _: &Value,
+            _: &Value,
+        ) -> AppResult<mmmm_application::PreparedPlan> {
+            panic!("transport fixture cannot plan")
+        }
+        fn prepare_recovery(
+            &mut self,
+            _: &PrincipalId,
+            _: &mmmm_application::RecoveryPreparation,
+            _: &Value,
+            _: &Value,
+        ) -> AppResult<mmmm_application::PreparedPlan> {
+            panic!("transport fixture cannot recover")
+        }
+    }
+    impl mmmm_application::IdSource for NoTransportPlanning {
+        fn next_id(&mut self, _: mmmm_application::IdKind) -> AppResult<String> {
+            panic!("transport fixture cannot issue IDs")
+        }
+    }
+    struct TransportCall {
+        route: CalibrationHostRoute,
+        slot: crate::service::RequestContextSlot,
+        original: Value,
+        prepare: bool,
+        cancel_after_retention: Arc<std::sync::atomic::AtomicBool>,
+        source_revoked: Arc<std::sync::atomic::AtomicBool>,
+        result: std::rc::Rc<std::cell::RefCell<Option<AppResult<Value>>>>,
+    }
+    impl crate::service::ServiceExtension for TransportCall {
+        fn call(
+            &mut self,
+            _: &str,
+            _: &Value,
+            context: &mut crate::service::ServiceExtensionContext<'_>,
+        ) -> Result<Value, crate::service::ServiceError> {
+            let request = self.slot.occupied_witness().unwrap();
+            let root = context.store.data_root().to_path_buf();
+            let operation = OperationId::new(text(&self.original, "operationId").unwrap()).unwrap();
+            let current = |store: &DurableStore| {
+                assert_eq!(store.data_root(), root);
+                // This cancellation is deliberately after durable truth exists,
+                // without a sleep or a race with the loopback response writer.
+                if !store.operation_evidence(&operation).unwrap().is_empty() {
+                    self.cancel_after_retention
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                request
+                    .check_local()
+                    .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
+                if self
+                    .source_revoked
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err(error(
+                        "FIXTURE_SOURCE_REVOKED",
+                        "Private fixture source ended",
+                    ));
+                }
+                Ok(())
+            };
+            let result = if self.prepare {
+                self.route
+                    .prepare(&request, &self.original, &|| current(context.store))
+                    .map(|()| json!({}))
+            } else {
+                self.route
+                    .dispatch_with_store(context.store, &request, &self.original, &current)
+            };
+            *self.result.borrow_mut() = Some(result);
+            // Preserve the transport result privately; no fake canonical output
+            // or public calibration approval is manufactured by the extension.
+            Err(crate::service::ServiceError::new(
+                "TRANSPORT_FIXTURE_DONE",
+                "Private transport fixture completed",
+            ))
+        }
+    }
+    fn entered_transport_call(
+        store: DurableStore,
+        bridge: HostBridge,
+        route: CalibrationHostRoute,
+        original: Value,
+        prepare: bool,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        source_revoked: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (crate::service::ApplicationService, AppError) {
+        use crate::service::{
+            ApplicationPorts, ApplicationService, ExtensionRouter, RequestBudget,
+            RequestContextSlot, ServiceDispatcher,
+        };
+        let slot = RequestContextSlot::default();
+        let authority = LocalAuthority::new(bridge.clone());
+        let mut service = ApplicationService::from_store(
+            store,
+            ApplicationPorts {
+                authority: Box::new(authority.clone()),
+                planner: Box::new(NoTransportPlanning),
+                provider: Box::new(HttpProviderPort::new(bridge.clone())),
+                observer: Box::new(crate::observer::NativeObserver::authenticated(
+                    bridge,
+                    authority,
+                    slot.clone(),
+                )),
+                ids: Box::new(NoTransportPlanning),
+                clock: Box::new(mmmm_application::SystemClock),
+            },
+        );
+        service.bind_request_context(slot.clone());
+        let result = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let mut extensions = ExtensionRouter::default();
+        extensions
+            .register(
+                ["catalog.search"],
+                Box::new(TransportCall {
+                    route: route.clone(),
+                    slot,
+                    original,
+                    prepare,
+                    cancel_after_retention: cancel.clone(),
+                    source_revoked,
+                    result: result.clone(),
+                }),
+            )
+            .unwrap();
+        service.set_extensions(extensions);
+        let mut sessions = crate::auth::SessionAuthority::new(1).unwrap();
+        let token = sessions
+            .install(crate::auth::SessionPolicy {
+                principal: route.read_owner.principal.clone(),
+                allowed_methods: ["catalog.search".into()].into(),
+                allowed_contexts: [route.read_owner.context_id.clone()].into(),
+                lifetime: Duration::from_secs(10),
+            })
+            .unwrap();
+        let principal = sessions.authenticate_token(&token).unwrap();
+        let budget = RequestBudget::new(Duration::from_secs(5), cancel).unwrap();
+        assert_eq!(
+            service
+                .call(&principal, "catalog.search", &json!({}), &budget)
+                .unwrap_err()
+                .code,
+            "TRANSPORT_FIXTURE_DONE"
+        );
+        let failure = result.borrow_mut().take().unwrap().unwrap_err();
+        (service, failure)
+    }
+    fn transport_store(root: &TransportRoot, intent: bool) -> (DurableStore, Value) {
+        let mut store =
+            DurableStore::open(mmmm_runtime::storage::StoreConfig::new(root.0.clone())).unwrap();
+        let mut plan: Value =
+            mmmm_contracts::parse_json(include_bytes!("../../../examples/execution-plan.json"))
+                .unwrap();
+        let mut original = route_fixture_invocation();
+        let deadline = bounded_host_deadline(Instant::now() + Duration::from_secs(10)).unwrap();
+        plan["expiresAt"] = json!(deadline);
+        plan["planHash"] = json!(mmmm_contracts::projected_digest("ExecutionPlan", &plan).unwrap());
+        original["deadlineAt"] = plan["expiresAt"].clone();
+        store.save_plan(&plan).unwrap();
+        let operation = OperationId::new(text(&original, "operationId").unwrap()).unwrap();
+        store
+            .reserve_operation(mmmm_runtime::storage::ReserveOperation {
+                operation_id: operation.clone(),
+                principal: PrincipalId::new("principal-fixture").unwrap(),
+                project_id: ProjectId::new("project-fixture").unwrap(),
+                idempotency_key: text(&original, "idempotencyKey").unwrap().into(),
+                plan_id: serde_json::from_value(plan["planId"].clone()).unwrap(),
+                plan_hash: serde_json::from_value(plan["planHash"].clone()).unwrap(),
+                context_id: context_id(&original["context"]).unwrap(),
+            })
+            .unwrap();
+        let step = StepId::new(text(&original, "stepId").unwrap()).unwrap();
+        if intent {
+            store.dispatch_intent(&operation, &step, &original).unwrap();
+        }
+        (store, original)
+    }
+    #[test]
+    fn private_dispatch_retains_same_store_truth_before_cancel_and_preserves_negative_response() {
+        for negative in [false, true] {
+            let root = TransportRoot::new();
+            let (store, original) = transport_store(&root, true);
+            let (bridge, witness) = local_route_witness();
+            let route = local_calibration_route(&bridge, &witness);
+            let host = route.current_host().unwrap();
+            let payload = if negative {
+                Err("ACTUAL_FIXTURE_NATIVE_FAILURE")
+            } else {
+                Ok(mmmm_contracts::parse_json(include_bytes!(
+                    "../../../examples/provider-result.json"
+                ))
+                .unwrap())
+            };
+            let (client, server) = calibration_protocol_endpoint(
+                vec![
+                    ("hello", Ok(host.hello)),
+                    ("inspect", Ok(host.context)),
+                    ("dispatch", payload),
+                ],
+                None,
+                None,
+            );
+            route.host.lock().unwrap().as_mut().unwrap().client = Arc::new(client);
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (mut service, failure) = entered_transport_call(
+                store,
+                bridge.clone(),
+                route.clone(),
+                original.clone(),
+                false,
+                cancel.clone(),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+            server.join().unwrap();
+            assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+            let store = service.management_store();
+            let operation = OperationId::new(text(&original, "operationId").unwrap()).unwrap();
+            let evidence = store.operation_evidence(&operation).unwrap();
+            assert_eq!(evidence.len(), 1);
+            let retained =
+                mmmm_contracts::parse_json(&store.read_blob(&evidence[0]).unwrap()).unwrap();
+            assert_eq!(retained["status"], if negative { "error" } else { "ok" });
+            if negative {
+                let dual = std::error::Error::source(&failure)
+                    .unwrap()
+                    .downcast_ref::<NativePairingOwnerFailure>()
+                    .unwrap();
+                assert_eq!(dual.primary.code, "HOST_REQUEST_FAILED");
+                assert_eq!(dual.checkpoint.code, "CANCELLED");
+                let native = std::error::Error::source(&dual.primary)
+                    .unwrap()
+                    .downcast_ref::<HostRequestFailure>()
+                    .unwrap();
+                assert_eq!(native.response, retained);
+                assert_eq!(retained["error"]["code"], "ACTUAL_FIXTURE_NATIVE_FAILURE");
+            } else {
+                assert_eq!(failure.code, "CANCELLED");
+            }
+            let key =
+                durable_invocation_key(store, &original, Instant::now() + Duration::from_secs(1))
+                    .unwrap();
+            assert_eq!(
+                route.retain_attempt(&key, true).unwrap_err().code,
+                "DISPATCH_ALREADY_ATTEMPTED"
+            );
+            assert!(bridge.state.lock().unwrap().retained_routes.is_empty());
+            assert!(bridge.state.lock().unwrap().invocations.is_empty());
+            assert_eq!(
+                store.operation(&operation).unwrap().steps[0].dispatch,
+                mmmm_runtime::storage::DispatchEvidence::IntentDurable
+            );
+        }
+    }
+    #[test]
+    fn private_prepare_preserves_runner_denial_and_post_source_failure_without_consuming_intent() {
+        let root = TransportRoot::new();
+        let (store, original) = transport_store(&root, false);
+        let operation = OperationId::new(text(&original, "operationId").unwrap()).unwrap();
+        let before = store.operation(&operation).unwrap();
+        assert_eq!(
+            before.steps[0].dispatch,
+            mmmm_runtime::storage::DispatchEvidence::NotSent
+        );
+        let (bridge, witness) = local_route_witness();
+        let route = local_calibration_route(&bridge, &witness);
+        let host = route.current_host().unwrap();
+        let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (client, server) = calibration_protocol_endpoint(
+            vec![
+                ("hello", Ok(host.hello)),
+                ("inspect", Ok(host.context)),
+                ("prepare", Err("CALIBRATION_RUNNER_UNAVAILABLE")),
+            ],
+            None,
+            Some((2, revoked.clone())),
+        );
+        route.host.lock().unwrap().as_mut().unwrap().client = Arc::new(client);
+        let (mut service, failure) = entered_transport_call(
+            store,
+            bridge,
+            route.clone(),
+            original,
+            true,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            revoked,
+        );
+        server.join().unwrap();
+        let dual = std::error::Error::source(&failure)
+            .unwrap()
+            .downcast_ref::<NativePairingOwnerFailure>()
+            .unwrap();
+        assert_eq!(dual.primary.code, "HOST_REQUEST_FAILED");
+        assert_eq!(dual.checkpoint.code, "FIXTURE_SOURCE_REVOKED");
+        let native = std::error::Error::source(&dual.primary)
+            .unwrap()
+            .downcast_ref::<HostRequestFailure>()
+            .unwrap();
+        assert_eq!(
+            native.response["error"]["code"],
+            "CALIBRATION_RUNNER_UNAVAILABLE"
+        );
+        assert!(route.attempts.lock().unwrap().is_empty());
+        assert_eq!(
+            service.management_store().operation(&operation).unwrap(),
+            before
+        );
+        assert!(
+            service
+                .management_store()
+                .operation_evidence(&operation)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

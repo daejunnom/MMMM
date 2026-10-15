@@ -149,6 +149,19 @@ impl SessionAuthority {
             .cloned()
             .ok_or(AuthError::InvalidCapability)
     }
+    /// The native management loop already owns this installed handle. This
+    /// lookup observes its actual current generation; public locators cannot
+    /// construct a principal or revive a replaced/revoked session.
+    pub(crate) fn installed_principal(
+        &self,
+        handle: &SessionHandle,
+    ) -> Result<AuthenticatedPrincipal, AuthError> {
+        self.sessions
+            .get(&handle.digest)
+            .filter(|session| session.is_current())
+            .cloned()
+            .ok_or(AuthError::InvalidCapability)
+    }
     pub fn revoke(&mut self, token: &SecretToken) {
         if let Some(session) = self.sessions.remove(&capability_digest(token)) {
             session.active.store(false, Ordering::Release);
@@ -246,14 +259,19 @@ mod replacement_tests {
             lifetime: Duration::from_secs(10),
         };
         let (token, handle) = authority.install_with_handle(policy.clone()).unwrap();
+        let installed = authority.installed_principal(&handle).unwrap();
+        assert!(installed.same_session(&authority.authenticate_token(&token).unwrap()));
         let original = authority.sessions.get_mut(&handle.digest).unwrap();
         original.expires_at = Instant::now() - Duration::from_secs(1);
         let expired = original.clone();
         assert!(authority.authenticate_token(&token).is_err());
+        assert!(authority.installed_principal(&handle).is_err());
         authority.replace(&handle, policy.clone()).unwrap();
         assert!(authority.authenticate_token(&token).is_ok());
         assert!(!expired.is_current());
+        assert!(!installed.same_session(&authority.installed_principal(&handle).unwrap()));
         authority.revoke_all();
+        assert!(authority.installed_principal(&handle).is_err());
         assert!(authority.replace(&handle, policy).is_err());
     }
     #[test]

@@ -1471,6 +1471,74 @@ ignored는 0이다. 명령 exit 0·57,337 ms, Job commit peak 711,147,520 bytes�
 확인했다. `413`은 이 두 소유 파일만 format했고 `414` Runtime/all-target strict Clippy도
 exit 0·정상 정리였다. 같은 source의 전체 Coordinator 연결 검증과 구분한다.
 
+## Calibration 공통 계획과 실행 소비자 연결
+
+D064의 `calibration-plan` CLI는 이미 실행 중인 Coordinator에 실제 native session으로
+접속한다. 입력은 data root·project ID·expected revision·context ID의 locator 네 개이며
+CLI에서 별도 plan/apply 알고리즘을 만들지 않는다. 기존 ApplicationService의 실제
+Plan 요청과 유한 예산 아래 현재 owner·Project head·host context·실제 command action
+descriptor와 등록 dependency pin을 확인하고 공통 `prepare_setup`/freeze로 저장한다.
+새 `SetupPlanningPort`는 trusted bounded Project 읽기와 head 현재성 검사를 요구한다.
+원 Project 자료는 8 MiB로 제한하며 같은 Store와 owner·원 요청의 전후 검사를 유지한다.
+
+계획은 Rust sealed normative47의 원 명령·선행 chain·독립 readback 요구에서 투영한다.
+objective/storage에서 정하는 94개 footprint locator는 선언이며 실제 게임 target이나
+예약·ADMIN·관측 자료를 발급하지 않는다. 실제 scope는 기존 LocalAuthority가 검사한다.
+불필요한 별도 recipe/body staging과 원장을 추가하지 않았으며 원 recipe CAS는 기존
+owner 선택 단계가 생성하고 Runtime이 대조한다. host descriptor나 pin이 없으면
+가상 action/profile을 만들지 않고 unavailable로 남긴다.
+
+저장 전 실패와 저장 후 checkpoint 실패를 구분한다. 후자는 실제 plan ID/hash와
+`SETUP_PLAN_COMMITTED` 및 원 typed 원인을 보존한다. private plan 교환은 최대 32개
+진단 기록과 실제 session·offer digest·현재 교환의 Finished를 사용한다. 재배달 때 원
+최초 completion을 보존하되 현재 delivery completion은 별도로 확인하여 이전 ACK로
+새 교환을 완료하지 않는다. 정상 ACK/EOF 뒤 CLI stdout 실패에도 원 locator가 남고
+자동 재시도하지 않는다. 이 경계 뒤 같은 selector로 명령을 새로 실행하면 새 plan이
+생성될 수 있으므로 동일 locator의 멱등 재시도를 보장하지 않는다.
+
+D065의 daemon·bootstrap·ProductionFactory·Composite는 같은 calibration registry를
+공유한다. 실제 Runtime 승인·ADMIN private 완료·host route를 함께 보존하며 실패한
+LocalAuthority 발행은 admission으로 사용하지 않는다. 소비자는 현재 들어온 실제
+RequestContextWitness와 새 owner 관측으로 같은 Store·원 operation/plan/recipe·현재
+Project/Policy·scope·grant·private generation을 검사한다. 원 bootstrap budget을 재사용하지
+않고 일치하지만 무효인 calibration을 일반 action 경로로 fallback하지 않는다.
+
+intent 저장은 실제 private prepare readiness를 전후 검사한 뒤 기존 Runtime의 원
+Invocation transaction을 사용한다. transaction 안에서는 로컬 owner/grant/request와
+claim만 검사하며 host RPC를 넣지 않는다. commit이 완료되면 성공을 그대로 반환하고
+후속 dispatch의 현재성 오류를 intent 거절로 바꾸지 않는다. private route는 원 read
+owner/lease를 확인하며 일반 route map과 grant를 보존한다. 원 attempt key/digest는
+최초 dispatch 시 소비 전에 기록하고 재시도로 다른 원문을 전송하지 않는다.
+
+획득한 실제 host 응답은 후행 취소·source 검사보다 먼저 기존 CAS evidence에 보존한다.
+positive/negative 응답과 후행 오류, 원 runner 실패와 후행 현재성 실패 및 evidence I/O
+실패를 typed 원인으로 남긴다. 실제 runner·capture/preconditions·독립 readback producer가
+없으면 해당 unavailable 오류를 반환하며 빈 관측이나 profile 승인으로 대체하지 않는다.
+Java purpose 승인 route가 존재하는 것과 실제 관리자·47개 실행·profile 인수는 구분한다.
+
+독립 소스 리뷰로 registry/Runtime claim·공통 creator·CLI/session 전송·Composite route의
+현재성, commit 이후 상태와 오류 보존을 확인하고 지적된 경계를 보완했다. 기존 소유
+SQLite/CAS·Application/loopback fixture를 재사용했다. 새 Application 검사 하나는 저장
+전후 실패 8개 조합과 원 locator/이중 원인 보존을, host 검사 두 개는 응답 후 취소와
+prepare 실패 후 source 철회를 실제 경로로 확인하기 위해 추가했다. 새 대형 fixture는 없다.
+
+Windows 관리 실행 `418`은 기존 native catalog 테스트의 DaemonHandles 구성에 새
+registry field가 빠져 compile에서 실패했고 test는 실행되지 않았다. 해당 기존 fixture의
+구성 한 곳을 보완했다. `419`의 동일 CLI/Application/Coordinator unit·bin 검사는 각각
+16/57/359 PASS, Coordinator의 기존 1 ignored였으며 실패는 0이다. 실제 추가 host 두
+검사와 setup·projection·현재 delivery 검사가 포함된다. command 0·169,826 ms, Job
+commit peak 1,424,076,800 bytes·peak process 6개·최대 표본 간격 148 ms였다. 원
+2 GiB/32 process 상한과 소유 잔여 자식 정리 뒤 drain·완전한 출력·export·scratch 정리·
+lease 해제를 확인했다. 원 compile 실패 증거도 보존했다. WSL/Ubuntu는 사용하지 않았다.
+
+`420` strict Clippy는 Boolean 표현식 두 곳, 후속 `422`는 테스트의 중첩 if 한 곳에서
+실패했다. 경고 억제 없이 동등 조건식으로 정리했고 `421`·`423`은 해당 소유 파일만
+format했다. 원 실패와 정상 drain/export/scratch/lease 기록을 보존한다. 이 표현식·format
+정리 뒤 `419` 테스트를 재실행한 것으로 표시하지 않는다. `424`의 동일 세 package/
+all-target strict Clippy는 exit 0·27,506 ms, Job commit peak 857,006,080 bytes·peak
+process 7개·최대 표본 간격 120 ms였다. 자연 종료·drain/output/export/scratch/lease가
+정상 완료됐다. 현재 source의 전체 CI는 이 로컬 검사와 별도로 확인한다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

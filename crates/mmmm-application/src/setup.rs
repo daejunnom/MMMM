@@ -4,7 +4,7 @@
 use crate::planning::check_context;
 use crate::undo_context::UndoExecutionContext;
 use crate::{Access, AppError, AppResult, Application, PreparedPlan};
-use mmmm_contracts::{ContextId, PrincipalId, ProjectId, Sha256Digest};
+use mmmm_contracts::{ContextId, PlanId, PrincipalId, ProjectId, Sha256Digest};
 use mmmm_runtime::storage::DurableStore;
 use serde_json::Value;
 
@@ -21,6 +21,22 @@ pub struct SetupSelection {
 /// 읽기·컴파일·private CAS staging만 수행하며 target mutation이나 별도 원장을 만들지 않는다.
 /// 구현은 봉인된 setup 원문과 필요한 증거를 확인한 뒤 정확한 단계와 footprint를 반환한다.
 pub trait SetupPlanningPort {
+    /// Read the actual current Project through an authenticated, bounded source.
+    /// The implementation retains its protected head pin and original request.
+    fn read_current_project_with_store(
+        &mut self,
+        store: &DurableStore,
+        principal: &PrincipalId,
+        selection: &SetupSelection,
+    ) -> AppResult<Value>;
+    /// Recheck the same Store, current owner/head and original request without
+    /// replacing the retained head or starting a new budget.
+    fn check_current_project_with_store(
+        &self,
+        store: &DurableStore,
+        principal: &PrincipalId,
+        selection: &SetupSelection,
+    ) -> AppResult<()>;
     fn prepare_setup_with_store(
         &mut self,
         store: &mut DurableStore,
@@ -29,6 +45,71 @@ pub trait SetupPlanningPort {
         project: &Value,
         context: &Value,
     ) -> AppResult<PreparedPlan>;
+}
+
+/// A private plan was saved before its final source checkpoint failed. The
+/// immutable locator remains available; this is neither rollback nor approval.
+#[derive(Debug)]
+pub struct SetupCommittedPlanFailure {
+    plan_id: PlanId,
+    plan_hash: Sha256Digest,
+    checkpoint: AppError,
+}
+impl SetupCommittedPlanFailure {
+    pub fn plan_id(&self) -> &PlanId {
+        &self.plan_id
+    }
+    pub fn plan_hash(&self) -> &Sha256Digest {
+        &self.plan_hash
+    }
+    pub fn checkpoint_failure(&self) -> &AppError {
+        &self.checkpoint
+    }
+}
+impl std::fmt::Display for SetupCommittedPlanFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Setup plan committed before its final source checkpoint failed")
+    }
+}
+impl std::error::Error for SetupCommittedPlanFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.checkpoint)
+    }
+}
+
+#[derive(Debug)]
+struct SetupCheckpointFailure {
+    primary: AppError,
+    checkpoint: AppError,
+}
+impl std::fmt::Display for SetupCheckpointFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Setup work failed: {}; subsequent source checkpoint failed: {}",
+            self.primary, self.checkpoint
+        )
+    }
+}
+impl std::error::Error for SetupCheckpointFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
+    }
+}
+fn checked_source<T>(result: AppResult<T>, checkpoint: AppResult<()>) -> AppResult<T> {
+    match (result, checkpoint) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(checkpoint)) => Err(checkpoint),
+        (Err(primary), Err(checkpoint)) => Err(AppError::caused_by(
+            primary.code,
+            primary.message,
+            SetupCheckpointFailure {
+                primary,
+                checkpoint,
+            },
+        )),
+    }
 }
 
 impl Application<'_> {
@@ -53,10 +134,19 @@ impl Application<'_> {
     ) -> AppResult<Value> {
         self.authority
             .authorize(principal, &selection.project_id, Access::Plan, None, None)?;
-        let project = self
-            .store
-            .project(&selection.project_id)
-            .map_err(|error| AppError::storage("NOT_FOUND", error))?;
+        setup.check_current_project_with_store(self.store, principal, selection)?;
+        let project = checked_source(
+            setup.read_current_project_with_store(self.store, principal, selection),
+            setup.check_current_project_with_store(self.store, principal, selection),
+        )?;
+        crate::validate("Project", &project)?;
+        mmmm_contracts::verify_projected_digest("Project", &project).map_err(AppError::digest)?;
+        if project["projectId"] != selection.project_id.as_str() {
+            return Err(AppError::new(
+                "PERMISSION_REQUIRED",
+                "Setup Project differs from its original selection",
+            ));
+        }
         if project["revision"].as_str() != Some(selection.expected_revision.as_str()) {
             return Err(AppError::new(
                 "REVISION_CONFLICT",
@@ -77,8 +167,28 @@ impl Application<'_> {
             Some(&context),
             None,
         )?;
-        let prepared =
-            setup.prepare_setup_with_store(self.store, principal, selection, &project, &context)?;
-        self.freeze_ordinary_plan(principal, &project, &context, prepared, undo)
+        let prepared = checked_source(
+            setup.prepare_setup_with_store(self.store, principal, selection, &project, &context),
+            setup.check_current_project_with_store(self.store, principal, selection),
+        )?;
+        setup.check_current_project_with_store(self.store, principal, selection)?;
+        let frozen = self.freeze_ordinary_plan(principal, &project, &context, prepared, undo);
+        let checkpoint = setup.check_current_project_with_store(self.store, principal, selection);
+        match (frozen, checkpoint) {
+            (Ok(plan), Err(checkpoint)) => {
+                let plan_id = crate::decode(&plan["planId"])?;
+                let plan_hash = crate::decode(&plan["planHash"])?;
+                Err(AppError::caused_by(
+                    "SETUP_PLAN_COMMITTED",
+                    "Setup plan was saved before its source checkpoint failed",
+                    SetupCommittedPlanFailure {
+                        plan_id,
+                        plan_hash,
+                        checkpoint,
+                    },
+                ))
+            }
+            (result, checkpoint) => checked_source(result, checkpoint),
+        }
     }
 }

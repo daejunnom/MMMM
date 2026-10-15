@@ -4,11 +4,15 @@ use crate::{
     credential::{CredentialRef, CredentialStore},
     endpoint::{EndpointError, EndpointRecord, RuntimeDirectory},
     http::LoopbackServer,
-    peer_management::{ManagementReceiver, management_channel},
-    service::ApplicationService,
+    peer_management::{
+        BootstrapBudget, BootstrapWitness, CompletedBootstrap, ManagementError, ManagementReceiver,
+        ManagementRequest, PublicFrame, management_channel,
+    },
+    service::{ApplicationService, RequestBudget, ServiceError},
 };
-use mmmm_contracts::SessionEpoch;
+use mmmm_contracts::{PlanId, ProjectId, RequestId, SessionEpoch, Sha256Digest};
 use std::{
+    collections::BTreeMap,
     io,
     sync::{
         Arc,
@@ -76,6 +80,244 @@ struct HostManagement {
     receiver: ManagementReceiver,
     session: SessionHandle,
     installed_policy: SessionPolicy,
+    calibration_plans: BTreeMap<RequestId, CalibrationPlanAttempt>,
+}
+const MAX_RETAINED_CALIBRATION_PLANS: usize = 32;
+/// These process-local diagnostics retain the original typed service failure
+/// and native delivery outcome. The immutable saved plan lives in the Store;
+/// this record is neither a second ledger nor a recoverable execution grant.
+struct CalibrationPlanAttempt {
+    witness: BootstrapWitness,
+    original_witness: BootstrapWitness,
+    owner: Option<crate::auth::AuthenticatedPrincipal>,
+    committed: Option<(PlanId, Sha256Digest)>,
+    failure: Option<ServiceError>,
+    delivery_failure: Option<ManagementError>,
+    native_failure: Option<crate::peer::PeerError>,
+    original_completion: Option<(bool, Instant)>,
+    delivery_completed: bool,
+}
+impl CalibrationPlanAttempt {
+    fn allow_receipt_redelivery(&self) -> Result<(), ManagementError> {
+        if self.delivery_completed {
+            Ok(())
+        } else {
+            Err(ManagementError::Busy)
+        }
+    }
+    fn begin_receipt_redelivery(
+        &mut self,
+        witness: &BootstrapWitness,
+    ) -> Result<(), ManagementError> {
+        self.allow_receipt_redelivery()?;
+        self.witness = witness.clone();
+        self.delivery_completed = false;
+        Ok(())
+    }
+    /// Returns true only for an originally successful saved result whose one
+    /// native delivery completed without a retained failure. Later receipt
+    /// delivery cannot erase an earlier source/native failure or completion.
+    fn observe_completion(
+        &mut self,
+        finished: &CompletedBootstrap,
+        budget: &BootstrapBudget,
+    ) -> bool {
+        if self.witness.id() != finished.witness().id()
+            || self.witness.nonce() != finished.witness().nonce()
+            || self.witness.offer_digest() != finished.witness().offer_digest()
+        {
+            self.delivery_failure
+                .get_or_insert(ManagementError::WrongReply);
+            return false;
+        }
+        self.delivery_completed = true;
+        self.original_completion
+            .get_or_insert((finished.delivered(), finished.completed_at()));
+        if let Some(failure) = finished.failure() {
+            self.native_failure.get_or_insert(failure);
+        }
+        if !finished.delivered() && self.delivery_failure.is_none() {
+            self.delivery_failure = Some(
+                budget
+                    .check()
+                    .err()
+                    .unwrap_or(ManagementError::Disconnected),
+            );
+        }
+        finished.delivered()
+            && self.committed.is_some()
+            && self.failure.is_none()
+            && self.delivery_failure.is_none()
+            && self.native_failure.is_none()
+    }
+}
+fn committed_calibration_plan(error: &ServiceError) -> Option<(PlanId, Sha256Digest)> {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    for _ in 0..8 {
+        let current = cause?;
+        if let Some(saved) = current.downcast_ref::<mmmm_application::SetupCommittedPlanFailure>() {
+            return Some((saved.plan_id().clone(), saved.plan_hash().clone()));
+        }
+        cause = current.source();
+    }
+    None
+}
+impl HostManagement {
+    fn prepare_calibration_plan(
+        &mut self,
+        service: &mut ApplicationService,
+        authority: &SessionAuthority,
+        offer: crate::peer_management::HostOffer,
+        budget: &BootstrapBudget,
+    ) -> Result<PublicFrame, ManagementError> {
+        let witness = offer.witness().clone();
+        let frame = offer.public().value();
+        let selection = mmmm_application::SetupSelection {
+            project_id: ProjectId::new(
+                frame["projectId"]
+                    .as_str()
+                    .ok_or(ManagementError::InvalidFrame)?,
+            )
+            .map_err(|_| ManagementError::InvalidFrame)?,
+            expected_revision: Sha256Digest::new(
+                frame["expectedRevision"]
+                    .as_str()
+                    .ok_or(ManagementError::InvalidFrame)?,
+            )
+            .map_err(|_| ManagementError::InvalidFrame)?,
+            context_id: mmmm_contracts::ContextId::new(
+                frame["contextId"]
+                    .as_str()
+                    .ok_or(ManagementError::InvalidFrame)?,
+            )
+            .map_err(|_| ManagementError::InvalidFrame)?,
+        };
+        if frame["dataRoot"].as_str().map(std::path::Path::new) != Some(service.data_root()) {
+            return Err(ManagementError::InvalidFrame);
+        }
+        // The CLI derives this public nonce from the Project/revision/context
+        // locators; the exact data root also remains bound by the offer digest. If result
+        // delivery was lost, the same live OS owner can recover the retained
+        // immutable locator without planning again or replaying an effect.
+        let previous = self.calibration_plans.iter().find_map(|(id, attempt)| {
+            (attempt.original_witness.nonce() == witness.nonce()
+                && attempt.original_witness.offer_digest() == witness.offer_digest()
+                && attempt.committed.is_some())
+            .then(|| id.clone())
+        });
+        if let Some(previous) = previous {
+            budget.check()?;
+            self.calibration_plans
+                .get(&previous)
+                .ok_or(ManagementError::WrongReply)?
+                .allow_receipt_redelivery()?;
+            let principal = authority
+                .installed_principal(&self.session)
+                .map_err(|_| ManagementError::InvalidFrame)?;
+            if !principal.permits("plan.create")
+                || !principal.permits_context(selection.context_id.as_str())
+            {
+                return Err(ManagementError::InvalidFrame);
+            }
+            if !self
+                .calibration_plans
+                .get(&previous)
+                .and_then(|attempt| attempt.owner.as_ref())
+                .is_some_and(|owner| owner.same_session(&principal))
+            {
+                return Err(ManagementError::InvalidFrame);
+            }
+            self.calibration_plans
+                .get_mut(&previous)
+                .ok_or(ManagementError::WrongReply)?
+                .begin_receipt_redelivery(&witness)?;
+            let attempt = self
+                .calibration_plans
+                .remove(&previous)
+                .ok_or(ManagementError::WrongReply)?;
+            let reply = calibration_plan_reply(
+                &witness,
+                &selection.project_id,
+                attempt.committed.as_ref(),
+                attempt.failure.is_some(),
+            );
+            self.calibration_plans.insert(witness.id().clone(), attempt);
+            return reply;
+        }
+        // Reserve retention capacity before the helper can freeze anything.
+        if self.calibration_plans.len() >= MAX_RETAINED_CALIBRATION_PLANS {
+            return Err(ManagementError::Busy);
+        }
+        let principal = authority.installed_principal(&self.session);
+        let owner = principal.as_ref().ok().cloned();
+        let result = (|| {
+            let request = RequestBudget::from_bootstrap(budget)?;
+            let principal = principal.map_err(|error| {
+                ServiceError::caused_by(
+                    "AUTHENTICATION_REQUIRED",
+                    "Current installed native owner session is unavailable",
+                    error,
+                )
+            })?;
+            let hosts = self.processor.calibration_planning_hosts();
+            service.prepare_calibration_plan(&principal, &selection, &request, &hosts)
+        })();
+        let (committed, failure) = match result {
+            Ok(receipt) => (
+                Some((receipt.plan_id().clone(), receipt.plan_hash().clone())),
+                None,
+            ),
+            Err(error) => (committed_calibration_plan(&error), Some(error)),
+        };
+        let reply = calibration_plan_reply(
+            &witness,
+            &selection.project_id,
+            committed.as_ref(),
+            failure.is_some(),
+        );
+        self.calibration_plans.insert(
+            witness.id().clone(),
+            CalibrationPlanAttempt {
+                original_witness: witness.clone(),
+                witness,
+                owner,
+                committed,
+                failure,
+                delivery_failure: reply.as_ref().err().copied(),
+                native_failure: None,
+                original_completion: None,
+                delivery_completed: false,
+            },
+        );
+        reply
+    }
+    fn finish_calibration_plan(
+        &mut self,
+        finished: &CompletedBootstrap,
+        budget: &BootstrapBudget,
+    ) -> bool {
+        let Some(attempt) = self.calibration_plans.get_mut(finished.witness().id()) else {
+            return false;
+        };
+        if attempt.observe_completion(finished, budget) {
+            self.calibration_plans.remove(finished.witness().id());
+        }
+        true
+    }
+}
+fn calibration_plan_reply(
+    witness: &BootstrapWitness,
+    project: &ProjectId,
+    committed: Option<&(PlanId, Sha256Digest)>,
+    checkpoint_failed: bool,
+) -> Result<PublicFrame, ManagementError> {
+    let (plan, hash) = committed.ok_or(ManagementError::InvalidFrame)?;
+    PublicFrame::from_value(serde_json::json!({
+        "kind":"native_calibration_plan_prepared", "protocolVersion":mmmm_contracts::CONTRACT_VERSION,
+        "nonce":witness.nonce(), "purpose":crate::peer_management::CALIBRATION_PLAN_PURPOSE,
+        "projectId":project, "planId":plan, "planHash":hash,
+        "outcome":if checkpoint_failed { "committed_checkpoint_failed" } else { "prepared" }
+    }))
 }
 impl Coordinator {
     pub fn start(
@@ -146,6 +388,7 @@ impl Coordinator {
                         receiver,
                         session,
                         installed_policy,
+                        calibration_plans: BTreeMap::new(),
                     }),
                 )
             }
@@ -345,20 +588,43 @@ impl Coordinator {
                     .as_ref()
                     .map(|responder| responder.deadline())
                     .unwrap_or(budget.deadline());
-                let reply = management.processor.handle_with_reply_deadline(
-                    self.service.management_store(),
-                    request,
-                    &epoch,
-                    &budget,
-                    reply_deadline,
-                );
+                let witness_id = request.witness().id().clone();
+                let reply = match request {
+                    ManagementRequest::Offer(offer) if offer.public().is_calibration_plan() => {
+                        management
+                            .prepare_calibration_plan(
+                                &mut self.service,
+                                &self.authority,
+                                offer,
+                                &budget,
+                            )
+                            .map(Some)
+                    }
+                    ManagementRequest::Finished(finished)
+                        if finished.witness().is_calibration_plan() =>
+                    {
+                        management.finish_calibration_plan(&finished, &budget);
+                        Ok(None)
+                    }
+                    request => management.processor.handle_with_reply_deadline(
+                        self.service.management_store(),
+                        request,
+                        &epoch,
+                        &budget,
+                        reply_deadline,
+                    ),
+                };
                 if let Some(responder) = responder {
                     // Delivery is not activation. The subsequent actual native
                     // ACK and EOF observation activates or rolls back its grant.
                     let wire_reply = reply.and_then(|frame| {
                         frame.ok_or(crate::peer_management::ManagementError::WrongReply)
                     });
-                    let _ = responder.respond(wire_reply);
+                    if let Err(error) = responder.respond(wire_reply)
+                        && let Some(attempt) = management.calibration_plans.get_mut(&witness_id)
+                    {
+                        attempt.delivery_failure.get_or_insert(error);
+                    }
                 } else {
                     reply.map_err(|_| CoordinatorError::Cleanup)?;
                 }
@@ -423,4 +689,133 @@ fn same_policy_identity(left: &SessionPolicy, right: &SessionPolicy) -> bool {
     left.principal == right.principal
         && left.allowed_methods == right.allowed_methods
         && left.allowed_contexts == right.allowed_contexts
+}
+
+#[cfg(test)]
+mod calibration_delivery_tests {
+    use super::*;
+    use crate::peer_management::HostOffer;
+
+    // Reuses the bounded management channel and closed public locator frame;
+    // no Store/host fixture is introduced for this delivery-only state test.
+    #[test]
+    fn receipt_redelivery_preserves_original_typed_failure_and_native_completion() {
+        let public = PublicFrame::from_value(serde_json::json!({
+            "kind":"native_calibration_plan_offer", "protocolVersion":"0.2.0", "nonce":"retained-plan",
+            "purpose":crate::peer_management::CALIBRATION_PLAN_PURPOSE,
+            "dataRoot":std::env::temp_dir(), "projectId":"project-fixture",
+            "expectedRevision":"a".repeat(64), "contextId":"context-fixture"
+        })).unwrap();
+        let offer = HostOffer::calibration_plan(public).unwrap();
+        let witness = offer.witness().clone();
+        let saved = (
+            PlanId::new("plan-fixture").unwrap(),
+            Sha256Digest::new("b".repeat(64)).unwrap(),
+        );
+        let cause = ServiceError::caused_by(
+            "SETUP_PLAN_COMMITTED",
+            "Saved before checkpoint failure",
+            io::Error::from_raw_os_error(123),
+        );
+        let mut attempt = CalibrationPlanAttempt {
+            witness: witness.clone(),
+            original_witness: witness.clone(),
+            owner: None,
+            committed: Some(saved.clone()),
+            failure: Some(cause),
+            delivery_failure: None,
+            native_failure: None,
+            original_completion: None,
+            delivery_completed: false,
+        };
+        let (sender, receiver) = management_channel();
+        let original = BootstrapBudget::new();
+        // A second exchange cannot move the original witness while its native
+        // ACK/EOF and Finished observation are still pending.
+        assert_eq!(
+            attempt.allow_receipt_redelivery(),
+            Err(ManagementError::Busy)
+        );
+        sender
+            .notify_finished_with_failure(
+                &witness,
+                false,
+                &original,
+                Some(crate::peer::PeerError::Native(456)),
+            )
+            .unwrap();
+        let (request, _) = receiver
+            .try_receive()
+            .unwrap()
+            .unwrap()
+            .into_parts()
+            .unwrap();
+        let ManagementRequest::Finished(finished) = request else {
+            unreachable!()
+        };
+        assert!(finished.witness().is_calibration_plan());
+        assert!(!attempt.observe_completion(&finished, &original));
+        assert!(attempt.allow_receipt_redelivery().is_ok());
+        let first_completion = attempt.original_completion.unwrap();
+        assert_eq!(
+            attempt.native_failure,
+            Some(crate::peer::PeerError::Native(456))
+        );
+        assert_eq!(attempt.committed, Some(saved.clone()));
+        assert_eq!(
+            std::error::Error::source(attempt.failure.as_ref().unwrap())
+                .unwrap()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(123)
+        );
+        let recovered = calibration_plan_reply(
+            &witness,
+            &ProjectId::new("project-fixture").unwrap(),
+            attempt.committed.as_ref(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(recovered.value()["outcome"], "committed_checkpoint_failed");
+        assert_eq!(recovered.value()["planId"], saved.0.as_str());
+        let later = BootstrapBudget::new();
+        let retry_offer = HostOffer::calibration_plan(
+            PublicFrame::from_value(offer.public().value().clone()).unwrap(),
+        )
+        .unwrap();
+        let retry_witness = retry_offer.witness().clone();
+        attempt.begin_receipt_redelivery(&retry_witness).unwrap();
+        assert_eq!(attempt.original_completion, Some(first_completion));
+        assert_eq!(
+            attempt.allow_receipt_redelivery(),
+            Err(ManagementError::Busy)
+        );
+        assert!(attempt.begin_receipt_redelivery(&witness).is_err());
+        assert_eq!(attempt.witness.id(), retry_witness.id());
+        sender
+            .notify_finished(&retry_witness, true, &later)
+            .unwrap();
+        let (request, _) = receiver
+            .try_receive()
+            .unwrap()
+            .unwrap()
+            .into_parts()
+            .unwrap();
+        let ManagementRequest::Finished(finished) = request else {
+            unreachable!()
+        };
+        assert!(!attempt.observe_completion(&finished, &later));
+        assert!(attempt.allow_receipt_redelivery().is_ok());
+        assert_eq!(attempt.original_completion, Some(first_completion));
+        assert_eq!(
+            attempt.native_failure,
+            Some(crate::peer::PeerError::Native(456))
+        );
+        assert_eq!(
+            attempt.failure.as_ref().unwrap().code,
+            "SETUP_PLAN_COMMITTED"
+        );
+        assert_eq!(attempt.committed, Some(saved));
+    }
 }

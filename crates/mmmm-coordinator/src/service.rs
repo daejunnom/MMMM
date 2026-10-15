@@ -539,6 +539,76 @@ impl ApplicationService {
         self.undo_execution = Some(UndoServiceComposition { authority, hosts });
         Ok(())
     }
+    /// Only the authenticated native management consumer calls this typed
+    /// locator entry. It preserves its original transport budget and the same
+    /// occupied request/Store/ports used by ordinary Plan creation.
+    pub(crate) fn prepare_calibration_plan(
+        &mut self,
+        principal: &AuthenticatedPrincipal,
+        selection: &mmmm_application::SetupSelection,
+        budget: &RequestBudget,
+        hosts: &crate::host::HostBridge,
+    ) -> Result<crate::calibration_planning::CalibrationPlanReceipt, ServiceError> {
+        budget.check()?;
+        if crate::peer::fatal_stop_requested() {
+            return Err(ServiceError::new(
+                "LOCAL_TRANSPORT_UNCERTAIN",
+                "Native local authentication transport completion is unresolved",
+            ));
+        }
+        if !principal.permits("plan.create") {
+            return Err(ServiceError::new(
+                "PERMISSION_REQUIRED",
+                "Current authenticated native Plan authority is required",
+            ));
+        }
+        let slot = self.request_context.as_ref().ok_or_else(|| {
+            ServiceError::new(
+                "INVALID_COMPOSITION",
+                "Calibration planning requires the actual service request slot",
+            )
+        })?;
+        let _scope = slot.enter(principal, budget, "plan.create")?;
+        let request = slot.current_witness("plan.create")?;
+        let owner =
+            crate::workspace_bootstrap::NativeOwnerWitness::capture(&self.store, budget.deadline())
+                .map_err(|cause| {
+                    ServiceError::caused_by(
+                        "PERMISSION_REQUIRED",
+                        "Actual native Store owner is required",
+                        cause,
+                    )
+                })?;
+        let mut provider = GuardedProvider {
+            inner: self.ports.provider.as_mut(),
+            budget,
+            principal,
+            method: "plan.create",
+        };
+        let mut observer = GuardedObserver {
+            inner: self.ports.observer.as_mut(),
+            budget,
+            principal,
+            method: "plan.create",
+        };
+        let mut application = Application {
+            store: &mut self.store,
+            authority: self.ports.authority.as_mut(),
+            planner: self.ports.planner.as_mut(),
+            provider: &mut provider,
+            observer: &mut observer,
+            ids: self.ports.ids.as_mut(),
+            clock: self.ports.clock.as_ref(),
+        };
+        crate::calibration_planning::prepare_normative47_plan(
+            &mut application,
+            &request,
+            &owner,
+            hosts,
+            selection,
+        )
+        .map_err(|cause| ServiceError::caused_by(cause.code, cause.message, cause))
+    }
     /// Authenticated bootstrap composition may persist initial authoring data;
     /// this is intentionally not exposed as a JSON-RPC escape hatch.
     pub fn bootstrap_project(&mut self, project: &Value) -> Result<(), StorageError> {

@@ -294,6 +294,7 @@ impl DaemonSourceFactory for ProductionFactory {
             request: handles.request.clone(),
             backend: native_backend,
             metadata,
+            calibration: handles.calibration.clone(),
         })
         .map_err(composition_error)?;
         let observer = provider.observer();

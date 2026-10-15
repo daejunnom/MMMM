@@ -44,6 +44,9 @@ pub struct DaemonHandles {
     pub hosts: HostBridge,
     pub authority: LocalAuthority,
     pub request: RequestContextSlot,
+    /// Same opaque completed-issuance registry used by the bootstrap processor
+    /// and production Provider/observer. Empty construction grants nothing.
+    pub calibration: crate::calibration_execution::CalibrationRegistry,
     /// Explicit daemon setup locator, checked against the protected Store.
     /// Per-call sources still require current principal/project authority.
     pub configured_project: Option<ProjectId>,
@@ -210,6 +213,7 @@ impl PreparedDaemon {
             hosts,
             authority,
             request,
+            calibration: crate::calibration_execution::CalibrationRegistry::default(),
             configured_project,
             workspace,
         };
@@ -268,15 +272,17 @@ impl PreparedDaemon {
             .bind_undo_execution(handles.authority.clone(), handles.hosts.clone())
             .map_err(DaemonError::Composition)?;
         service.set_extensions(extensions);
-        let mut processor =
-            HostBootstrapProcessor::new(handles.hosts.clone(), handles.authority.clone()).map_err(
-                |_| {
-                    DaemonError::Composition(ServiceError::new(
-                        "LOCAL_OWNER_UNAVAILABLE",
-                        "Current native local owner cannot be authenticated",
-                    ))
-                },
-            )?;
+        let mut processor = HostBootstrapProcessor::with_calibration_registry(
+            handles.hosts.clone(),
+            handles.authority.clone(),
+            handles.calibration.clone(),
+        )
+        .map_err(|_| {
+            DaemonError::Composition(ServiceError::new(
+                "LOCAL_OWNER_UNAVAILABLE",
+                "Current native local owner cannot be authenticated",
+            ))
+        })?;
         if let Some(workspace) = &handles.workspace {
             processor.install_workspace_context(&workspace.witness, service.management_store(), &workspace.context)
                 .map_err(|_| DaemonError::Composition(ServiceError::new("WORKSPACE_UNAVAILABLE", "Verified native workspace could not be installed in the current session policy")))?;

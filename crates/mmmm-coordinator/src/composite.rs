@@ -5,6 +5,7 @@
 use crate::{
     auth::AuthenticatedPrincipal,
     authority::LocalAuthority,
+    calibration_execution::{CalibrationAccess, CalibrationRegistry, EnteredCalibration},
     host::{
         DependencyProvenance, HostBridge, HostContextWitness, HttpProviderPort, VerifiedDependency,
     },
@@ -265,6 +266,7 @@ pub struct CompositeComposition {
     pub request: RequestContextSlot,
     pub backend: Rc<HostNativeBackend>,
     pub metadata: RustMetadataRegistry,
+    pub calibration: CalibrationRegistry,
 }
 #[derive(Clone)]
 struct Shared {
@@ -273,6 +275,7 @@ struct Shared {
     request: RequestContextSlot,
     backend: Rc<HostNativeBackend>,
     metadata: RustMetadataRegistry,
+    calibration: CalibrationRegistry,
     phases: Rc<RefCell<BTreeMap<InvocationId, Rc<FrozenPhase>>>>,
 }
 struct FrozenPhase {
@@ -304,6 +307,7 @@ impl CompositeProvider {
                 request: composition.request,
                 backend: composition.backend,
                 metadata: composition.metadata,
+                calibration: composition.calibration,
                 phases: Rc::new(RefCell::new(BTreeMap::new())),
             },
         })
@@ -319,6 +323,19 @@ impl CompositeProvider {
         invocation: &Value,
         receipt: Option<&str>,
     ) -> AppResult<()> {
+        let request = self.shared.calibration_request()?;
+        if let Some(entered) =
+            self.shared
+                .enter_calibration(store, &request, invocation, CalibrationAccess::Cancel)?
+        {
+            entered.verify_claim(store, invocation)?;
+            let result = entered
+                .route()
+                .cancel_with_store(store, &request, invocation, &|store| {
+                    entered.check_local(store)
+                });
+            return finish_native_observation(result, entered.check_local(store));
+        }
         durable_original(&self.shared, store, invocation, Access::Cancel)?;
         let call = self.shared.call(&invocation["context"])?;
         self.shared.authority.authorize_with_deadline(
@@ -337,6 +354,28 @@ impl CompositeProvider {
     }
 }
 impl Shared {
+    fn calibration_request(&self) -> AppResult<RequestContextWitness> {
+        self.request
+            .occupied_witness()
+            .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))
+    }
+    fn enter_calibration<'a>(
+        &'a self,
+        store: &DurableStore,
+        request: &'a RequestContextWitness,
+        original: &Value,
+        access: CalibrationAccess,
+    ) -> AppResult<Option<EnteredCalibration<'a>>> {
+        let operation: OperationId = decode(&original["operationId"])?;
+        self.calibration.enter(
+            store,
+            request,
+            &self.authority,
+            &operation,
+            original,
+            access,
+        )
+    }
     fn block_observer(&self) -> NativeObserver {
         NativeObserver::authenticated(
             self.hosts.clone(),
@@ -1190,6 +1229,14 @@ impl ProviderPort for CompositeProvider {
         condition: &Value,
         context: &Value,
     ) -> AppResult<Sha256Digest> {
+        if self.shared.calibration.matches_plan(plan)? {
+            // No original Invocation exists at this phase. A locator cannot
+            // authorize prepare or substitute an independent factual read.
+            return Err(error(
+                "CALIBRATION_PRECONDITION_UNAVAILABLE",
+                "Independent calibration plan precondition producer is unavailable",
+            ));
+        }
         if registered_direct_block(step) {
             let (call, scope) =
                 admit_plan_step(&self.shared, store, plan, step, condition, context)?;
@@ -1224,6 +1271,12 @@ impl ProviderPort for CompositeProvider {
         condition: &Value,
         context: &Value,
     ) -> AppResult<Sha256Digest> {
+        if self.shared.calibration.matches_plan(plan)? {
+            return Err(error(
+                "CALIBRATION_PRECONDITION_UNAVAILABLE",
+                "Independent calibration plan precondition producer is unavailable",
+            ));
+        }
         let subject = text(condition, "subject")?;
         if registered_direct_block(step) && subject.starts_with("native:") {
             let (call, scope) =
@@ -1306,11 +1359,60 @@ impl ProviderPort for CompositeProvider {
     fn dispatch(&mut self, _invocation: &Value) -> AppResult<Value> {
         Err(store_required())
     }
+    fn persist_dispatch_intent_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        operation: &OperationId,
+        step: &StepId,
+        invocation: &Value,
+        resolution: Option<&BlobRef>,
+    ) -> AppResult<mmmm_runtime::storage::StepRecord> {
+        let request = self.shared.calibration_request()?;
+        if let Some(entered) =
+            self.shared
+                .enter_calibration(store, &request, invocation, CalibrationAccess::Apply)?
+        {
+            if &entered.operation().operation_id != operation {
+                return Err(stale());
+            }
+            return entered.persist_intent(
+                store,
+                step,
+                invocation,
+                resolution,
+                &mut |route, request, original, store| {
+                    route.prepare(request, original, &|| entered.check_local(store))
+                },
+            );
+        }
+        // Preserve the ordinary Runtime transaction for all other routes.
+        match resolution {
+            Some(resolution) => {
+                store.dispatch_resolved_intent(operation, step, invocation, resolution)
+            }
+            None => store.dispatch_intent(operation, step, invocation),
+        }
+        .map_err(|cause| AppError::storage("DISPATCH_REJECTED", cause))
+    }
     fn dispatch_with_store(
         &mut self,
         store: &mut DurableStore,
         invocation: &Value,
     ) -> AppResult<Value> {
+        let request = self.shared.calibration_request()?;
+        if let Some(entered) =
+            self.shared
+                .enter_calibration(store, &request, invocation, CalibrationAccess::Apply)?
+        {
+            entered.verify_claim(store, invocation)?;
+            let result =
+                entered
+                    .route()
+                    .dispatch_with_store(store, &request, invocation, &|store| {
+                        entered.check_local(store)
+                    });
+            return finish_native_observation(result, entered.check_local(store));
+        }
         let (record, blob) = durable_original(&self.shared, store, invocation, Access::Apply)?;
         let call = self.shared.call(&invocation["context"])?;
         let step = record
@@ -1385,6 +1487,22 @@ impl ProviderPort for CompositeProvider {
         invocation: &Value,
         receipt: Option<&str>,
     ) -> AppResult<Option<Value>> {
+        let request = self.shared.calibration_request()?;
+        if let Some(entered) = self.shared.enter_calibration(
+            store,
+            &request,
+            invocation,
+            CalibrationAccess::Observe,
+        )? {
+            entered.verify_claim(store, invocation)?;
+            let result =
+                entered
+                    .route()
+                    .poll_with_store(store, &request, invocation, receipt, &|store| {
+                        entered.check_local(store)
+                    });
+            return finish_native_observation(result, entered.check_local(store));
+        }
         let (record, plan, step, call) =
             frozen_plan(&self.shared, store, invocation, Access::ObserveOperation)?;
         durable_original(&self.shared, store, invocation, Access::ObserveOperation)?;
@@ -1787,6 +1905,13 @@ impl IndependentObserverPort for CompositeObserver {
         invocation: &Value,
         scope: &WriteScope,
     ) -> AppResult<Option<BeforeCapture>> {
+        let request = self.shared.calibration_request()?;
+        if let Some(entered) =
+            self.shared
+                .enter_calibration(store, &request, invocation, CalibrationAccess::Apply)?
+        {
+            return calibration_before(&entered, store, scope);
+        }
         if registered_direct_block(invocation) {
             let (record, _, step, call) =
                 frozen_plan(&self.shared, store, invocation, Access::Apply)?;
@@ -1808,6 +1933,13 @@ impl IndependentObserverPort for CompositeObserver {
         invocation: &Value,
         scope: &WriteScope,
     ) -> AppResult<Option<BeforeCapture>> {
+        let request = self.shared.calibration_request()?;
+        if let Some(entered) =
+            self.shared
+                .enter_calibration(store, &request, invocation, CalibrationAccess::Apply)?
+        {
+            return calibration_before(&entered, store, scope);
+        }
         if registered_direct_block(invocation) {
             let (record, _, step, call) =
                 frozen_plan(&self.shared, store, invocation, Access::Apply)?;
@@ -1850,6 +1982,26 @@ impl IndependentObserverPort for CompositeObserver {
         invocation: &Value,
         scope: &WriteScope,
     ) -> AppResult<ReadbackEvidence> {
+        let request = self.shared.calibration_request()?;
+        if let Some(entered) = self.shared.enter_calibration(
+            store,
+            &request,
+            invocation,
+            CalibrationAccess::Observe,
+        )? {
+            entered.verify_claim(store, invocation)?;
+            let result = if &entered.operation().scope != scope {
+                Err(forbidden())
+            } else {
+                // calibration_run_source requires an actual independent source
+                // receipt/digest. Do not synthesize these from invocation args.
+                Err(error(
+                    "CALIBRATION_READBACK_UNAVAILABLE",
+                    "Independent calibration readback source producer is unavailable",
+                ))
+            };
+            return finish_native_observation(result, entered.check_local(store));
+        }
         if registered_direct_block(invocation) {
             let (record, _, step, call) =
                 frozen_plan(&self.shared, store, invocation, Access::ObserveOperation)?;
@@ -1955,6 +2107,22 @@ impl IndependentObserverPort for CompositeObserver {
         invocation: &Value,
         target: &str,
     ) -> AppResult<Vec<u8>> {
+        let request = self.shared.calibration_request()?;
+        if let Some(entered) = self.shared.enter_calibration(
+            store,
+            &request,
+            invocation,
+            CalibrationAccess::Observe,
+        )? {
+            entered.verify_claim(store, invocation)?;
+            return finish_native_observation(
+                Err(error(
+                    "CALIBRATION_RECOVERY_UNSUPPORTED",
+                    "Calibration cannot use an ordinary recovery target route",
+                )),
+                entered.check_local(store),
+            );
+        }
         if registered_direct_block(invocation) {
             let (record, _, step, call) =
                 frozen_plan(&self.shared, store, invocation, Access::ObserveOperation)?;
@@ -1985,6 +2153,22 @@ impl IndependentObserverPort for CompositeObserver {
         invocation: &Value,
         target: &str,
     ) -> AppResult<Vec<u8>> {
+        let request = self.shared.calibration_request()?;
+        if let Some(entered) = self.shared.enter_calibration(
+            store,
+            &request,
+            invocation,
+            CalibrationAccess::Observe,
+        )? {
+            entered.verify_claim(store, invocation)?;
+            return finish_native_observation(
+                Err(error(
+                    "CALIBRATION_RECOVERY_UNSUPPORTED",
+                    "Calibration cannot use an ordinary recovery target route",
+                )),
+                entered.check_local(store),
+            );
+        }
         if registered_direct_block(invocation) {
             let (record, _, step, call) =
                 frozen_plan(&self.shared, store, invocation, Access::ObserveOperation)?;
@@ -2277,6 +2461,30 @@ impl ProjectResourceAuthority for SourceAuthority {
         }
         self.0.source_acl("resourceIds", id.as_str())
     }
+}
+
+fn calibration_before(
+    entered: &EnteredCalibration<'_>,
+    store: &DurableStore,
+    scope: &WriteScope,
+) -> AppResult<Option<BeforeCapture>> {
+    let result = (|| {
+        if &entered.operation().scope != scope || entered.plan()["scope"] != json!(scope) {
+            return Err(forbidden());
+        }
+        // An actual null runner rejects here, before any durable intent.
+        // Readiness alone cannot manufacture an independent before-image.
+        entered
+            .route()
+            .prepare(entered.request(), entered.original(), &|| {
+                entered.check_local(store)
+            })?;
+        Err(error(
+            "CALIBRATION_CAPTURE_UNAVAILABLE",
+            "Independent calibration before-capture producer is unavailable",
+        ))
+    })();
+    finish_native_observation(result, entered.check_local(store))
 }
 
 fn frozen_plan(

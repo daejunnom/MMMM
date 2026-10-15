@@ -196,6 +196,16 @@ impl AuthenticatedPeerToken {
     }
 }
 impl PeerHostAttach {
+    /// One-phase owner selection already committed in the same Store. This
+    /// only proves result delivery; an ACK failure cannot revoke that fact.
+    pub(crate) fn complete_owner_selection(self) -> Result<(), PeerError> {
+        self.inner.complete_delivery()
+    }
+    /// The one-phase plan result is already durable. ACK/EOF confirms delivery
+    /// only and cannot undo or retry the saved plan.
+    pub(crate) fn complete_calibration_plan(self) -> Result<(), PeerError> {
+        self.inner.complete_delivery()
+    }
     pub fn offer(
         runtime: &Path,
         reference: &CredentialRef,

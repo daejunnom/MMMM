@@ -28,8 +28,8 @@ use crate::{
     workspace_bootstrap::NativeOwnerWitness,
 };
 use mmmm_contracts::{
-    ContextId, JsonLimits, ProjectId, ResourceId, ResourceLocation, Sha256Digest, TargetProfileId,
-    encode_json, parse_json_with_limits,
+    ContextId, JsonLimits, PlanId, ProjectId, ResourceId, ResourceLocation, Sha256Digest,
+    TargetProfileId, encode_json, parse_json_with_limits,
 };
 use mmmm_runtime::storage::{
     DurableStore, StorageError, StoreConfig,
@@ -59,6 +59,12 @@ const SOURCE_IMPORT: Duration = Duration::from_secs(30);
 const MAX_SOURCE_DOCUMENT: usize = 8 * 1024 * 1024;
 const MAX_SOURCE_TOTAL: usize = 32 * 1024 * 1024;
 const MAX_SOURCE_DOCUMENTS: usize = 256;
+
+fn random_suffix() -> Result<String, EntryError> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|_| EntryError::OutputInvalid)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
 
 #[derive(Debug)]
 pub enum EntryError {
@@ -109,6 +115,17 @@ pub enum EntryError {
         record: Box<CompatibilityApprovalRecord>,
         delivery: Box<EntryError>,
     },
+    CalibrationSelectionCommitted {
+        selection_digest: Sha256Digest,
+        delivery: Box<EntryError>,
+    },
+    CalibrationPlanCommitted {
+        project: ProjectId,
+        plan: PlanId,
+        hash: Sha256Digest,
+        checkpoint_failed: bool,
+        delivery: Option<Box<EntryError>>,
+    },
     Shutdown {
         primary: Option<Box<EntryError>>,
         cleanup: CoordinatorError,
@@ -124,6 +141,14 @@ impl std::fmt::Display for EntryError {
             Self::CatalogSourceRequest(error) => write!(f, "{}: Cold native catalog source use could not continue", error.code),
             Self::CompatibilityProfileArguments => f.write_str("Compatibility profile approval requires one initialized Project revision and exact existing profile resource ID/raw SHA-256, a bounded approval reference, separate artifact and interface SHA-256 selections; no profile JSON or authority options are accepted"),
             Self::CompatibilityProfileRequest(error) => write!(f, "{}: Cold native compatibility profile approval could not continue", error.code),
+            Self::CalibrationSelectionCommitted { selection_digest, delivery } => write!(f,
+                "Calibration owner selection {selection_digest} was committed and retained; result delivery failed: {delivery}"),
+            Self::CalibrationPlanCommitted { project, plan, hash, checkpoint_failed, delivery } => {
+                write!(f, "Calibration plan {plan} ({hash}) for Project {project} was saved and retained")?;
+                if *checkpoint_failed { f.write_str("; its final source checkpoint failed (SETUP_PLAN_COMMITTED); the Coordinator retains the original cause")?; }
+                if let Some(delivery) = delivery { write!(f, "; result delivery failed: {delivery}")?; }
+                Ok(())
+            }
             Self::SourceRequest(error) => write!(f, "{}: Native source request could not continue", error.code),
             Self::SourceFile(error) => error.fmt(f),
             Self::Deadline => f.write_str("Native command startup or delivery deadline reached"),
@@ -177,6 +202,10 @@ impl std::error::Error for EntryError {
             Self::HostReadPolicyCommitted { delivery, .. } => Some(delivery.as_ref()),
             Self::CatalogSourceUsesCommitted { delivery, .. } => Some(delivery.as_ref()),
             Self::CompatibilityProfileCommitted { delivery, .. } => Some(delivery.as_ref()),
+            Self::CalibrationSelectionCommitted { delivery, .. } => Some(delivery.as_ref()),
+            Self::CalibrationPlanCommitted { delivery, .. } => delivery
+                .as_deref()
+                .map(|error| error as &(dyn std::error::Error + 'static)),
             Self::Shutdown { cleanup, .. } => Some(cleanup),
             _ => None,
         }
@@ -224,7 +253,19 @@ enum Command {
         root: PathBuf,
         selection: NativeCompatibilityApprovalSelection,
     },
-    HostBridge,
+    CalibrationApprove {
+        root: PathBuf,
+        project: ProjectId,
+        plan: PlanId,
+        hash: Sha256Digest,
+    },
+    CalibrationPlan {
+        root: PathBuf,
+        selection: mmmm_application::SetupSelection,
+    },
+    HostBridge {
+        approval: bool,
+    },
     Owned(Vec<String>),
 }
 
@@ -264,8 +305,128 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
         return Ok(false);
     };
     match command {
-        Command::HostBridge => {
-            host_relay::run_stdio(&mut NativeDaemonLocator).map_err(EntryError::Relay)?;
+        Command::CalibrationPlan { root, selection } => {
+            use crate::{
+                credential::CredentialRef,
+                host_relay::CoordinatorLocator,
+                peer::PeerHostAttach,
+                peer_management::{HostOffer, PublicFrame},
+            };
+            let deadline = started + crate::peer_management::BOOTSTRAP_LIMIT;
+            let endpoint = host_relay::ExistingCoordinator
+                .ensure_endpoint(&root, &selection.project_id, deadline)
+                .map_err(EntryError::Relay)?;
+            let offer = PublicFrame::from_value(json!({
+                "kind":"native_calibration_plan_offer", "protocolVersion":mmmm_contracts::CONTRACT_VERSION,
+                "nonce":format!("calibration-plan-{}", mmmm_contracts::canonical_digest(&json!({
+                    "projectId":selection.project_id,"expectedRevision":selection.expected_revision,"contextId":selection.context_id
+                })).map_err(|_| EntryError::Arguments)?),
+                "purpose":crate::peer_management::CALIBRATION_PLAN_PURPOSE, "dataRoot":root,
+                "projectId":selection.project_id, "expectedRevision":selection.expected_revision, "contextId":selection.context_id
+            })).map_err(|_| EntryError::Arguments)?;
+            let offer =
+                HostOffer::calibration_plan(offer).map_err(|_| EntryError::OutputInvalid)?;
+            let reference = CredentialRef::new(&endpoint.credential_ref)
+                .map_err(|_| EntryError::OutputInvalid)?;
+            let (pending, prepared) = PeerHostAttach::offer_with_deadline(
+                &root.join("runtime"),
+                &reference,
+                offer,
+                deadline,
+            )
+            .map_err(EntryError::Peer)?;
+            if !prepared.is_calibration_plan()
+                || prepared.value()["projectId"] != selection.project_id.as_str()
+            {
+                return Err(EntryError::OutputInvalid);
+            }
+            let plan = PlanId::new(
+                prepared.value()["planId"]
+                    .as_str()
+                    .ok_or(EntryError::OutputInvalid)?,
+            )
+            .map_err(|_| EntryError::OutputInvalid)?;
+            let hash = Sha256Digest::new(
+                prepared.value()["planHash"]
+                    .as_str()
+                    .ok_or(EntryError::OutputInvalid)?,
+            )
+            .map_err(|_| EntryError::OutputInvalid)?;
+            let checkpoint_failed = prepared.value()["outcome"] == "committed_checkpoint_failed";
+            let result = json!({"kind":"calibration_plan_prepared", "projectId":selection.project_id,
+                "planId":plan,"planHash":hash,"outcome":prepared.value()["outcome"]});
+            let delivery = pending
+                .complete_calibration_plan()
+                .map_err(EntryError::Peer)
+                .and_then(|()| output(&result, deadline.min(Instant::now() + OUTPUT)))
+                .err()
+                .map(Box::new);
+            if checkpoint_failed || delivery.is_some() {
+                return Err(EntryError::CalibrationPlanCommitted {
+                    project: selection.project_id,
+                    plan,
+                    hash,
+                    checkpoint_failed,
+                    delivery,
+                });
+            }
+        }
+        Command::HostBridge { approval } => {
+            if approval {
+                host_relay::run_approval_stdio(&mut NativeDaemonLocator)
+            } else {
+                host_relay::run_stdio(&mut NativeDaemonLocator)
+            }
+            .map_err(EntryError::Relay)?;
+        }
+        Command::CalibrationApprove {
+            root,
+            project,
+            plan,
+            hash,
+        } => {
+            use crate::{
+                credential::CredentialRef,
+                host_relay::CoordinatorLocator,
+                peer::PeerHostAttach,
+                peer_management::{HostOffer, PublicFrame},
+            };
+            let deadline = started + Duration::from_secs(30);
+            let endpoint = host_relay::ExistingCoordinator
+                .ensure_endpoint(&root, &project, deadline)
+                .map_err(EntryError::Relay)?;
+            let nonce = format!("calibration-{}", random_suffix()?);
+            let offer = PublicFrame::from_value(json!({"kind":"native_calibration_owner_offer",
+                "protocolVersion":mmmm_contracts::CONTRACT_VERSION,"nonce":nonce,
+                "purpose":crate::bootstrap::calibration_approval::PURPOSE,
+                "dataRoot":root,"projectId":project,"planId":plan,"planHash":hash}))
+            .map_err(|_| EntryError::Arguments)?;
+            let offer = HostOffer::owner_selection(offer).map_err(|_| EntryError::OutputInvalid)?;
+            let reference = CredentialRef::new(&endpoint.credential_ref)
+                .map_err(|_| EntryError::OutputInvalid)?;
+            let (pending, selected) = PeerHostAttach::offer_with_deadline(
+                &root.join("runtime"),
+                &reference,
+                offer,
+                deadline,
+            )
+            .map_err(EntryError::Peer)?;
+            let selection_digest = Sha256Digest::new(
+                selected.value()["selectionDigest"]
+                    .as_str()
+                    .ok_or(EntryError::OutputInvalid)?,
+            )
+            .map_err(|_| EntryError::OutputInvalid)?;
+            let result = json!({"kind":"calibration_owner_selected","projectId":project,"planId":plan,"planHash":hash,
+                "selectionDigest":selection_digest,"approvalRef":selected.value()["approvalRef"],"expiresAt":selected.value()["expiresAt"]});
+            let delivered = pending
+                .complete_owner_selection()
+                .map_err(EntryError::Peer)
+                .and_then(|()| output(&result, deadline.min(Instant::now() + OUTPUT)));
+            delivered.map_err(|delivery| EntryError::CalibrationSelectionCommitted {
+                selection_digest,
+                delivery: Box::new(delivery),
+            })?;
         }
         Command::Owned(args) => {
             let mut owner = daemon_launch::adopt_child(&args).map_err(EntryError::Launch)?;
@@ -558,8 +719,12 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
         return Ok(Some(Command::Owned(args[1..].to_vec())));
     }
     if command == "host-bridge" {
-        return if args.len() == 2 && args[1] == "--stdio-bootstrap" {
-            Ok(Some(Command::HostBridge))
+        return if args.len() == 2
+            && matches!(args[1].as_str(), "--stdio-bootstrap" | "--stdio-approval")
+        {
+            Ok(Some(Command::HostBridge {
+                approval: args[1] == "--stdio-approval",
+            }))
         } else {
             Err(EntryError::Arguments)
         };
@@ -573,8 +738,15 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
             | "source-import"
             | "catalog-source-use"
             | "compatibility-profile-approve"
+            | "calibration-approve"
+            | "calibration-plan"
     ) {
         return Ok(None);
+    }
+    if matches!(command, "calibration-approve" | "calibration-plan")
+        && (args.len() != 9 || args.iter().any(|arg| arg.len() > 4096))
+    {
+        return Err(EntryError::Arguments);
     }
     // Eight required selector pairs are the complete cold approval surface.
     // Bound the argument collection before cloning or parsing any selector.
@@ -664,6 +836,34 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
         return Err(EntryError::Arguments);
     }
     let parsed = match command {
+        "calibration-plan" => Command::CalibrationPlan {
+            root,
+            selection: mmmm_application::SetupSelection {
+                project_id: ProjectId::new(
+                    options.remove("--project").ok_or(EntryError::Arguments)?,
+                )
+                .map_err(|_| EntryError::Arguments)?,
+                expected_revision: Sha256Digest::new(
+                    options
+                        .remove("--expected-revision")
+                        .ok_or(EntryError::Arguments)?,
+                )
+                .map_err(|_| EntryError::Arguments)?,
+                context_id: ContextId::new(
+                    options.remove("--context").ok_or(EntryError::Arguments)?,
+                )
+                .map_err(|_| EntryError::Arguments)?,
+            },
+        },
+        "calibration-approve" => Command::CalibrationApprove {
+            root,
+            project: ProjectId::new(options.remove("--project").ok_or(EntryError::Arguments)?)
+                .map_err(|_| EntryError::Arguments)?,
+            plan: PlanId::new(options.remove("--plan-id").ok_or(EntryError::Arguments)?)
+                .map_err(|_| EntryError::Arguments)?,
+            hash: Sha256Digest::new(options.remove("--plan-hash").ok_or(EntryError::Arguments)?)
+                .map_err(|_| EntryError::Arguments)?,
+        },
         "init" => Command::Init {
             root,
             name: options
@@ -1317,8 +1517,76 @@ mod tests {
     fn native_protocol_mode_and_finite_lifetime_are_closed() {
         assert!(matches!(
             parse(&args(&["host-bridge", "--stdio-bootstrap"])),
-            Ok(Some(Command::HostBridge))
+            Ok(Some(Command::HostBridge { approval: false }))
         ));
+        assert!(matches!(
+            parse(&args(&["host-bridge", "--stdio-approval"])),
+            Ok(Some(Command::HostBridge { approval: true }))
+        ));
+        let hash = "a".repeat(64);
+        let planning = args(&[
+            "calibration-plan",
+            "--data-root",
+            root(),
+            "--project",
+            "project-test",
+            "--expected-revision",
+            &hash,
+            "--context",
+            "context-test",
+        ]);
+        assert!(matches!(
+            parse(&planning),
+            Ok(Some(Command::CalibrationPlan { .. }))
+        ));
+        for (position, replacement) in [
+            (1, "--principal"),
+            (3, "--plan-json"),
+            (5, "--admin"),
+            (7, "--verified-write-profile"),
+        ] {
+            let mut forged = planning.clone();
+            forged[position] = replacement.into();
+            assert!(matches!(parse(&forged), Err(EntryError::Arguments)));
+        }
+        let mut relative_plan = planning.clone();
+        relative_plan[2] = "relative".into();
+        assert!(matches!(parse(&relative_plan), Err(EntryError::Arguments)));
+        let mut duplicate_plan = planning;
+        duplicate_plan[7] = "--project".into();
+        assert!(matches!(parse(&duplicate_plan), Err(EntryError::Arguments)));
+        let calibration = args(&[
+            "calibration-approve",
+            "--data-root",
+            root(),
+            "--project",
+            "project-test",
+            "--plan-id",
+            "plan-test",
+            "--plan-hash",
+            &hash,
+        ]);
+        assert!(matches!(
+            parse(&calibration),
+            Ok(Some(Command::CalibrationApprove { .. }))
+        ));
+        for field in [
+            "--principal",
+            "--admin",
+            "--verified-write-profile",
+            "--manifest",
+            "--expected-revision",
+        ] {
+            let mut forged = calibration.clone();
+            forged.extend(args(&[field, "true"]));
+            assert!(matches!(parse(&forged), Err(EntryError::Arguments)));
+        }
+        let mut duplicate = calibration.clone();
+        duplicate[7] = "--project".into();
+        assert!(matches!(parse(&duplicate), Err(EntryError::Arguments)));
+        let mut relative = calibration;
+        relative[2] = "relative".into();
+        assert!(matches!(parse(&relative), Err(EntryError::Arguments)));
         assert!(
             parse(&args(&[
                 "host-bridge",

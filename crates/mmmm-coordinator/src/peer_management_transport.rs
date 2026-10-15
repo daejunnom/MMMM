@@ -142,6 +142,17 @@ struct NativeFinish<'a> {
     delivered: bool,
 }
 impl NativeFinish<'_> {
+    fn failed(mut self, error: ExchangeError) -> Result<(), ExchangeError> {
+        self.budget.cancel();
+        let _ = self.sender.notify_finished_with_failure(
+            &self.witness,
+            false,
+            self.budget,
+            Some(PeerError::from(error)),
+        );
+        self.delivered = true;
+        Err(error)
+    }
     fn delivered(mut self) -> Result<(), ExchangeError> {
         self.budget.check()?;
         self.sender
@@ -176,10 +187,70 @@ pub(crate) fn serve_host_exchange<I: ManagementIo>(
     if public.kind() != ManagementKind::Offer {
         return Err(ManagementError::InvalidFrame.into());
     }
-    let mut raw_token = Zeroizing::new([0_u8; 32]);
-    read_exact(io, &mut *raw_token, budget)?;
-    let offer = HostOffer::from_raw(public, raw_token)?;
+    let offer = if public.is_calibration_plan() {
+        HostOffer::calibration_plan(public)?
+    } else if public.is_calibration_owner_selection() {
+        HostOffer::owner_selection(public)?
+    } else {
+        let mut raw_token = Zeroizing::new([0_u8; 32]);
+        read_exact(io, &mut *raw_token, budget)?;
+        HostOffer::from_raw(public, raw_token)?
+    };
+    let owner_selection = offer.public().is_calibration_owner_selection();
+    let calibration_plan = offer.public().is_calibration_plan();
     let witness = offer.witness().clone();
+    if calibration_plan {
+        // A frozen plan remains saved if any subsequent delivery fails. Its
+        // Finished receipt is consumed only by the private plan entry, never by
+        // pairing or approval rollback.
+        let finish = NativeFinish {
+            sender,
+            witness: witness.clone(),
+            budget,
+            delivered: false,
+        };
+        let delivery = (|| {
+            let prepared = sender
+                .submit(ManagementRequest::Offer(offer), budget)?
+                .wait()?;
+            if !prepared.is_calibration_plan() {
+                return Err(ManagementError::WrongReply.into());
+            }
+            write_public(io, &prepared, budget)?;
+            io.wait_readable(budget.deadline(), budget)?;
+            let mut acknowledgement = [0_u8; 1];
+            read_exact(io, &mut acknowledgement, budget)?;
+            if acknowledgement != [MANAGEMENT_ACK] {
+                return Err(PeerError::Protocol.into());
+            }
+            io.disconnect(budget)?;
+            Ok(())
+        })();
+        if let Err(error) = delivery {
+            return finish.failed(error);
+        }
+        return finish.delivered();
+    }
+    if owner_selection {
+        // This commits only the kernel owner's immutable plan selection. It
+        // stages no game grant and must never generate Finished(false), whose
+        // normal read-pairing rollback has a different ownership lifecycle.
+        let selected = sender
+            .submit(ManagementRequest::Offer(offer), budget)?
+            .wait()?;
+        if !selected.is_calibration_owner_selection() {
+            return Err(ManagementError::WrongReply.into());
+        }
+        write_public(io, &selected, budget)?;
+        io.wait_readable(budget.deadline(), budget)?;
+        let mut acknowledgement = [0_u8; 1];
+        read_exact(io, &mut acknowledgement, budget)?;
+        if acknowledgement != [MANAGEMENT_ACK] {
+            return Err(PeerError::Protocol.into());
+        }
+        io.disconnect(budget)?;
+        return Ok(());
+    }
     let finish = NativeFinish {
         sender,
         witness: witness.clone(),
@@ -219,6 +290,7 @@ pub(crate) struct HostAttachClient<I: ManagementIo> {
     nonce: String,
     budget: BootstrapBudget,
     phase: ClientPhase,
+    approval: bool,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ClientPhase {
@@ -234,15 +306,21 @@ impl<I: ManagementIo> HostAttachClient<I> {
         budget: BootstrapBudget,
     ) -> Result<(Self, PublicFrame), ExchangeError> {
         let (public, token, _) = offer.into_parts();
+        let owner_selection = public.is_native_owner_command();
+        let calibration_plan = public.is_calibration_plan();
+        let approval = public.value()["kind"] == "host_apply_approval_offer";
         let mut pending = Self {
             io,
             nonce: public.nonce().to_owned(),
             budget,
             phase: ClientPhase::Offered,
+            approval,
         };
         write_all(&mut pending.io, HOST_MAGIC, &pending.budget)?;
         write_public(&mut pending.io, &public, &pending.budget)?;
-        write_all(&mut pending.io, token.expose_secret(), &pending.budget)?;
+        if let Some(token) = &token {
+            write_all(&mut pending.io, token.expose_secret(), &pending.budget)?;
+        }
         drop(token);
         pending
             .io
@@ -250,6 +328,24 @@ impl<I: ManagementIo> HostAttachClient<I> {
         let authority = read_public(&mut pending.io, &pending.budget)?;
         if authority.kind() != ManagementKind::Authority || authority.nonce() != pending.nonce {
             return Err(ManagementError::WrongReply.into());
+        }
+        if authority.is_native_owner_command() != owner_selection
+            || authority.is_calibration_plan() != calibration_plan
+        {
+            return Err(ManagementError::WrongReply.into());
+        }
+        if !owner_selection
+            && authority.value()["kind"]
+                != if approval {
+                    "host_apply_approval_authority"
+                } else {
+                    "host_pairing_authority"
+                }
+        {
+            return Err(ManagementError::WrongReply.into());
+        }
+        if owner_selection {
+            pending.phase = ClientPhase::CompleteReceived;
         }
         Ok((pending, authority))
     }
@@ -264,6 +360,12 @@ impl<I: ManagementIo> HostAttachClient<I> {
         if self.phase != ClientPhase::Offered
             || public.kind() != ManagementKind::Installed
             || public.nonce() != self.nonce
+            || public.value()["kind"]
+                != if self.approval {
+                    "host_apply_approval_installed"
+                } else {
+                    "host_pairing_installed"
+                }
         {
             return Err(ManagementError::WrongReply.into());
         }
@@ -271,7 +373,15 @@ impl<I: ManagementIo> HostAttachClient<I> {
         self.io
             .wait_readable(self.budget.application_wait_deadline()?, &self.budget)?;
         let complete = read_public(&mut self.io, &self.budget)?;
-        if complete.kind() != ManagementKind::Complete || complete.nonce() != self.nonce {
+        if complete.kind() != ManagementKind::Complete
+            || complete.nonce() != self.nonce
+            || complete.value()["kind"]
+                != if self.approval {
+                    "host_apply_approval_complete"
+                } else {
+                    "host_pairing_complete"
+                }
+        {
             return Err(ManagementError::WrongReply.into());
         }
         self.phase = ClientPhase::CompleteReceived;
@@ -393,6 +503,7 @@ mod tests {
             nonce: "pair-staged".to_owned(),
             budget,
             phase: ClientPhase::Offered,
+            approval: false,
         }
     }
     fn ack_count(writes: &Arc<Mutex<Vec<Vec<u8>>>>) -> usize {
@@ -426,6 +537,94 @@ mod tests {
         ));
         assert_eq!(ack_count(&writes), 1);
         drop(client);
+        assert!(budget.check().is_ok());
+    }
+
+    #[test]
+    fn owner_selection_is_one_phase_without_a_host_capability_and_keeps_terminal_ack() {
+        for (outcome, eof_error) in [
+            ("prepared", None),
+            ("committed_checkpoint_failed", Some(PeerError::Native(123))),
+        ] {
+            let public = PublicFrame::from_value(json!({"kind":"native_calibration_plan_offer","protocolVersion":"0.2.0","nonce":"plan-staged",
+                "purpose":crate::peer_management::CALIBRATION_PLAN_PURPOSE,"dataRoot":std::env::temp_dir(),"projectId":"project-fixture",
+                "expectedRevision":"a".repeat(64),"contextId":"context-fixture"})).unwrap();
+            let length = public.encode().unwrap().payload().len();
+            let prepared = PublicFrame::from_value(json!({"kind":"native_calibration_plan_prepared","protocolVersion":"0.2.0","nonce":"plan-staged",
+                "purpose":crate::peer_management::CALIBRATION_PLAN_PURPOSE,"projectId":"project-fixture","planId":"plan-fixture",
+                "planHash":"b".repeat(64),"outcome":outcome})).unwrap().encode().unwrap();
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let io = ObservedIo {
+                input: prepared
+                    .length_prefix()
+                    .into_iter()
+                    .chain(prepared.payload().iter().copied())
+                    .collect(),
+                writes: writes.clone(),
+                eof_error,
+            };
+            let budget = BootstrapBudget::with_deadline(Instant::now() + Duration::from_secs(2));
+            let offer = HostOffer::calibration_plan(public).unwrap();
+            assert!(offer.witness().is_calibration_plan());
+            let (mut pending, reply) = HostAttachClient::offer(io, offer, budget.clone()).unwrap();
+            assert_eq!(reply.value()["outcome"], outcome);
+            assert_eq!(
+                writes.lock().unwrap().iter().map(Vec::len).sum::<usize>(),
+                HOST_MAGIC.len() + 4 + length
+            );
+            assert!(pending.installed_staged(installed()).is_err());
+            let delivery = pending.complete_delivery();
+            if let Some(error) = eof_error {
+                assert!(matches!(delivery, Err(ExchangeError::Native(actual)) if actual == error));
+                drop(pending);
+                assert_eq!(budget.check(), Err(ManagementError::Cancelled));
+            } else {
+                delivery.unwrap();
+                assert!(budget.check().is_ok());
+            }
+            assert_eq!(ack_count(&writes), 1);
+        }
+        let offer=PublicFrame::from_value(json!({"kind":"native_calibration_owner_offer","protocolVersion":"0.2.0","nonce":"owner-staged",
+            "purpose":crate::bootstrap::calibration_approval::PURPOSE,"dataRoot":std::env::temp_dir(),
+            "projectId":"project-fixture","planId":"plan-fixture","planHash":"a".repeat(64)})).unwrap();
+        let offer_length = offer.encode().unwrap().payload().len();
+        let selected=PublicFrame::from_value(json!({"kind":"native_calibration_owner_selected","protocolVersion":"0.2.0","nonce":"owner-staged",
+            "purpose":crate::bootstrap::calibration_approval::PURPOSE,"projectId":"project-fixture","planId":"plan-fixture","planHash":"a".repeat(64),
+            "approvalRef":"calibration-fixture","selectionDigest":"b".repeat(64),"expiresAt":"2099-01-01T00:00:00Z"})).unwrap().encode().unwrap();
+        let input = selected
+            .length_prefix()
+            .into_iter()
+            .chain(selected.payload().iter().copied())
+            .collect();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let io = ObservedIo {
+            input,
+            writes: writes.clone(),
+            eof_error: None,
+        };
+        let budget = BootstrapBudget::with_deadline(Instant::now() + Duration::from_secs(2));
+        let (mut pending, reply) = HostAttachClient::offer(
+            io,
+            HostOffer::owner_selection(offer).unwrap(),
+            budget.clone(),
+        )
+        .unwrap();
+        assert!(reply.is_calibration_owner_selection());
+        assert_eq!(
+            writes.lock().unwrap().iter().map(Vec::len).sum::<usize>(),
+            HOST_MAGIC.len() + 4 + offer_length
+        );
+        assert!(matches!(
+            pending.installed_staged(installed()),
+            Err(ExchangeError::Management(ManagementError::WrongReply))
+        ));
+        assert_eq!(ack_count(&writes), 0);
+        pending.complete_delivery().unwrap();
+        assert_eq!(ack_count(&writes), 1);
+        assert!(matches!(
+            pending.complete_delivery(),
+            Err(ExchangeError::Native(PeerError::Protocol))
+        ));
         assert!(budget.check().is_ok());
     }
 

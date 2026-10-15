@@ -814,6 +814,347 @@ struct Fixture {
     ids: Ids,
     clock: TestClock,
 }
+
+// Reuse the owned SQLite/CAS fixture for trusted setup source checkpoints.
+// This adapter grants no native owner or game execution capability.
+mod setup_source_tests {
+    use super::*;
+    use mmmm_runtime::storage::{
+        StorageError, StorageResult,
+        project_resources::{
+            ProjectHeadPin, ProjectResourceAuthority, ProjectResourceReader,
+            ProjectSourceRpcContext, RegisteredProjectResource, current_project_head_pin,
+        },
+    };
+
+    struct Control {
+        cancelled: Cell<bool>,
+        reading: Cell<bool>,
+        read_checks: Cell<usize>,
+        case: &'static str,
+        locator: RefCell<Option<(PlanId, Sha256Digest)>>,
+    }
+    struct Rpc {
+        principal: PrincipalId,
+        control: Rc<Control>,
+    }
+    impl ProjectSourceRpcContext for Rpc {
+        fn check(&self) -> StorageResult<()> {
+            if self.control.reading.get() {
+                self.control
+                    .read_checks
+                    .set(self.control.read_checks.get() + 1);
+                if self.control.case == "cancel_read" && self.control.read_checks.get() == 3 {
+                    self.control.cancelled.set(true);
+                }
+            }
+            if self.control.cancelled.get() {
+                return Err(StorageError::Conflict(
+                    "Original setup source request cancelled",
+                ));
+            }
+            Ok(())
+        }
+        fn authenticated_principal(&self) -> StorageResult<PrincipalId> {
+            self.check()?;
+            Ok(self.principal.clone())
+        }
+        fn context_id(&self) -> Option<&ContextId> {
+            None
+        }
+    }
+    struct ProjectAuthority {
+        principal: PrincipalId,
+        project: ProjectId,
+        revision: Sha256Digest,
+    }
+    impl ProjectResourceAuthority for ProjectAuthority {
+        fn authorize_project_read(
+            &mut self,
+            _store: &DurableStore,
+            principal: &PrincipalId,
+            context: Option<&ContextId>,
+            project: &ProjectId,
+            revision: &Sha256Digest,
+        ) -> StorageResult<()> {
+            if principal != &self.principal
+                || project != &self.project
+                || revision != &self.revision
+                || context.is_some()
+            {
+                return Err(StorageError::Conflict(
+                    "Actual setup fixture Project source",
+                ));
+            }
+            Ok(())
+        }
+        fn authorize_resource_read(
+            &mut self,
+            _store: &DurableStore,
+            _principal: &PrincipalId,
+            _context: Option<&ContextId>,
+            _project: &ProjectId,
+            _resource: &RegisteredProjectResource,
+        ) -> StorageResult<()> {
+            Err(StorageError::Conflict(
+                "Setup source test grants no resource read",
+            ))
+        }
+    }
+    struct Source {
+        rpc: Rpc,
+        head: ProjectHeadPin,
+        prepared: PreparedPlan,
+        preparations: usize,
+    }
+    impl SetupPlanningPort for Source {
+        fn read_current_project_with_store(
+            &mut self,
+            store: &DurableStore,
+            _principal: &PrincipalId,
+            selection: &SetupSelection,
+        ) -> AppResult<Value> {
+            let ceiling = if self.rpc.control.case == "read_limit" {
+                1
+            } else {
+                8 * 1024 * 1024
+            };
+            let mut reader = ProjectResourceReader::new(
+                Box::new(ProjectAuthority {
+                    principal: self.rpc.principal.clone(),
+                    project: selection.project_id.clone(),
+                    revision: self.head.revision.clone(),
+                }),
+                ceiling,
+            )
+            .unwrap();
+            self.rpc.control.reading.set(true);
+            let result = reader.read_project(
+                store,
+                &self.rpc,
+                &selection.project_id,
+                &self.head.revision,
+                ceiling,
+            );
+            self.rpc.control.reading.set(false);
+            result.map_err(|cause| AppError::storage("SETUP_READ_FAILED", cause))
+        }
+        fn check_current_project_with_store(
+            &self,
+            store: &DurableStore,
+            principal: &PrincipalId,
+            selection: &SetupSelection,
+        ) -> AppResult<()> {
+            self.rpc
+                .check()
+                .map_err(|cause| AppError::storage("SETUP_CHECKPOINT_STOPPED", cause))?;
+            assert_eq!(principal, &self.rpc.principal);
+            let actual = current_project_head_pin(store, &self.rpc, &selection.project_id)
+                .map_err(|cause| AppError::storage("SETUP_HEAD_FAILED", cause))?;
+            if actual != self.head {
+                return Err(AppError::new(
+                    "REVISION_CONFLICT",
+                    "Actual setup Project head changed",
+                ));
+            }
+            if self.rpc.control.case == "committed_postcheck"
+                && self
+                    .rpc
+                    .control
+                    .locator
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|(id, hash)| store.plan(id, hash).is_ok())
+            {
+                return Err(AppError::new(
+                    "SETUP_POSTCOMMIT_STOPPED",
+                    "Original checkpoint failed after actual plan save",
+                ));
+            }
+            Ok(())
+        }
+        fn prepare_setup_with_store(
+            &mut self,
+            store: &mut DurableStore,
+            _principal: &PrincipalId,
+            _selection: &SetupSelection,
+            project: &Value,
+            _context: &Value,
+        ) -> AppResult<PreparedPlan> {
+            self.preparations += 1;
+            if self.rpc.control.case == "head_drift" {
+                let mut changed = project.clone();
+                changed["name"] = json!("Actual setup head advanced");
+                changed["revision"] = json!(projected_digest("Project", &changed).unwrap());
+                store
+                    .save_project(&changed, Some(&self.head.revision))
+                    .unwrap();
+            }
+            if self.rpc.control.case == "prepare_and_checkpoint" {
+                self.rpc.control.cancelled.set(true);
+                return Err(AppError::new(
+                    "SETUP_PREPARATION_FAILED",
+                    "Original preparation failure",
+                ));
+            }
+            Ok(self.prepared.clone())
+        }
+    }
+    struct FreezeAuthority<'a> {
+        actual: &'a mut Authority,
+        control: Rc<Control>,
+    }
+    impl AuthorityPort for FreezeAuthority<'_> {
+        fn authorize(
+            &mut self,
+            principal: &PrincipalId,
+            project: &ProjectId,
+            access: Access,
+            context: Option<&Value>,
+            plan: Option<&Value>,
+        ) -> AppResult<()> {
+            self.actual
+                .authorize(principal, project, access, context, plan)?;
+            if access == Access::Plan
+                && let Some(plan) = plan
+            {
+                *self.control.locator.borrow_mut() = Some((
+                    decode(&plan["planId"]).unwrap(),
+                    decode(&plan["planHash"]).unwrap(),
+                ));
+                if self.control.case == "freeze_and_checkpoint" {
+                    self.control.cancelled.set(true);
+                    return Err(AppError::new(
+                        "SETUP_FREEZE_REJECTED",
+                        "Original freeze authority failure",
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+    #[test]
+    fn setup_uses_actual_bounded_project_and_preserves_primary_and_committed_postcheck_failures() {
+        for case in [
+            "success",
+            "read_limit",
+            "cancel_before",
+            "cancel_read",
+            "head_drift",
+            "prepare_and_checkpoint",
+            "freeze_and_checkpoint",
+            "committed_postcheck",
+        ] {
+            let mut fixture = Fixture::new(1);
+            let principal = fixture.principal.clone();
+            let selection = SetupSelection {
+                project_id: decode(&fixture.project["projectId"]).unwrap(),
+                expected_revision: decode(&fixture.project["revision"]).unwrap(),
+                context_id: decode(&fixture.provider.live_context["contextId"]).unwrap(),
+            };
+            let control = Rc::new(Control {
+                cancelled: Cell::new(false),
+                reading: Cell::new(false),
+                read_checks: Cell::new(0),
+                case,
+                locator: RefCell::new(None),
+            });
+            let rpc = Rpc {
+                principal: principal.clone(),
+                control: control.clone(),
+            };
+            let head =
+                current_project_head_pin(&fixture.store, &rpc, &selection.project_id).unwrap();
+            let mut source = Source {
+                rpc,
+                head,
+                prepared: fixture.planner.prepared.clone(),
+                preparations: 0,
+            };
+            if case == "cancel_before" {
+                control.cancelled.set(true);
+            }
+            let result = {
+                let mut authority = FreezeAuthority {
+                    actual: &mut fixture.authority,
+                    control: control.clone(),
+                };
+                let mut app = Application {
+                    store: &mut fixture.store,
+                    authority: &mut authority,
+                    planner: &mut fixture.planner,
+                    provider: &mut fixture.provider,
+                    observer: &mut fixture.observer,
+                    ids: &mut fixture.ids,
+                    clock: &fixture.clock,
+                };
+                app.prepare_setup(&principal, &selection, &mut source)
+            };
+            assert_eq!(fixture.target.borrow().dispatches, 0, "{case}");
+            if case == "success" {
+                let plan = result.unwrap();
+                assert_eq!(
+                    fixture
+                        .store
+                        .plan(
+                            &decode(&plan["planId"]).unwrap(),
+                            &decode(&plan["planHash"]).unwrap()
+                        )
+                        .unwrap(),
+                    plan
+                );
+                assert_eq!(source.preparations, 1);
+            } else {
+                let error = result.unwrap_err();
+                if matches!(case, "read_limit" | "cancel_before" | "cancel_read") {
+                    assert_eq!(source.preparations, 0, "{case}");
+                }
+                if case == "head_drift" {
+                    assert_eq!(error.code, "REVISION_CONFLICT");
+                }
+                if matches!(case, "prepare_and_checkpoint" | "freeze_and_checkpoint") {
+                    assert_eq!(
+                        error.code,
+                        if case == "prepare_and_checkpoint" {
+                            "SETUP_PREPARATION_FAILED"
+                        } else {
+                            "SETUP_FREEZE_REJECTED"
+                        }
+                    );
+                    let both = std::error::Error::source(&error).unwrap();
+                    assert!(both.to_string().contains("SETUP_CHECKPOINT_STOPPED"));
+                    assert!(
+                        std::error::Error::source(both)
+                            .unwrap()
+                            .downcast_ref::<AppError>()
+                            .is_some()
+                    );
+                }
+                if case == "committed_postcheck" {
+                    assert_eq!(error.code, "SETUP_PLAN_COMMITTED");
+                    let committed = std::error::Error::source(&error)
+                        .unwrap()
+                        .downcast_ref::<crate::SetupCommittedPlanFailure>()
+                        .unwrap();
+                    assert_eq!(
+                        committed.checkpoint_failure().code,
+                        "SETUP_POSTCOMMIT_STOPPED"
+                    );
+                    let saved = fixture
+                        .store
+                        .plan(committed.plan_id(), committed.plan_hash())
+                        .unwrap();
+                    assert_eq!(
+                        saved["projectBaseRevision"],
+                        selection.expected_revision.as_str()
+                    );
+                } else if let Some((id, hash)) = control.locator.borrow().as_ref() {
+                    assert!(fixture.store.plan(id, hash).is_err(), "{case}");
+                }
+            }
+        }
+    }
+}
 impl Fixture {
     fn new(steps: usize) -> Self {
         let root = TestRoot::new();

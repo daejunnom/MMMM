@@ -101,6 +101,14 @@ impl CoordinatorLocator for ExistingCoordinator {
 /// stdout belongs to the protocol helper, including actual flush ACK. Public
 /// diagnostics must go to bounded stderr and contain no frame or token bytes.
 pub fn run_stdio(locator: &mut dyn CoordinatorLocator) -> Result<(), RelayError> {
+    run_stdio_mode(locator, false)
+}
+
+pub fn run_approval_stdio(locator: &mut dyn CoordinatorLocator) -> Result<(), RelayError> {
+    run_stdio_mode(locator, true)
+}
+
+fn run_stdio_mode(locator: &mut dyn CoordinatorLocator, approval: bool) -> Result<(), RelayError> {
     let started = Instant::now();
     let whole_deadline = started + SESSION;
     let exchange_deadline = started + EXCHANGE;
@@ -115,7 +123,7 @@ pub fn run_stdio(locator: &mut dyn CoordinatorLocator) -> Result<(), RelayError>
         whole_deadline,
     )?;
     let cancel = AtomicBool::new(false);
-    let pending = exchange(&native, locator, exchange_deadline, &cancel);
+    let pending = exchange(&native, locator, exchange_deadline, &cancel, approval);
     // Reserve two seconds inside the original session bound. Terminal drain
     // proves native helper death even after partial output or clean input EOF.
     let drained = drain(&native, whole_deadline);
@@ -140,6 +148,7 @@ fn exchange(
     locator: &mut dyn CoordinatorLocator,
     deadline: Instant,
     cancel: &AtomicBool,
+    approval: bool,
 ) -> Result<PendingHostCompletion, RelayError> {
     let magic = read_exact(native, HOST_MAGIC.len(), deadline, cancel)?;
     if magic.as_slice() != HOST_MAGIC {
@@ -148,6 +157,15 @@ fn exchange(
     let public = PublicFrame::decode_owned(read_public_bytes(native, deadline, cancel)?)
         .map_err(|_| RelayError::Protocol)?;
     if public.kind() != ManagementKind::Offer {
+        return Err(RelayError::Protocol);
+    }
+    if public.value()["kind"]
+        != if approval {
+            "host_apply_approval_offer"
+        } else {
+            "host_pairing_offer"
+        }
+    {
         return Err(RelayError::Protocol);
     }
     let capability = read_exact(native, 32, deadline, cancel)?;

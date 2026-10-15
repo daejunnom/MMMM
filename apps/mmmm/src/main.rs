@@ -21,6 +21,10 @@ const USAGE: &str = "Usage:\n\
     Prefab, Clip and new raw resources can share one atomic batch; raw resource pairs can also be imported alone. The data root must contain an initialized Project and have no active daemon owner.\n\
     Select regular files directly. Links, hardlinks, special files and known secret paths are refused; source files are read without replacement or deletion.\n\
   mmmm call <function.name> --data-root <absolute root> [--json|--summary] < request.json\n\
+  mmmm calibration-plan --data-root <absolute root> --project <projectId> --expected-revision <sha256> --context <contextId>\n\
+  mmmm calibration-approve --data-root <absolute root> --project <projectId> --plan-id <planId> --plan-hash <sha256>\n\
+    Select one existing frozen normative47 plan through the active daemon's same-user native peer. The daemon checks its original Project revision against the same protected Store; this command does not reopen or replace the daemon owner.\n\
+    This commits the native owner's selection only. The currently paired game administrator must separately approve that exact plan and complete the private handshake. This grants no general write profile or caller-supplied administrator authority.\n\
   mmmm compatibility-profile-approve --data-root <absolute root> --project <projectId> --expected-revision <sha256> --profile-resource-id <resourceId> --profile-resource-sha256 <raw sha256> --approved-profile-ref <reference> --artifact-sha256 <sha256> --interface-sha256 <sha256>\n\
     This cold native owner command approves one existing Project profile resource (1..65536 bytes) for local_use_only. Import the original profile bytes first; raw resource SHA-256, canonical profile digest, implementation artifact digest and interface digest remain separate.\n\
     The initialized data root must have no active daemon. Approval checks the current Project revision, actual Policy and source rights. The same owner/Project/reference is immutable; identical replay is allowed. No profile JSON, caller authority or public host config grants approval.\n\
@@ -130,6 +134,37 @@ impl fmt::Display for PublicEntryError<'_> {
                 record.project_id(),
                 PublicEntryError(delivery)
             ),
+            EntryError::CalibrationSelectionCommitted {
+                selection_digest,
+                delivery,
+            } => write!(
+                f,
+                "Calibration owner selection {selection_digest} was committed and retained; result delivery failed: {}",
+                PublicEntryError(delivery)
+            ),
+            EntryError::CalibrationPlanCommitted {
+                project,
+                plan,
+                hash,
+                checkpoint_failed,
+                delivery,
+            } => {
+                write!(
+                    f,
+                    "Calibration plan {plan} ({hash}) for Project {project} was saved and retained"
+                )?;
+                if *checkpoint_failed {
+                    f.write_str("; its final source checkpoint failed (SETUP_PLAN_COMMITTED); the Coordinator retains the original cause")?;
+                }
+                if let Some(delivery) = delivery {
+                    write!(
+                        f,
+                        "; result delivery failed: {}",
+                        PublicEntryError(delivery)
+                    )?;
+                }
+                Ok(())
+            }
             // EntryError's other diagnostics contain fixed text, public pins,
             // or static native-operation codes with bounded numeric metadata.
             error => error.fmt(f),
@@ -262,6 +297,35 @@ mod diagnostic_tests {
             .unwrap()
             .is::<mmmm_coordinator::auth::AuthError>()
         );
+        let selected = EntryError::CalibrationSelectionCommitted {
+            selection_digest: mmmm_contracts::Sha256Digest::new("1".repeat(64)).unwrap(),
+            delivery: Box::new(authentication),
+        };
+        let rendered = PublicEntryError(&selected).to_string();
+        assert!(rendered.contains("was committed and retained; result delivery failed"));
+        assert!(rendered.contains("INVALID_SESSION_POLICY"));
+        assert!(
+            std::error::Error::source(&selected)
+                .unwrap()
+                .is::<EntryError>()
+        );
+        let prepared = EntryError::CalibrationPlanCommitted {
+            project: mmmm_contracts::ProjectId::new("project-fixture").unwrap(),
+            plan: mmmm_contracts::PlanId::new("plan-fixture").unwrap(),
+            hash: mmmm_contracts::Sha256Digest::new("2".repeat(64)).unwrap(),
+            checkpoint_failed: true,
+            delivery: Some(Box::new(selected)),
+        };
+        let rendered = PublicEntryError(&prepared).to_string();
+        assert!(rendered.contains("plan-fixture"));
+        assert!(rendered.contains("SETUP_PLAN_COMMITTED"));
+        assert!(rendered.contains("INVALID_SESSION_POLICY"));
+        assert!(
+            std::error::Error::source(&prepared)
+                .unwrap()
+                .is::<EntryError>()
+        );
+        assert!(USAGE.contains("mmmm calibration-plan --data-root <absolute root> --project <projectId> --expected-revision <sha256> --context <contextId>"));
     }
 
     #[test]

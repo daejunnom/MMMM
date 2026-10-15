@@ -215,6 +215,27 @@ fn approved_scope_rebinds_only_context_world_and_defers_session_activation() {
             .is_some()
     );
     let context = &reply.value()["contexts"][0];
+    // An owner locator that lacks a protected frozen plan is not an ADMIN
+    // confirmation and cannot roll back this independent read pairing.
+    let staged = processor.pending.values().next().unwrap();
+    let staged_policy = staged.policy.clone();
+    let staged_principal = staged.principal.clone();
+    let staged_project = staged.project.clone();
+    let owner_offer=PublicFrame::from_value(json!({"kind":"native_calibration_owner_offer","protocolVersion":"0.2.0","nonce":"owner-missing-plan",
+        "purpose":calibration_approval::PURPOSE,"dataRoot":root.0,"projectId":"project-fixture","planId":"plan-missing","planHash":"a".repeat(64)})).unwrap();
+    assert!(
+        processor
+            .handle(
+                &mut store,
+                ManagementRequest::Offer(HostOffer::owner_selection(owner_offer).unwrap()),
+                &epoch()
+            )
+            .is_err()
+    );
+    assert_eq!(processor.pending.len(), 1);
+    authority
+        .validate_staged_project(&staged_principal, &staged_project, &staged_policy)
+        .unwrap();
     verify_projected_digest("ExecutionContext", context).unwrap();
     assert_ne!(context["contextId"], "template-context");
     assert_eq!(

@@ -16,7 +16,7 @@ pub mod undo_context;
 pub mod undo_provider;
 
 pub use ports::*;
-pub use setup::{SetupPlanningPort, SetupSelection};
+pub use setup::{SetupCommittedPlanFailure, SetupPlanningPort, SetupSelection};
 pub use types::*;
 pub use undo::{
     HostUndoReceipt, HostUndoRegistration, InspectedHostUndoMaterial, UndoMaterialPort,
