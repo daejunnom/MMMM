@@ -1845,7 +1845,7 @@ extra·stale 거절 회귀를 작성하고 독립 리뷰/`466` format 뒤 `471`�
 통과했다. 이는 정적 소비자 연결 검증이며 actual scene/animation evidence 발급 또는
 게임 인수로 확대하지 않는다.
 
-## 공유 고정 SHA의 CI 실패 구분
+## cached storage 부재 관측과 실제 JVM 검사
 
 후속 cache-only source는 실제 `CommandStorage.namespaces`와 Container의 `storage` map을
 두 read accessor로 관측한다. 실제 cached namespace 안의 key 부재만 기존 full image의
@@ -1862,9 +1862,18 @@ absence를 요구한다. 원 false/true·bytes·digest 차이와 unknown/full-sc
 `b49b6b09c695b929534c11842294134a65053a5a84ea541a059c27ffdf4153e6`로 같으며 개별 목록도
 보존했다. command 0·83,315 ms·Job commit peak 1,550,729,216 bytes·9 process·최대 gap
 148 ms이며 owned-tail 정리 후 drain·완전한 출력·export·scratch 정리·lease 해제다.
-독립 source 리뷰 후 Java 9파일을 동결했고 Rust와 동일 shape도 대조했지만 새 Java의
-컴파일·단위 검사와 실제 Mixin·cache 관측은 아직 미실행이다. `148b2af`의 411 PASS는
-이 후속 Java 소스의 성공 근거가 아니다.
+독립 source 리뷰 후 Java 9파일을 동결했고 Rust와 동일 shape도 대조했다. `477`의
+staged 12파일 repository/diff 검사 뒤 고정 `773dadd1eda519ed88762054c7126229f19b61f3`의
+`478`에서 전체 JVM 7모듈 411개·36 XML·필수 11 executed task가 통과했다. 실패·오류·skip은
+0이다. 입력 196개의 전후 manifest SHA-256은
+`b9fd9eb7f903a62b7edd2181a4d59c01a1efd042e1a4c8fdb477802485d4ff2f`로 같고 원 XML을 별도
+보존했다. summary 12,594 bytes·SHA-256은
+`fdbb977e848016d9d15b54edac83e16c9e270055d755e674206d9ba9ce5451cf`다. command 0·62,432 ms·
+Job commit peak 1,379,459,072 bytes·6 process·최대 gap 137 ms이며 자연 종료·drain·완전한
+출력·export·scratch 정리·lease 해제를 확인했다. 새 Java의 컴파일·단위 검사와 실제 게임의
+Mixin 적용·cache 관측을 구분하며 후자는 아직 미실행이다.
+
+## 공유 고정 SHA의 CI 실패 구분
 
 추가 Windows API 관측 `438`은 Brigadier/native custom 실행 interface 10개,
 `439`는 DoubleTag 1개를 각각 원 JAR과 고정 JDK의 javap로 확인했다. 두 실행은 command
@@ -1935,6 +1944,23 @@ native 통합 회귀의 REVISION_CONFLICT/CONTEXT_UNKNOWN 불일치이며 test c
 417,859 ms, owned-tail 정리 후 drain·완전한 출력·export·scratch 정리·lease 해제다.
 후속 Clippy/native stdio 성공 근거는 없고 이후 수정이나 planner 통과를 이 과거 실행의
 성공으로 소급하지 않는다. 세 ZIP 모두 외부에 원문을 보존했으며 제품 DB/CAS는 대상이 아니다.
+
+고정 `021ad5aabbde08fc7dd57dd4143eaeab927c54a7`의 JVM CI 70 (`38806684418`)는
+Windows·Linux·macOS 및 집계 성공을 관측했다. 같은 source의 Rust CI 79
+(`38806685427`)는 Windows·Linux 성공, macOS tests 성공 뒤 lint와 집계 실패다.
+macOS 원 ZIP 55,515 bytes·SHA-256
+`f02363f2711981794e04970048cd333dc6636dfb88933dc91352533806e1cfab`를 밖에 보존하고
+source·expected·PR head를 대조했다. 실제 오류는 `process.rs::live_group_members`의 인수
+8개에 대한 `clippy::too_many_arguments`이며 compile 101이다. 원 lint 실행은 35,549 ms·
+drain·완전한 출력·export·scratch 정리·lease 해제이며 supervisor/cleanup 오류는 없다.
+테스트 실패나 자원 관측 실패로 바꾸지 않는다.
+
+후속 source는 같은 memory-exit·Pending·missing 진단의 원 mutable reference 세 개를
+macOS 전용 `MacGroupDiagnostics`로 묶고 함수 진입 시 해체한다. 관측 본문·순서·한도·원
+오류 보존 및 lint 정책을 바꾸지 않았다. 독립 source 리뷰 뒤 `479` format과 `480`의
+Windows 도구 all-target strict Clippy가 통과했다. `480`은 command 0·4,562 ms·Job commit
+peak 360,484,864 bytes·7 process·최대 gap 102 ms이며 자연 종료·drain·완전한 출력·export·
+scratch 정리·lease 해제다. 실제 macOS 컴파일·lint 통과는 이 Windows 검사로 주장하지 않는다.
 
 ## 첫 공개 배포 인수
 

@@ -2384,9 +2384,11 @@ mod native {
                 identity,
                 &mut self.reservation_valid,
                 resources,
-                &mut memory_exits,
-                &mut pending,
-                &mut self.resources.missing,
+                MacGroupDiagnostics {
+                    memory_exits: &mut memory_exits,
+                    pending: &mut pending,
+                    missing: &mut self.resources.missing,
+                },
                 allow_missing,
             );
             // Retain native exit facts even if a later member/identity check
@@ -2679,16 +2681,25 @@ mod native {
         Ok(Some(info))
     }
     #[cfg(target_os = "macos")]
+    struct MacGroupDiagnostics<'a> {
+        memory_exits: &'a mut Option<darwin_resources::ExitObservationEvidence>,
+        pending: &'a mut darwin_resources::PendingObservations,
+        missing: &'a mut darwin_resources::MissingMembers,
+    }
+    #[cfg(target_os = "macos")]
     fn live_group_members(
         group: libc::pid_t,
         leader_identity: darwin_resources::LeaderIdentity,
         reservation_valid: &mut bool,
         mut resources: Option<&mut darwin_resources::Sample>,
-        memory_exits: &mut Option<darwin_resources::ExitObservationEvidence>,
-        pending: &mut darwin_resources::PendingObservations,
-        missing: &mut darwin_resources::MissingMembers,
+        diagnostics: MacGroupDiagnostics<'_>,
         allow_missing: bool,
     ) -> Result<darwin_resources::GroupObservation, ProcessError> {
+        let MacGroupDiagnostics {
+            memory_exits,
+            pending,
+            missing,
+        } = diagnostics;
         #[link(name = "proc")]
         unsafe extern "C" {
             fn proc_listpids(
