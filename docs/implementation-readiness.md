@@ -1065,10 +1065,33 @@ Windows `341`의 기본 test thread 구성에서는 기존 native catalog 검사
 통과하고 1개가 ignored였으며, 별도 native stdio의 실제 deadline·drain 검증도 통과했다.
 두 결과를 모두 보존하며 동시 부하를 확정 원인으로 기록하지 않는다. 이어 실행될
 새 Runtime test EXE는 Application Control `4551`로 시작되지 않았으므로 새 Project
-head 검사 3개는 미실행이다. `343`의 앱 unit 16개는 Windows에서 실제 통과했다.
+head 검사 3개는 해당 로컬 실행에서 미실행이다. `343`의 앱 unit 16개는 Windows에서 실제 통과했다.
 `342`와 `343`은 출력·drain·export·scratch 정리·lease 해제를 완료했다. 직접 블록의
 Composite 위임은 아직 연결 전이므로 관련 메서드의 unused 경고가 남아 있고,
-현재 변경의 Java 컴파일·검사는 별도 수행 전이다.
+당시 변경의 Java 검사는 아래 후속 `346`에서 별도로 수행했다.
+
+WIP `49c053cb21d30bc7e6badbfebb20593f4dd14124`는 같은 feature 브랜치와
+Draft PR에 공유하고 정확한 원격 SHA를 확인했다. Windows JVM 관리 실행 `345`는
+Gradle 이전 JVM 초기화의 `jimage file name is null` 오류로 종료됐다. 그 실행이
+checkout에 생성한 오류 보고서는 내용을 열지 않고 정확한 소유 증거 루트로 옮겼다.
+관리 경로의 extended 접두사를 native DOS 경로로 정규화한 `346`은 7개 모듈의
+353개 테스트와 Gradle 33개 executed tasks를 통과했다. 모듈별 tests는 SDK 108,
+host-core 92, public-java-adapter 19, Fabric host 83, definition-observer 22,
+legacy fixture 18, provider fixture 11이며 실패·오류·skip은 모두 0이다.
+로컬 report 요약 SHA는
+`a0c2d481480950431c32d62061a1cf704ba4c164dd95b331d516aac83519815e`다.
+같은 실행의 command 0·36,426 ms·자연 drain·완전한 출력·export·scratch 정리 및
+lease 해제를 확인했다. Job commit peak는 1,386,319,872 bytes, peak process 6개,
+최대 표본 간격 146 ms이며 기존 2 GiB/32 process 상한을 유지했다. Gradle native
+access와 deprecated 경고는 보존했다. 이는 로컬 검사이며 CI·게임 성공으로
+재분류하지 않는다. 해당 source의 JVM CI 42 (`38744776835`)는 세 OS 및 집계의
+성공을 관측했다. Rust CI 51 (`38744776812`)도 세 OS의 실제 tests가 통과했지만
+strict Clippy와 집계는 실패했다. 실제 ZIP 6개를 별도 보존·감사했고 source/expected/
+PR head 및 별도 event SHA `8286282aff6a7f2fb026d58411a627337872273c`, raw digest와
+종료·정리 연결을 대조했다. 새 Project head 검사 3개는 세 OS stdout에서 실제 `ok`를
+확인했다. Clippy의 실제 세 오류는 direct observer 메서드 미사용, 같은 모듈의
+`int_plus_one`, peer codec의 `unused_unit`이며 후속 consumer 연결·표현식 수정을
+진행한다. Windows 로컬 SAC 차단과 원격 Windows 검사 성공은 별도 결과다.
 
 고정 `b854b617846036bcb09058ca7da3eed303a1e680`의 Rust CI 50
 (`38698720838`)과 JVM CI 41 (`38698720798`)은 세 OS 및 집계가 모두 성공했다.

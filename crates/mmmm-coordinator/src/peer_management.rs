@@ -402,10 +402,7 @@ fn validate_compatibility_approvals(value: &Value) -> Result<(), ManagementError
     match text(value, "status")? {
         "available" if value["reasonCode"].is_null() => (),
         "unavailable"
-            if value["reasonCode"] == "APPROVAL_SOURCE_UNAVAILABLE" && profiles.is_empty() =>
-        {
-            ()
-        }
+            if value["reasonCode"] == "APPROVAL_SOURCE_UNAVAILABLE" && profiles.is_empty() => {}
         _ => return Err(ManagementError::InvalidFrame),
     }
     if profiles.len() > MAX_COMPATIBILITY_APPROVALS {
