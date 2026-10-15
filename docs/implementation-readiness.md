@@ -1127,6 +1127,12 @@ all-target strict Clippy도 exit 0이었다. 기존 검사만 확장했으며 �
 실제 calibration runner·ADMIN 전용 bootstrap permit·issuer/provenance 연결과
 47개 case의 실제 게임 실행은 이 codec 수정으로 완료되지 않는다.
 
+공유 `052116b09f31d565ee70f99470a2b2475d862717`의 Windows JVM `363`은 실제
+제품 Java와 Fabric 컴파일을 마쳤지만, 새 public adapter test의 JUnit `fail` import
+누락으로 해당 test compile이 실패해 Gradle exit 1이었다. 다른 모듈 task의 실행을
+전체 성공으로 집계하지 않는다. 원 stdout·stderr와 source/tool digest 및 drain·export·
+scratch 정리·lease 해제를 보존했고 누락 import를 보완하여 같은 범위로 재검증한다.
+
 고정 `b854b617846036bcb09058ca7da3eed303a1e680`의 Rust CI 50
 (`38698720838`)과 JVM CI 41 (`38698720798`)은 세 OS 및 집계가 모두 성공했다.
 실제 ZIP 6개를 별도 보존하여 크기·SHA와 source/expected/PR head, 별도 event SHA
