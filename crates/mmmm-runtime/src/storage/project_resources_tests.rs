@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::storage::{StoreConfig, artifact::register_resource};
-use mmmm_contracts::{canonical_digest, encode_json, projected_digest};
+use mmmm_contracts::{canonical_digest, encode_json, projected_digest, raw_digest};
 use serde_json::json;
 use std::{
     cell::Cell,
@@ -580,4 +580,224 @@ fn missing_version_provenance_or_retention_is_not_repaired_by_digest_knowledge()
         .execute("DELETE FROM project_resource_provenance", [])
         .unwrap();
     assert!(reader(None).read(&store, &rpc, &request, 4096).is_err());
+}
+
+#[test]
+fn current_head_pin_is_factual_metadata_without_cas_io_and_preserves_original_cancellation() {
+    let root = Root::new();
+    let mut store = root.open();
+    let (project, revision, value) = seed(&mut store);
+    let bytes = encode_json(&value).unwrap();
+    let expected = ProjectHeadPin {
+        revision,
+        blob: BlobRef {
+            digest: raw_digest(&bytes),
+            byte_length: bytes.len() as u64,
+        },
+    };
+    let path = store.cas.path(&expected.blob.digest);
+    let held = path.with_extension("head-pin-held");
+    // Own fixture CAS bytes are temporarily absent. A factual metadata getter
+    // must not open or hash them, or mistake its pin for a source-read grant.
+    fs::rename(&path, &held).unwrap();
+    assert_eq!(
+        current_project_head_pin(&store, &Rpc::offline(), &project).unwrap(),
+        expected
+    );
+    fs::rename(held, path).unwrap();
+    for at in [1, 2, 3] {
+        let rpc = Rpc {
+            cancel_at: Some(at),
+            ..Rpc::offline()
+        };
+        assert!(matches!(current_project_head_pin(&store, &rpc, &project),
+            Err(StorageError::InvalidInput(message)) if message == "Fixture source request cancelled"));
+    }
+    assert!(matches!(
+        current_project_head_pin(
+            &store,
+            &Rpc::offline(),
+            &ProjectId::new("project-missing-head").unwrap()
+        ),
+        Err(StorageError::NotFound(_))
+    ));
+}
+
+#[test]
+fn current_head_pin_rejects_bounded_bad_digests_indices_and_lengths_before_cas_access() {
+    let root = Root::new();
+    let mut store = root.open();
+    let (project, revision, _) = seed(&mut store);
+    let original = current_project_head_pin(&store, &Rpc::offline(), &project).unwrap();
+    let alternate = resource(
+        &mut store,
+        &project,
+        "resource-other-head-pin",
+        b"other fixture blob",
+    );
+    for text in ["x".repeat(65_536), "g".repeat(64)] {
+        store
+            .connection
+            .execute(
+                "UPDATE project_heads SET revision=?2 WHERE project_id=?1",
+                params![project.as_str(), text],
+            )
+            .unwrap();
+        assert!(current_project_head_pin(&store, &Rpc::offline(), &project).is_err());
+    }
+    store
+        .connection
+        .execute(
+            "UPDATE project_heads SET revision=CAST(?2 AS TEXT) WHERE project_id=?1",
+            params![project.as_str(), vec![0xff_u8; 64]],
+        )
+        .unwrap();
+    assert!(matches!(
+        current_project_head_pin(&store, &Rpc::offline(), &project),
+        Err(StorageError::Corrupt(_))
+    ));
+    store
+        .connection
+        .execute(
+            "UPDATE project_heads SET revision=?2 WHERE project_id=?1",
+            params![project.as_str(), revision.as_str()],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE project_heads SET blob_digest=?2 WHERE project_id=?1",
+            params![project.as_str(), alternate["sha256"].as_str().unwrap()],
+        )
+        .unwrap();
+    assert!(current_project_head_pin(&store, &Rpc::offline(), &project).is_err());
+    store
+        .connection
+        .execute(
+            "UPDATE project_heads SET blob_digest=?2 WHERE project_id=?1",
+            params![project.as_str(), original.blob.digest.as_str()],
+        )
+        .unwrap();
+    store.connection.execute("DELETE FROM documents WHERE definition='Project' AND document_id=?1 AND content_hash=?2",
+        params![project.as_str(), revision.as_str()]).unwrap();
+    assert!(current_project_head_pin(&store, &Rpc::offline(), &project).is_err());
+    store.connection.execute("INSERT INTO documents(definition,document_id,content_hash,blob_digest) VALUES('Project',?1,?2,?3)",
+        params![project.as_str(), revision.as_str(), original.blob.digest.as_str()]).unwrap();
+    // Corrupt only this fixture's integer metadata; no large content is created.
+    store
+        .connection
+        .pragma_update(None, "ignore_check_constraints", "ON")
+        .unwrap();
+    for length in [-1, (MAX_PROJECT_BYTES + 1) as i64, i64::MAX] {
+        store
+            .connection
+            .execute(
+                "UPDATE blobs SET byte_length=?2 WHERE digest=?1",
+                params![original.blob.digest.as_str(), length],
+            )
+            .unwrap();
+        assert!(current_project_head_pin(&store, &Rpc::offline(), &project).is_err());
+    }
+    store
+        .connection
+        .execute(
+            "UPDATE blobs SET byte_length=?2 WHERE digest=?1",
+            params![
+                original.blob.digest.as_str(),
+                original.blob.byte_length as i64
+            ],
+        )
+        .unwrap();
+    store
+        .connection
+        .pragma_update(None, "ignore_check_constraints", "OFF")
+        .unwrap();
+    assert_eq!(
+        current_project_head_pin(&store, &Rpc::offline(), &project).unwrap(),
+        original
+    );
+}
+
+#[derive(Clone, Copy)]
+enum HeadDrift {
+    Revision,
+    Blob,
+    Length,
+}
+struct HeadDriftRpc<'a> {
+    store: &'a DurableStore,
+    project: ProjectId,
+    original: ProjectHeadPin,
+    alternate_blob: Sha256Digest,
+    drift: HeadDrift,
+    checks: Cell<usize>,
+}
+impl ProjectSourceRpcContext for HeadDriftRpc<'_> {
+    fn check(&self) -> StorageResult<()> {
+        let count = self.checks.get() + 1;
+        self.checks.set(count);
+        if count == 2 {
+            match self.drift {
+                HeadDrift::Revision => {
+                    let replacement = raw_digest(b"different fixture Project revision");
+                    self.store.connection.execute("INSERT INTO documents(definition,document_id,content_hash,blob_digest) VALUES('Project',?1,?2,?3)",
+                        params![self.project.as_str(), replacement.as_str(), self.original.blob.digest.as_str()])?;
+                    self.store.connection.execute(
+                        "UPDATE project_heads SET revision=?2 WHERE project_id=?1",
+                        params![self.project.as_str(), replacement.as_str()],
+                    )?;
+                }
+                HeadDrift::Blob => {
+                    self.store.connection.execute("UPDATE documents SET blob_digest=?3 WHERE definition='Project' AND document_id=?1 AND content_hash=?2",
+                        params![self.project.as_str(), self.original.revision.as_str(), self.alternate_blob.as_str()])?;
+                    self.store.connection.execute(
+                        "UPDATE project_heads SET blob_digest=?2 WHERE project_id=?1",
+                        params![self.project.as_str(), self.alternate_blob.as_str()],
+                    )?;
+                }
+                HeadDrift::Length => {
+                    self.store.connection.execute(
+                        "UPDATE blobs SET byte_length=byte_length+1 WHERE digest=?1",
+                        [self.original.blob.digest.as_str()],
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn authenticated_principal(&self) -> StorageResult<PrincipalId> {
+        self.check()?;
+        Ok(PrincipalId::new("head-pin-fixture-principal").unwrap())
+    }
+    fn context_id(&self) -> Option<&ContextId> {
+        None
+    }
+}
+
+#[test]
+fn current_head_pin_does_not_release_revision_blob_or_length_changed_during_checkpoint() {
+    for drift in [HeadDrift::Revision, HeadDrift::Blob, HeadDrift::Length] {
+        let root = Root::new();
+        let mut store = root.open();
+        let (project, _, _) = seed(&mut store);
+        let original = current_project_head_pin(&store, &Rpc::offline(), &project).unwrap();
+        let alternate = resource(
+            &mut store,
+            &project,
+            "resource-drift-head-pin",
+            b"other fixture blob",
+        );
+        let rpc = HeadDriftRpc {
+            store: &store,
+            project: project.clone(),
+            original,
+            alternate_blob: serde_json::from_value(alternate["sha256"].clone()).unwrap(),
+            drift,
+            checks: Cell::new(0),
+        };
+        assert!(matches!(
+            current_project_head_pin(&store, &rpc, &project),
+            Err(StorageError::Conflict("Current Project head pin changed"))
+        ));
+    }
 }

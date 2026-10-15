@@ -21,6 +21,10 @@ const USAGE: &str = "Usage:\n\
     Prefab, Clip and new raw resources can share one atomic batch; raw resource pairs can also be imported alone. The data root must contain an initialized Project and have no active daemon owner.\n\
     Select regular files directly. Links, hardlinks, special files and known secret paths are refused; source files are read without replacement or deletion.\n\
   mmmm call <function.name> --data-root <absolute root> [--json|--summary] < request.json\n\
+  mmmm compatibility-profile-approve --data-root <absolute root> --project <projectId> --expected-revision <sha256> --profile-resource-id <resourceId> --profile-resource-sha256 <raw sha256> --approved-profile-ref <reference> --artifact-sha256 <sha256> --interface-sha256 <sha256>\n\
+    This cold native owner command approves one existing Project profile resource (1..65536 bytes) for local_use_only. Import the original profile bytes first; raw resource SHA-256, canonical profile digest, implementation artifact digest and interface digest remain separate.\n\
+    The initialized data root must have no active daemon. Approval checks the current Project revision, actual Policy and source rights. The same owner/Project/reference is immutable; identical replay is allowed. No profile JSON, caller authority or public host config grants approval.\n\
+    The receipt records approval only; loaded Java interface observation, current context binding and game verification remain separate. A committed receipt is retained and identified when result delivery fails.\n\
   mmmm catalog-source-use --data-root <absolute root> --project <projectId> --expected-revision <sha256> --mode inspect\n\
   mmmm catalog-source-use --data-root <absolute root> --project <projectId> --expected-revision <sha256> --mode replace --expected-state-digest <sha256> [--game-artifact <resourceId>] [--mod <canonicalId>,<nativeId>,<resourceId> ...]\n\
     Replace selects the complete new set of existing whole Project resource containers for user_local_only catalog use. At most 256 selections and 64 KiB metadata; original source bytes, Project revision and game state are retained.\n\
@@ -116,6 +120,14 @@ impl fmt::Display for PublicEntryError<'_> {
                 snapshot.state_digest(),
                 snapshot.generation(),
                 snapshot.project_id(),
+                PublicEntryError(delivery)
+            ),
+            EntryError::CompatibilityProfileCommitted { record, delivery } => write!(
+                f,
+                "Compatibility profile approval {} for profile {} in Project {} was committed and retained; result delivery failed: {}",
+                record.approved_profile_ref(),
+                record.profile_digest(),
+                record.project_id(),
                 PublicEntryError(delivery)
             ),
             // EntryError's other diagnostics contain fixed text, public pins,
@@ -250,5 +262,15 @@ mod diagnostic_tests {
             .unwrap()
             .is::<mmmm_coordinator::auth::AuthError>()
         );
+    }
+
+    #[test]
+    fn compatibility_approval_help_keeps_cold_approval_and_runtime_observation_distinct() {
+        let failure = EntryError::CompatibilityProfileArguments;
+        let public = PublicEntryError(&failure).to_string();
+        assert!(public.contains("no profile JSON or authority options"));
+        assert!(USAGE.contains("--profile-resource-sha256 <raw sha256>"));
+        assert!(USAGE.contains("No profile JSON"));
+        assert!(USAGE.contains("loaded Java interface observation"));
     }
 }

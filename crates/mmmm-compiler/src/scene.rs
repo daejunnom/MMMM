@@ -2,11 +2,11 @@
 //! separate from caller profile text and from this source-only compiler draft.
 //! Generated lifecycle functions are never called by compilation.
 
-use crate::animation::{AnimationNodeBinding, AnimationSceneProjection};
+use crate::animation::{AnimationDraft, AnimationNodeBinding, AnimationSceneProjection};
 use crate::{GeneratedFunctionContract, StagedResource, VerifiedTarget, compiler_digest, decode};
 use mmmm_contracts::{
-    InstanceId, NodeId, ObjectId, PrefabId, ResourceId, ResourceLocation, Sha256Digest,
-    TargetProfileId, canonical_bytes, canonical_digest, projected_digest, raw_digest,
+    InstanceId, NodeId, ObjectId, PrefabId, RationalTime, ResourceId, ResourceLocation,
+    Sha256Digest, TargetProfileId, canonical_bytes, canonical_digest, projected_digest, raw_digest,
 };
 use mmmm_domain::{
     DomainError,
@@ -105,6 +105,15 @@ pub enum NativeSceneInstruction {
         position: [f64; 3],
         matrix: [f64; 16],
         payload: BTreeMap<String, Value>,
+    },
+    /// A pose for an existing owned display. The codec always resets all three
+    /// interpolation/teleport fields to zero and never spawns or teleports it.
+    DisplayPose {
+        dimension: ResourceLocation,
+        tag: String,
+        entity_kind: String,
+        uuid: [u8; 16],
+        matrix: [f64; 16],
     },
     Block {
         dimension: ResourceLocation,
@@ -519,6 +528,35 @@ impl SceneTargetCodec for Native26_3SceneCodec {
                     return unsupported("Unknown state storage codec");
                 }
             }
+            NativeSceneInstruction::DisplayPose {
+                dimension,
+                tag,
+                entity_kind,
+                uuid,
+                matrix,
+            } => {
+                if !["block", "item", "text"].contains(&entity_kind.as_str()) {
+                    return unsupported("Unknown display entity kind");
+                }
+                safe_token(tag)?;
+                if matrix
+                    .iter()
+                    .any(|value| !value.is_finite() || f64::from(*value as f32) != *value)
+                {
+                    return Err(range(
+                        "Native pose matrix must already contain exact finite target f32 values",
+                    ));
+                }
+                let matrix = matrix
+                    .iter()
+                    .map(|number| float_literal(*number))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(",");
+                vec![format!(
+                    "execute in {dimension} as {} if entity @s[type=minecraft:{entity_kind}_display,tag={tag}] run data merge entity @s {{transformation:[{matrix}],interpolation_duration:0,start_interpolation:0,teleport_duration:0}}",
+                    uuid_text(uuid)
+                )]
+            }
             NativeSceneInstruction::DisplayRemove {
                 dimension,
                 uuid,
@@ -557,6 +595,8 @@ pub struct SceneDraft {
     resource_ids: BTreeSet<String>,
     required_clip_ids: BTreeSet<String>,
     required_animation_bindings: BTreeSet<(String, String)>,
+    owned_clip_revisions: BTreeMap<ObjectId, Sha256Digest>,
+    game_ticks_per_second: RationalTime,
     animation_bindings: BTreeMap<InstanceId, AnimationSceneProjection>,
     state_bindings: BTreeMap<InstanceId, BTreeMap<mmmm_contracts::StateId, SceneStateBinding>>,
     input_revision: Sha256Digest,
@@ -658,6 +698,161 @@ impl SceneDraft {
     }
     pub fn target_profile_id(&self) -> &TargetProfileId {
         &self.target_profile_id
+    }
+
+    pub(crate) fn project_animation_poses(
+        &self,
+        animation: &AnimationDraft,
+        target: &VerifiedTarget,
+        tick: i32,
+        codec: &dyn SceneTargetCodec,
+        registry: &dyn SceneRegistryVerifier,
+    ) -> Result<Vec<NativeSceneStep>, DomainError> {
+        let codec_digest = codec.codec_digest();
+        if self.target_profile_digest != *target.profile_digest()
+            || self.target_artifact_digest != *target.artifact_digest()
+            || self.target_profile_digest != *animation.target_profile_digest()
+            || self.target_artifact_digest != *animation.target_artifact_digest()
+            || self.compiler_digest != compiler_digest()
+            || self.compiler_digest != *animation.compiler_digest()
+            || self.codec_digest != codec_digest
+            || self.game_ticks_per_second != *animation.target_tps()
+        {
+            return Err(DomainError::new(
+                "STALE_CONTEXT",
+                "Native animation target, compiler, codec or exact TPS differs from its scene",
+            ));
+        }
+        let clip =
+            ObjectId::new(animation.clip_id().as_str()).map_err(|error| fail(error.to_string()))?;
+        if self.owned_clip_revisions.get(&clip) != Some(animation.clip_revision())
+            || !self.required_animation_bindings.contains(&(
+                animation.instance_id().to_string(),
+                animation.clip_id().to_string(),
+            ))
+        {
+            return Err(DomainError::new(
+                "REVISION_CONFLICT",
+                "Native animation is outside the exact instance-qualified Project clip pin",
+            ));
+        }
+        let projection = self
+            .animation_bindings
+            .get(animation.instance_id())
+            .ok_or_else(|| unresolved("Native animation instance binding is absent"))?;
+        if animation.scene_projection() != projection {
+            return Err(DomainError::new(
+                "STALE_CONTEXT",
+                "Native animation parent, rest, origin, UUID, world or prefab binding differs",
+            ));
+        }
+        if !registry
+            .verify_codec(target, &codec_digest)?
+            .static_affine_display
+        {
+            return unsupported("Native display pose codec is unverified");
+        }
+        let mut displays = BTreeMap::new();
+        for step in &self.native_steps {
+            if step.phase != SceneLifecyclePhase::Stage
+                || step.instance_id != *animation.instance_id()
+                || !matches!(step.instruction, NativeSceneInstruction::Display { .. })
+            {
+                continue;
+            }
+            let node = step
+                .source_node_id
+                .as_ref()
+                .ok_or_else(|| unresolved("Native display has no exact source node"))?;
+            if displays.insert(node.clone(), step).is_some() {
+                return Err(unresolved(
+                    "Native animation node has duplicate display projections",
+                ));
+            }
+        }
+        let mut seen = BTreeSet::new();
+        let mut steps = Vec::new();
+        let mut output_bytes = 0;
+        for pose in animation.poses().iter().filter(|pose| pose.tick == tick) {
+            if !seen.insert(pose.node_id.clone()) || steps.len() >= MAX_RETAINED_BINDINGS {
+                return Err(range(
+                    "Native pose node count is duplicated or exceeds policy",
+                ));
+            }
+            let binding = projection
+                .nodes
+                .get(&pose.node_id)
+                .ok_or_else(|| unresolved("Native pose node is outside its sealed binding"))?;
+            let source = displays
+                .get(&pose.node_id)
+                .ok_or_else(|| unresolved("Native pose has no exact owned display source"))?;
+            let NativeSceneInstruction::Display {
+                dimension,
+                tag,
+                entity_kind,
+                uuid,
+                position,
+                ..
+            } = &source.instruction
+            else {
+                return Err(unresolved("Native pose source is not a display"));
+            };
+            if source.owner_prefab_id != *animation.owner_prefab_id()
+                || dimension != &projection.dimension
+                || binding.display_uuid.as_deref() != Some(uuid_text(uuid).as_str())
+                || position != &binding.display_origin
+            {
+                return Err(DomainError::new(
+                    "STALE_CONTEXT",
+                    "Native pose UUID, type origin or owner differs from its sealed scene source",
+                ));
+            }
+            let instruction = NativeSceneInstruction::DisplayPose {
+                dimension: dimension.clone(),
+                tag: tag.clone(),
+                entity_kind: entity_kind.clone(),
+                uuid: *uuid,
+                matrix: pose.matrix.map(f64::from),
+            };
+            let mut instruction_bytes = 0;
+            charge_serialized(&mut instruction_bytes, &instruction)?;
+            if instruction_bytes > MAX_LINE_BYTES {
+                return Err(range("Native pose instruction exceeds line policy"));
+            }
+            let encoded_commands = codec.encode_instruction(&instruction)?;
+            if encoded_commands.len() != 1 {
+                return Err(fail(
+                    "Native display pose requires exactly one closed command",
+                ));
+            }
+            validate_line(&encoded_commands[0])?;
+            registry.verify_encoded(target, &codec_digest, &instruction, &encoded_commands[0])?;
+            let step = NativeSceneStep {
+                phase: SceneLifecyclePhase::Activate,
+                source_object_id: clip.clone(),
+                source_node_id: Some(pose.node_id.clone()),
+                instance_id: animation.instance_id().clone(),
+                owner_prefab_id: animation.owner_prefab_id().clone(),
+                instruction,
+                encoded_commands,
+            };
+            charge_serialized(&mut output_bytes, &step)?;
+            steps.push(step);
+        }
+        if steps.is_empty()
+            || seen.len()
+                != projection
+                    .nodes
+                    .values()
+                    .filter(|node| node.display_uuid.is_some())
+                    .count()
+            || seen.len() != displays.len()
+        {
+            return Err(unresolved(
+                "Native pose does not cover every exact bound display once",
+            ));
+        }
+        Ok(steps)
     }
 }
 
@@ -1724,6 +1919,30 @@ pub fn scene_lower(
             "Scene lowering does not cover exactly all scene-kind owned sources",
         ));
     }
+    let mut owned_clip_revisions = BTreeMap::new();
+    for record in inputs.project["ownedResources"]
+        .as_array()
+        .ok_or_else(|| fail("Project ownership is absent"))?
+        .iter()
+        .filter(|record| record["kind"] == "clip")
+    {
+        if owned_clip_revisions.len() >= MAX_SOURCES {
+            return Err(range("Project clip pin count exceeds policy"));
+        }
+        let record: CoveredSceneSourceWire =
+            serde_json::from_value(record.clone()).map_err(|error| fail(error.to_string()))?;
+        if owned_clip_revisions
+            .insert(record.object_id, record.revision)
+            .is_some()
+        {
+            return Err(fail("Project has duplicate clip source pins"));
+        }
+    }
+    let game_ticks_per_second: RationalTime =
+        serde_json::from_value(inputs.project["gameTicksPerSecond"].clone())
+            .map_err(|error| fail(error.to_string()))?;
+    charge_serialized(&mut output_bytes, &owned_clip_revisions)?;
+    charge_serialized(&mut output_bytes, &game_ticks_per_second)?;
     Ok(SceneDraft {
         resources,
         resource_pack_resources,
@@ -1740,6 +1959,8 @@ pub fn scene_lower(
         resource_ids,
         required_clip_ids,
         required_animation_bindings,
+        owned_clip_revisions,
+        game_ticks_per_second,
         animation_bindings,
         state_bindings,
         input_revision,

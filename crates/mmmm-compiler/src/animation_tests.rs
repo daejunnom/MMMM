@@ -1161,7 +1161,24 @@ fn scene_animation_fixture(
     mutate: impl FnOnce(&mut AnimationBindings),
 ) -> (Value, crate::scene::SceneDraft, AnimationDraft) {
     let (project, scene) = crate::scene::tests::animation_pack_fixture();
+    let draft = animation_for_scene(&scene, tps, mutate);
+    (project, scene, draft)
+}
+
+fn animation_for_scene(
+    scene: &crate::scene::SceneDraft,
+    tps: i32,
+    mutate: impl FnOnce(&mut AnimationBindings),
+) -> AnimationDraft {
     let projection = scene.animation_bindings().values().next().unwrap();
+    animation_for_projection(projection, tps, mutate)
+}
+
+fn animation_for_projection(
+    projection: &AnimationSceneProjection,
+    tps: i32,
+    mutate: impl FnOnce(&mut AnimationBindings),
+) -> AnimationDraft {
     let mut input = AnimationBindings {
         instance_id: projection.instance_id.clone(),
         owner_prefab_id: projection.owner_prefab_id.clone(),
@@ -1174,15 +1191,14 @@ fn scene_animation_fixture(
     mutate(&mut input);
     let mut policy = settings(tps);
     policy.max_catchup_ticks = 8;
-    let draft = animation_compile(
+    animation_compile(
         &clip(),
         &target(),
         &verified(input),
         &AuthoredEvidence,
         policy,
     )
-    .unwrap();
-    (project, scene, draft)
+    .unwrap()
 }
 
 fn animation_pack_inputs(
@@ -1232,6 +1248,22 @@ fn animation_pack_request(project: &Value) -> Value {
 #[test]
 fn sealed_animation_pack_inherits_backend_effects_and_requires_exact_project_tps_scene_bindings() {
     let (project, scene, animation) = scene_animation_fixture(20, |_| {});
+    let native = animation
+        .native_pose_projection(
+            &target(),
+            &scene,
+            40,
+            &crate::scene::Native26_3SceneCodec,
+            &crate::scene::tests::animation_pose_registry(false),
+        )
+        .unwrap();
+    assert_eq!(native.tick(), 40);
+    assert!(!native.steps().is_empty());
+    assert_eq!(
+        native.scene().input_revision().as_str(),
+        project["revision"].as_str().unwrap()
+    );
+    drop(native);
     let objective = animation.timer_objective().to_owned();
     let play = animation.entry_points()["play"].clone();
     let pack = crate::pack_build(
@@ -1290,6 +1322,19 @@ fn sealed_animation_pack_inherits_backend_effects_and_requires_exact_project_tps
             }
         });
         assert_eq!(
+            animation
+                .native_pose_projection(
+                    &target(),
+                    &scene,
+                    0,
+                    &crate::scene::Native26_3SceneCodec,
+                    &crate::scene::tests::animation_pose_registry(false),
+                )
+                .unwrap_err()
+                .code,
+            "STALE_CONTEXT"
+        );
+        assert_eq!(
             crate::pack_build(
                 &animation_pack_request(&project),
                 &target(),
@@ -1300,6 +1345,278 @@ fn sealed_animation_pack_inherits_backend_effects_and_requires_exact_project_tps
             "STALE_CONTEXT"
         );
     }
+}
+
+#[test]
+fn native_pose_projection_uses_owned_scene_identity_at_exact_20_and_60_tps_endpoints() {
+    use crate::scene::{Native26_3SceneCodec, NativeSceneInstruction, SceneLifecyclePhase};
+    for tps in [20, 60] {
+        let (_, scene) = crate::scene::tests::animation_pack_fixture_at_tps(tps);
+        let animation = animation_for_scene(&scene, tps, |_| {});
+        assert_eq!(animation.duration_ticks(), 2 * tps);
+        let mut endpoint_commands = Vec::new();
+        for tick in [0, 2 * tps] {
+            let projected = animation
+                .native_pose_projection(
+                    &target(),
+                    &scene,
+                    tick,
+                    &Native26_3SceneCodec,
+                    &crate::scene::tests::animation_pose_registry(false),
+                )
+                .unwrap();
+            assert!(std::ptr::eq(projected.animation(), &animation));
+            assert!(std::ptr::eq(projected.scene(), &scene));
+            assert_eq!(projected.tick(), tick);
+            let binding = &scene.animation_bindings()[animation.instance_id()];
+            assert_eq!(
+                projected.steps().len(),
+                binding
+                    .nodes
+                    .values()
+                    .filter(|node| node.display_uuid.is_some())
+                    .count()
+            );
+            let mut commands = Vec::new();
+            for step in projected.steps() {
+                assert_eq!(step.phase(), SceneLifecyclePhase::Activate);
+                assert_eq!(
+                    step.source_object_id().as_str(),
+                    animation.clip_id().as_str()
+                );
+                assert_eq!(step.instance_id(), animation.instance_id());
+                assert_eq!(step.owner_prefab_id(), animation.owner_prefab_id());
+                let node = step.source_node_id().unwrap();
+                let NativeSceneInstruction::DisplayPose {
+                    dimension,
+                    tag,
+                    entity_kind,
+                    matrix,
+                    ..
+                } = step.instruction()
+                else {
+                    panic!("expected closed display pose")
+                };
+                assert_eq!(dimension, &binding.dimension);
+                let source = scene
+                    .native_steps()
+                    .iter()
+                    .find(|source| {
+                        source.phase() == SceneLifecyclePhase::Stage
+                            && source.instance_id() == animation.instance_id()
+                            && source.source_node_id() == Some(node)
+                            && matches!(
+                                source.instruction(),
+                                NativeSceneInstruction::Display { .. }
+                            )
+                    })
+                    .unwrap();
+                let NativeSceneInstruction::Display {
+                    tag: source_tag,
+                    entity_kind: source_kind,
+                    uuid: source_uuid,
+                    ..
+                } = source.instruction()
+                else {
+                    unreachable!()
+                };
+                let value = serde_json::to_value(step.instruction()).unwrap();
+                assert_eq!(value["kind"], "display_pose");
+                assert_eq!(value.as_object().unwrap().len(), 6);
+                assert_eq!(&value["uuid"], &json!(source_uuid));
+                assert_eq!(tag, source_tag);
+                assert_eq!(entity_kind, source_kind);
+                assert_eq!(
+                    *matrix,
+                    animation
+                        .poses()
+                        .iter()
+                        .find(|pose| pose.tick == tick && &pose.node_id == node)
+                        .unwrap()
+                        .matrix
+                        .map(f64::from)
+                );
+                assert!(
+                    matrix
+                        .iter()
+                        .all(|v| v.is_finite() && f64::from(*v as f32) == *v)
+                );
+                let command = &step.encoded_commands()[0];
+                assert_eq!(step.encoded_commands().len(), 1);
+                assert!(command.starts_with(&format!("execute in {dimension} as {} if entity @s[type=minecraft:{entity_kind}_display,tag={tag}] run data merge entity @s {{transformation:[", binding.nodes[node].display_uuid.as_ref().unwrap())));
+                assert!(command.ends_with(
+                    ",interpolation_duration:0,start_interpolation:0,teleport_duration:0}"
+                ));
+                commands.push(command.clone());
+            }
+            endpoint_commands.push(commands);
+        }
+        assert_ne!(endpoint_commands[0], endpoint_commands[1]);
+    }
+}
+
+#[test]
+fn native_pose_projection_rejects_outside_ticks_stale_pins_and_unverified_encoding() {
+    use crate::scene::Native26_3SceneCodec;
+    let (_, scene, animation) = scene_animation_fixture(20, |_| {});
+    for tick in [-1, 41] {
+        assert_eq!(
+            animation
+                .native_pose_projection(
+                    &target(),
+                    &scene,
+                    tick,
+                    &Native26_3SceneCodec,
+                    &crate::scene::tests::animation_pose_registry(false),
+                )
+                .unwrap_err()
+                .code,
+            "INVALID_TIME"
+        );
+    }
+    assert_eq!(
+        animation
+            .native_pose_projection(
+                &target(),
+                &scene,
+                0,
+                &Native26_3SceneCodec,
+                &crate::scene::tests::animation_pose_registry(true),
+            )
+            .unwrap_err()
+            .code,
+        "EVIDENCE_UNVERIFIED"
+    );
+    let mut stale_revision = animation.clone();
+    stale_revision.clip_revision = raw_digest(b"different authored clip revision");
+    assert_eq!(
+        stale_revision
+            .native_pose_projection(
+                &target(),
+                &scene,
+                0,
+                &Native26_3SceneCodec,
+                &crate::scene::tests::animation_pose_registry(false),
+            )
+            .unwrap_err()
+            .code,
+        "REVISION_CONFLICT"
+    );
+    for changed_compiler in [false, true] {
+        let mut stale_target = animation.clone();
+        if changed_compiler {
+            stale_target.compiler_digest = raw_digest(b"different compiler");
+        } else {
+            stale_target.target_artifact_digest = raw_digest(b"different target artifact");
+        }
+        assert_eq!(
+            stale_target
+                .native_pose_projection(
+                    &target(),
+                    &scene,
+                    0,
+                    &Native26_3SceneCodec,
+                    &crate::scene::tests::animation_pose_registry(false),
+                )
+                .unwrap_err()
+                .code,
+            "STALE_CONTEXT"
+        );
+    }
+    let (_, _, other_tps) = scene_animation_fixture(60, |_| {});
+    assert_eq!(
+        other_tps
+            .native_pose_projection(
+                &target(),
+                &scene,
+                0,
+                &Native26_3SceneCodec,
+                &crate::scene::tests::animation_pose_registry(false),
+            )
+            .unwrap_err()
+            .code,
+        "STALE_CONTEXT"
+    );
+    struct DifferentCodec;
+    impl crate::scene::SceneTargetCodec for DifferentCodec {
+        fn codec_digest(&self) -> Sha256Digest {
+            raw_digest(b"different codec")
+        }
+        fn encode_instruction(
+            &self,
+            _: &crate::scene::NativeSceneInstruction,
+        ) -> Result<Vec<String>, DomainError> {
+            panic!("stale codec must be rejected before encoding")
+        }
+    }
+    assert_eq!(
+        animation
+            .native_pose_projection(
+                &target(),
+                &scene,
+                0,
+                &DifferentCodec,
+                &crate::scene::tests::animation_pose_registry(false),
+            )
+            .unwrap_err()
+            .code,
+        "STALE_CONTEXT"
+    );
+    for eventful in [false, true] {
+        let mut value = clip();
+        if eventful {
+            value["events"] = json!([event("middle", "1", "1", 0, "early")]);
+        } else {
+            value["loop"] = json!(true);
+        }
+        let unsupported = compile(value, 20);
+        assert_eq!(
+            unsupported
+                .native_pose_projection(
+                    &target(),
+                    &scene,
+                    0,
+                    &Native26_3SceneCodec,
+                    &crate::scene::tests::animation_pose_registry(false),
+                )
+                .unwrap_err()
+                .code,
+            "UNOWNED_REQUIRED_CAPABILITY"
+        );
+    }
+}
+
+#[test]
+fn native_pose_projection_keeps_two_instance_sources_and_targets_disjoint() {
+    use crate::scene::{Native26_3SceneCodec, NativeSceneInstruction};
+    let (_, scene) = crate::scene::tests::animation_pack_fixture_two_instances();
+    let mut targets = BTreeSet::new();
+    let mut timers = BTreeSet::new();
+    assert_eq!(scene.animation_bindings().len(), 2);
+    for binding in scene.animation_bindings().values() {
+        let animation = animation_for_projection(binding, 20, |_| {});
+        assert!(timers.insert(animation.timer_objective().to_owned()));
+        let projected = animation
+            .native_pose_projection(
+                &target(),
+                &scene,
+                20,
+                &Native26_3SceneCodec,
+                &crate::scene::tests::animation_pose_registry(false),
+            )
+            .unwrap();
+        for step in projected.steps() {
+            assert_eq!(step.instance_id(), &binding.instance_id);
+            let NativeSceneInstruction::DisplayPose { uuid, .. } = step.instruction() else {
+                unreachable!()
+            };
+            assert!(
+                targets.insert(*uuid),
+                "two instances cannot own the same native pose target"
+            );
+        }
+    }
+    assert_eq!(timers.len(), 2);
 }
 
 #[test]

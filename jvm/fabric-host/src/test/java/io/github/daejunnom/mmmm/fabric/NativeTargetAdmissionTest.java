@@ -35,6 +35,7 @@ final class NativeTargetAdmissionTest {
     private static final String GENERATION = "31";
     private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-10-14T00:00:00Z"), ZoneOffset.UTC);
     private static final String COMMAND = "execute in minecraft:overworld run data merge block 0 64 0 {Command:\"say 😀\",auto:0b,TrackOutput:0b}";
+    private static final String POSE_COMMAND = "execute in minecraft:overworld as 00000000-0000-0000-0000-000000000001 if entity @s[type=minecraft:text_display,tag=mmmm_fixture] run data merge entity @s {transformation:[1f,0f,0f,0f,0f,1f,0f,0f,0f,0f,1f,0f,0f,0f,0f,1f],interpolation_duration:0,start_interpolation:0,teleport_duration:0}";
     private final NativeTargetAdmission admission = new NativeTargetAdmission(new ContractJson());
 
     @Test void missingDeniedUnavailableAndMalformedProofNeverStartSourceOrBrigadierCallbacks() throws IOException {
@@ -158,6 +159,65 @@ final class NativeTargetAdmissionTest {
         assertEquals("parsed", receipt(result, 0).path("parseStatus").asText()); assertEquals(contextBefore, inputs.context().toString()); assertEquals(factsBefore, inputs.facts().toString());
     }
 
+    @Test void displayPoseSignatureAllowsOnlyItsExactOwnedTargetMatrixAndMandatoryZeroResets() throws IOException {
+        ObjectNode step = first(poseInputs().request().withArray("instructions"));
+        assertDoesNotThrow(() -> NativeSceneExecutor.requireOperationSignature(step, 0, POSE_COMMAND));
+        for (String altered : new String[] {
+                POSE_COMMAND.replace("000000000001", "000000000002"),
+                POSE_COMMAND.replace("minecraft:text_display", "minecraft:item_display"),
+                POSE_COMMAND.replace("tag=mmmm_fixture", "tag=other_owner"),
+                POSE_COMMAND.replace(" run data merge entity @s ", " run tp @s "),
+                POSE_COMMAND.replace("transformation:[1f", "transformation:[2f"),
+                POSE_COMMAND.replace("1f", "1d"),
+                POSE_COMMAND.replace("interpolation_duration:0", "interpolation_duration:1"),
+                POSE_COMMAND.replace(",start_interpolation:0", ""),
+                POSE_COMMAND.replace("teleport_duration:0}", "teleport_duration:1}"),
+                POSE_COMMAND.replace("teleport_duration:0}", "teleport_duration:0,Pos:[0d,65d,0d]}"),
+                POSE_COMMAND.replace("teleport_duration:0}", "teleport_duration:0,text:\"changed\"}"),
+                POSE_COMMAND + " " }) {
+            assertThrows(ContractException.class, () -> NativeSceneExecutor.requireOperationSignature(step, 0, altered));
+        }
+        assertThrows(ContractException.class, () -> NativeSceneExecutor.requireOperationSignature(step, 1, POSE_COMMAND));
+    }
+
+    @Test void displayPoseUsesExactWidenedFloat32IncludingSignedZeroWithoutRegeneratingRustLiterals() throws IOException {
+        ObjectNode step = first(poseInputs().request().withArray("instructions")); ArrayNode matrix = step.withObject("instruction").withArray("matrix");
+        matrix.set(0, ContractJson.newObject().put("value", (double) 0.1f).get("value"));
+        matrix.set(1, ContractJson.newObject().put("value", -0.0).get("value"));
+        String exact = POSE_COMMAND.replaceFirst("1f,0f", "0.1f,-0f");
+        assertDoesNotThrow(() -> NativeSceneExecutor.requireOperationSignature(step, 0, exact));
+        assertThrows(ContractException.class, () -> NativeSceneExecutor.requireOperationSignature(step, 0, exact.replace("-0f", "0f")));
+        matrix.set(0, ContractJson.newObject().put("value", 0.1).get("value"));
+        assertThrows(ContractException.class, () -> NativeSceneExecutor.requireOperationSignature(step, 0, exact));
+        matrix.set(0, ContractJson.newObject().put("value", Double.NaN).get("value"));
+        assertThrows(ContractException.class, () -> NativeSceneExecutor.requireOperationSignature(step, 0, exact));
+    }
+
+    @Test void displayPoseStillRequiresIndependentSourceAndReadonlyAdmissionAndNeverExecutesFixtureHandlers() throws IOException {
+        Inputs inputs = poseInputs(); Harness denied = new Harness();
+        ObjectNode unsupported = observe(inputs, denied, (context, facts, host, generation, step, index) -> NativeTargetAdmission.SourceDecision.unsupported("PARSER_SOURCE_UNADMITTED"), poseGuard(new AtomicInteger()));
+        assertEquals("unsupported", receipt(unsupported, 0).path("parseStatus").asText()); denied.assertUntouched();
+        Harness missingGuard = new Harness();
+        assertEquals("NATIVE_READONLY_GUARD_UNAVAILABLE", receipt(observe(inputs, missingGuard, acceptedSource(), null), 0).path("reasonCode").asText()); missingGuard.assertUntouched();
+        Harness accepted = new Harness(); AtomicInteger guards = new AtomicInteger();
+        ObjectNode result = observe(inputs, accepted, acceptedSource(), poseGuard(guards));
+        assertEquals("parsed", receipt(result, 0).path("parseStatus").asText()); assertEquals(POSE_COMMAND, accepted.lastCommand);
+        assertTrue(guards.get() > 0); assertEquals(1, accepted.sourceFactory.get()); assertEquals(0, accepted.handler.get()); assertEquals(0, accepted.suggestion.get());
+        assertFalse(result.has("verified"));
+    }
+
+    @Test void displayPoseEncodedTargetTamperIsRejectedBeforeParsingAndClosedShapeTamperBeforeCallbacks() throws IOException {
+        for (String altered : new String[] { POSE_COMMAND.replace("000000000001", "000000000002"), POSE_COMMAND.replace("minecraft:text_display", "minecraft:block_display"), POSE_COMMAND.replace("tag=mmmm_fixture", "tag=other_owner") }) {
+            Inputs inputs = poseInputs(); command(first(inputs.request().withArray("instructions")), altered); Harness harness = new Harness();
+            ObjectNode result = observe(inputs, harness, acceptedSource(), poseGuard(new AtomicInteger()));
+            assertEquals("rejected", receipt(result, 0).path("parseStatus").asText()); assertEquals("NATIVE_EXECUTION_INVALID", receipt(result, 0).path("reasonCode").asText());
+            assertTrue(receipt(result, 0).path("consumedUtf16").isNull()); harness.assertUntouched();
+        }
+        Inputs changed = poseInputs(); first(changed.request().withArray("instructions")).withObject("instruction").putArray("position").add(0).add(65).add(0);
+        Harness untouched = new Harness();
+        assertThrows(ContractException.class, () -> observe(changed, untouched, acceptedSource(), poseGuard(new AtomicInteger()))); untouched.assertUntouched();
+    }
+
     private ObjectNode observe(Inputs inputs, Harness harness, NativeTargetAdmission.SourceAdmission source,
                                NativeTargetAdmission.ReadonlyParsedAdmission<Object> guard) {
         return admission.observe(inputs.context(), inputs.facts(), HOST, GENERATION, inputs.request(), source, harness::parse, guard, () -> 7L, CLOCK);
@@ -165,6 +225,12 @@ final class NativeTargetAdmissionTest {
     private static NativeTargetAdmission.SourceAdmission acceptedSource() { return (context, facts, host, generation, step, index) -> accepted(); }
     private static NativeTargetAdmission.SourceDecision accepted() { return NativeTargetAdmission.SourceDecision.admitted(sources("fixture.Parser", GENERATION), sources("fixture.Handler", GENERATION)); }
     private static NativeTargetAdmission.ReadonlyParsedAdmission<Object> acceptedGuard() { return (context, step, index, parsed, admitted) -> new NativeTargetAdmission.SourceReceipts(admitted.parserSources(), admitted.handlerSources()); }
+    private static NativeTargetAdmission.ReadonlyParsedAdmission<Object> poseGuard(AtomicInteger calls) {
+        return (context, step, index, parsed, admitted) -> {
+            NativeSceneExecutor.requireOperationSignature(step, index, parsed.getReader().getString()); calls.incrementAndGet();
+            return new NativeTargetAdmission.SourceReceipts(admitted.parserSources(), admitted.handlerSources());
+        };
+    }
     private static ArrayNode sources(String name, String generation) {
         ArrayNode sources = ContractJson.newObject().putArray("sources");
         sources.add(ContractJson.newObject().put("className", name).put("definitionSha256", "b".repeat(64)).put("containerSha256", "c".repeat(64))
@@ -183,6 +249,15 @@ final class NativeTargetAdmissionTest {
                 .put("instance_id", "instance-fixture").put("owner_prefab_id", "prefab-fixture"); step.set("instruction", instruction); command(step, COMMAND);
         ObjectNode request = ContractJson.newObject().put("kind", "target_admission").put("expectedRuntimeSourceFactsDigest", NativeProfileAdmission.sourceDigest(facts)).put("expectedRegistryGeneration", GENERATION);
         request.putArray("instructions").add(step); return new Inputs(context, facts, request);
+    }
+    private static Inputs poseInputs() throws IOException {
+        // The existing parser/source harness remains a pure fixture; it never supplies a live entity or runtime proof.
+        Inputs inputs = inputs(); ObjectNode step = first(inputs.request().withArray("instructions"));
+        step.put("phase", "activate").put("source_object_id", "clip-fixture").put("source_node_id", "node-fixture");
+        ObjectNode instruction = ContractJson.newObject().put("kind", "display_pose").put("dimension", "minecraft:overworld").put("tag", "mmmm_fixture").put("entity_kind", "text");
+        ArrayNode uuid = instruction.putArray("uuid"); for (int index = 0; index < 16; index++) uuid.add(index == 15 ? 1 : 0);
+        ArrayNode matrix = instruction.putArray("matrix"); for (int index = 0; index < 16; index++) matrix.add(index % 5 == 0 ? 1.0 : 0.0);
+        step.set("instruction", instruction); command(step, POSE_COMMAND); return inputs;
     }
     private static void command(ObjectNode step, String command) { ArrayNode commands = step.putArray("encoded_commands").add(command); step.put("commandDigest", ContractJson.digest(commands)); }
     private static ObjectNode first(ArrayNode values) { return ContractJson.object(values.get(0)); }

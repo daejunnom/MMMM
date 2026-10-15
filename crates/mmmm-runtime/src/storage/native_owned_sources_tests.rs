@@ -1343,3 +1343,6 @@ fn unresolved_durable_dispatch_fences_membership_even_with_disjoint_scope() {
 // 같은 보호 Store/bootstrap/Batch fixture로 source 사용 결정의 별도 수명을 검사한다.
 #[path = "catalog_source_use_tests.rs"]
 mod catalog_source_use_tests;
+
+#[path = "compatibility_approval_tests.rs"]
+mod compatibility_approval_tests;

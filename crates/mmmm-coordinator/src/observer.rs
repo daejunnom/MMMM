@@ -21,6 +21,9 @@ use mmmm_runtime::storage::{
 };
 use serde_json::{Value, json};
 
+#[path = "direct_block_observer.rs"]
+mod direct_block;
+
 pub struct NativeObserver {
     bridge: HostBridge,
     authentication: Option<ObserverAuthentication>,
@@ -276,6 +279,9 @@ impl IndependentObserverPort for NativeObserver {
         scope: &WriteScope,
         target: &str,
     ) -> AppResult<()> {
+        if direct_block::uses_native_subjects(invocation) {
+            return direct_block::validate_target(invocation, scope, target);
+        }
         let target = BlockTarget::parse(target)?;
         validate_region(invocation, scope, &target)
     }
@@ -298,6 +304,9 @@ impl IndependentObserverPort for NativeObserver {
         if invocation["actionId"] != "mmmm:block_patch" {
             return Ok(None);
         }
+        if direct_block::uses_native_subjects(invocation) {
+            return Err(store_required());
+        }
         let target = BlockTarget::from_arguments(&invocation["arguments"])?;
         validate_region(invocation, scope, &target)?;
         let admission = self.admission(store, invocation, scope, false)?;
@@ -313,6 +322,19 @@ impl IndependentObserverPort for NativeObserver {
                 bytes,
             }],
         }))
+    }
+    fn capture_before_retained_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        invocation: &Value,
+        scope: &WriteScope,
+    ) -> AppResult<Option<BeforeCapture>> {
+        if direct_block::uses_native_subjects(invocation) {
+            return self
+                .capture_direct_block(store, invocation, scope)
+                .map(Some);
+        }
+        self.capture_before_with_store(store, invocation, scope)
     }
     fn readback(
         &mut self,
@@ -332,6 +354,9 @@ impl IndependentObserverPort for NativeObserver {
                 "CAPABILITY_UNAVAILABLE",
                 "No native readback codec is installed for this action",
             ));
+        }
+        if direct_block::uses_native_subjects(invocation) {
+            return self.readback_direct_block(store, invocation, scope);
         }
         let target = BlockTarget::from_arguments(&invocation["arguments"])?;
         validate_region(invocation, scope, &target)?;
@@ -394,6 +419,9 @@ impl IndependentObserverPort for NativeObserver {
                 "No original native target codec is installed for this action",
             ));
         }
+        if direct_block::uses_native_subjects(invocation) {
+            return Err(store_required());
+        }
         let target = BlockTarget::parse(target)?;
         let original = BlockTarget::from_arguments(&invocation["arguments"])?;
         if target != original {
@@ -410,6 +438,17 @@ impl IndependentObserverPort for NativeObserver {
         let admission = self.admission(store, invocation, &scope, true)?;
         self.observe(store, &admission, &target)
             .map(|(bytes, _)| bytes)
+    }
+    fn read_target_retained_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        invocation: &Value,
+        target: &str,
+    ) -> AppResult<Vec<u8>> {
+        if direct_block::uses_native_subjects(invocation) {
+            return self.read_direct_block_target(store, invocation, target);
+        }
+        self.read_target_with_store(store, invocation, target)
     }
 }
 

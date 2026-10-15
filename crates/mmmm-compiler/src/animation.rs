@@ -96,7 +96,7 @@ pub trait AnimationEvidenceVerifier {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AnimationNodeBinding {
     pub parent: Option<NodeId>,
     pub rest_local: Transform,
@@ -129,7 +129,7 @@ pub struct AnimationBindings {
 /// Sealed draft projection used when composing with the scene generator.
 /// The pack builder must compare this exact topology/anchor/UUID projection
 /// against its scene draft, not accept a matching instance identifier alone.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AnimationSceneProjection {
     pub instance_id: InstanceId,
     pub owner_prefab_id: PrefabId,
@@ -354,7 +354,64 @@ pub struct AnimationDraft {
     quantization: Vec<QuantizedTime>,
 }
 
+/// One exact source tick derived from two sealed compiler drafts. This borrows
+/// their immutable provenance rather than issuing a runtime owner or before
+/// snapshot. Coordinator still owns current target reads, scope, and dispatch.
+#[derive(Debug)]
+pub struct NativeAnimationPoseProjection<'source> {
+    animation: &'source AnimationDraft,
+    scene: &'source crate::scene::SceneDraft,
+    tick: i32,
+    steps: Vec<crate::scene::NativeSceneStep>,
+}
+impl NativeAnimationPoseProjection<'_> {
+    pub fn animation(&self) -> &AnimationDraft {
+        self.animation
+    }
+    pub fn scene(&self) -> &crate::scene::SceneDraft {
+        self.scene
+    }
+    pub fn tick(&self) -> i32 {
+        self.tick
+    }
+    pub fn steps(&self) -> &[crate::scene::NativeSceneStep] {
+        &self.steps
+    }
+}
+
 impl AnimationDraft {
+    /// Project only already-compiled, instance-qualified poses. Caller matrices,
+    /// UUIDs, tags, reset durations, and claimed live before pins are not inputs.
+    /// Activate is a source phase; this neither schedules a tick nor plays a clip.
+    pub fn native_pose_projection<'source>(
+        &'source self,
+        target: &VerifiedTarget,
+        scene: &'source crate::scene::SceneDraft,
+        tick: i32,
+        codec: &dyn crate::scene::SceneTargetCodec,
+        registry: &dyn crate::scene::SceneRegistryVerifier,
+    ) -> Result<NativeAnimationPoseProjection<'source>, DomainError> {
+        if self.looping || !self.events.is_empty() {
+            return Err(DomainError::new(
+                "UNOWNED_REQUIRED_CAPABILITY",
+                "Native pose projection does not implement loop or event execution",
+            ));
+        }
+        if !(0..=self.duration_ticks).contains(&tick) {
+            return Err(DomainError::new(
+                "INVALID_TIME",
+                "Native pose tick is outside the sealed clip interval",
+            ));
+        }
+        let steps = scene.project_animation_poses(self, target, tick, codec, registry)?;
+        Ok(NativeAnimationPoseProjection {
+            animation: self,
+            scene,
+            tick,
+            steps,
+        })
+    }
+
     pub fn resources(&self) -> &BTreeMap<ResourceLocation, StagedResource> {
         &self.resources
     }

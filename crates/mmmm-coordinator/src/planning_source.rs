@@ -561,6 +561,16 @@ pub type SharedPlanningData = Rc<RefCell<Box<dyn PlanningDataPort>>>;
 /// approved artifact/profile evidence registry. The inherited typed methods
 /// deliberately cannot be implemented by parsing verification flags in JSON.
 pub trait PlanningBackendPort: PlanningEnvironmentPort {
+    /// Compatibility bindings revalidate protected approval and CAS through
+    /// the caller's Store before entering the same observed inventory.
+    fn inventory_with_store(
+        &mut self,
+        _store: &PlanningStore<'_>,
+        principal: &PrincipalId,
+        context: &Value,
+    ) -> AppResult<InventorySnapshot> {
+        self.inventory(principal, context)
+    }
     /// Match the independently queried hello/epoch against approved profile and
     /// artifact bytes plus the actual case evidence in the server registry.
     /// The sealed compiler target alone does not attest the connected host.
@@ -626,6 +636,20 @@ pub trait PlanningBackendPort: PlanningEnvironmentPort {
         context: &Value,
     ) -> AppResult<NativeTargetSnapshot> {
         self.snapshot_native_targets(principal, project, change, context)
+    }
+
+    /// Registered native actions observe and retain their exact before images
+    /// through the same call-scoped Store as the plan, never a reopened daemon.
+    fn registered_action_footprint_with_store(
+        &mut self,
+        _store: &PlanningStore<'_>,
+        principal: &PrincipalId,
+        project: &ProjectCatalog,
+        request: &Value,
+        action: &ActionDescriptor,
+        context: &Value,
+    ) -> AppResult<RegisteredActionFootprint> {
+        self.registered_action_footprint(principal, project, request, action, context)
     }
 
     fn verify_projection_references_with_store(
@@ -1671,7 +1695,7 @@ impl PlanningEnvironmentPort for ConcretePlanningEnvironment<'_> {
             .backend
             .try_borrow_mut()
             .map_err(|_| source_busy())?
-            .inventory(principal, context);
+            .inventory_with_store(&self.store, principal, context);
         let inventory = self.after(principal, context, result)?;
         if inventory.context().context_id().as_str() != text(context, "contextId")?
             || inventory.context().context_digest().as_str() != text(context, "contextDigest")?
@@ -1781,7 +1805,14 @@ impl PlanningEnvironmentPort for ConcretePlanningEnvironment<'_> {
             .backend
             .try_borrow_mut()
             .map_err(|_| source_busy())?
-            .registered_action_footprint(principal, project, request, action, context);
+            .registered_action_footprint_with_store(
+                &self.store,
+                principal,
+                project,
+                request,
+                action,
+                context,
+            );
         let footprint = self.after(principal, context, result)?;
         if footprint.scope.project_id != *project.project_id() {
             return Err(forbidden());

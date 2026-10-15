@@ -13,12 +13,14 @@ use crate::{
         BorrowedProjectSource, LocalPlanningAccess, PlanningBackendPort, PlanningStore,
         SharedPlanningContexts, SharedPlanningData, VerifiedPlanningTarget,
     },
+    production_factory::RegisteredCompatibilityProfiles,
     service::{RequestBudget, RequestContextSlot},
     target_profile::{RegisteredTargetProfiles, ResolvedTargetProfile},
 };
 use mmmm_adapters::{
     ActionDescriptor, ActionReadiness, Availability, CompatibilityEvidence, Effect,
-    InventorySnapshot, ProviderInventory, ProviderRegistry, RegistrationObservation, RouteContext,
+    InventorySnapshot, ProviderInventory, ProviderRegistry, RegistrationMode,
+    RegistrationObservation, RouteContext,
 };
 use mmmm_application::{Access, AppError, AppResult, AuthorityPort, RecoveryPreparation};
 use mmmm_compiler::{
@@ -59,6 +61,9 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     rc::Rc,
 };
+
+#[path = "native_block_footprint.rs"]
+mod block_footprint;
 
 const MAX_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
@@ -167,6 +172,7 @@ pub struct NativeBackendComposition {
     pub targets: RegisteredTargetProfiles,
     pub permissions: Option<SharedFeaturePermissions>,
     pub readiness: NativeReadinessRegistry,
+    pub compatibility: RegisteredCompatibilityProfiles,
     pub scene_registry: Rc<dyn SceneRegistryVerifier>,
     /// A registered Rust provider supplies metadata routes independently of
     /// Java. Absent registration leaves those routes unavailable.
@@ -686,6 +692,14 @@ fn observation_map<'a>(
 }
 
 impl PlanningBackendPort for HostNativeBackend {
+    fn inventory_with_store(
+        &mut self,
+        store: &PlanningStore<'_>,
+        principal: &PrincipalId,
+        context: &Value,
+    ) -> AppResult<InventorySnapshot> {
+        self.observed_inventory(Some(store), principal, context)
+    }
     fn verify_live_target(
         &mut self,
         _principal: &PrincipalId,
@@ -805,6 +819,17 @@ impl PlanningBackendPort for HostNativeBackend {
     ) -> AppResult<NativeTargetSnapshot> {
         self.snapshot(store, principal, project, change, context)
     }
+    fn registered_action_footprint_with_store(
+        &mut self,
+        store: &PlanningStore<'_>,
+        principal: &PrincipalId,
+        project: &ProjectCatalog,
+        request: &Value,
+        action: &ActionDescriptor,
+        context: &Value,
+    ) -> AppResult<RegisteredActionFootprint> {
+        self.owned_block_footprint(store, principal, project, request, action, context)
+    }
     fn verify_projection_references_with_store(
         &mut self,
         store: &PlanningStore<'_>,
@@ -901,36 +926,57 @@ impl PlanningBackendPort for HostNativeBackend {
     }
 }
 
-impl PlanningEnvironmentPort for HostNativeBackend {
-    fn execution_budget_ms(&mut self, principal: &PrincipalId, context: &Value) -> AppResult<u64> {
-        let (_, budget, _) = self.current(principal, context)?;
-        let remaining = budget
-            .deadline()
-            .saturating_duration_since(std::time::Instant::now())
-            .as_millis();
-        let milliseconds = u64::try_from(remaining.min(3_600_000)).map_err(|_| budget_error())?;
-        if milliseconds == 0 {
-            Err(budget_error())
-        } else {
-            Ok(milliseconds)
-        }
-    }
-    fn inventory(
+impl HostNativeBackend {
+    fn observed_inventory(
         &mut self,
+        store: Option<&PlanningStore<'_>>,
         principal: &PrincipalId,
         context: &Value,
     ) -> AppResult<InventorySnapshot> {
         let (authenticated, budget, access) = self.current(principal, context)?;
+        let call = self
+            .composition
+            .request
+            .occupied_witness()
+            .map_err(service_error)?;
         let permissions = match &self.composition.permissions {
             Some(port) => port.current(&authenticated, context, &budget)?,
             None => BTreeSet::new(),
         };
         let mut registry = ProviderRegistry::new();
         if context["environment"]["kind"] == "game" {
+            // Only the same-Store path may advertise the built-in direct codec.
+            // Its current actual host artifact is source identity, never a
+            // numeric target/profile or a generic provider readiness grant.
+            let owned_hello = if store.is_some() {
+                let hello = self.composition.hosts.hello_with_deadline(
+                    principal,
+                    &context_id(context)?,
+                    budget.deadline(),
+                );
+                let hello = block_footprint::finish(
+                    hello,
+                    (|| {
+                        call.check_local().map_err(service_error)?;
+                        self.current(principal, context).map(|_| ())
+                    })(),
+                )?;
+                Some(hello)
+            } else {
+                None
+            };
+            call.check_local().map_err(service_error)?;
             let raw = self.composition.hosts.inventory_with_deadline(
                 principal,
                 &context_id(context)?,
                 budget.deadline(),
+            );
+            let raw = block_footprint::finish(
+                raw,
+                (|| {
+                    call.check_local().map_err(service_error)?;
+                    self.current(principal, context).map(|_| ())
+                })(),
             )?;
             validate("ProviderInventory", &raw)?;
             let inventory: ProviderInventory =
@@ -953,6 +999,21 @@ impl PlanningEnvironmentPort for HostNativeBackend {
                         .version_evidence
                         .min(mmmm_adapters::VersionEvidence::InterfaceChecked);
                 }
+                if provider.registration_mode == RegistrationMode::Compatibility {
+                    let store = store.ok_or_else(store_required)?;
+                    store.with_read(|store| {
+                        self.composition.compatibility.bind_registered_into(
+                            store,
+                            &authenticated,
+                            context,
+                            &permissions,
+                            &provider,
+                            &mut registry,
+                            &budget,
+                        )
+                    })?;
+                    continue;
+                }
                 let action_readiness = provider
                     .actions
                     .iter()
@@ -961,12 +1022,17 @@ impl PlanningEnvironmentPort for HostNativeBackend {
                             action.action_id.clone(),
                             ActionReadiness {
                                 ready: provider.availability == Availability::Available,
-                                possible_loss_codes: self.composition.readiness.losses(
-                                    &authenticated,
-                                    context,
-                                    &provider.binding_id,
-                                    action,
-                                )?,
+                                possible_loss_codes: match owned_hello.as_ref().and_then(|hello| {
+                                    block_footprint::known_losses(&provider, action, hello, context)
+                                }) {
+                                    Some(losses) => Some(losses),
+                                    None => self.composition.readiness.losses(
+                                        &authenticated,
+                                        context,
+                                        &provider.binding_id,
+                                        action,
+                                    )?,
+                                },
                             },
                         ))
                     })
@@ -1010,7 +1076,30 @@ impl PlanningEnvironmentPort for HostNativeBackend {
             Some(context),
             Access::Plan,
         )?;
+        call.check_local().map_err(service_error)?;
         Ok(snapshot)
+    }
+}
+impl PlanningEnvironmentPort for HostNativeBackend {
+    fn execution_budget_ms(&mut self, principal: &PrincipalId, context: &Value) -> AppResult<u64> {
+        let (_, budget, _) = self.current(principal, context)?;
+        let remaining = budget
+            .deadline()
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis();
+        let milliseconds = u64::try_from(remaining.min(3_600_000)).map_err(|_| budget_error())?;
+        if milliseconds == 0 {
+            Err(budget_error())
+        } else {
+            Ok(milliseconds)
+        }
+    }
+    fn inventory(
+        &mut self,
+        principal: &PrincipalId,
+        context: &Value,
+    ) -> AppResult<InventorySnapshot> {
+        self.observed_inventory(None, principal, context)
     }
     fn binding_dependency(
         &mut self,
@@ -1588,6 +1677,12 @@ fn step_key(step: &NativeSceneStep) -> AppResult<Sha256Digest> {
         }
         NativeSceneInstruction::StateRemove { .. }
         | NativeSceneInstruction::DisplayRemove { .. } => {}
+        NativeSceneInstruction::DisplayPose { .. } => {
+            return Err(error(
+                "NATIVE_DELTA_UNSUPPORTED",
+                "Display pose activation needs its sealed current animation dispatch path",
+            ));
+        }
     }
     canonical_digest(&json!({"instance":step.instance_id(),"object":step.source_object_id(),"node":step.source_node_id(),"instruction":instruction})).map_err(|_| invalid())
 }
@@ -1653,6 +1748,12 @@ fn instruction_selectors(instruction: &NativeSceneInstruction) -> AppResult<Vec<
             return Err(error(
                 "NATIVE_SOURCE_MAPPING_REQUIRED",
                 "State storage/score selectors need a registered exact ResourceID mapping",
+            ));
+        }
+        NativeSceneInstruction::DisplayPose { .. } => {
+            return Err(error(
+                "NATIVE_DELTA_UNSUPPORTED",
+                "Display pose activation has no registered scene snapshot codec",
             ));
         }
     })

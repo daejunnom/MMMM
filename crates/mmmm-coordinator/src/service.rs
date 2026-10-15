@@ -241,6 +241,7 @@ impl std::error::Error for ServiceError {
 pub struct RequestBudget {
     deadline: Instant,
     cancelled: Arc<AtomicBool>,
+    bootstrap: Option<crate::peer_management::BootstrapBudget>,
 }
 impl RequestBudget {
     pub fn new(duration: Duration, cancelled: Arc<AtomicBool>) -> Result<Self, ServiceError> {
@@ -253,6 +254,7 @@ impl RequestBudget {
         Ok(Self {
             deadline: Instant::now() + duration,
             cancelled,
+            bootstrap: None,
         })
     }
     pub(crate) fn until(
@@ -269,9 +271,37 @@ impl RequestBudget {
         Ok(Self {
             deadline,
             cancelled,
+            bootstrap: None,
         })
     }
+    /// Read-only bootstrap source work shares the original native exchange
+    /// deadline, cancellation and peer-stop checks. No stage receives a reset.
+    pub(crate) fn from_bootstrap(
+        parent: &crate::peer_management::BootstrapBudget,
+    ) -> Result<Self, ServiceError> {
+        // BootstrapBudget already owns its closed finite bound. Construct
+        // directly so an expired original parent keeps its typed deadline
+        // cause rather than becoming a fresh-constructor INVALID_BUDGET.
+        let budget = Self {
+            deadline: parent.deadline(),
+            cancelled: parent.cancellation_signal(),
+            bootstrap: Some(parent.clone()),
+        };
+        budget.check()?;
+        Ok(budget)
+    }
     pub fn check(&self) -> Result<(), ServiceError> {
+        if let Some(parent) = &self.bootstrap {
+            parent.check().map_err(|cause| {
+                use crate::peer_management::ManagementError;
+                let code = match cause {
+                    ManagementError::Cancelled => "CANCELLED",
+                    ManagementError::Deadline => "TIME_BUDGET_EXCEEDED",
+                    _ => "LOCAL_TRANSPORT_UNCERTAIN",
+                };
+                ServiceError::caused_by(code, "Original host bootstrap request stopped", cause)
+            })?;
+        }
         if self.cancelled.load(Ordering::Acquire) {
             return Err(ServiceError::new("CANCELLED", "Request was cancelled"));
         }
@@ -284,7 +314,8 @@ impl RequestBudget {
         Ok(())
     }
     pub fn remaining(&self) -> Option<Duration> {
-        (!self.cancelled.load(Ordering::Acquire))
+        self.check()
+            .is_ok()
             .then(|| self.deadline.checked_duration_since(Instant::now()))
             .flatten()
     }

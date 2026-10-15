@@ -311,6 +311,7 @@ final class NativeSceneExecutor {
         String kind = text(value, "kind");
         Set<String> fields = switch (kind) {
             case "display" -> Set.of("kind", "dimension", "tag", "entity_kind", "uuid", "position", "matrix", "payload");
+            case "display_pose" -> Set.of("kind", "dimension", "tag", "entity_kind", "uuid", "matrix");
             case "block" -> Set.of("kind", "dimension", "position", "state");
             case "command_shell" -> Set.of("kind", "dimension", "position", "command_kind", "facing", "conditional");
             case "command_data" -> Set.of("kind", "dimension", "position", "source");
@@ -323,7 +324,7 @@ final class NativeSceneExecutor {
         exact(value, fields);
         Set<String> permitted = switch (phase) {
             case "stage" -> Set.of("display", "block", "command_shell", "command_data", "state_initialize");
-            case "activate" -> Set.of("command_activation");
+            case "activate" -> Set.of("command_activation", "display_pose");
             case "cleanup" -> Set.of("command_activation", "state_remove", "display_remove");
             default -> throw invalid();
         };
@@ -341,6 +342,10 @@ final class NativeSceneExecutor {
                 ObjectNode payload = object(value, "payload");
                 payload.fieldNames().forEachRemaining(key -> { if (DISPLAY_PROTECTED.contains(key)) throw invalid(); });
                 if (payload.has("billboard") && (!payload.get("billboard").isTextual() || !"fixed".equals(payload.get("billboard").textValue()))) throw invalid();
+            }
+            case "display_pose" -> {
+                token(text(value, "tag")); finiteArray(value.get("matrix"), 16, true);
+                for (JsonNode octet : value.path("uuid")) if (!octet.isIntegralNumber()) throw invalid();
             }
             case "block" -> {
                 ObjectNode state = object(value, "state"); exact(state, Set.of("blockId", "properties")); location(text(state, "blockId"));
@@ -403,7 +408,7 @@ final class NativeSceneExecutor {
         for (ObjectNode target : targets) {
             ObjectNode selector = object(target, "selector"); String type = text(selector, "kind"); boolean match = false;
             switch (kind) {
-                case "display", "display_remove" -> match = "entity".equals(type)
+                case "display", "display_pose", "display_remove" -> match = "entity".equals(type)
                         && text(instruction, "dimension").equals(selector.path("dimension").asText())
                         && uuid(instruction.get("uuid")).toString().equals(selector.path("uuid").asText())
                         && ("minecraft:" + text(instruction, "entity_kind") + "_display").equals(selector.path("expectedType").asText());
@@ -419,12 +424,12 @@ final class NativeSceneExecutor {
             }
             if (match) {
                 selected.add(target); found.add(type);
-                if ("display".equals(kind) && (!target.get("ownerTag").isTextual() || !text(instruction, "tag").equals(text(target, "ownerTag")))) throw invalid();
+                if (Set.of("display", "display_pose").contains(kind) && (!target.get("ownerTag").isTextual() || !text(instruction, "tag").equals(text(target, "ownerTag")))) throw invalid();
                 if ("display_remove".equals(kind) && !target.get("ownerTag").isTextual()) throw failure("OWNERSHIP_UNPROVEN", "Entity removal requires its sealed actual ownership tag");
             }
         }
         Set<String> required = switch (kind) {
-            case "display", "display_remove" -> Set.of("entity");
+            case "display", "display_pose", "display_remove" -> Set.of("entity");
             case "block", "command_shell", "command_data", "command_activation" -> Set.of("block_state", "block_entity");
             default -> "scoreboard".equals(text(instruction, "storage_kind")) ? Set.of("score", "objective") : Set.of("storage");
         };
@@ -536,6 +541,27 @@ final class NativeSceneExecutor {
                 }
                 // Native typed-NBT/UUID/tag/payload/matrix comparison is required in requireCommand.
             }
+            case "display_pose" -> {
+                if (index != 0) throw invalid();
+                finiteArray(instruction.get("matrix"), 16, true);
+                prefix = "execute in " + text(instruction, "dimension") + " as " + uuid(instruction.get("uuid"))
+                        + " if entity @s[type=minecraft:" + text(instruction, "entity_kind") + "_display,tag="
+                        + text(instruction, "tag") + "] run data merge entity @s {transformation:[";
+                String suffix = "],interpolation_duration:0,start_interpolation:0,teleport_duration:0}";
+                if (!command.startsWith(prefix) || !command.endsWith(suffix)) throw invalid();
+                String[] matrix = command.substring(prefix.length(), command.length() - suffix.length()).split(",", -1);
+                if (matrix.length != 16) throw invalid();
+                for (int component = 0; component < matrix.length; component++) {
+                    String literal = matrix[component];
+                    if (!literal.matches("-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?f")) throw invalid();
+                    float actual;
+                    try { actual = Float.parseFloat(literal.substring(0, literal.length() - 1)); }
+                    catch (NumberFormatException exception) { throw invalid(); }
+                    if (!Float.isFinite(actual) || Float.floatToRawIntBits(actual)
+                            != Float.floatToRawIntBits(instruction.path("matrix").path(component).floatValue())) throw invalid();
+                }
+                // Native parsed NBT must independently contain only this matrix and the three zero resets.
+            }
             case "block", "command_shell", "command_data", "command_activation" -> {
                 String position = positionText(instruction.get("position"));
                 prefix = "execute in " + text(instruction, "dimension") + " run ";
@@ -643,7 +669,7 @@ final class NativeSceneExecutor {
                 && "full_target".equals(raw.path("coverage").asText());
     }
     private static boolean indirectEffectsPossible(ObjectNode step) {
-        return Set.of("block", "command_shell", "command_data", "command_activation", "display", "display_remove").contains(object(step, "instruction").path("kind").asText());
+        return Set.of("block", "command_shell", "command_data", "command_activation", "display", "display_pose", "display_remove").contains(object(step, "instruction").path("kind").asText());
     }
     private static void requireScopeSubset(ObjectNode scope, ObjectNode installed) {
         if (!text(scope, "projectId").equals(text(installed, "projectId"))) throw failure("SCOPE_DENIED", "Native execution belongs to another installed project");

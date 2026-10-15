@@ -139,6 +139,92 @@ final class PublicJavaAdapterTest {
         }
     }
 
+    @Test void readonlyCompatibilityProbePinsRealInterfaceAndReadsOnlyActualRegisteredInventory() throws Exception {
+        ObjectNode profile = scalarProfile(); ObjectNode environment = example("execution-context.json").withObject("environment").deepCopy();
+        String profileDigest = ContractJson.digest(profile); String interfaceDigest = scalarInterfaceDigest(profile);
+        try (CompatibilityInterfaceProbe probe = CompatibilityInterfaceProbe.detect(contracts, ContractJson.bytes(profile),
+                profileDigest, "approval-fixture-scalar", interfaceDigest, artifact, loader, authority::checkClass,
+                TARGET, authority, environment)) {
+            assertNull(System.getProperty("mmmm.javaadapter.fixture.initialized"));
+            assertEquals(profileDigest, probe.profileDigest()); assertEquals(artifact.sha256(), probe.artifactDigest());
+            assertEquals(interfaceDigest, probe.interfaceDigest());
+            ObjectNode bindingMaterial = ContractJson.newObject().put("kind", "mmmm-compatibility-binding/1")
+                    .put("profileDigest", profileDigest).put("interfaceDigest", interfaceDigest);
+            bindingMaterial.set("environment", environment);
+            assertEquals("compat-" + ContractJson.digest(bindingMaterial), probe.bindingId());
+            ObjectNode provider = probe.providerDescriptor();
+            assertEquals("compatibility", provider.path("registrationMode").asText());
+            assertEquals("local_profile", provider.path("origin").path("kind").asText());
+            assertEquals("approval-fixture-scalar", provider.path("origin").path("sourceId").asText());
+            assertEquals(profileDigest, provider.path("origin").path("sourceDigest").asText());
+            HostQueue queue = new HostQueue();
+            HostAuthority live = new HostAuthority() {
+                @Override public boolean ready() { return true; }
+                @Override public ObjectNode hello() { return ContractJson.newObject(); }
+                @Override public void check(HostSession session, ObjectNode context, Set<String> permissions, boolean write) { assertFalse(write); }
+                @Override public void checkPreconditions(HostSession session, ObjectNode context, ObjectNode arguments) { }
+            };
+            Clock clock = Clock.fixed(Instant.parse("2026-10-13T11:59:00Z"), ZoneOffset.UTC);
+            try (HostRuntime runtime = new HostRuntime(contracts, queue, live, (binding, descriptor) -> {
+                assertEquals(probe.bindingId(), binding);
+                if (descriptor.has("providerId")) assertEquals(profileDigest, descriptor.path("origin").path("sourceDigest").asText());
+                else assertEquals(artifact.sha256(), descriptor.path("implementationDigest").asText());
+            }, clock)) {
+                runtime.registerProvider(probe.registrationDescriptor());
+                probe.register((descriptor, handler, callbacks) -> runtime.register(probe.bindingId(), descriptor, handler, callbacks));
+                ObjectNode registered = ContractJson.object(runtime.inventory().path("providers").get(0));
+                String before = runtime.inventory().path("inventoryRevision").asText();
+                ObjectNode observed = probe.inspect(registered, environment);
+                assertEquals(provider, observed.get("registeredProvider"));
+                assertEquals(profileDigest, observed.path("profileDigest").asText());
+                assertEquals(interfaceDigest, CompatibilityInterfaceProbe.interfaceDigest(observed.withObject("interface")));
+                assertFalse(observed.path("interface").has("evidence"));
+                assertEquals("server_main", observed.path("interface").path("support").path("threadAffinity").asText());
+                assertTrue(observed.path("interface").path("support").path("scopedHandleTypes").isEmpty());
+                assertNull(System.getProperty("mmmm.javaadapter.fixture.initialized"));
+                assertEquals(before, runtime.inventory().path("inventoryRevision").asText());
+                ObjectNode changed = registered.deepCopy().put("providerVersion", "0.2.0");
+                assertEquals("REGISTRATION_CHANGED", assertThrows(ContractException.class, () -> probe.inspect(changed, environment)).code());
+                ObjectNode anotherEpoch = environment.deepCopy().put("sessionEpoch", "epoch-other");
+                assertEquals("REGISTRATION_CHANGED", assertThrows(ContractException.class, () -> probe.inspect(registered, anotherEpoch)).code());
+                authority.enabled = false;
+                assertEquals("PROFILE_UNAPPROVED", assertThrows(ContractException.class, () -> probe.inspect(registered, environment)).code());
+                assertNull(System.getProperty("mmmm.javaadapter.fixture.initialized"));
+                authority.enabled = true;
+                ObjectNode context = example("execution-context.json");
+                HostSession session = new HostSession("principal-fixture", "epoch-fixture-01", "game-fixture-01", "server",
+                        UUID.randomUUID(), Set.of("diagnostic.read"), false);
+                session.installContext(contracts, context);
+                ObjectNode request = ContractJson.newObject().put("contextId", context.path("contextId").asText())
+                        .put("bindingId", probe.bindingId()).put("actionId", profile.path("action").path("actionId").asText())
+                        .put("actionDigest", ContractJson.digest(profile.get("action")));
+                request.set("arguments", ContractJson.newObject().put("left", 17).put("right", 25));
+                var pending = runtime.registeredRead(session, new RegisteredActionRead(contracts, request), clock.instant().plusSeconds(10));
+                assertFalse(pending.toCompletableFuture().isDone());
+                assertNull(System.getProperty("mmmm.javaadapter.fixture.initialized"));
+                queue.drain(); assertEquals(42, pending.toCompletableFuture().join().data().path("value").asInt());
+                assertEquals(1, calls());
+            }
+        }
+    }
+
+    @Test void readonlyProbeRejectsProfileAndInterfacePinTamperingBeforeInitialization() throws Exception {
+        ObjectNode profile = scalarProfile(); ObjectNode environment = example("execution-context.json").withObject("environment").deepCopy();
+        String actualProfile = ContractJson.digest(profile); String actualInterface = scalarInterfaceDigest(profile);
+        assertEquals("PROFILE_UNAPPROVED", assertThrows(ContractException.class, () -> CompatibilityInterfaceProbe.detect(contracts,
+                ContractJson.bytes(profile), "0".repeat(64), "approval-fixture-scalar", actualInterface,
+                artifact, loader, authority::checkClass, TARGET, authority, environment)).code());
+        assertEquals("INTERFACE_MISMATCH", assertThrows(ContractException.class, () -> CompatibilityInterfaceProbe.detect(contracts,
+                ContractJson.bytes(profile), actualProfile, "approval-fixture-scalar", "0".repeat(64),
+                artifact, loader, authority::checkClass, TARGET, authority, environment)).code());
+        ObjectNode handles = profile.deepCopy(); handles.withObject("binding").put("receiver", "registered_handle")
+                .put("receiverHandleType", "org.mmmm.fixture.ReceiverApi");
+        assertEquals("UNSUPPORTED_BINDING", assertThrows(ContractException.class, () -> CompatibilityInterfaceProbe.detect(contracts,
+                ContractJson.bytes(handles), ContractJson.digest(handles), "approval-fixture-scalar", actualInterface,
+                artifact, loader, authority::checkClass, TARGET, authority, environment)).code());
+        assertNull(System.getProperty("mmmm.javaadapter.fixture.initialized"));
+    }
+
     @Test void unsupportedParameterAndUnregisteredReceiverNeverInitializeOrConstruct() throws Exception {
         ObjectNode unsupported = profile(); ObjectNode binding = unsupported.withObject("binding").put("methodName", "rejectsThread");
         binding.putArray("parameterTypes").add("java.lang.Thread");
@@ -279,6 +365,33 @@ final class PublicJavaAdapterTest {
     private ObjectNode profile() throws IOException {
         ObjectNode result = example("compat-public-java.json"); result.withObject("action").put("implementationDigest", artifact.sha256()).put("planning", "unsupported");
         return result;
+    }
+    private ObjectNode scalarProfile() throws IOException {
+        ObjectNode profile = profile(); ObjectNode binding = profile.withObject("binding");
+        binding.put("methodName", "add").put("returnType", "int").put("resultCodec", "scalar");
+        binding.putArray("parameterTypes").add("int").add("int");
+        var mappings = binding.putArray("arguments");
+        mappings.addObject().put("kind", "argument").put("pointer", "/left").put("codec", "integer");
+        mappings.addObject().put("kind", "argument").put("pointer", "/right").put("codec", "integer");
+        ObjectNode input = ContractJson.newObject().put("type", "object").put("additionalProperties", false);
+        input.putObject("properties").putObject("left").put("type", "integer");
+        input.withObject("properties").putObject("right").put("type", "integer");
+        input.putArray("required").add("left").add("right");
+        profile.withObject("action").set("inputSchema", input); profile.withObject("action").set("outputSchema", valueSchema("integer"));
+        return profile;
+    }
+    private String scalarInterfaceDigest(ObjectNode profile) {
+        ObjectNode support = ContractJson.newObject().put("kind", "public_java").put("publicLookupChecked", true)
+                .put("initializationPerformed", false).put("threadAffinity", "server_main");
+        ObjectNode signature = support.putObject("signature");
+        for (String key : new String[] {"ownerClass", "methodName", "parameterTypes", "returnType", "receiver"}) {
+            signature.set(key, profile.path("binding").get(key).deepCopy());
+        }
+        support.putNull("receiverResolver"); support.putArray("scopedHandleTypes");
+        ObjectNode material = ContractJson.newObject().put("kind", "mmmm-interface-observation/1").put("side", "server")
+                .put("loader", "fabric").put("targetGameVersion", "26.3").put("modId", "fixture_legacy")
+                .put("modVersion", "0.1.0").put("hostProtocolVersion", ContractJson.VERSION).put("implementationDigest", artifact.sha256());
+        material.set("support", support); return ContractJson.digest(material);
     }
     private Invocation invocation(PublicJavaAdapter.Candidate candidate, ObjectNode arguments) throws IOException {
         ObjectNode value = example("invocation.json"); ObjectNode action = candidate.descriptor();

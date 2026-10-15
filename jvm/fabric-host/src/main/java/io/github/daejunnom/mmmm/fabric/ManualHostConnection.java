@@ -21,6 +21,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -127,7 +128,7 @@ final class ManualHostConnection {
                             Arrays.fill(privateCapability, (byte) 0); throw new ContractException("HOST_PAIRING_CANCELLED", "Pairing capability lifetime ended before installation");
                         }
                         try {
-                        validateAuthority(offer, setup, authority);
+                        var compatibilityApprovals = validateAuthority(offer, setup, authority);
                         var player = host.pairedCandidate(playerId);
                         if (player == null || player.createCommandSourceStack().getPermissionContext().permissionLevel() != PermissionLevel.ADMINS) {
                             throw new ContractException("PERMISSION_DENIED", "Actual paired player administrator permission ended");
@@ -142,7 +143,7 @@ final class ManualHostConnection {
                         String endpoint;
                         if (cancelled.get()) { Arrays.fill(bearer, (byte) 0); throw new ContractException("HOST_PAIRING_CANCELLED", "Pairing generation ended before listener activation"); }
                         String epoch = offer.path("hostHello").path("environment").path("sessionEpoch").asText(); installedEpoch.set(epoch);
-                        try { endpoint = host.install(playerId, offer.path("principalId").asText(), bearer, permissions, contexts, sources, actions, false); }
+                        try { endpoint = host.install(playerId, offer.path("principalId").asText(), bearer, permissions, contexts, sources, actions, false, compatibilityApprovals); }
                         catch (java.io.IOException exception) { throw new ContractException("HOST_PAIRING_FAILED", "The paired loopback listener could not be started"); }
                         finally { Arrays.fill(bearer, (byte) 0); }
                         if (cancelled.get()) { host.revokePairing(epoch); throw new ContractException("HOST_PAIRING_CANCELLED", "Pairing generation ended during listener activation"); }
@@ -161,8 +162,8 @@ final class ManualHostConnection {
             cancelled.set(true); host.revokePairing(installedEpoch.get()); throw exception;
         } finally { Arrays.fill(raw, (byte) 0); }
     }
-    private void validateAuthority(ObjectNode offer, HostSetup setup, ObjectNode authority) {
-        HostDispatcher.exactFields(authority, Set.of("kind", "protocolVersion", "nonce", "contexts", "approvedSources", "approvedActions", "permissions", "writeProfileVerified"));
+    private List<NativeCompatibilityApprovals.ApprovedProfile> validateAuthority(ObjectNode offer, HostSetup setup, ObjectNode authority) {
+        HostDispatcher.exactFields(authority, Set.of("kind", "protocolVersion", "nonce", "contexts", "approvedSources", "approvedActions", "permissions", "writeProfileVerified", "compatibilityApprovals"));
         if (!authority.path("writeProfileVerified").isBoolean() || authority.path("writeProfileVerified").asBoolean()
                 || !authority.path("contexts").isArray() || authority.path("contexts").isEmpty() || authority.path("contexts").size() > 16
                 || !authority.path("approvedSources").isObject() || !authority.path("approvedActions").isArray() || !authority.path("permissions").isArray()) throw invalid();
@@ -190,6 +191,35 @@ final class ManualHostConnection {
             if (!action.isTextual() || !expected.contains(action.asText()) || !approved.add(action.asText())) throw invalid();
         }
         if (!expected.equals(approved)) throw invalid();
+        return decodeCompatibilityApprovals(authority.get("compatibilityApprovals"));
+    }
+
+    /** Private owner bridge transport only; decoding these values does not issue or install an approval. */
+    static List<NativeCompatibilityApprovals.ApprovedProfile> decodeCompatibilityApprovals(JsonNode value) {
+        ObjectNode collection = ContractJson.object(value);
+        HostDispatcher.exactFields(collection, Set.of("status", "reasonCode", "profiles"));
+        JsonNode status = collection.get("status"); JsonNode reason = collection.get("reasonCode"); JsonNode profiles = collection.get("profiles");
+        if (!status.isTextual() || !profiles.isArray() || profiles.size() > 128) throw invalid();
+        if ("unavailable".equals(status.asText())) {
+            if (!reason.isTextual() || !"APPROVAL_SOURCE_UNAVAILABLE".equals(reason.asText()) || !profiles.isEmpty()) throw invalid();
+            return List.of();
+        }
+        if (!"available".equals(status.asText()) || !reason.isNull()) throw invalid();
+        var decoded = new ArrayList<NativeCompatibilityApprovals.ApprovedProfile>(); var references = new HashSet<String>();
+        int rawBytes = 0;
+        for (JsonNode element : profiles) {
+            ObjectNode profile = ContractJson.object(element);
+            HostDispatcher.exactFields(profile, Set.of("approvedProfileRef", "profileBytesHex", "profileDigest", "artifactDigest", "allowedInterfaceDigest"));
+            String reference = HostDispatcher.string(profile, "approvedProfileRef"); String hex = HostDispatcher.string(profile, "profileBytesHex");
+            String profileDigest = HostDispatcher.string(profile, "profileDigest"); String artifactDigest = HostDispatcher.string(profile, "artifactDigest");
+            String interfaceDigest = HostDispatcher.string(profile, "allowedInterfaceDigest");
+            if (!reference.matches("[A-Za-z0-9_.:-]{1,256}") || !references.add(reference)
+                    || hex.length() < 2 || hex.length() > 2 * 65536 || (hex.length() & 1) != 0 || !hex.matches("[a-f0-9]+")
+                    || !profileDigest.matches("[a-f0-9]{64}") || !artifactDigest.matches("[a-f0-9]{64}") || !interfaceDigest.matches("[a-f0-9]{64}")) throw invalid();
+            rawBytes += hex.length() / 2; if (rawBytes > 256 * 1024) throw invalid();
+            decoded.add(new NativeCompatibilityApprovals.ApprovedProfile(reference, HexFormat.of().parseHex(hex), profileDigest, artifactDigest, interfaceDigest));
+        }
+        return List.copyOf(decoded);
     }
     private static boolean scopeSubset(ObjectNode requested, JsonNode actual) {
         if (!requested.path("projectId").equals(actual.path("projectId"))) return false;

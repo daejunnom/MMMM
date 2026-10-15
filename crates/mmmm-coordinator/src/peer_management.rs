@@ -33,6 +33,9 @@ pub const BOOTSTRAP_LIMIT: Duration = Duration::from_secs(30);
 pub const NATIVE_IO_LIMIT: Duration = Duration::from_secs(5);
 pub const APPLICATION_REPLY_LIMIT: Duration = Duration::from_secs(10);
 const POLL_SLICE: Duration = Duration::from_millis(20);
+const MAX_COMPATIBILITY_APPROVALS: usize = 128;
+const MAX_COMPATIBILITY_PROFILE_BYTES: usize = 65_536;
+const MAX_COMPATIBILITY_PROFILE_TOTAL: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManagementError {
@@ -91,6 +94,34 @@ impl PublicFrame {
         Self::decode(&bytes)
     }
     pub fn from_value(value: Value) -> Result<Self, ManagementError> {
+        // Preserve a structured size failure before the strict parser's JSON
+        // error is reduced to InvalidFrame. Optional trusted metadata may be
+        // omitted only for actual global bounds, never malformed wire fields.
+        let boundary = limits();
+        let mut pending = vec![(&value, 0usize)];
+        let mut nodes = 0usize;
+        while let Some((current, depth)) = pending.pop() {
+            nodes += 1;
+            if nodes > boundary.max_nodes || depth > boundary.max_depth {
+                return Err(ManagementError::FrameTooLarge);
+            }
+            let remaining = boundary.max_nodes - nodes - pending.len();
+            match current {
+                Value::Array(children) => {
+                    if children.len() > remaining {
+                        return Err(ManagementError::FrameTooLarge);
+                    }
+                    pending.extend(children.iter().map(|child| (child, depth + 1)));
+                }
+                Value::Object(children) => {
+                    if children.len() > remaining {
+                        return Err(ManagementError::FrameTooLarge);
+                    }
+                    pending.extend(children.values().map(|child| (child, depth + 1)));
+                }
+                _ => (),
+            }
+        }
         let mut writer = PublicWriter(Zeroizing::new(Vec::new()));
         serde_json::to_writer(&mut writer, &value).map_err(|_| ManagementError::FrameTooLarge)?;
         Self::decode_owned(writer.0)
@@ -234,6 +265,7 @@ fn validate_public(value: &Value) -> Result<ManagementKind, ManagementError> {
                     "contexts",
                     "approvedSources",
                     "approvedActions",
+                    "compatibilityApprovals",
                     "permissions",
                     "writeProfileVerified",
                 ],
@@ -265,6 +297,7 @@ fn validate_public(value: &Value) -> Result<ManagementKind, ManagementError> {
                 digest(sha.as_str().ok_or(ManagementError::InvalidFrame)?)?;
             }
             unique_strings(array(value, "approvedActions")?, digest)?;
+            validate_compatibility_approvals(&value["compatibilityApprovals"])?;
             unique_strings(array(value, "permissions")?, |permission| {
                 if matches!(
                     permission,
@@ -356,6 +389,72 @@ fn digest(value: &str) -> Result<(), ManagementError> {
         .map(|_| ())
         .map_err(|_| ManagementError::InvalidFrame)
 }
+
+/// These bounded bytes are authenticated composition inputs to the host, not
+/// approval issued by this codec. Native owner, Policy, exact source/CAS and
+/// interface checks remain with their existing protected producers/consumers.
+fn validate_compatibility_approvals(value: &Value) -> Result<(), ManagementError> {
+    exact(
+        value.as_object().ok_or(ManagementError::InvalidFrame)?,
+        &["status", "reasonCode", "profiles"],
+    )?;
+    let profiles = array(value, "profiles")?;
+    match text(value, "status")? {
+        "available" if value["reasonCode"].is_null() => (),
+        "unavailable"
+            if value["reasonCode"] == "APPROVAL_SOURCE_UNAVAILABLE" && profiles.is_empty() =>
+        {
+            ()
+        }
+        _ => return Err(ManagementError::InvalidFrame),
+    }
+    if profiles.len() > MAX_COMPATIBILITY_APPROVALS {
+        return Err(ManagementError::InvalidFrame);
+    }
+    let mut references = BTreeSet::new();
+    let mut bytes = 0usize;
+    for profile in profiles {
+        exact(
+            profile.as_object().ok_or(ManagementError::InvalidFrame)?,
+            &[
+                "approvedProfileRef",
+                "profileBytesHex",
+                "profileDigest",
+                "artifactDigest",
+                "allowedInterfaceDigest",
+            ],
+        )?;
+        let reference = text(profile, "approvedProfileRef")?;
+        if reference.is_empty()
+            || reference.len() > 256
+            || !reference
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_.:-".contains(&byte))
+            || !references.insert(reference)
+        {
+            return Err(ManagementError::InvalidFrame);
+        }
+        let raw = text(profile, "profileBytesHex")?;
+        if raw.is_empty()
+            || raw.len() > MAX_COMPATIBILITY_PROFILE_BYTES * 2
+            || !raw.len().is_multiple_of(2)
+            || !raw
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ManagementError::InvalidFrame);
+        }
+        bytes = bytes
+            .checked_add(raw.len() / 2)
+            .filter(|total| *total <= MAX_COMPATIBILITY_PROFILE_TOTAL)
+            .ok_or(ManagementError::InvalidFrame)?;
+        for key in ["profileDigest", "artifactDigest", "allowedInterfaceDigest"] {
+            digest(text(profile, key)?)?;
+        }
+    }
+    Ok(())
+}
+
 fn unique_strings(
     values: &[Value],
     check: impl Fn(&str) -> Result<(), ManagementError>,
@@ -434,6 +533,9 @@ impl BootstrapBudget {
     }
     pub fn deadline(&self) -> Instant {
         self.deadline
+    }
+    pub(crate) fn cancellation_signal(&self) -> Arc<AtomicBool> {
+        self.cancelled.clone()
     }
     pub fn check(&self) -> Result<(), ManagementError> {
         if crate::peer::fatal_stop_requested() {
@@ -887,7 +989,8 @@ mod tests {
         PublicFrame::from_value(json!({
             "kind":"host_pairing_authority", "protocolVersion":"0.2.0", "nonce":nonce,
             "contexts":[context], "approvedSources":{"mmmm_host":"0".repeat(64)},
-            "approvedActions":[], "permissions":["mmmm:world_read"], "writeProfileVerified":false
+            "approvedActions":[], "permissions":["mmmm:world_read"], "writeProfileVerified":false,
+            "compatibilityApprovals":{"status":"available","reasonCode":null,"profiles":[]}
         }))
         .unwrap()
     }
@@ -907,6 +1010,50 @@ mod tests {
         assert_eq!(expired.deadline(), before);
         assert_eq!(expired.check(), Err(ManagementError::Deadline));
         assert_eq!(expired.native_io_deadline(), Err(ManagementError::Deadline));
+        let stopped = crate::service::RequestBudget::from_bootstrap(&expired)
+            .err()
+            .unwrap();
+        assert_eq!(stopped.code, "TIME_BUDGET_EXCEEDED");
+        assert!(matches!(
+            std::error::Error::source(&stopped)
+                .and_then(|cause| cause.downcast_ref::<ManagementError>()),
+            Some(ManagementError::Deadline)
+        ));
+
+        let request = crate::service::RequestBudget::from_bootstrap(&budget).unwrap();
+        let retained = request.clone();
+        assert_eq!(request.deadline(), deadline);
+        assert_eq!(retained.deadline(), deadline);
+        assert!(std::ptr::eq(
+            request.cancellation(),
+            budget.cancelled.as_ref()
+        ));
+        budget.cancel();
+        for derived in [&request, &retained] {
+            let stopped = derived.check().err().unwrap();
+            assert_eq!(stopped.code, "CANCELLED");
+            assert!(matches!(
+                std::error::Error::source(&stopped)
+                    .and_then(|cause| cause.downcast_ref::<ManagementError>()),
+                Some(ManagementError::Cancelled)
+            ));
+        }
+        assert!(crate::service::RequestBudget::from_bootstrap(&budget).is_err());
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let peer = BootstrapBudget::for_peer(Instant::now(), stop.clone());
+        let request = crate::service::RequestBudget::from_bootstrap(&peer).unwrap();
+        assert_eq!(request.deadline(), peer.deadline());
+        stop.store(true, Ordering::Release);
+        assert!(!request.cancellation().load(Ordering::Acquire));
+        let stopped = request.check().err().unwrap();
+        assert_eq!(stopped.code, "CANCELLED");
+        assert!(matches!(
+            std::error::Error::source(&stopped)
+                .and_then(|cause| cause.downcast_ref::<ManagementError>()),
+            Some(ManagementError::Cancelled)
+        ));
+        assert!(crate::service::RequestBudget::from_bootstrap(&peer).is_err());
     }
     #[test]
     fn public_frames_reject_unknown_duplicate_secret_and_size_boundaries() {
@@ -940,6 +1087,180 @@ mod tests {
         let mut authority = authority("pair-fixture").into_value();
         authority["permissions"] = json!(["mmmm:world_write"]);
         assert!(PublicFrame::from_value(authority).is_err());
+    }
+
+    fn compatibility_profile(reference: &str, bytes: usize) -> Value {
+        // Codec fixture only: these bytes/pins issue no native-owner approval,
+        // actual Java observation, registration or execution grant.
+        json!({"approvedProfileRef":reference,"profileBytesHex":"00".repeat(bytes),
+            "profileDigest":"a".repeat(64),"artifactDigest":"b".repeat(64),
+            "allowedInterfaceDigest":"c".repeat(64)})
+    }
+    fn compatibility_authority(profiles: Vec<Value>) -> Value {
+        let mut value = authority("pair-compatibility-fixture").into_value();
+        value["compatibilityApprovals"]["profiles"] = json!(profiles);
+        value
+    }
+
+    #[test]
+    fn compatibility_approval_frame_requires_closed_explicit_status_and_profile_fields() {
+        let available =
+            compatibility_authority(vec![compatibility_profile("approval:Scalar_v1", 1)]);
+        assert!(PublicFrame::from_value(available.clone()).is_ok());
+        let mut unavailable = compatibility_authority(Vec::new());
+        unavailable["compatibilityApprovals"] = json!({"status":"unavailable",
+            "reasonCode":"APPROVAL_SOURCE_UNAVAILABLE","profiles":[]});
+        assert!(PublicFrame::from_value(unavailable).is_ok());
+        for invalid in [
+            Value::Null,
+            json!([]),
+            json!({}),
+            json!({"status":"available","profiles":[]}),
+            json!({"status":"available","reasonCode":null,"profiles":[],"approved":true}),
+            json!({"status":"available","reasonCode":"APPROVAL_SOURCE_UNAVAILABLE","profiles":[]}),
+            json!({"status":"unavailable","reasonCode":null,"profiles":[]}),
+            json!({"status":"unavailable","reasonCode":"OTHER_REASON","profiles":[]}),
+            json!({"status":"unknown","reasonCode":null,"profiles":[]}),
+            json!({"status":"unavailable","reasonCode":"APPROVAL_SOURCE_UNAVAILABLE",
+                "profiles":[compatibility_profile("approval-one", 1)]}),
+        ] {
+            let mut value = available.clone();
+            value["compatibilityApprovals"] = invalid;
+            assert!(PublicFrame::from_value(value).is_err());
+        }
+        let mut omitted = available.clone();
+        omitted
+            .as_object_mut()
+            .unwrap()
+            .remove("compatibilityApprovals");
+        assert!(PublicFrame::from_value(omitted).is_err());
+        for key in [
+            "approvedProfileRef",
+            "profileBytesHex",
+            "profileDigest",
+            "artifactDigest",
+            "allowedInterfaceDigest",
+        ] {
+            let mut value = available.clone();
+            value["compatibilityApprovals"]["profiles"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+            assert!(PublicFrame::from_value(value).is_err());
+        }
+        let mut injection = available;
+        injection["compatibilityApprovals"]["profiles"][0]["nativeOwner"] = json!("claimed-owner");
+        assert!(PublicFrame::from_value(injection).is_err());
+    }
+
+    #[test]
+    fn compatibility_approval_frame_bounds_unique_references_lower_hex_and_profile_bytes() {
+        let profile = compatibility_profile("approval-one", 1);
+        assert!(
+            PublicFrame::from_value(compatibility_authority(vec![
+                profile.clone(),
+                profile.clone()
+            ]))
+            .is_err()
+        );
+        for invalid in [
+            "",
+            "approval with space",
+            "approval/slash",
+            "승인",
+            "approval\nline",
+        ] {
+            let mut changed = profile.clone();
+            changed["approvedProfileRef"] = json!(invalid);
+            assert!(PublicFrame::from_value(compatibility_authority(vec![changed])).is_err());
+        }
+        let mut changed = profile.clone();
+        changed["approvedProfileRef"] = json!("a".repeat(257));
+        assert!(PublicFrame::from_value(compatibility_authority(vec![changed])).is_err());
+        for invalid in [
+            Value::Null,
+            json!(1),
+            json!(""),
+            json!("0"),
+            json!("0A"),
+            json!("gg"),
+            json!("００"),
+        ] {
+            let mut changed = profile.clone();
+            changed["profileBytesHex"] = invalid;
+            assert!(PublicFrame::from_value(compatibility_authority(vec![changed])).is_err());
+        }
+        for key in ["profileDigest", "artifactDigest", "allowedInterfaceDigest"] {
+            for invalid in [
+                Value::Null,
+                json!(1),
+                json!("a".repeat(63)),
+                json!("A".repeat(64)),
+                json!("g".repeat(64)),
+            ] {
+                let mut changed = profile.clone();
+                changed[key] = invalid;
+                assert!(PublicFrame::from_value(compatibility_authority(vec![changed])).is_err());
+            }
+        }
+        let selected = (0..MAX_COMPATIBILITY_APPROVALS)
+            .map(|index| compatibility_profile(&format!("approval-{index}"), 1))
+            .collect::<Vec<_>>();
+        assert!(PublicFrame::from_value(compatibility_authority(selected.clone())).is_ok());
+        let mut too_many = selected;
+        too_many.push(compatibility_profile("approval-over-limit", 1));
+        assert!(PublicFrame::from_value(compatibility_authority(too_many)).is_err());
+        assert!(
+            PublicFrame::from_value(compatibility_authority(vec![compatibility_profile(
+                "approval-max",
+                MAX_COMPATIBILITY_PROFILE_BYTES
+            )]))
+            .is_ok()
+        );
+        assert!(
+            PublicFrame::from_value(compatibility_authority(vec![compatibility_profile(
+                "approval-too-large",
+                MAX_COMPATIBILITY_PROFILE_BYTES + 1
+            )]))
+            .is_err()
+        );
+        let at_limit = (0..4)
+            .map(|index| {
+                compatibility_profile(
+                    &format!("approval-total-{index}"),
+                    MAX_COMPATIBILITY_PROFILE_BYTES,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(PublicFrame::from_value(compatibility_authority(at_limit.clone())).is_ok());
+        let mut over_limit = at_limit;
+        over_limit.push(compatibility_profile("approval-extra-byte", 1));
+        assert!(PublicFrame::from_value(compatibility_authority(over_limit)).is_err());
+        assert_eq!(limits().max_bytes, 1024 * 1024);
+        assert_eq!(limits().max_nodes, 4096);
+        // Every member is individually valid and the basic native reply fits.
+        // Adding a valid optional map must retain a typed global node failure
+        // so the pairing producer can omit the whole map instead of failing
+        // native pairing or masking malformed fields.
+        let mut base = compatibility_authority(Vec::new());
+        base["contexts"][0]["scope"]["resourceIds"] = json!(
+            (0..3300)
+                .map(|index| format!("resource-node-{index}"))
+                .collect::<Vec<_>>()
+        );
+        base["contexts"][0]["contextDigest"] = json!(
+            mmmm_contracts::projected_digest("ExecutionContext", &base["contexts"][0]).unwrap()
+        );
+        assert!(PublicFrame::from_value(base.clone()).is_ok());
+        base["compatibilityApprovals"]["profiles"] = json!(
+            (0..128)
+                .map(|index| compatibility_profile(&format!("approval-node-{index}"), 1))
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            PublicFrame::from_value(base),
+            Err(ManagementError::FrameTooLarge)
+        ));
     }
 
     #[test]

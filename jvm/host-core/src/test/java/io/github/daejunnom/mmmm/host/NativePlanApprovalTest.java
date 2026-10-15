@@ -239,6 +239,59 @@ final class NativePlanApprovalTest {
         assertThrows(ContractException.class, () -> approval(oversizedCoordinate));
     }
 
+    @Test void displayPoseRetainsExactInvocationPinsAndOnlyAnAlreadyPresentOwnedTarget() throws IOException {
+        ObjectNode wire = nativeFixture(); ObjectNode source = poseManifest(wire); NativePlanApproval approval = approval(source);
+        Invocation invocation = invocation(wire); ObjectNode pose = first(first(source, "nativeExecutions"), "steps");
+        assertDoesNotThrow(() -> NativePlanApproval.validateSealedNativeStep(pose));
+        assertThrows(ContractException.class, () -> approval.execution(invocation), "A typed pose is not Invocation admission");
+        approval.checkInvocation(session(wire), invocation, true);
+        ObjectNode admitted = first(approval.execution(invocation), "steps");
+        assertEquals("activate", admitted.path("phase").asText());
+        for (String field : Set.of("source_object_id", "source_node_id", "instance_id", "owner_prefab_id")) assertEquals(pose.path(field), admitted.path(field));
+        assertEquals(1, admitted.path("encoded_commands").size());
+        assertFalse(admitted.path("instruction").has("position")); assertFalse(admitted.path("instruction").has("payload"));
+        assertThrows(ContractException.class, () -> approval.activationProof(invocation, admitted, "say fixture"), "Pose phase cannot grant an indirect command body");
+    }
+
+    @Test void displayPoseRejectsWrongUuidTypeDimensionTagAndMissingPresentOwnership() throws IOException {
+        for (int kind = 0; kind < 8; kind++) {
+            ObjectNode source = poseManifest(nativeFixture()); ObjectNode execution = first(source, "nativeExecutions");
+            ObjectNode instruction = first(execution, "steps").withObject("instruction"); ObjectNode target = first(execution, "observedTargets");
+            switch (kind) {
+                case 0 -> instruction.withArray("uuid").set(15, ContractJson.parse(new byte[] {'2'}));
+                case 1 -> instruction.put("entity_kind", "item");
+                case 2 -> instruction.put("dimension", "minecraft:the_nether");
+                case 3 -> instruction.put("tag", "other_owner");
+                case 4 -> target.putNull("ownerTag");
+                case 5 -> target.put("expectedPresence", "unknown");
+                case 6 -> target.put("expectedPresence", "absent");
+                default -> target.withObject("selector").put("uuid", "00000000-0000-0000-0000-000000000002");
+            }
+            assertThrows(ContractException.class, () -> approval(source));
+        }
+    }
+
+    @Test void displayPoseSourceIsClosedFiniteExactFloat32AndCannotCarryPositionPayloadOrResetInputs() throws IOException {
+        for (int kind = 0; kind < 12; kind++) {
+            ObjectNode step = first(first(poseManifest(nativeFixture()), "nativeExecutions"), "steps"); ObjectNode instruction = step.withObject("instruction");
+            switch (kind) {
+                case 0 -> instruction.withArray("matrix").remove(0);
+                case 1 -> instruction.withArray("matrix").set(0, ContractJson.newObject().put("value", Double.NaN).get("value"));
+                case 2 -> instruction.withArray("matrix").set(0, ContractJson.newObject().put("value", 0.1).get("value"));
+                case 3 -> instruction.put("tag", "mmmm_fixture,tag=other");
+                case 4 -> instruction.withArray("uuid").set(0, ContractJson.newObject().put("value", 256).get("value"));
+                case 5 -> instruction.withArray("uuid").set(0, ContractJson.newObject().put("value", 1.0).get("value"));
+                case 6 -> instruction.putArray("position").add(0).add(64).add(0);
+                case 7 -> instruction.putObject("payload").put("text", "changed");
+                case 8 -> instruction.put("interpolation_duration", 0);
+                case 9 -> step.put("phase", "stage");
+                case 10 -> { step.withArray("encoded_commands").add(step.path("encoded_commands").get(0).textValue()); step.put("commandDigest", ContractJson.digest(step.path("encoded_commands"))); }
+                default -> instruction.withArray("matrix").set(0, ContractJson.newObject().put("value", Double.POSITIVE_INFINITY).get("value"));
+            }
+            assertThrows(ContractException.class, () -> NativePlanApproval.validateSealedNativeStep(step));
+        }
+    }
+
     @Test void activationWithoutItsUniquePlanBoundSourceProofCannotBeAdmitted() throws IOException {
         ActivationFixture fixture = activationFixture(); ObjectNode missing = fixture.manifest().deepCopy();
         first(missing, "nativeExecutions").withArray("nativeActivationProofs").removeAll();
@@ -441,6 +494,21 @@ final class NativePlanApprovalTest {
         step.put("commandDigest", ContractJson.digest(commands)); result.putArray("steps").add(step); return result;
     }
     private static ObjectNode selector(String kind) { return ContractJson.newObject().put("kind", kind).put("objective", "state").put("resourceId", "resource-state"); }
+    private ObjectNode poseManifest(ObjectNode wire) {
+        // Reuses the private plan/context fixture; this authored shape supplies no actual entity or source proof.
+        ObjectNode result = manifest(wire, true); ObjectNode execution = first(result, "nativeExecutions").put("phase", "activate");
+        ObjectNode step = first(execution, "steps").put("phase", "activate").put("source_object_id", "clip-fixture").put("source_node_id", "node-fixture");
+        ObjectNode instruction = ContractJson.newObject().put("kind", "display_pose").put("dimension", "minecraft:overworld").put("tag", "mmmm_fixture").put("entity_kind", "text");
+        ArrayNode uuid = instruction.putArray("uuid"); for (int index = 0; index < 16; index++) uuid.add(index == 15 ? 1 : 0);
+        ArrayNode matrix = instruction.putArray("matrix"); for (int index = 0; index < 16; index++) matrix.add(index % 5 == 0 ? 1.0 : 0.0);
+        step.set("instruction", instruction); ArrayNode commands = step.putArray("encoded_commands");
+        commands.add("execute in minecraft:overworld as 00000000-0000-0000-0000-000000000001 if entity @s[type=minecraft:text_display,tag=mmmm_fixture] run data merge entity @s {transformation:[1f,0f,0f,0f,0f,1f,0f,0f,0f,0f,1f,0f,0f,0f,0f,1f],interpolation_duration:0,start_interpolation:0,teleport_duration:0}");
+        step.put("commandDigest", ContractJson.digest(commands));
+        ObjectNode selector = ContractJson.newObject().put("kind", "entity").put("dimension", "minecraft:overworld")
+                .put("uuid", "00000000-0000-0000-0000-000000000001").put("expectedType", "minecraft:text_display");
+        execution.withArray("observedTargets").removeAll().add(observed(selector).put("ownerTag", "mmmm_fixture")); execution.withArray("resourceTargets").removeAll();
+        return result;
+    }
     private static ObjectNode association(ObjectNode selector) { ObjectNode result = ContractJson.newObject().put("resourceId", "resource-state"); result.set("selector", selector.deepCopy()); return result; }
     private static ObjectNode observed(ObjectNode selector) {
         ObjectNode result = ContractJson.newObject().put("expectedDigest", SHA_A).put("expectedPresence", "present").putNull("ownerTag"); result.set("selector", selector.deepCopy()); return result;

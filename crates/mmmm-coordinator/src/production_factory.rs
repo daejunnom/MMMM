@@ -45,6 +45,14 @@ use mmmm_runtime::storage::DurableStore;
 use serde_json::Value;
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
+#[path = "compatibility_registration.rs"]
+mod compatibility_registration;
+pub use compatibility_registration::{
+    NativeApprovedCompatibilityProfile, NativeCompatibilityApprovalSelection,
+    RegisteredCompatibilityProfiles, approve_native_compatibility_profile,
+    read_native_compatibility_profile, read_native_compatibility_profiles,
+};
+
 /// Trusted process composition accepts typed ports, never readiness flags,
 /// permission strings copied from profiles, or wire source registrations.
 /// Targets are registered later through the exact shared registry returned by
@@ -72,6 +80,7 @@ pub struct ProductionRegistries {
     pub targets: RegisteredTargetProfiles,
     pub dependencies: SharedPlanningDependencies,
     pub readiness: NativeReadinessRegistry,
+    pub compatibility: RegisteredCompatibilityProfiles,
 }
 
 pub struct ProductionFactory {
@@ -240,6 +249,11 @@ impl DaemonSourceFactory for ProductionFactory {
             contexts.clone(),
             catalog.clone(),
         );
+        let compatibility = RegisteredCompatibilityProfiles::new(
+            handles.request.clone(),
+            handles.authority.clone(),
+            handles.hosts.clone(),
+        );
         let metadata =
             RustMetadataRegistry::new(self.executable_digest.clone(), handles.authority.clone());
         let dependency = RegisteredPlanningDependency::owned_executable(
@@ -268,6 +282,7 @@ impl DaemonSourceFactory for ProductionFactory {
             readiness: inputs.readiness.clone(),
             scene_registry: inputs.scene_registry,
             owned_inventory: Some(Rc::new(metadata.clone())),
+            compatibility: compatibility.clone(),
         }));
         // Cloning this backend preserves its exact Rc registries. The executor
         // and observer also share one CompositeProvider invocation phase map.
@@ -299,6 +314,7 @@ impl DaemonSourceFactory for ProductionFactory {
             catalog: Some(catalog.clone()),
             permissions: inputs.permissions,
             symbols: inputs.symbols,
+            compatibility: compatibility.clone(),
         });
         let artifacts = features.artifact_authority(Box::new(handles.authority.clone()));
         workspace.witness.check_store(store).map_err(|_| {
@@ -320,6 +336,7 @@ impl DaemonSourceFactory for ProductionFactory {
             targets,
             dependencies: inputs.dependencies.clone(),
             readiness: inputs.readiness,
+            compatibility,
         });
         Ok(DaemonSourceParts {
             contexts,

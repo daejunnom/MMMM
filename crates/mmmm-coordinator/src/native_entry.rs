@@ -4,6 +4,7 @@
 
 use crate::{
     CoordinatorClient,
+    bootstrap::NativeWorkspacePermit,
     catalog_source_use::{LocalCatalogSourceUseAction, manage_catalog_source_use},
     daemon::{DaemonError, PreparedDaemon},
     daemon_launch::{self, DaemonLaunchError, NativeDaemonLocator},
@@ -18,19 +19,24 @@ use crate::{
     native_source_ingress::{
         NativeRawSourceResource, NativeSourceDocument, NativeSourceInput, NativeSourceKind,
     },
-    production_factory::ProductionFactory,
+    production_factory::{
+        NativeCompatibilityApprovalSelection, ProductionFactory,
+        approve_native_compatibility_profile,
+    },
     service::{RequestBudget, ServiceError},
     stdio_io::{NativeStdioPort, StdioError, StdioLimits},
+    workspace_bootstrap::NativeOwnerWitness,
 };
 use mmmm_contracts::{
     ContextId, JsonLimits, ProjectId, ResourceId, ResourceLocation, Sha256Digest, TargetProfileId,
     encode_json, parse_json_with_limits,
 };
 use mmmm_runtime::storage::{
-    StoreConfig,
+    DurableStore, StorageError, StoreConfig,
     catalog_source_use::{
         CatalogSourceUseRole, CatalogSourceUseSelection, CatalogSourceUseSnapshot,
     },
+    compatibility_approval::CompatibilityApprovalRecord,
     host_setup::{HostReadPolicy, HostReadPolicyRecord},
     native_owned_sources::NativeOwnedSourceCommitReceipt,
 };
@@ -61,6 +67,8 @@ pub enum EntryError {
     SourceArguments,
     CatalogSourceArguments,
     CatalogSourceRequest(mmmm_application::AppError),
+    CompatibilityProfileArguments,
+    CompatibilityProfileRequest(mmmm_application::AppError),
     SourceRequest(ServiceError),
     SourceFile(ImportFileError),
     Deadline,
@@ -97,6 +105,10 @@ pub enum EntryError {
         snapshot: Box<CatalogSourceUseSnapshot>,
         delivery: Box<EntryError>,
     },
+    CompatibilityProfileCommitted {
+        record: Box<CompatibilityApprovalRecord>,
+        delivery: Box<EntryError>,
+    },
     Shutdown {
         primary: Option<Box<EntryError>>,
         cleanup: CoordinatorError,
@@ -110,6 +122,8 @@ impl std::fmt::Display for EntryError {
             Self::SourceArguments => f.write_str("Native source import requires at least one document or raw resource pair and at most 256 combined document/resource inputs: --document <kind>:<JSON>, --document-file <kind>:<absolute JSON path>, and adjacent --resource-descriptor-file/--resource-bytes-file paths; kinds are prefab|instance|clip and OS argv limits may be smaller"),
             Self::CatalogSourceArguments => f.write_str("Catalog source use requires --mode inspect or replace; replace needs --expected-state-digest and a complete set selected by --game-artifact <resourceId>/repeated --mod <canonicalId>,<nativeId>,<resourceId>, or explicit --withdraw true with no selections; <=256 selections, <=64 KiB selector metadata, user_local_only only"),
             Self::CatalogSourceRequest(error) => write!(f, "{}: Cold native catalog source use could not continue", error.code),
+            Self::CompatibilityProfileArguments => f.write_str("Compatibility profile approval requires one initialized Project revision and exact existing profile resource ID/raw SHA-256, a bounded approval reference, separate artifact and interface SHA-256 selections; no profile JSON or authority options are accepted"),
+            Self::CompatibilityProfileRequest(error) => write!(f, "{}: Cold native compatibility profile approval could not continue", error.code),
             Self::SourceRequest(error) => write!(f, "{}: Native source request could not continue", error.code),
             Self::SourceFile(error) => error.fmt(f),
             Self::Deadline => f.write_str("Native command startup or delivery deadline reached"),
@@ -135,6 +149,9 @@ impl std::fmt::Display for EntryError {
             Self::CatalogSourceUsesCommitted { snapshot, delivery } => write!(f,
                 "Catalog source use {} at generation {} for Project {} was committed and retained; result delivery failed: {delivery}",
                 snapshot.state_digest(), snapshot.generation(), snapshot.project_id()),
+            Self::CompatibilityProfileCommitted { record, delivery } => write!(f,
+                "Compatibility profile approval {} for profile {} in Project {} was committed and retained; result delivery failed: {delivery}",
+                record.approved_profile_ref(), record.profile_digest(), record.project_id()),
             Self::Shutdown { .. } => f.write_str("Coordinator shutdown is unresolved; durable data and discovery requiring cleanup are retained"),
         }
     }
@@ -145,6 +162,7 @@ impl std::error::Error for EntryError {
             Self::Daemon(e) => Some(e),
             Self::SourceRequest(e) => Some(e),
             Self::CatalogSourceRequest(e) => Some(e),
+            Self::CompatibilityProfileRequest(e) => Some(e),
             Self::SourceFile(e) => Some(e),
             Self::Launch(e) => Some(e),
             Self::Setup(e) => Some(e),
@@ -158,6 +176,7 @@ impl std::error::Error for EntryError {
             Self::SourcesCommitted { delivery, .. } => Some(delivery.as_ref()),
             Self::HostReadPolicyCommitted { delivery, .. } => Some(delivery.as_ref()),
             Self::CatalogSourceUsesCommitted { delivery, .. } => Some(delivery.as_ref()),
+            Self::CompatibilityProfileCommitted { delivery, .. } => Some(delivery.as_ref()),
             Self::Shutdown { cleanup, .. } => Some(cleanup),
             _ => None,
         }
@@ -200,6 +219,10 @@ enum Command {
         project: ProjectId,
         expected_revision: Sha256Digest,
         action: LocalCatalogSourceUseAction,
+    },
+    CompatibilityProfileApprove {
+        root: PathBuf,
+        selection: NativeCompatibilityApprovalSelection,
     },
     HostBridge,
     Owned(Vec<String>),
@@ -395,6 +418,21 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
                 )?;
             }
         }
+        Command::CompatibilityProfileApprove { root, selection } => {
+            let budget =
+                RequestBudget::until(started + SOURCE_IMPORT, Arc::new(AtomicBool::new(false)))
+                    .map_err(EntryError::SourceRequest)?;
+            let record =
+                approve_compatibility_profile(StoreConfig::new(root), &selection, &budget)?;
+            deliver_compatibility_profile(
+                record,
+                &selection.expected_project_revision,
+                &budget,
+                |value, deadline| {
+                    output_with_limit(value, deadline, MAX_OUTPUT, budget.cancellation())
+                },
+            )?;
+        }
         Command::CatalogSourceUse {
             root,
             project,
@@ -528,9 +566,22 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
     }
     if !matches!(
         command,
-        "init" | "daemon" | "start" | "host-setup" | "source-import" | "catalog-source-use"
+        "init"
+            | "daemon"
+            | "start"
+            | "host-setup"
+            | "source-import"
+            | "catalog-source-use"
+            | "compatibility-profile-approve"
     ) {
         return Ok(None);
+    }
+    // Eight required selector pairs are the complete cold approval surface.
+    // Bound the argument collection before cloning or parsing any selector.
+    if command == "compatibility-profile-approve"
+        && (args.len() != 17 || args.iter().any(|arg| arg.len() > 65_536))
+    {
+        return Err(EntryError::CompatibilityProfileArguments);
     }
     let mut options = std::collections::BTreeMap::new();
     let mut documents = Vec::new();
@@ -711,6 +762,55 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
                 raw_resources,
             }
         }
+        "compatibility-profile-approve" => {
+            let invalid = || EntryError::CompatibilityProfileArguments;
+            let project_id = ProjectId::new(options.remove("--project").ok_or_else(invalid)?)
+                .map_err(|_| invalid())?;
+            let expected_project_revision =
+                Sha256Digest::new(options.remove("--expected-revision").ok_or_else(invalid)?)
+                    .map_err(|_| invalid())?;
+            let profile_resource_id = ResourceId::new(
+                options
+                    .remove("--profile-resource-id")
+                    .ok_or_else(invalid)?,
+            )
+            .map_err(|_| invalid())?;
+            let profile_resource_sha256 = Sha256Digest::new(
+                options
+                    .remove("--profile-resource-sha256")
+                    .ok_or_else(invalid)?,
+            )
+            .map_err(|_| invalid())?;
+            let approved_profile_ref = options
+                .remove("--approved-profile-ref")
+                .filter(|value| {
+                    !value.is_empty()
+                        && value.len() <= 256
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"_.:-".contains(&byte))
+                })
+                .ok_or_else(invalid)?
+                .to_owned();
+            let artifact_digest =
+                Sha256Digest::new(options.remove("--artifact-sha256").ok_or_else(invalid)?)
+                    .map_err(|_| invalid())?;
+            let allowed_interface_digest =
+                Sha256Digest::new(options.remove("--interface-sha256").ok_or_else(invalid)?)
+                    .map_err(|_| invalid())?;
+            Command::CompatibilityProfileApprove {
+                root,
+                selection: NativeCompatibilityApprovalSelection {
+                    project_id,
+                    expected_project_revision,
+                    profile_resource_id,
+                    profile_resource_sha256,
+                    approved_profile_ref,
+                    artifact_digest,
+                    allowed_interface_digest,
+                },
+            }
+        }
         "catalog-source-use" => {
             let project = ProjectId::new(options.remove("--project").ok_or(EntryError::Arguments)?)
                 .map_err(|_| EntryError::Arguments)?;
@@ -845,6 +945,81 @@ fn deliver_catalog_source_uses(
         .and_then(|()| budget.check().map_err(EntryError::SourceRequest));
     result.map_err(|delivery| EntryError::CatalogSourceUsesCommitted {
         snapshot: Box::new(snapshot),
+        delivery: Box::new(delivery),
+    })
+}
+
+/// Open the existing protected ledger once. This cold owner operation publishes
+/// no listener, host context or Apply grant and never creates an empty Store.
+fn approve_compatibility_profile(
+    config: StoreConfig,
+    selection: &NativeCompatibilityApprovalSelection,
+    budget: &RequestBudget,
+) -> Result<CompatibilityApprovalRecord, EntryError> {
+    budget.check().map_err(EntryError::SourceRequest)?;
+    let mut store = DurableStore::open_existing(config).map_err(compatibility_storage_error)?;
+    let owner = NativeOwnerWitness::capture(&store, budget.deadline())
+        .map_err(compatibility_storage_error)?;
+    owner
+        .check_project(&store, &selection.project_id)
+        .map_err(compatibility_storage_error)?;
+    budget.check().map_err(EntryError::SourceRequest)?;
+    // The shared approval composition owns current Policy, exact CAS/raw and
+    // projected profile pins, source rights and the journal's pre-commit checks.
+    // Do not perform a fallible check after its confirmed committed receipt.
+    approve_native_compatibility_profile(&mut store, &owner, budget, selection)
+        .map_err(EntryError::CompatibilityProfileRequest)
+}
+
+fn compatibility_storage_error(cause: StorageError) -> EntryError {
+    let code = match &cause {
+        StorageError::Busy => "SOURCE_BUSY",
+        StorageError::Fenced(_) => "WRITE_SCOPE_FENCED",
+        StorageError::Conflict(_) => "REVISION_CONFLICT",
+        StorageError::Corrupt(_) => "INVALID_STORED_EVIDENCE",
+        StorageError::InvalidInput(_) | StorageError::Contract(_) => "INVALID_INPUT",
+        _ => "SOURCE_UNAVAILABLE",
+    };
+    EntryError::CompatibilityProfileRequest(mmmm_application::AppError::caused_by(
+        code,
+        "Native compatibility approval could not verify its protected Store",
+        cause,
+    ))
+}
+
+fn compatibility_profile_value(
+    record: &CompatibilityApprovalRecord,
+    revision: &Sha256Digest,
+) -> Value {
+    // Publish typed locators and digests only. The full source, native owner,
+    // actual Policy, source rights and data-root path remain in protected state.
+    json!({"kind":"compatibility_profile_approved","projectId":record.project_id(),
+        "currentProjectRevision":revision,"approvedProfileRef":record.approved_profile_ref(),
+        "profileResourceId":record.profile_resource()["resourceId"],
+        "profileResourceSha256":record.profile_resource()["sha256"],
+        "profileDigest":record.profile_digest(),"artifactSha256":record.artifact_digest(),
+        "interfaceSha256":record.allowed_interface_digest(),"policyDigest":record.policy_revision(),
+        "scopeDigest":record.scope_digest(),"localUseOnly":record.local_use_only()})
+}
+
+fn deliver_compatibility_profile(
+    record: CompatibilityApprovalRecord,
+    revision: &Sha256Digest,
+    budget: &RequestBudget,
+    deliver: impl FnOnce(&Value, Instant) -> Result<(), EntryError>,
+) -> Result<(), EntryError> {
+    let result = budget
+        .check()
+        .map_err(EntryError::SourceRequest)
+        .and_then(|()| {
+            deliver(
+                &compatibility_profile_value(&record, revision),
+                budget.deadline(),
+            )
+        })
+        .and_then(|()| budget.check().map_err(EntryError::SourceRequest));
+    result.map_err(|delivery| EntryError::CompatibilityProfileCommitted {
+        record: Box::new(record),
         delivery: Box::new(delivery),
     })
 }
@@ -1287,6 +1462,123 @@ mod tests {
         assert!(matches!(check(Instant::now()), Err(EntryError::Deadline)));
     }
 
+    fn compatibility_approval_args() -> Vec<String> {
+        args(&[
+            "compatibility-profile-approve",
+            "--data-root",
+            root(),
+            "--project",
+            "project-compatibility",
+            "--expected-revision",
+            &"a".repeat(64),
+            "--profile-resource-id",
+            "resource-compatibility-profile",
+            "--profile-resource-sha256",
+            &"b".repeat(64),
+            "--approved-profile-ref",
+            "approval:legacy.public.v1",
+            "--artifact-sha256",
+            &"c".repeat(64),
+            "--interface-sha256",
+            &"d".repeat(64),
+        ])
+    }
+
+    #[test]
+    fn compatibility_approval_parser_keeps_raw_artifact_interface_and_revision_pins_separate() {
+        let Some(Command::CompatibilityProfileApprove {
+            root: selected_root,
+            selection,
+        }) = parse(&compatibility_approval_args()).unwrap()
+        else {
+            panic!("cold profile selector missing");
+        };
+        assert_eq!(selected_root, PathBuf::from(root()));
+        assert_eq!(selection.project_id.as_str(), "project-compatibility");
+        assert_eq!(selection.expected_project_revision.as_str(), "a".repeat(64));
+        assert_eq!(
+            selection.profile_resource_id.as_str(),
+            "resource-compatibility-profile"
+        );
+        assert_eq!(selection.profile_resource_sha256.as_str(), "b".repeat(64));
+        assert_eq!(selection.approved_profile_ref, "approval:legacy.public.v1");
+        assert_eq!(selection.artifact_digest.as_str(), "c".repeat(64));
+        assert_eq!(selection.allowed_interface_digest.as_str(), "d".repeat(64));
+    }
+
+    #[test]
+    fn compatibility_approval_parser_rejects_omitted_duplicate_unknown_or_unbounded_selections() {
+        for pair in 0..8 {
+            let mut omitted = compatibility_approval_args();
+            omitted.drain(1 + pair * 2..3 + pair * 2);
+            assert!(parse(&omitted).is_err());
+        }
+        for (index, invalid) in [
+            (2, "relative-root"),
+            (4, "bad project"),
+            (6, "claimed revision"),
+            (8, "bad/resource"),
+            (10, "claimed digest"),
+            (12, ""),
+            (12, "approval with space"),
+            (12, "approval\nline"),
+            (14, "claimed artifact"),
+            (16, "claimed interface"),
+        ] {
+            let mut input = compatibility_approval_args();
+            input[index] = invalid.into();
+            assert!(parse(&input).is_err());
+        }
+        for (index, length) in [(12, 257), (2, 65_537)] {
+            let mut input = compatibility_approval_args();
+            input[index] = "x".repeat(length);
+            assert!(parse(&input).is_err());
+        }
+        for (option, value) in [
+            ("--project", "duplicate-project"),
+            ("--profile-json", "{}"),
+            ("--profile-digest", &"0".repeat(64)),
+            ("--native-owner", "claimed-owner"),
+            ("--policy-revision", "claimed-policy"),
+            ("--scope-json", "{}"),
+            ("--approved", "true"),
+        ] {
+            let mut extra = compatibility_approval_args();
+            extra.extend(args(&[option, value]));
+            assert!(parse(&extra).is_err());
+            // Replacing a required selector must also reject a same-size argv.
+            let mut replaced = compatibility_approval_args();
+            replaced[7] = option.into();
+            replaced[8] = value.into();
+            assert!(parse(&replaced).is_err());
+        }
+        let mut odd = compatibility_approval_args();
+        odd.push("--unexpected".into());
+        assert!(parse(&odd).is_err());
+        assert!(parse(&args(&["--version"])).unwrap().is_none());
+    }
+
+    #[test]
+    fn compatibility_request_diagnostics_keep_static_code_without_untrusted_causes() {
+        let failure =
+            EntryError::CompatibilityProfileRequest(mmmm_application::AppError::caused_by(
+                "PROFILE_UNTRUSTED",
+                "untrusted profile message must stay private",
+                std::io::Error::other("private selected path and source bytes"),
+            ));
+        let public = failure.to_string();
+        assert!(public.contains("PROFILE_UNTRUSTED"));
+        assert!(!public.contains("untrusted profile message"));
+        assert!(!public.contains("private selected path"));
+        let retained = std::error::Error::source(&failure).unwrap();
+        assert!(retained.is::<mmmm_application::AppError>());
+        assert!(
+            std::error::Error::source(retained)
+                .unwrap()
+                .is::<std::io::Error>()
+        );
+    }
+
     fn import_args() -> Vec<String> {
         args(&[
             "source-import",
@@ -1487,6 +1779,272 @@ mod tests {
             cancelled,
         )
     }
+
+    // Reuse the existing protected Store/import fixture and the canonical
+    // public-Java example. The scalar-only variation tests the narrower initial
+    // read slice; neither variant supplies a Java observation or game evidence.
+    fn compatibility_approval_fixture(
+        scalar: bool,
+    ) -> (
+        ImportRoot,
+        ProjectBootstrapReceipt,
+        NativeOwnedSourceCommitReceipt,
+        NativeCompatibilityApprovalSelection,
+    ) {
+        let root = ImportRoot::new();
+        let initialized = root.initialize();
+        let mut profile =
+            parse_json(include_bytes!("../../../examples/compat-public-java.json")).unwrap();
+        let bytes = if scalar {
+            profile["binding"]["resultCodec"] = json!("scalar");
+            profile["binding"]["returnType"] = json!("java.lang.String");
+            profile["action"]["outputSchema"] = json!({"type":"object",
+                "properties":{"value":{"type":"string"}},"required":["value"],
+                "additionalProperties":false});
+            [b" \n".as_slice(), &encode_json(&profile).unwrap(), b"\n "].concat()
+        } else {
+            include_bytes!("../../../examples/compat-public-java.json").to_vec()
+        };
+        let resource_id = ResourceId::new("resource-native-compatibility-profile").unwrap();
+        let metadata = encode_json(&json!({"resourceId":resource_id,
+            "sha256":raw_digest(&bytes),"mediaType":"application/vnd.mmmm.compatibility-profile+json",
+            "sizeBytes":bytes.len()})).unwrap();
+        let (budget, _) = import_budget();
+        let prepared = root.prepare(&initialized.project_id, &budget);
+        let receipt = prepared
+            .import_native_sources(&NativeSourceInput {
+                project: &initialized.project_id,
+                expected_revision: &initialized.project_revision,
+                documents: &[],
+                retained_resources: &[],
+                raw_resources: &[NativeRawSourceResource {
+                    metadata: &metadata,
+                    bytes: &bytes,
+                }],
+            })
+            .unwrap();
+        let selection = NativeCompatibilityApprovalSelection {
+            project_id: receipt.project_id.clone(),
+            expected_project_revision: receipt.project_revision.clone(),
+            profile_resource_id: resource_id,
+            profile_resource_sha256: raw_digest(&bytes),
+            approved_profile_ref: "approval:native.scalar.v1".into(),
+            artifact_digest: serde_json::from_value(
+                profile["action"]["implementationDigest"].clone(),
+            )
+            .unwrap(),
+            allowed_interface_digest: Sha256Digest::new("d".repeat(64)).unwrap(),
+        };
+        (root, initialized, receipt, selection)
+    }
+
+    fn approve_profile_fixture(
+        root: &ImportRoot,
+        selection: &NativeCompatibilityApprovalSelection,
+    ) -> Result<CompatibilityApprovalRecord, EntryError> {
+        let (budget, _) = import_budget();
+        approve_compatibility_profile(StoreConfig::new(root.0.clone()), selection, &budget)
+    }
+
+    #[test]
+    fn cold_compatibility_approval_retains_exact_source_and_replays_only_immutable_pins() {
+        let (root, _, receipt, selection) = compatibility_approval_fixture(true);
+        let before = root.open().project(&receipt.project_id).unwrap();
+        {
+            let store = root.open();
+            let (budget, _) = import_budget();
+            let owner = NativeOwnerWitness::capture(&store, budget.deadline()).unwrap();
+            let failure = crate::production_factory::read_native_compatibility_profile(
+                &store,
+                &owner,
+                &budget,
+                &selection.project_id,
+                &selection.approved_profile_ref,
+            );
+            assert!(matches!(failure, Err(ref error) if error.code == "PROFILE_UNTRUSTED"));
+        }
+        let approved = approve_profile_fixture(&root, &selection).unwrap();
+        assert_eq!(
+            approve_profile_fixture(&root, &selection).unwrap(),
+            approved
+        );
+        assert_eq!(approved.project_id(), &receipt.project_id);
+        assert_eq!(
+            approved.profile_resource()["resourceId"],
+            selection.profile_resource_id.as_str()
+        );
+        assert_eq!(
+            approved.profile_resource()["sha256"],
+            selection.profile_resource_sha256.as_str()
+        );
+        assert_ne!(
+            approved.profile_digest(),
+            &selection.profile_resource_sha256
+        );
+        assert!(approved.local_use_only());
+        let mut changed = selection.clone();
+        changed.allowed_interface_digest = Sha256Digest::new("e".repeat(64)).unwrap();
+        assert!(approve_profile_fixture(&root, &changed).is_err());
+        assert_eq!(
+            approve_profile_fixture(&root, &selection).unwrap(),
+            approved
+        );
+        assert_eq!(root.open().project(&receipt.project_id).unwrap(), before);
+        {
+            let store = root.open();
+            let (budget, _) = import_budget();
+            let owner = NativeOwnerWitness::capture(&store, budget.deadline()).unwrap();
+            let actual = crate::production_factory::read_native_compatibility_profile(
+                &store,
+                &owner,
+                &budget,
+                &selection.project_id,
+                &selection.approved_profile_ref,
+            )
+            .unwrap();
+            assert_eq!(actual.record(), &approved);
+            assert_eq!(
+                raw_digest(actual.profile_bytes()),
+                selection.profile_resource_sha256
+            );
+            assert_eq!(
+                projected_digest(
+                    "CompatibilityProfile",
+                    &parse_json(actual.profile_bytes()).unwrap()
+                )
+                .unwrap(),
+                *approved.profile_digest()
+            );
+        }
+        let value = compatibility_profile_value(&approved, &receipt.project_revision);
+        assert_eq!(value["profileDigest"], approved.profile_digest().as_str());
+        for excluded in [
+            "nativeOwner",
+            "policy",
+            "profile",
+            "dataRoot",
+            "sourceRights",
+        ] {
+            assert!(value.get(excluded).is_none());
+        }
+        assert!(!root.0.join("runtime").exists());
+    }
+
+    #[test]
+    fn cold_compatibility_approval_requires_existing_unlocked_current_project_and_raw_source() {
+        let (root, initialized, receipt, selection) = compatibility_approval_fixture(true);
+        let held = root.open();
+        let failure = approve_profile_fixture(&root, &selection).unwrap_err();
+        assert!(
+            matches!(failure, EntryError::CompatibilityProfileRequest(ref error)
+            if error.code == "SOURCE_BUSY"
+                && matches!(std::error::Error::source(error)
+                    .and_then(|cause| cause.downcast_ref::<StorageError>()), Some(StorageError::Busy)))
+        );
+        drop(held);
+        for replacement in [
+            initialized.project_revision,
+            Sha256Digest::new("f".repeat(64)).unwrap(),
+        ] {
+            let mut stale = selection.clone();
+            stale.expected_project_revision = replacement;
+            assert!(approve_profile_fixture(&root, &stale).is_err());
+        }
+        let mut wrong_raw = selection.clone();
+        wrong_raw.profile_resource_sha256 = Sha256Digest::new("0".repeat(64)).unwrap();
+        assert!(approve_profile_fixture(&root, &wrong_raw).is_err());
+        let mut wrong_project = selection.clone();
+        wrong_project.project_id = ProjectId::new("project-unregistered-compatibility").unwrap();
+        assert!(approve_profile_fixture(&root, &wrong_project).is_err());
+        let mut missing_resource = selection.clone();
+        missing_resource.profile_resource_id =
+            ResourceId::new("resource-unregistered-profile").unwrap();
+        assert!(approve_profile_fixture(&root, &missing_resource).is_err());
+        let absent = ImportRoot::new();
+        assert!(approve_profile_fixture(&absent, &selection).is_err());
+        assert!(!absent.0.join("journal.sqlite3").exists());
+        assert!(!absent.0.join("blobs").exists());
+        assert!(!absent.0.join("runtime").exists());
+        let approved = approve_profile_fixture(&root, &selection).unwrap();
+        assert_eq!(approved.project_id(), &receipt.project_id);
+        assert!(!root.0.join("runtime").exists());
+    }
+
+    #[test]
+    fn cold_compatibility_approval_rejects_original_map_codec_and_preserves_cancellation() {
+        let (unsupported, _, _, selection) = compatibility_approval_fixture(false);
+        assert!(matches!(approve_profile_fixture(&unsupported, &selection),
+            Err(EntryError::CompatibilityProfileRequest(ref error))
+                if error.code == "CAPABILITY_UNAVAILABLE"));
+        let (root, _, _, selection) = compatibility_approval_fixture(true);
+        let (budget, cancellation) = import_budget();
+        cancellation.store(true, Ordering::Release);
+        let failure =
+            approve_compatibility_profile(StoreConfig::new(root.0.clone()), &selection, &budget)
+                .unwrap_err();
+        assert!(matches!(failure, EntryError::SourceRequest(ref error)
+            if error.code == "CANCELLED"));
+        let expired = RequestBudget::until(
+            Instant::now() + Duration::from_millis(50),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        let failure =
+            approve_compatibility_profile(StoreConfig::new(root.0.clone()), &selection, &expired)
+                .unwrap_err();
+        assert!(matches!(failure, EntryError::SourceRequest(ref error)
+            if error.code == "TIME_BUDGET_EXCEEDED"));
+        assert!(!root.0.join("runtime").exists());
+        assert!(approve_profile_fixture(&root, &selection).is_ok());
+    }
+
+    #[test]
+    fn confirmed_compatibility_approval_survives_delivery_failure_or_later_cancellation() {
+        for phase in 0..3 {
+            let (root, _, receipt, selection) = compatibility_approval_fixture(true);
+            let approved = approve_profile_fixture(&root, &selection).unwrap();
+            let (budget, cancellation) = import_budget();
+            if phase == 1 {
+                cancellation.store(true, Ordering::Release);
+            }
+            let failure = deliver_compatibility_profile(
+                approved.clone(),
+                &receipt.project_revision,
+                &budget,
+                |value, _| {
+                    assert_eq!(value["kind"], "compatibility_profile_approved");
+                    if phase == 2 {
+                        cancellation.store(true, Ordering::Release);
+                        Ok(())
+                    } else {
+                        Err(EntryError::OutputInvalid)
+                    }
+                },
+            )
+            .unwrap_err();
+            let EntryError::CompatibilityProfileCommitted { record, delivery } = failure else {
+                panic!("confirmed compatibility approval receipt lost");
+            };
+            assert_eq!(*record, approved);
+            if phase == 0 {
+                assert!(matches!(*delivery, EntryError::OutputInvalid));
+            } else {
+                assert!(matches!(*delivery, EntryError::SourceRequest(ref error)
+                if error.code == "CANCELLED"));
+            }
+            assert_eq!(
+                approve_profile_fixture(&root, &selection).unwrap(),
+                approved
+            );
+            let diagnostic =
+                EntryError::CompatibilityProfileCommitted { record, delivery }.to_string();
+            assert!(diagnostic.contains("committed and retained"));
+            assert!(diagnostic.contains(approved.profile_digest().as_str()));
+            assert!(!root.0.join("runtime").exists());
+        }
+    }
+
     fn import_prefab() -> Value {
         let original = parse_json(include_bytes!("../../../examples/prefab.json")).unwrap();
         let mut prefab = json!({

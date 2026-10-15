@@ -54,6 +54,84 @@ pub trait ProjectSourceRpcContext {
     fn context_id(&self) -> Option<&ContextId>;
 }
 
+/// Protected head metadata only. This pin grants no Project/resource access,
+/// proves no CAS contents and must be followed by the existing authorized,
+/// bounded checked reader before any document bytes are consumed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectHeadPin {
+    pub revision: Sha256Digest,
+    pub blob: BlobRef,
+}
+
+/// Capture one exact Project head/document/blob association without opening
+/// CAS. All digest reads are at most 65 bytes; the existing 8MiB Project ceiling
+/// is checked before a caller can select its checked source reader. Original
+/// request cancellation/deadline errors propagate unchanged. A second bounded
+/// observation detects revision, raw blob or length drift during that check.
+pub fn current_project_head_pin(
+    store: &DurableStore,
+    rpc: &dyn ProjectSourceRpcContext,
+    project: &ProjectId,
+) -> StorageResult<ProjectHeadPin> {
+    rpc.check()?;
+    let pin = project_head_metadata(store, project)?;
+    rpc.check()?;
+    if project_head_metadata(store, project)? != pin {
+        return Err(StorageError::Conflict("Current Project head pin changed"));
+    }
+    rpc.check()?;
+    Ok(pin)
+}
+
+struct ProjectHeadMetadata {
+    revision: Vec<u8>,
+    head_blob: Vec<u8>,
+    document_blob: Option<Vec<u8>>,
+    byte_length: Option<i64>,
+}
+fn project_head_metadata(
+    store: &DurableStore,
+    project: &ProjectId,
+) -> StorageResult<ProjectHeadPin> {
+    let row = store.connection.query_row(
+        "SELECT substr(CAST(h.revision AS BLOB),1,65),substr(CAST(h.blob_digest AS BLOB),1,65),substr(CAST(d.blob_digest AS BLOB),1,65),b.byte_length FROM project_heads h LEFT JOIN documents d ON d.definition='Project' AND d.document_id=h.project_id AND d.content_hash=h.revision LEFT JOIN blobs b ON b.digest=h.blob_digest WHERE h.project_id=?1 LIMIT 1",
+        [project.as_str()],
+        |row| Ok(ProjectHeadMetadata {
+            revision: row.get(0)?, head_blob: row.get(1)?,
+            document_blob: row.get(2)?, byte_length: row.get(3)?,
+        }),
+    ).optional()?.ok_or(StorageError::NotFound("Current Project source"))?;
+    let digest_text = |bytes: &[u8]| -> StorageResult<String> {
+        if bytes.len() != 64 {
+            return Err(StorageError::Corrupt(
+                "Current Project metadata digest length".into(),
+            ));
+        }
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| StorageError::Corrupt("Current Project metadata UTF-8".into()))?;
+        Sha256Digest::new(text.to_owned()).map_err(contract)?;
+        Ok(text.to_owned())
+    };
+    let revision = Sha256Digest::new(digest_text(&row.revision)?).map_err(contract)?;
+    let head_blob = digest_text(&row.head_blob)?;
+    let document_blob = row.document_blob.ok_or(StorageError::Conflict(
+        "Current Project source revision/index",
+    ))?;
+    if digest_text(&document_blob)? != head_blob {
+        return Err(StorageError::Conflict(
+            "Current Project source revision/index",
+        ));
+    }
+    let length = row
+        .byte_length
+        .ok_or_else(|| StorageError::Corrupt("Current Project blob metadata is missing".into()))?;
+    let blob = blob_from_row((head_blob, length))?;
+    if blob.byte_length > MAX_PROJECT_BYTES {
+        return Err(invalid("Current Project source byte budget exceeded"));
+    }
+    Ok(ProjectHeadPin { revision, blob })
+}
+
 #[derive(Clone, Debug)]
 pub enum ProjectResourceQuery {
     Current {

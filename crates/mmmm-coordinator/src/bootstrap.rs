@@ -287,6 +287,7 @@ struct PendingBootstrap {
     rollback_observation: RollbackObservation,
     publication_failure: Option<Arc<mmmm_application::AppError>>,
     first_rollback_failure: Option<Arc<mmmm_application::AppError>>,
+    compatibility_failure: Option<Arc<mmmm_application::AppError>>,
     retained_encoded_bytes: usize,
     lease_expires: Instant,
 }
@@ -309,6 +310,7 @@ struct RejectedPairingCompletion {
     _rollback: RollbackObservation,
     _publication_failure: Option<Arc<mmmm_application::AppError>>,
     _first_rollback_failure: Option<Arc<mmmm_application::AppError>>,
+    _compatibility_failure: Option<Arc<mmmm_application::AppError>>,
 }
 
 /// A factual native delivery observation. Only `finish` constructs it from
@@ -387,6 +389,7 @@ struct ActiveBootstrap {
     context_id: ContextId,
     route_owner: Option<HostRouteOwner>,
     expires: Instant,
+    _compatibility_failure: Option<Arc<mmmm_application::AppError>>,
 }
 
 pub(crate) mod workspace_seal {
@@ -486,6 +489,7 @@ impl HostBootstrapProcessor {
                     context_id: id,
                     route_owner: None,
                     expires: Instant::now() + Duration::from_secs(1800),
+                    _compatibility_failure: None,
                 },
             },
         );
@@ -673,6 +677,11 @@ impl HostBootstrapProcessor {
         )
         .map_err(|_| ManagementError::InvalidFrame)?;
         validate_live_offer(value, &artifact)?;
+        // Imported JSON cannot populate this map. Read only protected native
+        // approvals and exact current Policy/profile CAS under this exchange's
+        // original owner, deadline, cancellation and peer-stop controls.
+        let (compatibility_approvals, compatibility_failure) =
+            compatibility_approvals_for_pairing(store, budget, &project)?;
         let context_id = new_context_id()?;
         let scope = rebound_scope(scope, &context_id, &value["hostHello"]["environment"])?;
         let policy = self
@@ -702,6 +711,7 @@ impl HostBootstrapProcessor {
             rollback_observation: RollbackObservation::NotAttempted,
             publication_failure: None,
             first_rollback_failure: None,
+            compatibility_failure,
             retained_encoded_bytes,
             lease_expires: now + SESSION_LIFETIME,
         };
@@ -723,12 +733,40 @@ impl HostBootstrapProcessor {
                 .iter()
                 .map(|action| canonical_digest(action).map_err(|_| ManagementError::InvalidFrame))
                 .collect::<Result<Vec<_>, _>>()?;
-            let reply = PublicFrame::from_value(json!({
+            let mut reply_value = json!({
                 "kind":"host_pairing_authority", "protocolVersion":mmmm_contracts::CONTRACT_VERSION,
                 "nonce":pending.witness.nonce(), "contexts":[pending.context],
                 "approvedSources":{(NATIVE_SOURCE_ID):artifact}, "approvedActions":actions,
                 "permissions":READ_PERMISSIONS, "writeProfileVerified":false,
-            }))?;
+                "compatibilityApprovals":compatibility_approvals,
+            });
+            let reply = match PublicFrame::from_value(reply_value.clone()) {
+                Ok(reply) => reply,
+                Err(ManagementError::FrameTooLarge)
+                    if reply_value["compatibilityApprovals"]["profiles"]
+                        .as_array()
+                        .is_some_and(|profiles| !profiles.is_empty()) =>
+                {
+                    // Optional source metadata cannot consume the native
+                    // pairing frame's whole bound. No partial map is issued.
+                    reply_value["compatibilityApprovals"] = json!({
+                        "status":"unavailable","reasonCode":"APPROVAL_SOURCE_UNAVAILABLE","profiles":[]
+                    });
+                    pending.compatibility_failure = Some(Arc::new(
+                        mmmm_application::AppError::new(
+                            "INPUT_LIMIT",
+                            "Compatibility approvals exceed the original private pairing frame bound",
+                        ),
+                    ));
+                    PublicFrame::from_value(reply_value)?
+                }
+                Err(cause) => return Err(cause),
+            };
+            pending.retained_encoded_bytes = pending
+                .retained_encoded_bytes
+                .checked_add(reply.encode()?.payload().len())
+                .filter(|bytes| *bytes <= MAX_REJECTED_ENCODED_BYTES)
+                .ok_or(ManagementError::FrameTooLarge)?;
             budget.check()?;
             Ok(reply)
         })();
@@ -943,6 +981,7 @@ impl HostBootstrapProcessor {
                     context_id: pending.context_id,
                     route_owner: pending.route_owner,
                     expires: pending.lease_expires,
+                    _compatibility_failure: pending.compatibility_failure,
                 },
             );
             return Ok(());
@@ -1112,6 +1151,7 @@ impl HostBootstrapProcessor {
                 _rollback: pending.rollback_observation,
                 _publication_failure: pending.publication_failure,
                 _first_rollback_failure: pending.first_rollback_failure,
+                _compatibility_failure: pending.compatibility_failure,
             },
         );
         Ok(())
@@ -1142,6 +1182,80 @@ impl HostBootstrapProcessor {
         }
         Ok(())
     }
+}
+
+fn compatibility_approvals_for_pairing(
+    store: &DurableStore,
+    budget: &BootstrapBudget,
+    project: &ProjectId,
+) -> Result<(Value, Option<Arc<mmmm_application::AppError>>), ManagementError> {
+    use crate::{
+        production_factory::read_native_compatibility_profiles, service::RequestBudget,
+        workspace_bootstrap::NativeOwnerWitness,
+    };
+    use mmmm_application::AppError;
+    budget.check()?;
+    let result = (|| {
+        let request = RequestBudget::from_bootstrap(budget)
+            .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
+        let owner = NativeOwnerWitness::capture(store, budget.deadline())
+            .map_err(|cause| AppError::storage("COMPATIBILITY_SOURCE_UNAVAILABLE", cause))?;
+        let approvals = read_native_compatibility_profiles(store, &owner, &request, project)?;
+        let mut profiles = Vec::with_capacity(approvals.len());
+        let mut raw_bytes = 0usize;
+        for approved in approvals {
+            request
+                .check()
+                .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
+            let bytes = approved.profile_bytes();
+            raw_bytes = raw_bytes.checked_add(bytes.len()).ok_or_else(|| {
+                AppError::new(
+                    "INPUT_LIMIT",
+                    "Compatibility bootstrap source bytes exceed their bound",
+                )
+            })?;
+            if bytes.is_empty() || bytes.len() > 65_536 || raw_bytes > 256 * 1024 {
+                return Err(AppError::new(
+                    "INPUT_LIMIT",
+                    "Compatibility bootstrap source bytes exceed their bound",
+                ));
+            }
+            let mut hex = Vec::with_capacity(bytes.len() * 2);
+            const DIGITS: &[u8; 16] = b"0123456789abcdef";
+            for (index, byte) in bytes.iter().copied().enumerate() {
+                if index.is_multiple_of(4096) {
+                    request
+                        .check()
+                        .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
+                }
+                hex.push(DIGITS[usize::from(byte >> 4)]);
+                hex.push(DIGITS[usize::from(byte & 15)]);
+            }
+            let record = approved.record();
+            profiles.push(json!({
+                "approvedProfileRef":record.approved_profile_ref(),
+                "profileBytesHex":String::from_utf8(hex).map_err(|_| AppError::new("INVALID_INPUT", "Compatibility source hex encoding failed"))?,
+                "profileDigest":record.profile_digest(),
+                "artifactDigest":record.artifact_digest(),
+                "allowedInterfaceDigest":record.allowed_interface_digest(),
+            }));
+        }
+        request
+            .check()
+            .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
+        Ok(json!({"status":"available","reasonCode":null,"profiles":profiles}))
+    })();
+    // A cancelled/expired/uncertain exchange never falls back to a successful
+    // native pairing. Only this optional source's own failure becomes closed
+    // unavailable; retain the original typed cause alongside the lifecycle.
+    budget.check()?;
+    Ok(match result {
+        Ok(value) => (value, None),
+        Err(cause) => (
+            json!({"status":"unavailable","reasonCode":"APPROVAL_SOURCE_UNAVAILABLE","profiles":[]}),
+            Some(Arc::new(cause)),
+        ),
+    })
 }
 
 fn validate_live_offer(value: &Value, artifact: &Sha256Digest) -> Result<(), ManagementError> {

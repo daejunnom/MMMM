@@ -67,6 +67,7 @@ public final class MmmmFabricHost implements ModInitializer {
     private final java.util.concurrent.atomic.AtomicInteger pendingInspections = new java.util.concurrent.atomic.AtomicInteger();
     private volatile MinecraftServer server;
     private volatile HostRuntime runtime;
+    private NativeCompatibilityApprovals compatibilityApprovals;
     private volatile HostSession session;
     private volatile PairedLoopbackServer endpoint;
     private volatile boolean reloading;
@@ -204,6 +205,34 @@ public final class MmmmFabricHost implements ModInitializer {
                           Set<String> permissions, List<ObjectNode> contexts,
                           Map<String, String> approvedSources, Set<String> approvedActions,
                           boolean exactWriteProfileVerified) throws IOException {
+        return install(pairedPlayer, principalRef, asciiBearer, permissions, contexts, approvedSources, approvedActions,
+                exactWriteProfileVerified, List.of());
+    }
+
+    /** Typed owner records remain distinct from artifact/action approval and from registered providers. */
+    public String install(UUID pairedPlayer, String principalRef, byte[] asciiBearer,
+                          Set<String> permissions, List<ObjectNode> contexts,
+                          Map<String, String> approvedSources, Set<String> approvedActions,
+                          boolean exactWriteProfileVerified,
+                          List<NativeCompatibilityApprovals.ApprovedProfile> compatibilityProfiles) throws IOException {
+        requireServerThread();
+        NativeCompatibilityApprovals pending = new NativeCompatibilityApprovals(contracts, compatibilityProfiles,
+                (profile, actualEnvironment, actualGeneration) -> {
+                    throw new ContractException("COMPATIBILITY_SOURCE_UNAVAILABLE", "No actual loaded compatibility source resolver is installed");
+                });
+        try {
+            return installNative(pairedPlayer, principalRef, asciiBearer, permissions, contexts, approvedSources, approvedActions,
+                    exactWriteProfileVerified, pending);
+        } catch (IOException | RuntimeException failure) {
+            try { pending.close(); } catch (RuntimeException cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+            throw failure;
+        }
+    }
+
+    private String installNative(UUID pairedPlayer, String principalRef, byte[] asciiBearer,
+                                 Set<String> permissions, List<ObjectNode> contexts,
+                                 Map<String, String> approvedSources, Set<String> approvedActions,
+                                 boolean exactWriteProfileVerified, NativeCompatibilityApprovals pendingCompatibility) throws IOException {
         requireServerThread();
         disconnect();
         if (contexts.isEmpty() || contexts.size() > 16) throw new ContractException("CONTEXT_LIMIT", "Pairing requires a bounded nonempty immutable context set");
@@ -269,6 +298,7 @@ public final class MmmmFabricHost implements ModInitializer {
                 candidateSession.checkOpen();
                 routes.put(candidateSession, new SessionRoute(listener, null, null, null)); routeOrder.add(candidateSession);
                 installedSources = acceptedSources; installedActions = acceptedActions; installedContexts = admittedContexts;
+                compatibilityApprovals = pendingCompatibility;
                 runtime = candidate; session = candidateSession; endpoint = listener;
             }
             return listener.endpoint();
@@ -278,6 +308,7 @@ public final class MmmmFabricHost implements ModInitializer {
                 if (session == candidateSession) {
                     session = null; if (endpoint == listener) endpoint = null; if (runtime == candidate) runtime = null;
                 }
+                if (compatibilityApprovals == pendingCompatibility) compatibilityApprovals = null;
             }
             if (listener != null) listener.close(); candidate.close(); candidateSession.close();
             throw exception;
@@ -490,25 +521,30 @@ public final class MmmmFabricHost implements ModInitializer {
                 if (!dimension.equals(context.path("dimension").asText())) throw new ContractException("CONTEXT_SCOPE_MISMATCH", "Action dimension differs from its context");
                 BlockPos position = NativeBlocks.position(input.path("position"));
                 NativeBlocks.requireScope(context, dimension, position);
-                output = NativeBlocks.observe(loaded, level, position);
                 if ("mmmm:block_patch".equals(id)) {
-                    ObjectNode before = output.deepCopy();
-                    var current = loaded.require(level, position).getBlockState(position);
-                    var desired = NativeBlocks.decode(input.path("desiredState"));
-                    if (current.hasBlockEntity() || desired.hasBlockEntity()) {
-                        throw new ContractException("BLOCK_ENTITY_UNSUPPORTED", "This direct-state action does not overwrite block entity data");
-                    }
-                    if (!before.path("blockState").equals(input.path("expectedState"))) {
-                        throw new ContractException("PRECONDITION_CHANGED", "Live block state differs from the pinned before state");
-                    }
+                    SessionRoute directRoute = sessionRoute(paired);
+                    ObjectNode preflight = ownedBlockPreflight(paired, context, input, implementationDigest, local::checkActive, invocation);
+                    if (!"known".equals(preflight.path("status").asText())) throw new ContractException(preflight.path("reasonCode").asText(), "Owned direct block conditions are unsupported");
+                    ObjectNode before = ContractJson.newObject().put("dimension", dimension).put("observedTick", preflight.path("observedToTick").asText());
+                    before.set("position", preflight.path("position").deepCopy()); before.set("blockState", preflight.path("cells").get(13).path("state").deepCopy());
+                    var desired = OwnedBlockPatchPreflight.desired(input.path("desiredState"));
                     local.beginMutation();
+                    Runnable directCurrent = () -> {
+                        local.checkActive();
+                        if (runtime != target || sessionRoute(paired) != directRoute) throw new ContractException("SESSION_ROUTE_CHANGED", "Direct mutation route changed during admission");
+                        new PlatformAuthority(null).check(paired, context, Set.of("mmmm:world_write"), false); local.checkActive();
+                    };
+                    OwnedBlockPatchPreflight.requireCurrentCells(loaded, level, context, input, Long.toString(registryGeneration), directCurrent);
                     boolean changed = level.setBlock(position, desired, 2);
                     ObjectNode after = NativeBlocks.observe(loaded, level, position);
                     ObjectNode evidence = ContractJson.newObject().put("kind", "direct_block_state").put("setBlockReportedSuccess", changed);
+                    evidence.put("knownProducerId", OwnedBlockPatchPreflight.PRODUCER).put("preflightPin", preflight.path("conditionsDigest").asText());
+                    OwnedBlockPatchPreflight.directFields(evidence);
                     evidence.set("before", before); evidence.set("after", after); local.recordEffect(evidence);
-                    output = evidence.deepCopy().put("indirectEffects", "not_observed");
+                    output = evidence.deepCopy();
                     return CompletableFuture.completedFuture(ProviderResult.complete(contracts, output, "recorded"));
                 }
+                output = NativeBlocks.observe(loaded, level, position);
                 return CompletableFuture.completedFuture(ProviderResult.complete(contracts, output, "none"));
             }, "read".equals(descriptor.path("effect").asText()) ? new OptionalCallbacks(null, null, null, (request, local) -> {
                 local.requireGameThread(); ObjectNode context = local.executionContext(); ObjectNode input = request.arguments();
@@ -551,9 +587,11 @@ public final class MmmmFabricHost implements ModInitializer {
                 if (result.isDone()) return;
                 control.checkpoint();
                 Set<String> required = "command_complete".equals(kind) ? Set.of("mmmm:command_complete")
-                        : Set.of("undo_registration", "undo_material", "undo_role", "undo_job").contains(kind) ? Set.of("mmmm:provider_inventory") : Set.of("mmmm:world_read");
+                        : Set.of("undo_registration", "undo_material", "undo_role", "undo_job", "compatibility_interface").contains(kind) ? Set.of("mmmm:provider_inventory") : Set.of("mmmm:world_read");
                 new PlatformAuthority(null).check(paired, context, required, false);
-                if ("undo_registration".equals(kind)) {
+                if ("compatibility_interface".equals(kind)) {
+                    unavailableCompatibility(paired, context, payload, control, result);
+                } else if ("undo_registration".equals(kind)) {
                     HostDispatcher.exactFields(payload, Set.of("kind", "bindingId", "sourceActionId"));
                     result.complete(runtime.undoRegistration(HostDispatcher.string(payload, "bindingId"), HostDispatcher.string(payload, "sourceActionId")));
                 } else if ("undo_material".equals(kind)) {
@@ -614,6 +652,13 @@ public final class MmmmFabricHost implements ModInitializer {
                 } else if ("runtime_sources".equals(kind)) {
                     HostDispatcher.exactFields(payload, Set.of("kind"));
                     result.complete(collectSourceFacts(paired, context, control, result, required));
+                } else if ("owned_block_patch_preflight".equals(kind)) {
+                    HostDispatcher.exactFields(payload, Set.of("kind", "dimension", "position", "expectedState", "desiredState", "expectedRegistryGeneration"));
+                    ObjectNode input = payload.deepCopy(); input.remove("kind");
+                    result.complete(ownedBlockPreflight(paired, context, input, nativeBlockImplementation(), () -> {
+                        control.checkpoint();
+                        if (result.isDone()) throw new ContractException("CANCELLATION_REQUESTED", "Owned block inspection ended");
+                    }, null));
                 } else if ("target_admission".equals(kind)) {
                     ObjectNode facts = collectSourceFacts(paired, context, control, result, required);
                     result.complete(new NativeTargetAdmission(contracts).inspect(server, player(paired), context, facts,
@@ -685,6 +730,137 @@ public final class MmmmFabricHost implements ModInitializer {
         try { result.orTimeout(Math.min(10_000, control.remainingMillis()), java.util.concurrent.TimeUnit.MILLISECONDS); }
         catch (RuntimeException failure) { result.completeExceptionally(failure); }
         return result.minimalCompletionStage();
+    }
+
+    /** Retained typed profiles do not become providers while the actual source resolver is absent. */
+    private void unavailableCompatibility(HostSession paired, ObjectNode context, ObjectNode payload,
+                                           HostDispatcher.InspectionControl control, CompletableFuture<ObjectNode> response) {
+        MinecraftServer currentServer = server; HostRuntime currentRuntime = runtime; long generation = registryGeneration;
+        String currentEpoch = epoch; SessionRoute route = sessionRoute(paired); NativeCompatibilityApprovals retained = compatibilityApprovals;
+        Runnable checkpoint = () -> {
+            control.checkpoint(); requireServerThread(); paired.checkOpen();
+            if (response.isDone()) throw new ContractException("CANCELLATION_REQUESTED", "Compatibility inspection ended");
+            if (server != currentServer || runtime != currentRuntime || registryGeneration != generation
+                    || !java.util.Objects.equals(epoch, currentEpoch) || sessionRoute(paired) != route || compatibilityApprovals != retained) {
+                throw new ContractException("SESSION_EPOCH_MISMATCH", "Compatibility inspection owner or generation changed");
+            }
+            if (!paired.context(HostDispatcher.string(context, "contextId")).equals(context)) throw new ContractException("STALE_CONTEXT", "Compatibility context differs from its current owner");
+            new PlatformAuthority(null).check(paired, context, Set.of("mmmm:provider_inventory"), false); control.checkpoint();
+        };
+        try {
+            checkpoint.run();
+            HostDispatcher.exactFields(payload, Set.of("kind", "approvedProfileRef", "profileDigest"));
+            if (retained != null) retained.inspectUnavailable(payload);
+            throw new ContractException("COMPATIBILITY_SOURCE_UNAVAILABLE", "No actual loaded compatibility source resolver is installed");
+        } catch (RuntimeException failure) {
+            try { checkpoint.run(); } catch (RuntimeException current) { if (current != failure) failure.addSuppressed(current); }
+            throw failure;
+        }
+    }
+
+    /** The built-in registration is checked as a whole; an action name or caller digest is no grant. */
+    private String nativeBlockImplementation() {
+        String found = null;
+        for (JsonNode provider : runtime.inventory().path("providers")) {
+            if (!"mmmm:native".equals(provider.path("providerId").asText())
+                    || !"builtin".equals(provider.path("origin").path("kind").asText())
+                    || !"mmmm_host".equals(provider.path("origin").path("sourceId").asText())) continue;
+            String digest = provider.path("origin").path("sourceDigest").asText();
+            if (!digest.equals(installedSources.get("mmmm_host"))) throw new ContractException("OWNED_BLOCK_SOURCE_UNAVAILABLE", "Built-in source approval changed");
+            ObjectNode expected = descriptors(digest).stream().filter(action -> "mmmm:block_patch".equals(action.path("actionId").asText())).findFirst().orElseThrow();
+            ObjectNode actual = runtime.describe(provider.path("bindingId").asText(), "mmmm:block_patch");
+            if (found != null || !ContractJson.digest(expected).equals(ContractJson.digest(actual))) throw new ContractException("DEPENDENCY_CHANGED", "Built-in direct codec registration changed");
+            found = digest;
+        }
+        if (found == null) throw new ContractException("OWNED_BLOCK_SOURCE_UNAVAILABLE", "Built-in direct codec is not registered");
+        return found;
+    }
+
+    private ObjectNode ownedBlockPreflight(HostSession paired, ObjectNode context, ObjectNode input,
+                                          String implementationDigest, Runnable active, Invocation invocation) {
+        requireServerThread();
+        MinecraftServer currentServer = server; HostRuntime currentRuntime = runtime;
+        long generation = registryGeneration; String currentEpoch = epoch; SessionRoute route = sessionRoute(paired);
+        String contextId = HostDispatcher.string(context, "contextId");
+        Set<String> permissions = Set.of(invocation == null ? "mmmm:world_read" : "mmmm:world_write");
+        Runnable checkpoint = () -> {
+            active.run(); requireServerThread(); paired.checkOpen();
+            if (server != currentServer || runtime != currentRuntime || registryGeneration != generation
+                    || !java.util.Objects.equals(epoch, currentEpoch) || sessionRoute(paired) != route) {
+                throw new ContractException("SESSION_EPOCH_MISMATCH", "Owned block observation route or generation changed");
+            }
+            if (!paired.context(contextId).equals(context)) throw new ContractException("STALE_CONTEXT", "Owned block context differs from its current owner");
+            // Cheap current permission/player checks bracket each getter. The retained write plan,
+            // full source profile and invocation are checked at the outer pre/post boundaries.
+            new PlatformAuthority(null).check(paired, context, permissions, false); active.run();
+        };
+        Runnable admission = () -> {
+            checkpoint.run();
+            if (invocation != null) {
+                PlatformAuthority authority = new PlatformAuthority(null);
+                authority.check(paired, context, permissions, true); authority.checkInvocation(paired, invocation, true);
+            }
+            checkpoint.run();
+        };
+        ObjectNode before = null; ObjectNode receipt = null; RuntimeException failure = null;
+        try {
+            checkpoint.run(); OwnedBlockPatchPreflight.validateInput(context, input, Long.toString(generation));
+            admission.run();
+            if (!implementationDigest.equals(nativeBlockImplementation())) throw new ContractException("DEPENDENCY_CHANGED", "Direct codec implementation differs from its registration");
+            checkpoint.run();
+            before = NativeSourceFacts.observe(currentServer, Long.toString(generation), environment(), checkpoint::run);
+            String hostDigest = ownedBlockHostDigest(before, implementationDigest);
+            receipt = OwnedBlockPatchPreflight.inspect(loaded, level(context.path("dimension").asText()), context, input,
+                    before, hostDigest, implementationDigest, Long.toString(generation), checkpoint);
+        } catch (RuntimeException original) { failure = original; }
+        try {
+            checkpoint.run();
+            if (before != null) {
+                ObjectNode after = NativeSourceFacts.observe(currentServer, Long.toString(generation), environment(), checkpoint::run);
+                ownedBlockHostDigest(after, implementationDigest);
+                if (!NativeProfileAdmission.sourceDigest(before).equals(NativeProfileAdmission.sourceDigest(after))) {
+                    throw new ContractException("TARGET_DRIFT", "Current direct block source facts changed during observation");
+                }
+            }
+            admission.run(); checkpoint.run();
+            if (receipt != null && "known".equals(receipt.path("status").asText())) {
+                OwnedBlockPatchPreflight.requireCurrentCells(loaded, level(context.path("dimension").asText()), context, input,
+                        Long.toString(generation), checkpoint);
+            }
+            checkpoint.run();
+        } catch (RuntimeException current) {
+            if (failure == null) failure = current; else if (current != failure) failure.addSuppressed(current);
+        }
+        if (failure != null) throw failure;
+        return receipt;
+    }
+
+    private static String ownedBlockHostDigest(ObjectNode facts, String implementationDigest) {
+        for (JsonNode mod : facts.path("mods")) {
+            if (!"mmmm_host".equals(mod.path("modId").asText())) continue;
+            JsonNode archives = mod.path("installation").path("archives");
+            JsonNode roots = mod.path("runtimeRoots");
+            if ("observed_origin_list".equals(mod.path("installation").path("status").asText())
+                    && archives.isArray() && archives.size() == 1 && roots.isArray() && roots.size() == 1
+                    && sameOwnedHostArchive(archives.get(0), roots.get(0), implementationDigest)) {
+                int matches = 0;
+                for (JsonNode archive : facts.path("archives")) if (sameOwnedHostArchive(archives.get(0), archive, implementationDigest)) matches++;
+                if (matches == 1) return implementationDigest;
+            }
+            break;
+        }
+        throw new ContractException("OWNED_BLOCK_SOURCE_UNAVAILABLE", "Current ordinary host artifact does not match the registered direct codec");
+    }
+
+    private static boolean sameOwnedHostArchive(JsonNode left, JsonNode right, String digest) {
+        for (JsonNode receipt : List.of(left, right)) {
+            if (!"observed".equals(receipt.path("status").asText()) || !"container_input_bytes".equals(receipt.path("scope").asText())
+                    || !digest.equals(receipt.path("sha256").asText())
+                    || !("archive-sha256-" + digest).equals(receipt.path("sourceId").asText())
+                    || !receipt.path("sizeBytes").isIntegralNumber() || !receipt.path("sizeBytes").canConvertToLong()
+                    || receipt.path("sizeBytes").longValue() <= 0 || receipt.path("sizeBytes").longValue() > 64L * 1024 * 1024) return false;
+        }
+        return left.path("sizeBytes").longValue() == right.path("sizeBytes").longValue();
     }
 
     private ObjectNode collectSourceFacts(HostSession paired, ObjectNode context,
@@ -984,7 +1160,8 @@ public final class MmmmFabricHost implements ModInitializer {
         blockProperties.putObject("properties").put("type", "object").putObject("additionalProperties").put("type", "string").put("minLength", 1);
         patch.withObject("properties").set("expectedState", blockState.deepCopy());
         patch.withObject("properties").set("desiredState", blockState.deepCopy());
-        patch.withArray("required").add("expectedState").add("desiredState");
+        patch.withObject("properties").putObject("expectedRegistryGeneration").put("type", "string").put("pattern", "^(0|[1-9][0-9]{0,18})$");
+        patch.withArray("required").add("expectedState").add("desiredState").add("expectedRegistryGeneration");
         ObjectNode command = ContractJson.newObject().put("type", "object").put("additionalProperties", false);
         command.putObject("properties").putObject("command").put("type", "string").put("minLength", 1).put("maxLength", 65_536);
         command.putArray("required").add("command");
@@ -997,8 +1174,17 @@ public final class MmmmFabricHost implements ModInitializer {
         patchProperties.putObject("kind").put("const", "direct_block_state");
         patchProperties.putObject("setBlockReportedSuccess").put("type", "boolean");
         patchProperties.putObject("indirectEffects").put("const", "not_observed");
+        patchProperties.putObject("knownProducerId").put("const", OwnedBlockPatchPreflight.PRODUCER);
+        patchProperties.putObject("preflightPin").put("type", "string").put("pattern", "^[0-9a-f]{64}$");
+        patchProperties.putObject("directCoverage").put("const", "block_state_cells");
+        patchProperties.putObject("exactUndoSupported").put("const", false);
+        patchProperties.putObject("lossCode").put("const", OwnedBlockPatchPreflight.LOSS);
+        var exactLimitations = patchProperties.putObject("limitations").putArray("const");
+        OwnedBlockPatchPreflight.LIMITATIONS.forEach(exactLimitations::add);
         patchProperties.set("before", observed.deepCopy()); patchProperties.set("after", observed.deepCopy());
         patchOutput.putArray("required").add("kind").add("setBlockReportedSuccess").add("before").add("after").add("indirectEffects");
+        patchOutput.withArray("required").add("knownProducerId").add("preflightPin").add("directCoverage")
+                .add("exactUndoSupported").add("lossCode").add("limitations");
         ObjectNode commandOutput = ContractJson.newObject().put("type", "object").put("additionalProperties", false);
         commandOutput.putObject("properties").putObject("commandReturnInt32").put("type", "integer")
                 .put("minimum", Integer.MIN_VALUE).put("maximum", Integer.MAX_VALUE);
@@ -1006,7 +1192,10 @@ public final class MmmmFabricHost implements ModInitializer {
         commandOutput.putArray("required").add("commandReturnInt32").add("completionClaim");
         List<ObjectNode> result = new ArrayList<>();
         result.add(descriptor("mmmm:block_read", "mmmm:block_state_read", "read", point, observed, digest, "mmmm:world_read", "provider_completion"));
-        result.add(descriptor("mmmm:block_patch", "mmmm:block_state_patch", "write", patch, patchOutput, digest, "mmmm:world_write", "independent_readback"));
+        ObjectNode directPatch = descriptor("mmmm:block_patch", "mmmm:block_state_patch", "write", patch, patchOutput, digest, "mmmm:world_write", "independent_readback");
+        OwnedBlockPatchPreflight.LIMITATIONS.forEach(directPatch.withArray("limitations")::add);
+        directPatch.withArray("limitations").add(OwnedBlockPatchPreflight.LOSS);
+        contracts.validate("ActionDescriptor", directPatch); result.add(directPatch);
         result.add(descriptor("mmmm:command_execute", "mmmm:raw_command", "unknown", command, commandOutput, digest, "mmmm:command_execute", "independent_readback"));
         ObjectNode prepared = ContractJson.newObject().put("type", "object").put("additionalProperties", false);
         prepared.putArray("required").add("preparedChange");
@@ -1048,14 +1237,17 @@ public final class MmmmFabricHost implements ModInitializer {
         definitionCollection.retireAll();
         final List<HostSession> owners; final List<SessionRoute> retired;
         final PairedLoopbackServer oldEndpoint; final HostRuntime oldRuntime; final HostSession oldSession;
+        final NativeCompatibilityApprovals oldCompatibility;
         synchronized (routes) {
             owners = List.copyOf(routes.keySet()); retired = List.copyOf(routes.values());
             oldEndpoint = endpoint; oldRuntime = runtime; oldSession = session;
+            oldCompatibility = compatibilityApprovals; compatibilityApprovals = null;
             owners.forEach(HostSession::close); if (oldSession != null) oldSession.close();
             routes.clear(); routeOrder.clear(); nativeHistory.clear(); nativeHistoryCount = 0; nativeHistoryBytes = 0;
             invocationRoutes.clear(); installedSources = Map.of(); installedActions = Set.of(); installedContexts = List.of();
             endpoint = null; runtime = null; session = null;
         }
+        if (oldCompatibility != null) oldCompatibility.close();
         retired.forEach(route -> route.endpoint().close());
         if (oldEndpoint != null) oldEndpoint.close();
         if (oldRuntime != null) oldRuntime.close();

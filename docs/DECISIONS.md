@@ -83,6 +83,8 @@
 
 | MMMM-D053 | 같은 retained game 디렉터리의 실행 경로 표현은 명시적으로 선택하고 held native identity로 검증한다. | Windows의 가상화된 AppData에서 Java IO와 NIO가 다른 경로 문자열을 보존하여 Fabric의 system library 제외가 깨질 수 있다. 별도 launch directory는 비밀·상대·상위 경로와 link/reparse를 거절한 뒤 현재 소유권 및 원 game handle의 volume/file identity와 대조한다. 기존 root digest·owner·lease를 유지하고 자동 별칭 검색·소유권 채택·자료 이동·복사를 하지 않는다. cwd와 Java 입력의 일관성은 실제 launcher가 고정하며 도구는 argv나 classpath 권한을 확대하지 않는다. 원 기한·자원·출력·drain 및 보존 규칙을 유지하고 실제 원인 및 게임 성공은 별도 관측으로 확인한다. |
 
+| MMMM-D054 | Native pose의 sealed 저작 projection, 직접 블록 codec과 Compatibility의 보호된 승인 사실을 각각 독립 경계로 연결한다. | Display pose의 UUID·type·tag·matrix는 같은 SceneDraft와 AnimationDraft 및 exact target·clip revision·TPS에서만 도출하며 caller 입력이나 실제 실행 승인으로 바꾸지 않는다. 직접 블록의 known은 관측한 block-state subject에 한정한다. 27셀 guard와 보수적 region은 조명·POI·neighbor 등 간접 효과의 완전 범위가 아니며 간접복구·정확 undo 보장 제외를 warning/dropped/명시 승인 loss로 고정한다. 기존 실제 plan·profile·관리자 권한은 유지한다. Compatibility는 같은 보호 SQLite의 실제 native owner·Project·원본 ResourceRef·별도 profile/artifact/interface·현재 Policy 및 local-use scope를 묶은 불변 record에서 출발한다. CAS/import·공개 설정·관측된 profile만으로 승인을 만들지 않는다. private bootstrap은 원 기한·취소·peer stop과 1 MiB frame을 유지하며 최대 128 profile·개별 64 KiB·합계 256 KiB의 전체 map만 전달한다. 선택적 source 실패는 기본 native 읽기 pairing과 분리하고 생성한 Pending·Active 및 완료된 Rejected의 수명에 원 typed cause를 보존한다. Pending 생성 전 fatal 취소·기한과 Complete 전 rollback에서 해당 선택적 읽기 오류의 영구 보존은 발급하지 않는다. 실제 Java interface resolver·실행 권한·게임 tick 재생·클라이언트 시각 및 릴리스 인수는 해당 구현과 실제 증거가 확보될 때까지 미완료다. |
+
 ## 구현 전에 확인할 항목
 
 - 원본 계약과 예제 패키지의 내용, 버전 및 digest.

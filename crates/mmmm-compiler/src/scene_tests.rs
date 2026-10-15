@@ -39,6 +39,7 @@ fn target() -> VerifiedTarget {
 #[derive(Default)]
 struct AuthoredRegistry {
     reject_codec: bool,
+    reject_pose: bool,
     reject_rotation: bool,
     alter_opaque: bool,
     path: Option<String>,
@@ -69,9 +70,15 @@ impl SceneRegistryVerifier for AuthoredRegistry {
         &self,
         _: &VerifiedTarget,
         _: &Sha256Digest,
-        _: &NativeSceneInstruction,
+        instruction: &NativeSceneInstruction,
         _: &str,
     ) -> Result<(), DomainError> {
+        if self.reject_pose && matches!(instruction, NativeSceneInstruction::DisplayPose { .. }) {
+            return Err(DomainError::new(
+                "EVIDENCE_UNVERIFIED",
+                "Authored pose command witness rejected",
+            ));
+        }
         self.checked_lines.set(self.checked_lines.get() + 1);
         Ok(())
     }
@@ -165,6 +172,25 @@ impl SceneRegistryVerifier for AuthoredRegistry {
 /// canonical project owns the actual original clip revision, while scene
 /// lowering only seals its own per-instance node/UUID/origin projection.
 pub(crate) fn animation_pack_fixture() -> (Value, SceneDraft) {
+    animation_pack_fixture_at_tps(20)
+}
+
+pub(crate) fn animation_pose_registry(reject_pose: bool) -> impl SceneRegistryVerifier {
+    AuthoredRegistry {
+        reject_pose,
+        ..AuthoredRegistry::default()
+    }
+}
+
+pub(crate) fn animation_pack_fixture_at_tps(tps: i32) -> (Value, SceneDraft) {
+    animation_pack_fixture_instances(tps, false)
+}
+
+pub(crate) fn animation_pack_fixture_two_instances() -> (Value, SceneDraft) {
+    animation_pack_fixture_instances(20, true)
+}
+
+fn animation_pack_fixture_instances(tps: i32, two_instances: bool) -> (Value, SceneDraft) {
     let mut prefab = prefab_value();
     prefab["nodes"][1]["nodeId"] = json!("door");
     prefab["nodes"][1]["transform"] =
@@ -172,19 +198,77 @@ pub(crate) fn animation_pack_fixture() -> (Value, SceneDraft) {
     prefab["clipIds"] = json!(["clip-door"]);
     stamp("Prefab", &mut prefab);
     let instance = instance_value(&prefab);
-    let mut source = inputs(vec![prefab], vec![instance], vec![], vec![], vec![]);
+    let mut instances = vec![instance];
+    if two_instances {
+        // The existing fixture has one instance; duplicate source identities
+        // cannot exercise disjoint native pose ownership across two instances.
+        let mut second = instances[0].clone();
+        second["instanceId"] = json!("instance-shop-b");
+        stamp("Instance", &mut second);
+        instances.push(second);
+    }
+    let mut source = inputs(vec![prefab], instances, vec![], vec![], vec![]);
     let clip: Value =
         serde_json::from_slice(include_bytes!("../../../examples/animation-clip.json")).unwrap();
     source.project["ownedResources"]
         .as_array_mut()
         .unwrap()
         .push(json!({"kind":"clip","objectId":clip["clipId"],"revision":clip["revision"]}));
+    source.project["gameTicksPerSecond"] = json!({"numerator":tps.to_string(),"denominator":"1"});
     stamp("Project", &mut source.project);
     let project = source.project.clone();
     (
         project,
         lower(source, &AuthoredRegistry::default()).unwrap(),
     )
+}
+
+#[test]
+fn display_pose_codec_emits_one_closed_owned_uuid_merge_without_rounding_caller_values() {
+    let instruction = NativeSceneInstruction::DisplayPose {
+        dimension: ResourceLocation::new("minecraft:overworld").unwrap(),
+        tag: "mmmm.fixture".into(),
+        entity_kind: "block".into(),
+        uuid: [0x11; 16],
+        matrix: *Matrix4::identity().values(),
+    };
+    assert_eq!(
+        Native26_3SceneCodec
+            .encode_instruction(&instruction)
+            .unwrap(),
+        vec![
+            "execute in minecraft:overworld as 11111111-1111-1111-1111-111111111111 if entity @s[type=minecraft:block_display,tag=mmmm.fixture] run data merge entity @s {transformation:[1f,0f,0f,0f,0f,1f,0f,0f,0f,0f,1f,0f,0f,0f,0f,1f],interpolation_duration:0,start_interpolation:0,teleport_duration:0}"
+        ]
+    );
+    for invalid in [f64::NAN, f64::INFINITY, 1.1] {
+        let mut changed = instruction.clone();
+        let NativeSceneInstruction::DisplayPose { matrix, .. } = &mut changed else {
+            unreachable!()
+        };
+        matrix[0] = invalid;
+        assert_eq!(
+            Native26_3SceneCodec
+                .encode_instruction(&changed)
+                .unwrap_err()
+                .code,
+            "NUMERIC_RANGE"
+        );
+    }
+    for unowned in ["tag", "type"] {
+        let mut changed = instruction.clone();
+        let NativeSceneInstruction::DisplayPose {
+            tag, entity_kind, ..
+        } = &mut changed
+        else {
+            unreachable!()
+        };
+        if unowned == "tag" {
+            *tag = "injected,tag=other".into();
+        } else {
+            *entity_kind = "armor_stand".into();
+        }
+        assert!(Native26_3SceneCodec.encode_instruction(&changed).is_err());
+    }
 }
 
 #[test]

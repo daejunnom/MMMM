@@ -8,7 +8,8 @@ use crate::{
     service::{RequestBudget, ServiceError, ServiceExtension, ServiceExtensionContext},
 };
 use mmmm_adapters::{
-    InterfaceObservation, InventorySnapshot, ProfileApproval, ProviderRegistry, RouteContext,
+    InterfaceObservation, InventorySnapshot, ProfileApproval, ProviderDescriptor, ProviderRegistry,
+    RouteContext,
 };
 use mmmm_application::Application;
 use mmmm_compiler::{PackBuildInputs, ResolvedSymbols, VerifiedTarget};
@@ -159,6 +160,23 @@ pub trait FeatureSources {
         _budget: &RequestBudget,
     ) -> Result<CompatibilityInputs<'a>, ServiceError> {
         Err(unavailable())
+    }
+    /// Production registries borrow their private state for this call only.
+    /// Existing sources retain the canonical approval and binding algorithm.
+    fn compatibility_bind(
+        &mut self,
+        access: &FeatureAccess,
+        input: &Value,
+        store: &DurableStore,
+        budget: &RequestBudget,
+    ) -> Result<ProviderDescriptor, ServiceError> {
+        let route = route_context(access)?;
+        let source = self.compatibility(access, input, store, budget)?;
+        budget.check()?;
+        source
+            .registry
+            .bind_compatibility(input, &route, &source.approval, &source.observation)
+            .map_err(adapter_error)
     }
     fn math_inputs(
         &mut self,
@@ -435,15 +453,14 @@ impl FeatureExtension {
                 .map_err(adapter_error)
             }
             "compatibility.bind" => {
-                let route = route_context(access)?;
-                let source =
-                    self.sources
-                        .compatibility(access, input, context.store, context.budget)?;
                 context.check(method)?;
-                let descriptor = source
-                    .registry
-                    .bind_compatibility(input, &route, &source.approval, &source.observation)
-                    .map_err(adapter_error)?;
+                let descriptor = self.sources.compatibility_bind(
+                    access,
+                    input,
+                    context.store,
+                    context.budget,
+                )?;
+                context.check(method)?;
                 serde_json::to_value(descriptor).map_err(|_| invalid_source())
             }
             "catalog.search" | "catalog.describe" => {

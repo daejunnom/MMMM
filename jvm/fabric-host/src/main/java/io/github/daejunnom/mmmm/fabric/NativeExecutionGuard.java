@@ -80,6 +80,7 @@ final class NativeExecutionGuard implements NativeSceneExecutor.NativeInspector 
     private final NativeTombstones tombstones;
     private PendingDispatch pending;
     private OwnedRemoval removal;
+    private OwnedPose pose;
 
     NativeExecutionGuard(ContractJson contracts, MinecraftServer server, ServerPlayer player, LoadedChunks chunks, LoadedEntities entities,
                          Invocation invocation, ObjectNode approvedExecution,
@@ -109,7 +110,7 @@ final class NativeExecutionGuard implements NativeSceneExecutor.NativeInspector 
                                              boolean dispatchBoundary) {
         current(installedContext, approvedExecution);
         requireSealedStep(sealedStep);
-        if (dispatchBoundary) removal = null;
+        if (dispatchBoundary) { removal = null; pose = null; }
         ObjectNode instruction = object(sealedStep, "instruction");
         List<ObservedTarget> targets = targets(approvedExecution, exactApprovedTargets);
         String kind = text(instruction, "kind");
@@ -118,6 +119,7 @@ final class NativeExecutionGuard implements NativeSceneExecutor.NativeInspector 
         }
         switch (kind) {
             case "display" -> requireSpawn(instruction, targets);
+            case "display_pose" -> requirePose(instruction, targets, dispatchBoundary);
             case "display_remove" -> requireRemoval(instruction, targets, dispatchBoundary);
             case "block" -> {
                 BlockPos position = requirePosition(instruction);
@@ -175,6 +177,7 @@ final class NativeExecutionGuard implements NativeSceneExecutor.NativeInspector 
         ParsedValues values = parsedValues(parsed, instruction);
         switch (text(instruction, "kind")) {
             case "display" -> requireDisplayNbt(instruction, values.compound());
+            case "display_pose" -> requireDisplayPoseNbt(instruction, values.compound());
             case "block" -> {
                 BlockInput block = values.block();
                 if (!block.getState().equals(NativeBlocks.decode(instruction.get("state")))) throw invalid();
@@ -215,8 +218,8 @@ final class NativeExecutionGuard implements NativeSceneExecutor.NativeInspector 
         // command solely because its text or typed argument happens to look like a native operation.
         if (dispatchBoundary) {
             requireInstruction(installedContext, approvedExecution, sealedStep, exactApprovedTargets, true);
-            pending = new PendingDispatch(parsed, sealedStep.deepCopy(), commandIndex, removal);
-            removal = null;
+            pending = new PendingDispatch(parsed, sealedStep.deepCopy(), commandIndex, removal, pose);
+            removal = null; pose = null;
         }
     }
 
@@ -231,6 +234,14 @@ final class NativeExecutionGuard implements NativeSceneExecutor.NativeInspector 
                 || parsed.getReader().canRead() || !parsed.getExceptions().isEmpty()) throw invalid();
         parsedValues(parsed, object(prepared.sealedStep(), "instruction"));
         NativeSceneExecutor.requireOperationSignature(prepared.sealedStep(), prepared.commandIndex(), parsed.getReader().getString());
+        if (prepared.pose() != null) {
+            OwnedPose owned = prepared.pose();
+            Entity actual = NativeTargets.requireOwnedEntity(chunks, entities, level(), context, owned.actual().getUUID(),
+                    owned.expectedType(), owned.ownerTag());
+            if (actual != owned.actual()) throw fail("TARGET_IDENTITY_MISMATCH", "The retained pose target is a different actual entity instance");
+            NativeTargets.Observation fresh = inspect(owned.selector());
+            if (!fresh.sha256().equals(owned.beforeSha256())) throw fail("TARGET_DRIFT", "The retained pose target changed before native dispatch");
+        }
         if (prepared.removal() != null) {
             OwnedRemoval owned = prepared.removal();
             Entity actual = NativeTargets.requireOwnedEntity(chunks, entities, level(), context, owned.actual().getUUID(),
@@ -316,6 +327,22 @@ final class NativeExecutionGuard implements NativeSceneExecutor.NativeInspector 
         if (dispatchBoundary) {
             removal = new OwnedRemoval(actual, target.selector().deepCopy(), ContractJson.digest(target.raw()),
                     text(target.selector(), "expectedType"), text(target.record(), "ownerTag"));
+        }
+    }
+
+    private void requirePose(ObjectNode instruction, List<ObservedTarget> targets, boolean dispatchBoundary) {
+        ObservedTarget target = only(targets, "entity"); requireEntitySelector(instruction, target.selector());
+        requireFull(target.raw());
+        if (!"present".equals(target.raw().path("presence").asText()) || !target.record().path("ownerTag").isTextual()
+                || !text(instruction, "tag").equals(text(target.record(), "ownerTag"))) {
+            throw fail("OWNERSHIP_UNPROVEN", "Display pose requires the actual retained entity and its exact sealed ownership tag");
+        }
+        Entity actual = NativeTargets.requireOwnedEntity(chunks, entities, level(), context, uuid(instruction.path("uuid")),
+                text(target.selector(), "expectedType"), text(instruction, "tag"));
+        requirePosition(actual.blockPosition());
+        if (dispatchBoundary) {
+            pose = new OwnedPose(actual, target.selector().deepCopy(), ContractJson.digest(target.raw()),
+                    text(target.selector(), "expectedType"), text(instruction, "tag"));
         }
     }
 
@@ -511,6 +538,7 @@ final class NativeExecutionGuard implements NativeSceneExecutor.NativeInspector 
     private static Set<String> literals(ObjectNode instruction) {
         return switch (text(instruction, "kind")) {
             case "display" -> Set.of("execute", "in", "run", "summon");
+            case "display_pose" -> Set.of("execute", "in", "as", "if", "entity", "run", "data", "merge");
             case "block", "command_shell" -> Set.of("execute", "in", "run", "setblock");
             case "command_data", "command_activation" -> Set.of("execute", "in", "run", "data", "merge", "block");
             case "display_remove" -> Set.of("execute", "in", "as", "if", "entity", "run", "kill");
@@ -597,6 +625,15 @@ final class NativeExecutionGuard implements NativeSceneExecutor.NativeInspector 
         });
     }
 
+    private static void requireDisplayPoseNbt(ObjectNode instruction, CompoundTag actual) {
+        requireFields(actual, Set.of("transformation", "interpolation_duration", "start_interpolation", "teleport_duration"));
+        List<Tag> matrix = list(actual.get("transformation"));
+        if (matrix.size() != 16) throw invalid();
+        for (int index = 0; index < 16; index++) requireFloat(matrix.get(index), instruction.path("matrix").path(index).floatValue());
+        requireInt(actual.get("interpolation_duration"), 0); requireInt(actual.get("start_interpolation"), 0);
+        requireInt(actual.get("teleport_duration"), 0);
+    }
+
     private static void requirePayload(Tag actual, JsonNode desired, int depth, int[] budget) {
         if (++budget[0] > MAX_NBT_NODES || depth > MAX_NBT_DEPTH || actual == null || desired.isNull()) throw invalid();
         if (desired.isObject()) {
@@ -670,7 +707,8 @@ final class NativeExecutionGuard implements NativeSceneExecutor.NativeInspector 
 
     private record ObservedTarget(ObjectNode record, ObjectNode selector, ObjectNode raw) { }
     private record OwnedRemoval(Entity actual, ObjectNode selector, String beforeSha256, String expectedType, String ownerTag) { }
-    private record PendingDispatch(ParseResults<CommandSourceStack> parsed, ObjectNode sealedStep, int commandIndex, OwnedRemoval removal) { }
+    private record OwnedPose(Entity actual, ObjectNode selector, String beforeSha256, String expectedType, String ownerTag) { }
+    private record PendingDispatch(ParseResults<CommandSourceStack> parsed, ObjectNode sealedStep, int commandIndex, OwnedRemoval removal, OwnedPose pose) { }
     private record ParsedValues(List<Object> arguments, List<CommandContextBuilder<CommandSourceStack>> contexts) {
         private CompoundTag compound() {
             CompoundTag result = null;

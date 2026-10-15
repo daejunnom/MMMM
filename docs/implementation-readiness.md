@@ -1015,6 +1015,75 @@ busy와 중단 lease, 소유 기록 변경, 한도 초과와 외부 경로를 �
 각각 확인한다. 제품 DB, CAS, 작업 원장, 복구 자료, 사용자 원본, 다른 checkout과
 릴리스 증거가 정리되지 않음을 확인한다. 검증된 결과에 실제 명령과 환경을 등록한다.
 
+## Sealed pose와 직접 블록 및 Compatibility 연결 작업
+
+현재 작업은 세 경계를 분리하여 연결한다. compiler의 새 `display_pose`는 같은
+sealed scene과 animation draft의 exact clip revision·target·TPS·instance/node
+binding을 대조한다. 이미 컴파일한 target f32 pose만 사용하고 caller matrix나
+UUID를 받지 않으며, 기존 display의 세 interpolation/teleport 필드를 0으로 고정한다.
+이 projection은 실제 tick scheduler, 현재 world before-state 또는 실행 권한이 아니다.
+
+직접 `mmmm:block_patch`는 실제 AIR/STONE 기본 상태와 27셀의 loaded/current 상태를
+전후 확인하는 좁은 preflight와 연결 중이다. Rust는 직접 block-state와 block-entity
+부재를 별도 reader/CAS로 포착한다. `full_target`은 그 정확한 subject bytes의 범위다.
+조명·POI·entity·neighbor 효과는 `not_observed`이며 정확 undo를 보장하지 않는다.
+`INDIRECT_ENGINE_EFFECTS_EXCLUDED` loss는 명시 승인을 요구한다. 이 관측을 모든
+engine 효과의 완전 footprint나 새로운 native profile/관리자 승인으로 사용하지 않는다.
+실제 precondition·dispatch·before-capture·readback·reconcile의 연결 검증이 남아 있다.
+
+Compatibility 승인 저장은 기존 보호 Store에 actual native owner·Project·원본
+ResourceRef raw SHA와 별도의 profile/artifact/interface pin·현재 Policy/local-use scope를
+보존한다. 같은 ref의 exact replay만 허용하고 다른 pin은 충돌한다. cold CLI 선택,
+FN19와 inventory의 같은 canonical binder, 원 bootstrap의 유한 map 전달을 연결 중이다.
+Java helper의 실제 resolver가 없는 상태는 명시적으로 unavailable이며, 메타데이터
+탐지나 승인 저장을 실행 가능한 adapter 또는 실제 AD01/AD02 인수로 표시하지 않는다.
+
+Windows 관리 실행 `implementation-checks-20261014-330`은 새 compiler 오류 반환의
+타입 불일치로 컴파일 exit 101이었다. 이를 수정한 `332`는 compiler 89개와 runtime
+120개 unit 및 compiler doctest 1개가 통과했고 `333`의 두 package/all-target strict
+Clippy도 exit 0이었다. 새 protected record 검사는 기존 SQLite/CAS fixture를 사용하며
+실제 Java/게임 관측을 만들지 않는다. 두 실행의 원 stdout·stderr와 결과는 외부 증거에
+보존했고 drain·출력·export·scratch 정리 및 lease 해제를 확인했다. 나머지 연결의
+전체 Rust/JVM 검사는 별도 수행·기록하며 이 부분 성공을 전체 인수로 확대하지 않는다.
+
+추가 통합의 Windows `335`는 새 observer 하위 모듈의 세 메서드 접근 범위와 기존
+bootstrap fixture 초기화 세 곳 누락으로 컴파일 exit 101이었다. 해당 연결을 수정한
+`337`은 컴파일을 마쳤지만 앱 테스트 EXE가 실제 Application Control `4551`로
+차단되어 한 테스트도 실행되지 않았다. Coordinator 검사가 실행됐다고도 기록하지
+않는다. 원 오류와 stdout·stderr 및 관리 결과는 보존했고 drain·export·scratch와
+lease는 정상 완료했다. 이는 사용자 조건에 따른 해당 검사의 Ubuntu 대체 근거이며,
+Ubuntu 결과는 아직 발급하지 않는다. 선택적 승인 payload의 전체 JSON node 한도와
+Project의 사전 크기·chunk 취소 경계는 독립 리뷰에 따라 보완했다. 보호 DB의 현재
+Project head·blob·길이를 bounded metadata로 먼저 대조하고, 8 MiB 상한과 원 요청의
+chunk별 취소 검사를 통과한 실제 Project만 읽는다. 선택적 map 부착으로 전체 node
+한도를 넘으면 정확한 크기 오류로 처리하며 기본 native pairing은 unavailable map으로
+계속할 수 있다. malformed frame을 일괄 fallback하지 않는다.
+
+Windows `341`의 기본 test thread 구성에서는 기존 native catalog 검사 하나가 기대한
+`SOURCE_UNAVAILABLE` 대신 `CANCELLED`를 받아 실패했다. 소스·기대값·기한을 바꾸지
+않고 CI와 같은 `--test-threads=2`로 실행한 `342`에서는 Coordinator unit 343개가
+통과하고 1개가 ignored였으며, 별도 native stdio의 실제 deadline·drain 검증도 통과했다.
+두 결과를 모두 보존하며 동시 부하를 확정 원인으로 기록하지 않는다. 이어 실행될
+새 Runtime test EXE는 Application Control `4551`로 시작되지 않았으므로 새 Project
+head 검사 3개는 미실행이다. `343`의 앱 unit 16개는 Windows에서 실제 통과했다.
+`342`와 `343`은 출력·drain·export·scratch 정리·lease 해제를 완료했다. 직접 블록의
+Composite 위임은 아직 연결 전이므로 관련 메서드의 unused 경고가 남아 있고,
+현재 변경의 Java 컴파일·검사는 별도 수행 전이다.
+
+고정 `b854b617846036bcb09058ca7da3eed303a1e680`의 Rust CI 50
+(`38698720838`)과 JVM CI 41 (`38698720798`)은 세 OS 및 집계가 모두 성공했다.
+실제 ZIP 6개를 별도 보존하여 크기·SHA와 source/expected/PR head, 별도 event SHA
+`7b9574498d7a29880d36004b4bd987d6dc1ba0b2`, 명령·raw pin 및 종료·정리 연결을
+대조했다. JVM은 각 OS 7모듈 333개와 필수 11 tasks를 실제 실행했다. 이 결과는
+추가 중인 현재 source나 게임 인수의 성공을 대신하지 않는다. Linux 최초 candidate
+stat-open ESRCH의 실제 skip 양성은 해당 성공 자료에 없고, macOS Rust test의 실제
+rusage/member Pending 1건은 start/exit 존재 bool을 보존하지만 전환 지속시간은 없다.
+
+사용자가 계정 인증 문제로 Minecraft 클라이언트에 접속할 수 없다고 확인했다.
+로그인·실제 관리자 pairing·클라이언트 시각 검증은 미실행이며, 계정 설정이나 인증
+우회로 이 항목을 대체하지 않는다. 초기 Windows 서버 Ready와 정상 stop/save 로그는
+앞서 기록한 범위의 관측으로 유지하고 전체 G2/G3 또는 공개 배포 완료로 표시하지 않는다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

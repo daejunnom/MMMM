@@ -381,3 +381,208 @@ fn contradictory_resource_aliases_cannot_choose_a_desired_source() {
         "STALE_CONTEXT"
     );
 }
+
+/// The existing canonical DTOs are enough for these closed decoder boundaries.
+/// This in-memory response is factual test input, never pairing, source approval,
+/// a runtime profile, actual native readback or game acceptance evidence.
+fn direct_block_receipt() -> (Value, Value, block_footprint::SourcePins) {
+    let context = example(include_bytes!("../../../examples/execution-context.json"));
+    let pins = block_footprint::SourcePins {
+        host: raw_digest(b"own-host-artifact-test-only"),
+        source_facts: raw_digest(b"actual-source-facts-test-only"),
+    };
+    let mut cells = Vec::new();
+    for y in -1..=1 {
+        for z in -1..=1 {
+            for x in -1..=1 {
+                cells.push(json!({"position":[x,64+y,z],"state":{"blockId":"minecraft:air","properties":{}},
+            "registryIdentity":"vanilla_air","blockEntityAbsent":true,"fluidEmpty":true}));
+            }
+        }
+    }
+    let mut receipt = json!({"format":"mmmm.owned-block-footprint/1","status":"known","reasonCode":null,
+        "producerId":"mmmm:vanilla_air_stone_direct_block_patch/v1","hostArtifactDigest":pins.host,
+        "implementationDigest":pins.host,"profileDigest":block_footprint::direct_profile(&pins.host).unwrap(),
+        "runtimeSourceFactsDigest":pins.source_facts,"registryGeneration":"7","contextDigest":context["contextDigest"],
+        "dimension":"minecraft:overworld","position":[0,64,0],
+        "expectedState":{"blockId":"minecraft:air","properties":{}},
+        "desiredState":{"blockId":"minecraft:stone","properties":{}},"observedFromTick":"100","observedToTick":"100",
+        "cells":cells,"conditionsDigest":null,"directCoverage":"block_state_cells","indirectEffects":"not_observed",
+        "exactUndoSupported":false,"lossCode":"INDIRECT_ENGINE_EFFECTS_EXCLUDED",
+        "limitations":["conservative_3x3x3_fence_only","entity_poi_lighting_neighbor_effects_not_observed",
+            "indirect_effect_recovery_not_guaranteed","exact_undo_not_supported"]});
+    revise_direct_conditions(&mut receipt);
+    (receipt, context, pins)
+}
+fn direct_block_arguments(receipt: &Value) -> Value {
+    json!({"dimension":receipt["dimension"],"position":receipt["position"],
+        "expectedState":receipt["expectedState"],"desiredState":receipt["desiredState"],"expectedRegistryGeneration":receipt["registryGeneration"]})
+}
+fn revise_direct_conditions(receipt: &mut Value) {
+    let mut stable = receipt.clone();
+    let fields = stable.as_object_mut().unwrap();
+    for field in ["observedFromTick", "observedToTick", "conditionsDigest"] {
+        fields.remove(field);
+    }
+    receipt["conditionsDigest"] = json!(canonical_digest(&stable).unwrap());
+}
+
+#[test]
+fn direct_block_receipt_binds_current_pins_and_preserves_indirect_limitations() {
+    let (receipt, context, pins) = direct_block_receipt();
+    let arguments =
+        block_footprint::BlockArguments::decode(&direct_block_arguments(&receipt)).unwrap();
+    assert!(block_footprint::decode_receipt(&receipt, &arguments, &pins, &context).is_ok());
+    for field in [
+        "contextDigest",
+        "runtimeSourceFactsDigest",
+        "hostArtifactDigest",
+        "implementationDigest",
+    ] {
+        let mut changed = receipt.clone();
+        changed[field] = json!(raw_digest(b"different-current-source"));
+        revise_direct_conditions(&mut changed);
+        assert_eq!(
+            block_footprint::decode_receipt(&changed, &arguments, &pins, &context)
+                .err()
+                .unwrap()
+                .code,
+            "STALE_CONTEXT"
+        );
+    }
+    for (field, value) in [
+        ("exactUndoSupported", json!(true)),
+        ("indirectEffects", json!("complete")),
+        ("directCoverage", json!("all_engine_effects")),
+        ("limitations", json!([])),
+    ] {
+        let mut changed = receipt.clone();
+        changed[field] = value;
+        revise_direct_conditions(&mut changed);
+        assert!(block_footprint::decode_receipt(&changed, &arguments, &pins, &context).is_err());
+    }
+    let loss = block_footprint::direct_limitation();
+    validate("LossRecord", &loss).unwrap();
+    assert_eq!(loss["disposition"], "dropped");
+    assert_eq!(loss["severity"], "warning");
+    assert_eq!(loss["approvalRequired"], true);
+}
+
+#[test]
+fn direct_block_receipt_rejects_reordered_cells_unknown_reasons_and_reconstructed_recipe() {
+    let (receipt, context, pins) = direct_block_receipt();
+    let arguments =
+        block_footprint::BlockArguments::decode(&direct_block_arguments(&receipt)).unwrap();
+    for variant in 0..5 {
+        let mut changed = receipt.clone();
+        match variant {
+            0 => changed["cells"].as_array_mut().unwrap().swap(0, 1),
+            1 => changed["cells"][0]["fluidEmpty"] = json!(false),
+            2 => changed["profileDigest"] = json!(raw_digest(b"caller-reconstructed-profile")),
+            3 => changed["cells"][0]["registryIdentity"] = json!("caller_air_alias"),
+            _ => {
+                changed["extraGrant"] = json!(true);
+            }
+        }
+        revise_direct_conditions(&mut changed);
+        assert!(block_footprint::decode_receipt(&changed, &arguments, &pins, &context).is_err());
+    }
+    let mut unsupported = receipt;
+    unsupported["status"] = json!("unsupported");
+    unsupported["cells"] = json!([]);
+    unsupported["conditionsDigest"] = Value::Null;
+    unsupported["reasonCode"] = json!("OWNED_BLOCK_NEIGHBOR_NOT_AIR");
+    assert_eq!(
+        block_footprint::decode_receipt(&unsupported, &arguments, &pins, &context)
+            .err()
+            .unwrap()
+            .code,
+        "CAPABILITY_UNAVAILABLE"
+    );
+    unsupported["reasonCode"] = json!("PERMISSION_DENIED");
+    assert_eq!(
+        block_footprint::decode_receipt(&unsupported, &arguments, &pins, &context)
+            .err()
+            .unwrap()
+            .code,
+        "INVALID_INPUT"
+    );
+}
+
+#[test]
+fn direct_block_arguments_are_closed_and_neighbors_never_wrap_int32() {
+    let (receipt, _, _) = direct_block_receipt();
+    let args = direct_block_arguments(&receipt);
+    for invalid_position in [
+        json!([i32::MIN, 64, 0]),
+        json!([i32::MAX, 64, 0]),
+        json!([0, 64.5, 0]),
+    ] {
+        let mut changed = args.clone();
+        changed["position"] = invalid_position;
+        assert!(block_footprint::BlockArguments::decode(&changed).is_err());
+    }
+    let mut extra = args.clone();
+    extra["producerId"] = receipt["producerId"].clone();
+    assert!(block_footprint::BlockArguments::decode(&extra).is_err());
+    let mut generation = args;
+    generation["expectedRegistryGeneration"] = json!("007");
+    assert!(block_footprint::BlockArguments::decode(&generation).is_err());
+}
+
+#[test]
+fn direct_block_readiness_requires_actual_builtin_source_and_current_descriptor() {
+    let (receipt, context, pins) = direct_block_receipt();
+    let mut provider = example(include_bytes!("../../../examples/provider-supported.json"));
+    provider["providerId"] = json!("mmmm:native");
+    provider["origin"] = json!({"kind":"builtin","sourceId":"mmmm_host","sourceDigest":pins.host});
+    provider["environment"] = context["environment"].clone();
+    let action = &mut provider["actions"][0];
+    action["actionId"] = json!("mmmm:block_patch");
+    action["semanticKind"] = json!("mmmm:block_state_patch");
+    action["effect"] = json!("write");
+    action["verificationRequirement"] = json!("independent_readback");
+    action["requiredPermissions"] = json!(["mmmm:world_write"]);
+    action["implementationDigest"] = json!(pins.host);
+    action["inputSchema"] = json!({"type":"object","additionalProperties":false,
+        "required":["dimension","position","expectedState","desiredState","expectedRegistryGeneration"],
+        "properties":{"dimension":{"type":"string"},"position":{"type":"array"},"expectedState":{"type":"object"},
+            "desiredState":{"type":"object"},"expectedRegistryGeneration":{"type":"string"}}});
+    action["outputSchema"] = json!({"type":"object","additionalProperties":false,
+        "required":["kind","setBlockReportedSuccess","before","after","indirectEffects","knownProducerId","preflightPin",
+            "directCoverage","exactUndoSupported","lossCode","limitations"],
+        "properties":{"kind":{"const":"direct_block_state"},"indirectEffects":{"const":"not_observed"},
+            "knownProducerId":{"const":receipt["producerId"]},"directCoverage":{"const":"block_state_cells"},
+            "exactUndoSupported":{"const":false},"lossCode":{"const":receipt["lossCode"]},"limitations":{"const":receipt["limitations"]}}});
+    let provider: mmmm_adapters::ProviderDescriptor = serde_json::from_value(provider).unwrap();
+    let hello = json!({"hostBuild":pins.host,"environment":context["environment"],"gameVersion":"26.3","javaMajor":25,"loader":{"id":"fabric"}});
+    assert_eq!(
+        block_footprint::known_losses(&provider, &provider.actions[0], &hello, &context),
+        Some(BTreeSet::from(["INDIRECT_ENGINE_EFFECTS_EXCLUDED".into()]))
+    );
+    let mut other = provider.clone();
+    other.origin.source_id = "other_sdk_mod".into();
+    assert!(block_footprint::known_losses(&other, &other.actions[0], &hello, &context).is_none());
+    let mut other = provider.clone();
+    other.actions[0].implementation_digest = raw_digest(b"another-implementation");
+    assert!(block_footprint::known_losses(&other, &other.actions[0], &hello, &context).is_none());
+    let mut other = provider;
+    other.actions[0].output_schema["properties"]["exactUndoSupported"]["const"] = json!(true);
+    assert!(block_footprint::known_losses(&other, &other.actions[0], &hello, &context).is_none());
+}
+
+#[test]
+fn direct_block_host_failure_keeps_the_simultaneous_current_checkpoint_cause() {
+    let result: AppResult<()> = block_footprint::finish(
+        Err(error("NATIVE_OBSERVATION_FAILED", "Original host failure")),
+        Err(error("TIME_BUDGET_EXCEEDED", "Original call ended")),
+    );
+    let failure = result.err().unwrap();
+    assert_eq!(failure.code, "NATIVE_OBSERVATION_FAILED");
+    let source = std::error::Error::source(&failure).unwrap();
+    assert!(source.to_string().contains("TIME_BUDGET_EXCEEDED"));
+    assert_eq!(
+        source.source().unwrap().to_string(),
+        "NATIVE_OBSERVATION_FAILED: Original host failure"
+    );
+}

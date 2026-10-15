@@ -441,6 +441,7 @@ public final class NativePlanApproval {
     private static void validateInstruction(ObjectNode instruction, String phase) {
         String kind = text(instruction, "kind"); Set<String> fields = switch (kind) {
             case "display" -> Set.of("kind", "dimension", "tag", "entity_kind", "uuid", "position", "matrix", "payload");
+            case "display_pose" -> Set.of("kind", "dimension", "tag", "entity_kind", "uuid", "matrix");
             case "block" -> Set.of("kind", "dimension", "position", "state");
             case "command_shell" -> Set.of("kind", "dimension", "position", "command_kind", "facing", "conditional");
             case "command_data" -> Set.of("kind", "dimension", "position", "source");
@@ -455,7 +456,7 @@ public final class NativePlanApproval {
         // A valid phase alone grants no authority over an indirect command body.
         boolean phaseMatches = switch (phase) {
             case "stage" -> Set.of("display", "block", "command_shell", "command_data", "state_initialize").contains(kind);
-            case "activate" -> "command_activation".equals(kind);
+            case "activate" -> Set.of("command_activation", "display_pose").contains(kind);
             case "cleanup" -> Set.of("state_remove", "display_remove").contains(kind)
                     || ("command_activation".equals(kind) && instruction.path("auto").isBoolean() && !instruction.path("auto").booleanValue());
             default -> false;
@@ -470,6 +471,9 @@ public final class NativePlanApproval {
         if ("display".equals(kind)) {
             boundedText(instruction, "tag", 256); finiteVector(instruction.path("position"), 3, false); finiteVector(instruction.path("matrix"), 16, true);
             ContractJson.object(instruction.path("payload"));
+        } else if ("display_pose".equals(kind)) {
+            if (!boundedText(instruction, "tag", 128).matches("[A-Za-z0-9_.#-]+")) throw invalid("Display pose ownership tag is not a literal native token");
+            finiteVector(instruction.path("matrix"), 16, true);
         } else if (instruction.has("position")) integerVector(instruction.path("position"), 3);
         if ("block".equals(kind)) {
             ObjectNode state = ContractJson.object(instruction.path("state")); exact(state, Set.of("blockId", "properties")); location(state, "blockId");
@@ -508,17 +512,22 @@ public final class NativePlanApproval {
     }
 
     private static void validatePresence(ObjectNode execution, Map<String, ObjectNode> observed) {
+        Set<String> poses = new HashSet<>();
         for (ObjectNode target : observed.values()) {
             ObjectNode selector = ContractJson.object(target.path("selector")); boolean spawn = false; boolean remove = false;
             for (JsonNode step : execution.path("steps")) {
                 ObjectNode instruction = ContractJson.object(step.path("instruction")); String kind = text(instruction, "kind");
-                if ((!"display".equals(kind) && !"display_remove".equals(kind)) || !"entity".equals(text(selector, "kind"))) continue;
+                if (!Set.of("display", "display_pose", "display_remove").contains(kind) || !"entity".equals(text(selector, "kind"))) continue;
                 if (!text(instruction, "dimension").equals(text(selector, "dimension"))
                         || !("minecraft:" + text(instruction, "entity_kind") + "_display").equals(text(selector, "expectedType"))
                         || !nativeUuid(instruction.path("uuid")).equals(text(selector, "uuid"))) continue;
                 if ("display".equals(kind)) {
                     if (!target.path("ownerTag").isTextual() || !text(instruction, "tag").equals(text(target, "ownerTag"))) throw invalid("Spawn ownership tag differs from its sealed source");
                     spawn = true;
+                } else if ("display_pose".equals(kind)) {
+                    if (!"present".equals(text(target, "expectedPresence")) || !target.path("ownerTag").isTextual()
+                            || !text(instruction, "tag").equals(text(target, "ownerTag"))) throw invalid("Display pose requires its exact present owned before target");
+                    poses.add(ContractJson.digest(step));
                 } else {
                     if (!target.path("ownerTag").isTextual() || !"present".equals(text(target, "expectedPresence"))) throw invalid("Destructive entity target needs present owned before state");
                     remove = true;
@@ -526,6 +535,11 @@ public final class NativePlanApproval {
             }
             if ("unknown".equals(text(target, "expectedPresence")) && (!spawn || remove)) throw invalid("Unknown before state is permitted only for a sealed scoped spawn attempt");
             if (spawn && "present".equals(text(target, "expectedPresence"))) throw invalid("A display spawn cannot overwrite an observed UUID");
+        }
+        for (JsonNode step : execution.path("steps")) {
+            if ("display_pose".equals(step.path("instruction").path("kind").asText()) && !poses.contains(ContractJson.digest(step))) {
+                throw invalid("Display pose lacks its exact UUID, type, dimension and owned before target");
+            }
         }
     }
     private static String nativeUuid(JsonNode value) {

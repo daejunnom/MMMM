@@ -15,9 +15,10 @@ use crate::{
         ObservedStateSnapshot, PlanningDataPort, PlanningStore, SharedPlanningBackend,
         SharedPlanningContexts, SharedPlanningData, SharedPlanningDependencies,
     },
+    production_factory::RegisteredCompatibilityProfiles,
     service::{RequestBudget, RequestContextSlot, ServiceError},
 };
-use mmmm_adapters::InventorySnapshot;
+use mmmm_adapters::{InventorySnapshot, ProviderDescriptor};
 use mmmm_application::{Access, AppError, AppResult};
 use mmmm_compiler::ResolvedSymbols;
 use mmmm_contracts::strict_json::{ControlledJsonError, parse_json_with_control};
@@ -586,6 +587,7 @@ pub struct FeatureSourceComposition {
     pub catalog: Option<RegisteredCatalogSources>,
     pub permissions: Option<SharedFeaturePermissions>,
     pub symbols: Option<SharedFeatureSymbols>,
+    pub compatibility: RegisteredCompatibilityProfiles,
 }
 #[derive(Clone, Default)]
 struct FeatureOrigin {
@@ -932,6 +934,47 @@ impl LocalFeatureSources {
 }
 
 impl FeatureSources for LocalFeatureSources {
+    fn compatibility_bind(
+        &mut self,
+        access: &FeatureAccess,
+        input: &Value,
+        store: &DurableStore,
+        budget: &RequestBudget,
+    ) -> Result<ProviderDescriptor, ServiceError> {
+        let (principal, _) = self.current(access, budget)?;
+        let context = access
+            .context
+            .as_ref()
+            .ok_or_else(|| service(unavailable()))?;
+        let result = self.composition.compatibility.bind(
+            store,
+            &principal,
+            context,
+            &access.granted_permissions,
+            input,
+            budget,
+        );
+        // Preserve the native/host/storage cause if the original entered call
+        // also loses its local request authority after the bounded observation.
+        let current = self
+            .current(access, budget)
+            .map(|_| ())
+            .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause));
+        match (result, current) {
+            (Ok(descriptor), Ok(())) => Ok(descriptor),
+            (Err(cause), Ok(())) | (Ok(_), Err(cause)) => {
+                Err(ServiceError::caused_by(cause.code, cause.message, cause))
+            }
+            (Err(primary), Err(checkpoint)) => Err(ServiceError::caused_by(
+                primary.code,
+                primary.message,
+                crate::host::NativePairingOwnerFailure {
+                    primary,
+                    checkpoint,
+                },
+            )),
+        }
+    }
     fn access(
         &mut self,
         principal: &AuthenticatedPrincipal,

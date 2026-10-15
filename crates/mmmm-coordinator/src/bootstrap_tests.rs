@@ -196,6 +196,24 @@ fn approved_scope_rebinds_only_context_world_and_defers_session_activation() {
     );
     assert_eq!(reply.value()["approvedActions"], json!([descriptor_digest]));
     assert_eq!(reply.value()["writeProfileVerified"], false);
+    assert_eq!(
+        reply.value()["compatibilityApprovals"],
+        json!({
+            "status":"unavailable","reasonCode":"APPROVAL_SOURCE_UNAVAILABLE","profiles":[]
+        })
+    );
+    // This legacy fixture has no native-owned approval source. Preserve the
+    // optional source failure without fabricating compatibility registration
+    // or preventing the already approved native read-only pairing.
+    assert!(
+        processor
+            .pending
+            .values()
+            .next()
+            .unwrap()
+            .compatibility_failure
+            .is_some()
+    );
     let context = &reply.value()["contexts"][0];
     verify_projected_digest("ExecutionContext", context).unwrap();
     assert_ne!(context["contextId"], "template-context");
@@ -1576,6 +1594,7 @@ fn expiration_and_shutdown_preserve_newer_authority_generation() {
             context_id: context_id.clone(),
             route_owner: None,
             expires: Instant::now() - Duration::from_millis(1),
+            _compatibility_failure: None,
         },
     );
     authority
@@ -1605,6 +1624,7 @@ fn expiration_and_shutdown_preserve_newer_authority_generation() {
             context_id,
             route_owner: None,
             expires: Instant::now() + SESSION_LIFETIME,
+            _compatibility_failure: None,
         },
     );
     processor.shutdown().unwrap();
@@ -1756,6 +1776,7 @@ fn game_principal_session_cannot_union_native_owner_workspace_contexts() {
             context_id: game_context.clone(),
             route_owner: None,
             expires: Instant::now() + Duration::from_secs(60),
+            _compatibility_failure: None,
         },
     );
     let current = processor.current_session_policy().unwrap();
