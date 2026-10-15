@@ -50,12 +50,8 @@ public final class NativePlanApproval {
     private final Map<String, ObjectNode> steps = new HashMap<>();
     private final Map<String, ObjectNode> executions = new HashMap<>();
     private final Map<String, List<NativeActivationApproval>> activationProofs = new HashMap<>();
-    private final Map<String, Reservation> reservations = new HashMap<>();
-    private final Map<String, String> invocationSteps = new HashMap<>();
+    private final NativeInvocationReservations reservations;
     private HostSession approvedSession;
-    private String operationId;
-
-    private record Reservation(String invocationId, String wireDigest) { }
 
     public NativePlanApproval(ContractJson contracts, JsonNode value) { this(contracts, value, Clock.systemUTC()); }
 
@@ -74,6 +70,7 @@ public final class NativePlanApproval {
         for (String field : Set.of("planHash", "policyRevision")) sha(manifest, field);
         try { expiresAt = Instant.parse(text(manifest, "expiresAt")); }
         catch (DateTimeParseException exception) { throw invalid("Approval expiry is not an instant"); }
+        reservations = new NativeInvocationReservations(expiresAt, clock);
         for (JsonNode valuePin : array(manifest, "contextPins", 1, MAX_STEPS)) {
             contracts.validate("ContextPin", valuePin); ObjectNode pin = ContractJson.object(valuePin).deepCopy();
             if (!"game".equals(pin.path("environment").path("kind").asText())) throw invalid("Native approval needs a game context");
@@ -212,30 +209,18 @@ public final class NativePlanApproval {
             requireScopeSubset(ContractJson.object(execution.path("targetScope")), context);
             preparedChange(invocation, execution);
         }
-        String wireDigest = ContractJson.digest(invocation.wire()); Reservation previous = reservations.get(invocation.stepId());
-        if (previous != null && (!previous.invocationId().equals(invocation.invocationId()) || !previous.wireDigest().equals(wireDigest))) throw rebound();
-        if (operationId != null && !operationId.equals(invocation.operationId())) throw rebound();
-        String previousStep = invocationSteps.get(invocation.invocationId());
-        if (previousStep != null && !previousStep.equals(invocation.stepId())) throw rebound();
-        if (!clock.instant().isBefore(expiresAt) && (write || previous == null)) {
-            throw expired();
-        }
+        NativeInvocationReservations.Candidate candidate = reservations.inspect(invocation, write);
         validateStepScope(context, step);
-        if (previous == null) {
+        if (reservations.admit(candidate)) {
             approvedSession = session;
-            operationId = invocation.operationId();
-            reservations.put(invocation.stepId(), new Reservation(invocation.invocationId(), wireDigest));
-            invocationSteps.put(invocation.invocationId(), invocation.stepId());
         }
     }
 
     /** No CAS access or domain lowering: return only the immutable authority projection. */
     public synchronized ObjectNode execution(Invocation invocation) {
         if (approvedSession == null) throw mismatch(); approvedSession.checkOpen();
-        requireStep(invocation); Reservation reservation = reservations.get(invocation.stepId());
-        if (reservation == null || !reservation.invocationId().equals(invocation.invocationId())
-                || !reservation.wireDigest().equals(ContractJson.digest(invocation.wire()))
-                || !invocation.operationId().equals(operationId)) throw mismatch();
+        requireStep(invocation);
+        if (!reservations.containsExact(invocation)) throw mismatch();
         ObjectNode execution = executions.get(invocation.stepId());
         if (execution == null) throw new ContractException("NATIVE_EXECUTION_UNAPPROVED", "This approved step has no native execution");
         preparedChange(invocation, execution); return execution.deepCopy();

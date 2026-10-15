@@ -95,6 +95,44 @@ final class NativePlanApprovalTest {
                 () -> expired.checkInvocation(session, invocation, false)).code());
     }
 
+    @Test void externalTargetsNeverSatisfyTheOrdinaryResourceAclOrConsumeItsReservation() throws IOException {
+        ObjectNode wire = fixture(); ObjectNode context = wire.withObject("context");
+        context.withObject("scope").withArray("externalTargetIds").add("calibration-objective-fixture");
+        repinContext(wire);
+        ObjectNode source = manifest(wire, false); ObjectNode step = first(source, "steps");
+        step.withArray("resourcesRead").add("calibration-objective-fixture");
+        step.withArray("resourcesWritten").add("calibration-objective-fixture");
+        NativePlanApproval ordinary = approval(source); HostSession session = session(wire);
+        assertEquals("NATIVE_APPROVAL_MISMATCH", assertThrows(ContractException.class,
+                () -> ordinary.checkSession(session)).code());
+        assertEquals("NATIVE_APPROVAL_MISMATCH", assertThrows(ContractException.class,
+                () -> ordinary.checkInvocation(session, invocation(wire), true)).code());
+        ObjectNode other = wire.deepCopy().put("operationId", "another-operation").put("invocationId", "another-invocation");
+        assertEquals("NATIVE_APPROVAL_MISMATCH", assertThrows(ContractException.class,
+                () -> ordinary.checkInvocation(session, invocation(other), true)).code(),
+                "A failed resource ACL must not become a sticky admission or an external-target grant");
+    }
+
+    @Test void reservationCandidatesBindTheirOwnerGenerationAndFirstAdmissionExpiry() throws IOException {
+        Invocation original = invocation(fixture()); Instant expiry = Instant.parse("2026-10-13T12:01:00Z");
+        NativeInvocationReservations first = new NativeInvocationReservations(expiry, clock);
+        NativeInvocationReservations second = new NativeInvocationReservations(expiry, clock);
+        NativeInvocationReservations.Candidate foreign = first.inspect(original, true);
+        assertEquals("NATIVE_APPROVAL_REBOUND", assertThrows(ContractException.class, () -> second.admit(foreign)).code());
+        NativeInvocationReservations.Candidate current = first.inspect(original, true);
+        assertTrue(first.admit(current));
+        assertEquals("NATIVE_APPROVAL_REBOUND", assertThrows(ContractException.class, () -> first.admit(foreign)).code());
+        NativeInvocationReservations.Candidate history = first.inspect(original, false);
+        NativeInvocationReservations.Candidate expiresBeforeInsert = second.inspect(original, true);
+        clock.now = expiry;
+        assertEquals("NATIVE_APPROVAL_EXPIRED", assertThrows(ContractException.class,
+                () -> second.admit(expiresBeforeInsert)).code());
+        assertFalse(second.containsExact(original), "A first claim must not cross expiry while its owner checks the typed scope");
+        assertFalse(first.admit(history), "An exact historical candidate remains a no-mutation result after expiry");
+        assertTrue(first.containsExact(original));
+        assertDoesNotThrow(() -> first.inspect(original, false));
+    }
+
     @Test void differentStepsShareOneOperationButCannotReuseAnInvocationId() throws IOException {
         ObjectNode wire = fixture(); ObjectNode source = manifest(wire, false);
         ObjectNode secondStep = first(source, "steps").deepCopy().put("stepId", "second-step"); source.withArray("steps").add(secondStep);

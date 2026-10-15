@@ -1654,6 +1654,26 @@ EX14 전체 인수 성공으로 표시하지 않는다. 마지막 두 실행은 
 원 로그·실패를 보존했고 owned-tail 정리 뒤 drain·완전한 출력·export·scratch 정리·
 lease 해제를 확인했다. 이 source의 strict Clippy와 새 고정 SHA CI는 아직 미실행이다.
 
+## 공통 Invocation reservation 집중 검증
+
+D069는 기존 NativePlanApproval의 sticky 상태만 권한 중립 primitive로 분리하며 일반
+resource ACL을 유지한다. 독립 source 리뷰에서 inspect와 insert 사이 만료 P2를 발견해
+최초 insert 직전에 원 Clock/expiry를 다시 검사했고 재리뷰에서 해소했다. 외부 Candidate,
+stale generation, 원 Invocation 재바인딩과 ACL 실패는 새 claim을 만들지 않으며 정확한
+historical nonwrite 조회는 기존 동작을 유지한다.
+
+Windows 관리 JVM `444`는 source base `bf0f253b5d0dcdaa2208637a6959bd6dacc2fb6b`와
+수정된 host-core 3파일을 구분해 검증했다. 고정 전체 SHA의 clean checkout 검사가 아니다.
+선택한 SDK/host-core·계약/예제·Gradle 설정 입력 94개의 전후 pin이 같았고 input manifest
+SHA-256은 `f543b4b0caea700cfd38d5a7584e3a1c324bc226c57a7428add69dd04d3bdf05`다.
+두 필수 Gradle test task가 실제 실행되어 SDK 108개·host-core 96개가 통과했으며 XML
+14개를 CreateNew/flush/hash 대조하여 외부 evidence에 보존했다. command exit 0·22,191 ms,
+Job commit peak 1,192,431,616 bytes·6 process·최대 sample gap 148 ms이며 자연 종료·
+drain·완전한 출력·export·scratch 정리·lease 해제를 확인했다. 요약 6,551 bytes·SHA-256은
+`f73038d7d668db68aaccd075159d39826f3ee82db8f90513601fa9a1fa61d9c3`다.
+작성 중인 Fabric 승인 binding·full image·실제 runner/Source3는 이 집중 검사의 입력이나
+성공 범위에 포함하지 않는다. 전체 JVM 및 게임 검증은 조합 source 동결 뒤 별도다.
+
 ## 공유 고정 SHA의 CI 실패 구분
 
 추가 Windows API 관측 `438`은 Brigadier/native custom 실행 interface 10개,
