@@ -324,204 +324,260 @@ impl DurableStore {
         resolution_witness: Option<&BlobRef>,
         undo_authorization: Option<super::undo::UndoIntentAuthorization<'_>>,
     ) -> StorageResult<StepRecord> {
-        self.validator
-            .validate("Invocation", invocation)
-            .map_err(|e| StorageError::Contract(e.to_string()))?;
-        let bytes = encode_json(invocation).map_err(|e| StorageError::Contract(e.to_string()))?;
-        let blob = self.cas.put(&bytes)?;
-        let invocation_id: InvocationId =
-            serde_json::from_value(invocation["invocationId"].clone())
+        self.dispatch_intent_authorized(
+            operation,
+            step_id,
+            invocation,
+            resolution_witness,
+            undo_authorization,
+            None,
+        )
+    }
+
+    pub(crate) fn dispatch_intent_authorized(
+        &mut self,
+        operation: &OperationId,
+        step_id: &StepId,
+        invocation: &Value,
+        resolution_witness: Option<&BlobRef>,
+        undo_authorization: Option<super::undo::UndoIntentAuthorization<'_>>,
+        calibration_authorization: Option<
+            super::calibration_approval::CalibrationIntentAuthorization<'_>,
+        >,
+    ) -> StorageResult<StepRecord> {
+        let result = (|| {
+            self.validator
+                .validate("Invocation", invocation)
                 .map_err(|e| StorageError::Contract(e.to_string()))?;
-        // The unique mutable Store borrow and exclusive root lease protect
-        // this connection. The undo hook shares read-only durable verification
-        // on the same connection; all live provider reads precede this tx.
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let mut record = read_record(&transaction, operation)?;
-        if record.cancellation_requested
-            || record.reconciliation_required
-            || !matches!(
-                record.state,
-                OperationState::Queued | OperationState::Running
-            )
-        {
-            return Err(StorageError::InvalidTransition(
-                "New dispatch requires queued or running state".into(),
-            ));
-        }
-        let index = record
-            .steps
-            .iter()
-            .position(|s| &s.step_id == step_id)
-            .ok_or(StorageError::NotFound("Plan step"))?;
-        if record.steps[index].dispatch != DispatchEvidence::NotSent || record.steps[index].finished
-        {
-            return Err(StorageError::Conflict(
-                "Step already has a durable dispatch intent",
-            ));
-        }
-        if invocation["operationId"] != operation.as_str()
-            || invocation["stepId"] != step_id.as_str()
-            || invocation["context"]["projectId"] != record.project_id.as_str()
-            || invocation["context"]["principalRef"] != record.principal.as_str()
-        {
-            return Err(StorageError::Conflict("Invocation identity"));
-        }
-        if undo_authorization.is_none() {
-            super::undo::reject_recovery_only_route(&transaction, invocation)?;
-        } else if resolution_witness.is_some() {
-            return Err(StorageError::Conflict(
-                "Provider undo cannot use result resolution authorization",
-            ));
-        }
-        // Context/action/implementation pins must match the frozen step; the
-        // application separately validates expiry, grant and target preconditions.
-        let plan = Self::load_plan_in(&transaction, &self.cas, &record.plan_id, &record.plan_hash)?;
-        let step = plan["steps"]
-            .as_array()
-            .and_then(|s| s.iter().find(|s| s["stepId"] == step_id.as_str()))
-            .ok_or(StorageError::NotFound("Frozen plan step"))?;
-        for field in [
-            "bindingId",
-            "actionId",
-            "actionContractVersion",
-            "actionDigest",
-            "implementationDigest",
-        ] {
-            if invocation[field] != step[field] {
-                return Err(StorageError::Conflict("Frozen invocation route"));
-            }
-        }
-        if invocation["context"]["contextId"] != step["contextId"] {
-            return Err(StorageError::Conflict("Frozen step context"));
-        }
-        let context_hash =
-            mmmm_contracts::verify_projected_digest("ExecutionContext", &invocation["context"])
-                .map_err(|e| StorageError::Contract(e.to_string()))?;
-        if invocation["contextDigest"] != context_hash.as_str()
-            || invocation["context"]["policyRevision"] != plan["policyRevision"]
-            || !plan["contextPins"].as_array().is_some_and(|pins| {
-                pins.iter().any(|pin| {
-                    pin["contextId"] == step["contextId"]
-                        && pin["contextDigest"] == context_hash.as_str()
-                })
-            })
-        {
-            return Err(StorageError::Conflict("Frozen context digest/policy"));
-        }
-        let result_bound = step["resultBindings"]
-            .as_array()
-            .is_some_and(|bindings| !bindings.is_empty());
-        let resolution_refs = match (result_bound, resolution_witness) {
-            (true, Some(witness_blob)) => super::result_binding::verify_resolution(
-                &transaction,
-                &self.cas,
-                &self.validator,
-                super::result_binding::ResolutionInput {
-                    record: &record,
-                    plan: &plan,
-                    step,
-                    invocation,
-                    witness_blob,
-                },
-            )?,
-            (true, None) => {
+            let bytes =
+                encode_json(invocation).map_err(|e| StorageError::Contract(e.to_string()))?;
+            let blob = self.cas.put(&bytes)?;
+            let invocation_id: InvocationId =
+                serde_json::from_value(invocation["invocationId"].clone())
+                    .map_err(|e| StorageError::Contract(e.to_string()))?;
+            // The unique mutable Store borrow and exclusive root lease protect
+            // this connection. The undo hook shares read-only durable verification
+            // on the same connection; all live provider reads precede this tx.
+            let transaction =
+                Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+            let mut record = read_record(&transaction, operation)?;
+            if record.cancellation_requested
+                || record.reconciliation_required
+                || !matches!(
+                    record.state,
+                    OperationState::Queued | OperationState::Running
+                )
+            {
                 return Err(StorageError::InvalidTransition(
-                    "Result-bound dispatch requires a registered resolution witness".into(),
+                    "New dispatch requires queued or running state".into(),
                 ));
             }
-            (false, Some(_)) => {
-                return Err(StorageError::Conflict(
-                    "Resolution witness on an unbound step",
-                ));
-            }
-            (false, None) => {
-                if invocation["arguments"] != step["arguments"] {
-                    return Err(StorageError::Conflict("Frozen invocation arguments"));
-                }
-                Vec::new()
-            }
-        };
-        for dependency in step["dependsOn"]
-            .as_array()
-            .ok_or_else(|| StorageError::Corrupt("Frozen dependency list missing".into()))?
-        {
-            let prior = record
+            let index = record
                 .steps
                 .iter()
-                .find(|stored| dependency == stored.step_id.as_str())
-                .ok_or_else(|| {
-                    StorageError::Contract("Frozen step dependency does not exist".into())
-                })?;
-            if !step_verified(prior) {
-                return Err(StorageError::InvalidTransition(
-                    "Predecessor step has not completed its required verification".into(),
+                .position(|s| &s.step_id == step_id)
+                .ok_or(StorageError::NotFound("Plan step"))?;
+            if record.steps[index].dispatch != DispatchEvidence::NotSent
+                || record.steps[index].finished
+            {
+                return Err(StorageError::Conflict(
+                    "Step already has a durable dispatch intent",
                 ));
             }
-        }
-        let args_hash = mmmm_contracts::canonical_digest(&invocation["arguments"])
-            .map_err(|e| StorageError::Contract(e.to_string()))?;
-        if invocation["argumentsDigest"] != args_hash.as_str() {
-            return Err(StorageError::Conflict("Invocation arguments digest"));
-        }
-        if let Some(authorization) = &undo_authorization {
-            super::undo::reserve_undo_in(
-                &transaction,
-                self,
-                super::undo::UndoClaimInput {
-                    operation: &record,
-                    plan: &plan,
-                    step,
-                    invocation,
-                    invocation_blob: &blob,
-                },
-                authorization,
-            )?;
-        }
-        if record.steps[index].write_effect {
-            check_fences(
-                &transaction,
-                &record.scope,
-                record.whole_project_fence,
-                Some(operation),
-            )?;
-            transaction.execute("INSERT OR IGNORE INTO write_fences(operation_id,scope_json,whole_project) VALUES(?1,?2,?3)",
+            if invocation["operationId"] != operation.as_str()
+                || invocation["stepId"] != step_id.as_str()
+                || invocation["context"]["projectId"] != record.project_id.as_str()
+                || invocation["context"]["principalRef"] != record.principal.as_str()
+            {
+                return Err(StorageError::Conflict("Invocation identity"));
+            }
+            if calibration_authorization.is_none() {
+                super::calibration_approval::reject_unclaimed_plan(&transaction, &record)?;
+            } else if undo_authorization.is_some() || resolution_witness.is_some() {
+                return Err(StorageError::Conflict(
+                    "Calibration cannot borrow undo or result-resolution authority",
+                ));
+            }
+            if undo_authorization.is_none() {
+                super::undo::reject_recovery_only_route(&transaction, invocation)?;
+            } else if resolution_witness.is_some() {
+                return Err(StorageError::Conflict(
+                    "Provider undo cannot use result resolution authorization",
+                ));
+            }
+            // Context/action/implementation pins must match the frozen step; the
+            // application separately validates expiry, grant and target preconditions.
+            let plan =
+                Self::load_plan_in(&transaction, &self.cas, &record.plan_id, &record.plan_hash)?;
+            let step = plan["steps"]
+                .as_array()
+                .and_then(|s| s.iter().find(|s| s["stepId"] == step_id.as_str()))
+                .ok_or(StorageError::NotFound("Frozen plan step"))?;
+            for field in [
+                "bindingId",
+                "actionId",
+                "actionContractVersion",
+                "actionDigest",
+                "implementationDigest",
+            ] {
+                if invocation[field] != step[field] {
+                    return Err(StorageError::Conflict("Frozen invocation route"));
+                }
+            }
+            if invocation["context"]["contextId"] != step["contextId"] {
+                return Err(StorageError::Conflict("Frozen step context"));
+            }
+            let context_hash =
+                mmmm_contracts::verify_projected_digest("ExecutionContext", &invocation["context"])
+                    .map_err(|e| StorageError::Contract(e.to_string()))?;
+            if invocation["contextDigest"] != context_hash.as_str()
+                || invocation["context"]["policyRevision"] != plan["policyRevision"]
+                || !plan["contextPins"].as_array().is_some_and(|pins| {
+                    pins.iter().any(|pin| {
+                        pin["contextId"] == step["contextId"]
+                            && pin["contextDigest"] == context_hash.as_str()
+                    })
+                })
+            {
+                return Err(StorageError::Conflict("Frozen context digest/policy"));
+            }
+            let result_bound = step["resultBindings"]
+                .as_array()
+                .is_some_and(|bindings| !bindings.is_empty());
+            let resolution_refs = match (result_bound, resolution_witness) {
+                (true, Some(witness_blob)) => super::result_binding::verify_resolution(
+                    &transaction,
+                    &self.cas,
+                    &self.validator,
+                    super::result_binding::ResolutionInput {
+                        record: &record,
+                        plan: &plan,
+                        step,
+                        invocation,
+                        witness_blob,
+                    },
+                )?,
+                (true, None) => {
+                    return Err(StorageError::InvalidTransition(
+                        "Result-bound dispatch requires a registered resolution witness".into(),
+                    ));
+                }
+                (false, Some(_)) => {
+                    return Err(StorageError::Conflict(
+                        "Resolution witness on an unbound step",
+                    ));
+                }
+                (false, None) => {
+                    if invocation["arguments"] != step["arguments"] {
+                        return Err(StorageError::Conflict("Frozen invocation arguments"));
+                    }
+                    Vec::new()
+                }
+            };
+            for dependency in step["dependsOn"]
+                .as_array()
+                .ok_or_else(|| StorageError::Corrupt("Frozen dependency list missing".into()))?
+            {
+                let prior = record
+                    .steps
+                    .iter()
+                    .find(|stored| dependency == stored.step_id.as_str())
+                    .ok_or_else(|| {
+                        StorageError::Contract("Frozen step dependency does not exist".into())
+                    })?;
+                if !step_verified(prior) {
+                    return Err(StorageError::InvalidTransition(
+                        "Predecessor step has not completed its required verification".into(),
+                    ));
+                }
+            }
+            let args_hash = mmmm_contracts::canonical_digest(&invocation["arguments"])
+                .map_err(|e| StorageError::Contract(e.to_string()))?;
+            if invocation["argumentsDigest"] != args_hash.as_str() {
+                return Err(StorageError::Conflict("Invocation arguments digest"));
+            }
+            if let Some(authorization) = &undo_authorization {
+                super::undo::reserve_undo_in(
+                    &transaction,
+                    self,
+                    super::undo::UndoClaimInput {
+                        operation: &record,
+                        plan: &plan,
+                        step,
+                        invocation,
+                        invocation_blob: &blob,
+                    },
+                    authorization,
+                )?;
+            }
+            if record.steps[index].write_effect {
+                check_fences(
+                    &transaction,
+                    &record.scope,
+                    record.whole_project_fence,
+                    Some(operation),
+                )?;
+                transaction.execute("INSERT OR IGNORE INTO write_fences(operation_id,scope_json,whole_project) VALUES(?1,?2,?3)",
                 params![operation.as_str(),encode(&record.scope)?,i64::from(record.whole_project_fence)])?;
-        }
-        pin_blob(&transaction, "operation", operation.as_str(), &blob)?;
-        for source in &resolution_refs {
-            pin_blob(
-                &transaction,
-                "result_resolution",
-                invocation_id.as_str(),
-                source,
-            )?;
-        }
-        if let Some(witness) = resolution_witness {
-            pin_blob(
-                &transaction,
-                "result_resolution_witness",
-                invocation_id.as_str(),
-                witness,
-            )?;
-        }
-        transaction.execute("INSERT INTO invocations(invocation_id,operation_id,step_id,invocation_hash,blob_digest) VALUES(?1,?2,?3,?4,?5)",
+            }
+            pin_blob(&transaction, "operation", operation.as_str(), &blob)?;
+            for source in &resolution_refs {
+                pin_blob(
+                    &transaction,
+                    "result_resolution",
+                    invocation_id.as_str(),
+                    source,
+                )?;
+            }
+            if let Some(witness) = resolution_witness {
+                pin_blob(
+                    &transaction,
+                    "result_resolution_witness",
+                    invocation_id.as_str(),
+                    witness,
+                )?;
+            }
+            transaction.execute("INSERT INTO invocations(invocation_id,operation_id,step_id,invocation_hash,blob_digest) VALUES(?1,?2,?3,?4,?5)",
             params![invocation_id.as_str(),operation.as_str(),step_id.as_str(),raw_digest(&bytes).as_str(),blob.digest.as_str()])?;
-        record.state = OperationState::Running;
-        let stored = &mut record.steps[index];
-        stored.dispatch = DispatchEvidence::IntentDurable;
-        stored.effect = if stored.write_effect {
-            EffectEvidence::Unknown
-        } else {
-            EffectEvidence::NoneConfirmed
-        };
-        stored.further_effects_possible = stored.write_effect;
-        stored.invocation_id = Some(invocation_id);
-        stored.invocation_digest = Some(blob.digest);
-        let result = stored.clone();
-        write_record(&transaction, &record, "dispatch_intent")?;
-        transaction.commit()?;
-        Ok(result)
+            if let Some(authorization) = &calibration_authorization {
+                super::calibration_approval::claim_in(
+                    &transaction,
+                    self,
+                    &record,
+                    &plan,
+                    step_id,
+                    invocation,
+                    authorization,
+                )?;
+            }
+            record.state = OperationState::Running;
+            let stored = &mut record.steps[index];
+            stored.dispatch = DispatchEvidence::IntentDurable;
+            stored.effect = if stored.write_effect {
+                EffectEvidence::Unknown
+            } else {
+                EffectEvidence::NoneConfirmed
+            };
+            stored.further_effects_possible = stored.write_effect;
+            stored.invocation_id = Some(invocation_id);
+            stored.invocation_digest = Some(blob.digest);
+            let result = stored.clone();
+            write_record(&transaction, &record, "dispatch_intent")?;
+            if let Some(authorization) = &calibration_authorization {
+                super::calibration_approval::precommit(self, authorization)?;
+            }
+            transaction.commit()?;
+            Ok(result)
+        })();
+        if result.is_err()
+            && let Some(authorization) = &calibration_authorization
+        {
+            return super::calibration_approval::checked_after(
+                result,
+                super::calibration_approval::failure_checkpoint(self, authorization),
+            );
+        }
+        result
     }
 
     pub fn record_observation(

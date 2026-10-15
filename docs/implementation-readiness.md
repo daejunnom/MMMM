@@ -1312,9 +1312,16 @@ ABI2와 stdout digest가 같고 실제 current-view fixture까지 완료했다. 
 원 owner·일부 JDK/JAR 원문은 미포함이며 실제 게임 calibration 실행은 여전히 미실행이다.
 
 `826e8b7b0c7bc416de408ed6b0fb365e6e4f07a8`의 JVM CI 53 (`38763086193`)도 세 OS와
-집계가 성공했고 원 ZIP 3개를 별도 보존했다. 이 실행은 D062 source 정정 이전이므로
-앞선 Linux threads 3 실패의 회복 양성으로 기록하지 않는다. source·실제 pin·종료와
-정리 및 재사용할 입력의 동일성은 해당 artifact로 따로 대조한다.
+집계가 성공했고 원 ZIP 3개 감사도 마쳤다. source/expected/PR head 및 별도 event SHA
+`f931e7c3d76524359da08e893885ad7b7b3037ba`, 각 OS 386 tests/31 reports/11 executed
+tasks와 native 3단계·12 source pin·원 receipt 및 정상 종료·정리를 대조했다. CI 52와
+JVM inventory 177개 및 selected source 54개의 경로·길이·SHA·순서가 같아 해당 입력
+분석을 재사용할 수 있으나 새 실제 실행의 성공은 CI 53 원 receipt로 확인했다.
+Windows DLL digest는 앞선 실행과 달라 이번 실제 bytes를 다시 hash하여 pin과
+대조했고 원인은 관측되지 않아 추정하지 않는다. Linux startup은 Complete 3개·최대
+sample gap 111 ms·incomplete 0이며 leader/member Pending history는 없다. 이 실행은
+D062 source 정정 이전이고 Pending 양성이 없어 threads 3 전이의 회복으로 기록하지
+않는다. inventory 두 개를 저장소와 supervisor의 전체 영향 입력으로 확대하지 않는다.
 
 D062는 `linux_resources.rs`의 reserved leader에만 stable threads 3 조건을 추가한다.
 기존 동일 threads 2와 모든 anchor·identity·typed errno·pidfd 조건을 유지하고 일반
@@ -1326,6 +1333,18 @@ member·불일치·다른 수를 거절한다. 기존 순수 검사 한 곳을 �
 command 0·28,216 ms, Job commit peak 453,840,896 bytes·peak process 10개·최대
 표본 간격 146 ms, 소유 잔여 자식 정리 이후 drain·출력·export·scratch·lease 정상
 완료이며 원 2 GiB/32 process 상한을 유지했다.
+
+공유한 `6b60643caa19f8e9cfbadcda0b642d8ef4d1a9e4`의 JVM CI 54
+(`38764462668`)도 세 OS와 집계가 성공했고 실제 ZIP 3개 감사를 마쳤다. source/expected/
+PR head·별도 event SHA `5833577245a37305cd4b6876ce67b5ab46e7fa63`, OS별 386 tests와
+필수 11 executed tasks, 실제 native 3단계 및 pin/receipt·정상 종료/정리가 일치했다.
+JVM inventory 177개는 CI 53과 같고 selected source 54개 중 D062의 한 파일만 달랐으며
+그 원 bytes를 고정 Git blob과 대조했다. Linux header witness에 전후 threads 2의
+reserved leader Pending 1건이 실제 남았고 해당 phase는 정상 완료했다. 새 threads 3
+조건의 실제 양성 record는 없어 그 회복 근거로 확대하지 않는다. macOS startup에도
+기존 before-memory/session native ESRCH Pending 1건이 있었지만 memory/rusage exit
+분기 관측으로 바꾸지 않는다. 이번 새 source bootstrap·현재 실제 결과와 이전 입력의
+좁은 분석 재사용을 구분하며 실제 게임·calibration runner나 release는 미실행이다.
 
 D061의 Rust 연결은 sealed plan의 `loaded_source_expectations()`에서 원 function ID와
 logical entry bytes·digest를 빌려 주고 native resource lookup ID를 구분한다. 정본
@@ -1352,6 +1371,50 @@ rusage/member Pending 1건은 start/exit 존재 bool을 보존하지만 전환 �
 로그인·실제 관리자 pairing·클라이언트 시각 검증은 미실행이며, 계정 설정이나 인증
 우회로 이 항목을 대체하지 않는다. 초기 Windows 서버 Ready와 정상 stop/save 로그는
 앞서 기록한 범위의 관측으로 유지하고 전체 G2/G3 또는 공개 배포 완료로 표시하지 않는다.
+
+## Calibration 승인과 intent 연결의 부분 구현
+
+D063의 Runtime은 같은 보호 Store에 native owner의 plan 선택과 ADMIN 완료 확인을
+구분해 보존하는 API 및 one-use claim을 구현했다. record와 사전 검증 seal에는 공개
+역직렬화 경로가 없고, 실제 owner·정본 recipe·ADMIN/source 사실은 필수 trusted port가
+검사한다. claim은 기존 Invocation·fence·operation과 같은 Immediate transaction에
+들어가며 첫 durable intent에서 하나의 operation에 고정한다. 실패·취소 뒤 claim을
+해제하거나 다른 operation으로 옮기지 않는다. 신규 table이 없는 기존 DB의 일반
+dispatch는 기존 동작을 유지하고, 명시적 selection 등록에서만 내부 schema를 만든다.
+기존 외부 SQLite/CAS/native-owner fixture로 새 검사 6개를 작성한 이유는 47개 원
+claim·재시작·같은 transaction rollback·선택/확정 분리 및 원 오류와 checkpoint 오류의
+동시 보존이 기존 fixture 검사에 없기 때문이다. 대형 fixture는 추가하지 않았다.
+
+Application은 non-undo intent에서 같은 Store·operation·step·Invocation 및 원 resolution
+witness를 ProviderPort의 좁은 저장 hook에 전달한다. 기본 구현은 기존 Runtime 두
+함수를 그대로 호출하고 GuardedProvider는 원 admission 뒤 전달한다. registered undo는
+별도 기존 claim 경로를 유지한다. 기존 검사 5개를 확장했으며 새 fixture는 없다.
+Runtime 6파일과 Application/guard 5파일의 독립 소스 리뷰에서 새 blocking finding은
+없었다. 실제 Composite calibration 선택, Coordinator의 native owner/ADMIN 확인
+producer와 Java purpose route의 전체 검증은 이 부분 구현의 성공으로 대신하지 않는다.
+
+Windows 관리 실행 `392`·`394`는 동결된 소유 source를 format했고 `393`은 Application
+56개와 Runtime 129개 unit test가 전부 통과했다. Runtime의 새 claim 검사 6개도 실제
+`ok`를 확인했다. command 0·68,844 ms, Job commit peak 751,157,248 bytes·peak process
+6개·최대 표본 간격 139 ms였으며 원 2 GiB/32 process 상한과 소유 잔여 자식 정리 후
+drain·완전한 출력·export·scratch 정리·lease 반환을 확인했다. 실제 Windows에서 두
+test EXE가 실행됐으며 WSL/Ubuntu로 전환하지 않았다.
+
+같은 두 package/all-target strict Clippy `395`는 표현식 경고 세 개로 exit 101이었다.
+경고 억제 없이 동등 표현식으로 정리하는 중 잘못 선택한 유사 closure의 문법 오류로
+`396` format과 `397` compile도 실패했다. 원 실패와 정상 drain·export·scratch·lease
+기록을 보존했다. 정확한 두 closure를 복구한 `398` format 및 `399`의 같은 범위 strict
+Clippy는 exit 0이었다. 동등 표현식 정리와 format 결과로 기존 테스트를 재실행한
+것처럼 기록하지 않으며 현재 source의 전체 CI는 별도로 확인한다.
+
+기존 Application은 intent 실패 뒤 진단 note 저장도 실패하면 원 intent 오류보다 note
+오류를 반환하는 한계가 있다. 이번 hook의 신규 회귀와 구분하지만, 실제 calibration
+production 연결에서 두 실패를 함께 보존하도록 후속 보완한다. 실제 게임 runner와
+issuer/readback·최초 target profile·클라이언트 및 공개 배포 인수는 미완료다.
+
+공유 `6b60643`의 Rust CI 63 (`38764462975`)은 세 OS tests·strict Clippy와 집계 성공을
+관측했고 원 ZIP 3개를 별도 보존했다. 앞서 감사한 JVM CI 54와 함께 이전 고정 source의
+검증이며, 위 미커밋 calibration 연결의 성공으로 확대하지 않는다.
 
 ## 첫 공개 배포 인수
 

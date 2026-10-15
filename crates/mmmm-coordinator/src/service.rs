@@ -800,6 +800,23 @@ impl ProviderPort for GuardedProvider<'_> {
         self.admission()?;
         self.inner.dispatch(invocation)
     }
+    fn persist_dispatch_intent_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        original_operation: &mmmm_contracts::OperationId,
+        original_step: &mmmm_contracts::StepId,
+        original_invocation: &Value,
+        resolution_witness: Option<&mmmm_runtime::storage::BlobRef>,
+    ) -> mmmm_application::AppResult<mmmm_runtime::storage::StepRecord> {
+        self.admission()?;
+        self.inner.persist_dispatch_intent_with_store(
+            store,
+            original_operation,
+            original_step,
+            original_invocation,
+            resolution_witness,
+        )
+    }
     fn dispatch_with_store(
         &mut self,
         store: &mut DurableStore,

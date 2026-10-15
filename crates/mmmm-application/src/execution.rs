@@ -293,16 +293,13 @@ impl Application<'_> {
                     })
                 }
             } else {
-                match resolution_witness.as_ref() {
-                    Some(witness) => self
-                        .store
-                        .dispatch_resolved_intent(operation, &step_id, &invocation, witness)
-                        .map_err(|error| AppError::storage("DISPATCH_REJECTED", error)),
-                    None => self
-                        .store
-                        .dispatch_intent(operation, &step_id, &invocation)
-                        .map_err(|error| AppError::storage("DISPATCH_REJECTED", error)),
-                }
+                self.provider.persist_dispatch_intent_with_store(
+                    self.store,
+                    operation,
+                    &step_id,
+                    &invocation,
+                    resolution_witness.as_ref(),
+                )
             };
             if let Err(e) = intent {
                 self.note(

@@ -1,7 +1,9 @@
 use crate::types::*;
-use mmmm_contracts::{ContextId, ObjectId, PrincipalId, ProjectId, Sha256Digest};
+use mmmm_contracts::{
+    ContextId, ObjectId, OperationId, PrincipalId, ProjectId, Sha256Digest, StepId,
+};
 use mmmm_runtime::storage::result_binding::RegisteredResultCodec;
-use mmmm_runtime::storage::{DurableStore, WriteScope};
+use mmmm_runtime::storage::{BlobRef, DurableStore, StepRecord, WriteScope};
 use serde_json::Value;
 
 /// Authenticated composition supplies this port. It intersects the live user
@@ -126,6 +128,29 @@ pub trait ProviderPort {
         context: &Value,
     ) -> AppResult<Sha256Digest>;
     fn verify_dependencies(&mut self, dependency_pins: &[Value], context: &Value) -> AppResult<()>;
+    /// Persist this original intent through the same durable store before any
+    /// provider dispatch. Trusted composition may select a protected atomic
+    /// claim; invocation JSON and a resolution witness confer no such authority.
+    /// Registered undo retains its separate atomic claim boundary.
+    fn persist_dispatch_intent_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        original_operation: &OperationId,
+        original_step: &StepId,
+        original_invocation: &Value,
+        resolution_witness: Option<&BlobRef>,
+    ) -> AppResult<StepRecord> {
+        match resolution_witness {
+            Some(witness) => store.dispatch_resolved_intent(
+                original_operation,
+                original_step,
+                original_invocation,
+                witness,
+            ),
+            None => store.dispatch_intent(original_operation, original_step, original_invocation),
+        }
+        .map_err(|error| AppError::storage("DISPATCH_REJECTED", error))
+    }
     /// This is called only after SQLite commits the full dispatch intent.
     /// Any error at this point is ambiguous; it cannot authorize another write.
     fn dispatch(&mut self, invocation: &Value) -> AppResult<Value>;

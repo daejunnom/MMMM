@@ -12,6 +12,7 @@ mod types;
 pub mod artifact;
 pub mod authored_projection;
 pub mod bootstrap;
+pub mod calibration_approval;
 pub mod catalog_source_use;
 pub mod compatibility_approval;
 pub mod host_setup;

@@ -101,6 +101,8 @@
 
 | MMMM-D062 | 실제 CI 52에서 확인한 Linux reserved leader의 전후 동일 threads 3도 원 오류를 보존한 Pending으로만 처리한다. | 원 leader anchor·미회수 Child 예약·전후 identity·양쪽 Zombie·RSS Open/ESRCH 3·실제 BoundValidated pidfd TerminalPoll/NotReady와 errno 없음 조건을 유지한다. reserved leader만 동일 (2,2) 또는 (3,3)을 허용하고 OwnedMember는 기존 (2,2), candidate·비대칭·다른 수는 계속 거절한다. 마지막 실제 Complete부터 1,000 ms·이전 Complete 필수·100 ms cadence·부분 자원 하한 검사·오류와 history 보존 및 원 drain/reap 규칙은 바꾸지 않는다. Pending을 RSS 0·완전 표본·종료·ABI 성공으로 올리지 않으며 native 조회·재시도·sleep·기한 확대도 없다. 원 CI 실패, source 검증과 후속 실제 Linux 관측을 구분한다. |
 
+| MMMM-D063 | 최초 normative47 calibration 승인은 실제 native owner의 frozen plan 선택과 실제 게임 ADMIN의 private 완료 확인을 결합하는 별도 목적이다. | 기존 same-user native peer·동일 Store·anonymous APPLY_APPROVAL 교환을 재사용하며 공개 method/FN/version이나 별도 operation 원장을 만들지 않는다. 원 Project revision·Policy·정본 recipe/suite·plan hash·현재 host/context/source·유한 수명을 묶고 원 witness의 ACK/EOF 완료 전에 승인 사실을 확정하지 않는다. private 목적 route는 원 read owner/lease를 확인하면서 일반 read map·grant를 덮거나 철회하지 않고 verifiedWriteProfile도 false로 유지한다. prepare는 비교와 실제 readiness만 확인하며 소비하지 않는다. 실제 dispatch는 같은 기존 journal transaction에서 한 operation 및 step별 원 Invocation에 고정하고 실패·취소 뒤 claim을 되돌리지 않는다. runner 부재는 intent 이전 readiness에서 명확히 거절하며 일반 profile/write gate를 열거나 성공 handler로 대신하지 않는다. pack load/reload와 successor의 새 pairing·47개 실행은 수명이 다른 별도 operation이며 기존 불변 resource/CAS 참조로 연결한다. 이 결정의 실제 연결·검사 상태는 구현 착수 조건에서 따로 기록하고 ADMIN 발급의 게임 관측은 미실행이다. |
+
 D061의 Rust 비교 입력은 같은 sealed `CalibrationDispatchPlan`의
 `loaded_source_expectations()`에서만 투영한다. 원 function ID·logical entry bytes와
 program digest는 plan에서 빌리고, native resource lookup ID는 별도로 구분한다.

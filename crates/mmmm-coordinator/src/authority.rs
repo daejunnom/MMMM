@@ -456,6 +456,49 @@ impl LocalAuthority {
         plan: &Value,
         lifetime: Duration,
     ) -> AppResult<()> {
+        self.approve_plan_bounded(principal, plan, lifetime, None, &|| Ok(()))
+    }
+    /// 원 native 요청의 절대 기한을 모든 context 조회와 마지막 승인 검사에 전달한다.
+    pub fn approve_plan_with_deadline(
+        &self,
+        principal: &PrincipalId,
+        plan: &Value,
+        lifetime: Duration,
+        deadline: Instant,
+    ) -> AppResult<()> {
+        self.approve_plan_with_control(principal, plan, lifetime, deadline, &|| Ok(()))
+    }
+    /// 현재 요청의 취소 검사만 빌려 쓰며 callback이나 bootstrap 수명을 보관하지 않는다.
+    /// checkpoint는 authority state를 재진입하거나 별도 host I/O를 수행하지 않는다.
+    pub fn approve_plan_with_control(
+        &self,
+        principal: &PrincipalId,
+        plan: &Value,
+        lifetime: Duration,
+        deadline: Instant,
+        checkpoint: &dyn Fn() -> AppResult<()>,
+    ) -> AppResult<()> {
+        self.approve_plan_bounded(principal, plan, lifetime, Some(deadline), checkpoint)
+    }
+    fn approve_plan_bounded(
+        &self,
+        principal: &PrincipalId,
+        plan: &Value,
+        lifetime: Duration,
+        deadline: Option<Instant>,
+        checkpoint: &dyn Fn() -> AppResult<()>,
+    ) -> AppResult<()> {
+        let check = || {
+            checkpoint()?;
+            if deadline.is_some_and(|until| Instant::now() >= until) {
+                return Err(error(
+                    "TIME_BUDGET_EXCEEDED",
+                    "Original plan approval deadline reached",
+                ));
+            }
+            Ok(())
+        };
+        check()?;
         validate("ExecutionPlan", plan)?;
         let hash = verify_projected_digest("ExecutionPlan", plan)
             .map_err(|_| error("STALE_PLAN", "Approved plan digest is invalid"))?;
@@ -474,7 +517,25 @@ impl LocalAuthority {
         {
             let id = ContextId::new(text(pin, "contextId")?)
                 .map_err(|_| error("STALE_CONTEXT", "Plan context identity is invalid"))?;
-            let context = self.hosts.context(principal, &id)?;
+            check()?;
+            let observed = match deadline {
+                Some(until) => self.hosts.context_with_deadline(principal, &id, until),
+                None => self.hosts.context(principal, &id),
+            };
+            let context = match (observed, check()) {
+                (Ok(context), Ok(())) => context,
+                (Err(cause), Ok(())) | (Ok(_), Err(cause)) => return Err(cause),
+                (Err(primary), Err(checkpoint)) => {
+                    return Err(AppError::caused_by(
+                        primary.code,
+                        primary.message,
+                        crate::host::NativePairingOwnerFailure {
+                            primary,
+                            checkpoint,
+                        },
+                    ));
+                }
+            };
             if context["contextDigest"] != pin["contextDigest"]
                 || context["environment"] != pin["environment"]
             {
@@ -485,12 +546,14 @@ impl LocalAuthority {
             }
             contexts.insert(id);
         }
+        check()?;
         let mut state = self.state.lock().map_err(|_| {
             error(
                 "AUTHORITY_UNAVAILABLE",
                 "Current authority state is unavailable",
             )
         })?;
+        check()?;
         let project_grant = grant(&state, principal, &project)?;
         if contexts.is_empty()
             || !contexts.is_subset(&project_grant.contexts)
@@ -517,6 +580,7 @@ impl LocalAuthority {
                 "Explicit approval capacity is exhausted",
             ));
         }
+        check()?;
         state.approvals.insert(
             (principal.clone(), project, hash),
             PlanApproval {

@@ -125,6 +125,9 @@ struct BundleHostState {
     receipt_inspections: Cell<usize>,
     recover_dispatches: Cell<usize>,
     recover_observations: Cell<usize>,
+    intent_calls: Cell<usize>,
+    reject_intent: Cell<bool>,
+    intent_operation: RefCell<Option<OperationId>>,
 }
 impl BundleHostState {
     fn check_session(&self, principal: &PrincipalId, context: &Value) -> AppResult<()> {
@@ -363,6 +366,47 @@ impl ProviderPort for BundleProvider<'_> {
     fn request_cancel(&mut self, invocation: &Value, receipt: Option<&str>) -> AppResult<()> {
         self.ordinary.request_cancel(invocation, receipt)
     }
+    fn persist_dispatch_intent_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        original_operation: &OperationId,
+        original_step: &StepId,
+        original_invocation: &Value,
+        resolution_witness: Option<&BlobRef>,
+    ) -> AppResult<mmmm_runtime::storage::StepRecord> {
+        assert!(
+            !self.host.is_undo(original_invocation),
+            "Registered undo must retain its separate atomic claim"
+        );
+        assert_eq!(
+            json!(original_operation),
+            original_invocation["operationId"]
+        );
+        assert_eq!(json!(original_step), original_invocation["stepId"]);
+        self.host.intent_calls.set(self.host.intent_calls.get() + 1);
+        *self.host.intent_operation.borrow_mut() = Some(original_operation.clone());
+        if self.host.reject_intent.get() {
+            return Err(AppError::storage(
+                "DISPATCH_REJECTED",
+                StorageError::Conflict("Fixture protected dispatch claim rejected"),
+            ));
+        }
+        let record = self.ordinary.persist_dispatch_intent_with_store(
+            store,
+            original_operation,
+            original_step,
+            original_invocation,
+            resolution_witness,
+        )?;
+        assert_eq!(record.dispatch, DispatchEvidence::IntentDurable);
+        assert_eq!(
+            store
+                .stored_invocation(original_operation, original_step)
+                .unwrap(),
+            *original_invocation
+        );
+        Ok(record)
+    }
     fn dispatch_with_store(
         &mut self,
         store: &mut DurableStore,
@@ -579,6 +623,9 @@ impl BundleFixture {
             receipt_inspections: Cell::new(0),
             recover_dispatches: Cell::new(0),
             recover_observations: Cell::new(0),
+            intent_calls: Cell::new(0),
+            reject_intent: Cell::new(false),
+            intent_operation: RefCell::new(None),
         }));
         Self {
             fixture,
@@ -679,6 +726,7 @@ fn common_undo_existing_key_and_terminal_report_open_no_offline_game_rpc() {
     fixture.approve(&plan);
     let report = fixture.apply(&plan, "bundle-existing-key").unwrap();
     assert_eq!(report["state"], "succeeded");
+    assert_eq!(fixture.host.0.intent_calls.get(), 1);
     let operation: OperationId = decode(&report["operationId"]).unwrap();
     let before = json!(fixture.fixture.store.operation(&operation).unwrap());
     let opens = fixture.contexts.opens;
@@ -694,6 +742,7 @@ fn common_undo_existing_key_and_terminal_report_open_no_offline_game_rpc() {
     assert_eq!(fixture.reconcile(&report).unwrap(), report);
     assert_eq!(fixture.contexts.opens, opens);
     assert_eq!(fixture.host.0.role_inspections.get(), roles);
+    assert_eq!(fixture.host.0.intent_calls.get(), 1);
     assert_eq!(
         json!(fixture.fixture.store.operation(&operation).unwrap()),
         before
@@ -760,6 +809,37 @@ fn common_undo_ordinary_external_write_needs_no_game_role_or_rpc() {
         b"after-first"
     );
     assert_eq!(fixture.fixture.target.borrow().write_dispatches, 1);
+
+    let mut rejected = BundleFixture::new(false, false);
+    let rejected_plan = rejected.plan();
+    rejected.approve(&rejected_plan);
+    rejected.host.0.reject_intent.set(true);
+    let error = rejected
+        .apply(&rejected_plan, "bundle-intent-rejected")
+        .unwrap_err();
+    assert_eq!(error.code, "DISPATCH_REJECTED");
+    assert!(matches!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<StorageError>(),
+        Some(StorageError::Conflict(
+            "Fixture protected dispatch claim rejected"
+        ))
+    ));
+    assert_eq!(rejected.host.0.intent_calls.get(), 1);
+    assert_eq!(rejected.fixture.target.borrow().dispatches, 0);
+    assert_eq!(rejected.fixture.target.borrow().targets[TARGET], b"before");
+    let operation = rejected.host.0.intent_operation.borrow().clone().unwrap();
+    let record = rejected.fixture.store.operation(&operation).unwrap();
+    assert_eq!(record.steps[0].dispatch, DispatchEvidence::NotSent);
+    assert!(record.steps[0].invocation_id.is_none());
+    assert!(
+        rejected
+            .fixture
+            .store
+            .stored_invocation(&operation, &record.steps[0].step_id)
+            .is_err()
+    );
 }
 
 #[test]
@@ -769,6 +849,8 @@ fn common_undo_failed_source_first_settled_provenance_fresh_plan_claim_restore_a
     fixture.approve(&source_plan);
     let source_report = fixture.apply(&source_plan, "bundle-failed-source").unwrap();
     assert_eq!(source_report["state"], "partial");
+    assert_eq!(fixture.host.0.intent_calls.get(), 1);
+    fixture.host.0.reject_intent.set(true);
     assert_eq!(source_report["result"]["providerStatusCounts"]["failed"], 1);
     let undo_plan = fixture.recovery(&source_report).unwrap();
     assert_ne!(undo_plan["planId"], source_plan["planId"]);
@@ -856,6 +938,7 @@ fn common_undo_failed_source_first_settled_provenance_fresh_plan_claim_restore_a
     fixture.contexts.unbound_dispatch = false;
     let restored = fixture.apply(&undo_plan, "bundle-approved-undo").unwrap();
     assert_eq!(restored["state"], "succeeded");
+    assert_eq!(fixture.host.0.intent_calls.get(), 1);
     assert_eq!(fixture.fixture.target.borrow().targets[TARGET], b"before");
     assert_eq!(fixture.host.0.recover_dispatches.get(), 1);
     assert_eq!(fixture.host.0.recover_observations.get(), 1);

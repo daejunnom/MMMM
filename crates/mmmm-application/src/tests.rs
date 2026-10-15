@@ -1152,6 +1152,36 @@ fn planning_has_no_target_effects_and_apply_twice_retains_one_durable_dispatch()
     let record = fixture.store.operation(&id).unwrap();
     assert_eq!(record.steps[0].dispatch, DispatchEvidence::Observed);
     assert!(record.steps[0].finished);
+    let invocation = fixture
+        .store
+        .stored_invocation(&id, &record.steps[0].step_id)
+        .unwrap();
+    let duplicate = fixture
+        .provider
+        .persist_dispatch_intent_with_store(
+            &mut fixture.store,
+            &id,
+            &record.steps[0].step_id,
+            &invocation,
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(duplicate.code, "DISPATCH_REJECTED");
+    assert!(
+        std::error::Error::source(&duplicate)
+            .unwrap()
+            .downcast_ref::<mmmm_runtime::storage::StorageError>()
+            .is_some()
+    );
+    assert_eq!(fixture.store.operation(&id).unwrap(), record);
+    assert_eq!(
+        fixture
+            .store
+            .stored_invocation(&id, &record.steps[0].step_id)
+            .unwrap(),
+        invocation
+    );
+    assert_eq!(fixture.target.borrow().dispatches, 1);
     assert_eq!(fixture.store.recovery_snapshots(&id).unwrap().len(), 1);
     assert!(fixture.root.0.is_absolute());
 }
@@ -2532,6 +2562,34 @@ fn result_bound_consumer_uses_original_validated_data_and_retains_immutable_plan
     assert_eq!(witness.bindings.len(), 1);
     let binding = &witness.bindings[0];
     let record = fixture.store.operation(&operation).unwrap();
+    let resolved_step = record
+        .steps
+        .iter()
+        .find(|step| step.step_id == consumer)
+        .unwrap();
+    assert_eq!(resolved_step.dispatch, DispatchEvidence::Observed);
+    assert_eq!(
+        resolved_step.invocation_digest,
+        Some(raw_digest(&encode_json(&invocation).unwrap()))
+    );
+    let duplicate = fixture
+        .provider
+        .persist_dispatch_intent_with_store(
+            &mut fixture.store,
+            &operation,
+            &consumer,
+            &invocation,
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(duplicate.code, "DISPATCH_REJECTED");
+    assert_eq!(fixture.store.operation(&operation).unwrap(), record);
+    let retained_witness = fixture
+        .store
+        .stored_resolution_witness(&operation, &consumer)
+        .unwrap();
+    assert_eq!(json!(retained_witness), json!(witness));
+    assert_eq!(fixture.target.borrow().dispatches, 2);
     let source = record
         .steps
         .iter()

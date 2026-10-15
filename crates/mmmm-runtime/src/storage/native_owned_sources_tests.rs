@@ -1346,3 +1346,6 @@ mod catalog_source_use_tests;
 
 #[path = "compatibility_approval_tests.rs"]
 mod compatibility_approval_tests;
+
+#[path = "calibration_approval_tests.rs"]
+mod calibration_approval_tests;

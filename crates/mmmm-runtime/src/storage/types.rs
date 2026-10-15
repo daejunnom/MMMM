@@ -19,6 +19,13 @@ pub enum StorageError {
     Conflict(&'static str),
     Fenced(Vec<OperationId>),
     InvalidTransition(String),
+    /// Calibration work and its original request checkpoint both failed.
+    /// Inspect primary_failure() for the original classification; neither
+    /// cause grants retry, rollback completion or release of a durable claim.
+    CalibrationCheckpointFailure {
+        primary: Box<StorageError>,
+        checkpoint: Box<StorageError>,
+    },
 }
 
 impl fmt::Display for StorageError {
@@ -44,10 +51,37 @@ impl fmt::Display for StorageError {
                 ops.len()
             ),
             Self::InvalidTransition(e) => write!(f, "Invalid operation transition: {e}"),
+            Self::CalibrationCheckpointFailure { .. } => {
+                f.write_str("Calibration approval work and its original checkpoint both failed")
+            }
         }
     }
 }
-impl std::error::Error for StorageError {}
+impl StorageError {
+    /// Preserve typed classification without treating a concurrent checkpoint
+    /// failure as a generic I/O error or replacing the original failure.
+    pub fn primary_failure(&self) -> &Self {
+        let mut current = self;
+        while let Self::CalibrationCheckpointFailure { primary, .. } = current {
+            current = primary;
+        }
+        current
+    }
+    pub fn checkpoint_failure(&self) -> Option<&Self> {
+        match self {
+            Self::CalibrationCheckpointFailure { checkpoint, .. } => Some(checkpoint),
+            _ => None,
+        }
+    }
+}
+impl std::error::Error for StorageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CalibrationCheckpointFailure { primary, .. } => Some(primary.as_ref()),
+            _ => None,
+        }
+    }
+}
 impl From<io::Error> for StorageError {
     fn from(e: io::Error) -> Self {
         Self::Io(e)
