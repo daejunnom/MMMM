@@ -2023,6 +2023,56 @@ export·scratch 정리·lease 해제다. 실제 filesystem/JNI/game 인수는 �
 집계 성공을 확인했다. 이 두 새 원 ZIP 감사는 수행하지 않았다. 이후 미공유 bootstrap·
 파일 kernel·정책 변경의 성공 근거로 사용하지 않는다.
 
+## 소유 파일 kernel과 최초 설치의 native 경계
+
+`mmmm-owned-files`는 기존 selected-file reader의 held ancestry·ordinary identity·
+NOFOLLOW/reparse·원 checkpoint와 명시 close를 옮긴 실제 공통 kernel이다. 새 owned
+디렉터리는 Windows의 held parent에서 `NtCreateFile(FILE_CREATE)`로 원자적으로
+생성하고, 반환한 동일 handle·FILE_CREATED·ordinary/reparse·volume/file identity를
+검사한다. STATUS_PENDING은 입력/출력 allocation과 parent를 한 번만 격리하며 더 이상
+같은 생성 capability를 사용하지 않는다. POSIX는 openat/O_EXCL과 협력적 named/held
+관측을 사용하며 동일 UID의 rename/ABA를 원자적으로 막는다고 주장하지 않는다.
+새 파일은 CreateNew·bounded write·sync·같은 handle의 독립 재읽기 두 번과 원 bytes/SHA를
+검사한다. 기존 빈 디렉터리도 채택하지 않고 부분 생성 뒤 실패는 자동 삭제하지 않는다.
+
+observer JNI는 Rust 정본 normative47에서 나온 정확한 48개 roster·원문·전체 bundle을
+검증한 뒤 이 kernel을 소비한다. Java가 source를 재생성하거나 별도 파일 알고리즘을
+갖지 않는다. 실제 Class/loader/generation·원 request/operation lease를 유지하며 native
+오류와 Java Throwable 및 후행 current 실패를 함께 보존한다. fresh storage 검사는 실제
+서버의 world ROOT를 발급하고 실제 dataFolder/getDataFile의 제한된 하위 상대 경로만
+native absence walk에 전달한다. dataFolder 자체가 없을 때도 이 첫 부재를 읽기만 한다.
+새 Mixin 접근자는 실제 SavedData type·constructor·cache 관계를 확인한 fresh-only 취득에
+한정하며 get/load/negative cache를 부재 증거로 사용하지 않는다. Java 설치·초기화·reload
+생산자는 현재 WIP이며 Rust 공통 bootstrap operation 연결은 별도 진행 중이다.
+
+kernel과 JNI/Java 경계의 독립 source 리뷰는 확정 신규 P0–P2가 없었다. `487`의 observer
+56개와 `488`의 observer/kernel/policy strict 검사가 통과했다. 후속 Java world ROOT 두
+파일은 별도 독립 재리뷰를 마쳤으며, 이전 JVM478 성공을 이 새 Java의 성공으로 사용하지
+않는다. 새 JNI 여섯 slot의 C header witness·실제 JNI 호출·새 Java 컴파일은 아직 미실행이다.
+
+Windows `493`에서 CLI 16개·Application 58개·Coordinator 381개·kernel 3개가 통과했고
+기존 Coordinator 1개 ignored를 유지했다. 실제 CreateNew와 원 bytes 검증·기존 child
+거절·partial/cancel 보존·nested absence·secret guard 및 기존 selected-file Windows
+공유 경계 회귀를 포함한다. Unix symlink/rename 검증이나 게임 설치 결과로 확대하지 않는다.
+display 순수 해석 3개와 실제 Store/no-entered-request 거절, bootstrap raw Invocation
+pin·frame 한도·두 fresh preflight·만료 reply의 I/O 전 중단 회귀도 이 실행에서 통과했다.
+이는 일부 미공유 bootstrap 소스를 포함한 로컬 검사이며 전체 고정 SHA 인수와 구분한다.
+
+`493`의 base는 `21de15b5a2f52e419c4039daaa66cdd269bbd303`, 영향 입력 304개·
+7,658,414 bytes의 전후 manifest SHA는
+`aa89560bc7aa17845fcff3a35b7366d54b5c6107cb84ae26151f98c4dcbafd68`로 일치했다.
+별도 source-binding은 43,208 bytes·SHA
+`2cf99e26a0c7cc55152b27c7834cabbe524bab1d3d09399b211d326dbc5693d9`로 보존했고
+원 managed receipt를 변경하지 않았다. command 0·252,027 ms·Job commit peak
+1,630,527,488 bytes·6 process·최대 sample gap 146 ms이며 owned-tail 정리 뒤 drain·
+완전한 출력·export·scratch 정리·lease 해제를 확인했다. 후속 `494`의 strict Clippy는
+실제 exit 101로 실패했다. 새 bootstrap의 collapsible-if 2건과 인자 수 3건이 원인이며
+22,672 ms·정상 drain/export/정리를 별도 보존했다. 그 교정과 재검증은 진행 중이다.
+
+실제 source 설치·fresh cache 취득·47개 초기화·reload·새 pairing과 readonly reconcile,
+게임 ADMIN·Mixin/JNI 적중·최종 3OS 및 client 인수는 아직 미실행이다. closed file facts를
+이후 root의 identity 연속성이나 loaded 함수의 source 인과 증명으로 바꾸지 않는다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

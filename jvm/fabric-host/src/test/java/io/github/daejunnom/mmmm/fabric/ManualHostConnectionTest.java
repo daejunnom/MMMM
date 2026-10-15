@@ -49,6 +49,30 @@ final class ManualHostConnectionTest {
         assertThrows(ContractException.class, () -> ManualHostConnection.validateCalibrationCompletion(offer, completed, null, "b".repeat(64)));
     }
 
+    @Test void bootstrapCompletionCannotAdoptNumericApprovalOrCallerAuthorityFields() {
+        ObjectNode offer = ContractJson.newObject().put("nonce", "bootstrap-fixture").put("purpose", NativeCalibrationBootstrap.PURPOSE);
+        offer.putObject("hostHello").putObject("environment").put("sessionEpoch", "epoch-fixture-01");
+        offer.putArray("contextIds").add("context-fixture-01");
+        ObjectNode completed = ContractJson.newObject().put("kind", "host_apply_approval_complete").put("protocolVersion", ContractJson.VERSION)
+                .put("nonce", "bootstrap-fixture").put("ready", true).put("coordinatorEpoch", "coordinator-fixture")
+                .put("hostEpoch", "epoch-fixture-01").put("contextId", "context-fixture-01").put("purpose", NativeCalibrationBootstrap.PURPOSE)
+                .put("selectionDigest", "a".repeat(64)).put("manifestDigest", "b".repeat(64));
+        assertDoesNotThrow(() -> ManualHostConnection.validateBootstrapCompletion(offer, completed, "a".repeat(64), "b".repeat(64)));
+        for (String field : List.of("kind", "protocolVersion", "nonce", "coordinatorEpoch", "hostEpoch", "contextId", "purpose", "selectionDigest", "manifestDigest")) {
+            ObjectNode changed = completed.deepCopy().put(field, "changed value");
+            assertThrows(ContractException.class, () -> ManualHostConnection.validateBootstrapCompletion(offer, changed, "a".repeat(64), "b".repeat(64)));
+        }
+        assertThrows(ContractException.class, () -> ManualHostConnection.validateBootstrapCompletion(offer,
+                completed.deepCopy().put("purpose", NativeCalibrationApproval.PURPOSE), "a".repeat(64), "b".repeat(64)));
+        assertThrows(ContractException.class, () -> ManualHostConnection.validateCalibrationCompletion(offer, completed, "a".repeat(64), "b".repeat(64)));
+        assertThrows(ContractException.class, () -> ManualHostConnection.validateBootstrapCompletion(
+                offer.deepCopy().put("purpose", NativeCalibrationApproval.PURPOSE), completed, "a".repeat(64), "b".repeat(64)));
+        assertThrows(ContractException.class, () -> ManualHostConnection.validateBootstrapCompletion(offer,
+                completed.deepCopy().put("verifiedWriteProfile", true), "a".repeat(64), "b".repeat(64)));
+        assertThrows(ContractException.class, () -> ManualHostConnection.validateBootstrapCompletion(offer,
+                completed.deepCopy().put("ready", false), "a".repeat(64), "b".repeat(64)));
+    }
+
     @Test void boundedOriginalProfileBytesRemainSeparateFromArtifactAndInterfacePins() throws IOException {
         byte[] raw = profileBytes(); ObjectNode entry = entry("owner.approval:1", HexFormat.of().formatHex(raw));
         entry.put("profileDigest", ContractJson.digest(ContractJson.parse(raw)));

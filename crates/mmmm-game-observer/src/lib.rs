@@ -19,6 +19,7 @@ mod classfile;
 mod definitions;
 mod ffi;
 mod native_producer;
+mod owned_pack_files;
 
 use std::ffi::{c_char, c_void};
 
@@ -103,4 +104,21 @@ pub unsafe extern "C" fn Java_io_github_daejunnom_mmmm_observer_DefinitionObserv
     actual: *mut c_void,
 ) -> *mut c_void {
     native_producer::hidden_forwarder(env.cast(), actual)
+}
+
+/// Narrow actual-platform port, with no persistent consumer filesystem handle map.
+///
+/// # Safety
+/// Arguments must be live references from this attached thread's pinned JDK 25
+/// JNI environment; the private platform port owns the original current checks.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_io_github_daejunnom_mmmm_observer_DefinitionOwnedPackFilesBridge_nativeCall(
+    env: *mut c_void,
+    bridge: *mut c_void,
+    port: *mut c_void,
+    frame: *mut c_void,
+    operation: i32,
+) -> *mut c_void {
+    // SAFETY: the foreign entry arguments belong to this calling JNI frame.
+    unsafe { owned_pack_files::call(env.cast(), bridge, port, frame, operation) }
 }

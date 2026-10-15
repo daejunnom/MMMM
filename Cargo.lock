@@ -723,6 +723,7 @@ dependencies = [
  "mmmm-domain",
  "mmmm-exchange",
  "mmmm-native-process",
+ "mmmm-owned-files",
  "mmmm-planner",
  "mmmm-policy",
  "mmmm-reference",
@@ -764,12 +765,28 @@ dependencies = [
 [[package]]
 name = "mmmm-game-observer"
 version = "0.1.0"
+dependencies = [
+ "mmmm-compiler",
+ "mmmm-contracts",
+ "mmmm-owned-files",
+ "serde_json",
+ "sha2",
+]
 
 [[package]]
 name = "mmmm-native-process"
 version = "0.1.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "mmmm-owned-files"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sha2",
+ "windows-sys",
 ]
 
 [[package]]

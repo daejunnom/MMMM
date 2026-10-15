@@ -11,6 +11,7 @@ members = [
     "crates/mmmm-planner",
     "crates/mmmm-game-observer",
     "crates/mmmm-native-process",
+    "crates/mmmm-owned-files",
 ]
 resolver = "3"
 

@@ -2,6 +2,8 @@
 //! file-handle identity, no-follow behavior or the live native owner boundary.
 //! Only newly created, marked files outside the checkout are read or removed.
 //! Known secret names appear only in pure lexical tests; none are created.
+//! Shared-kernel CreateNew cases reuse this fixture rather than creating another
+//! ownership/cleanup implementation in the neutral native crate.
 
 use super::*;
 use crate::{
@@ -206,6 +208,281 @@ fn lexical_path(suffix: &str) -> PathBuf {
     {
         PathBuf::from(format!("/selected/{suffix}"))
     }
+}
+
+#[test]
+fn shared_create_new_kernel_verifies_original_bytes_and_never_adopts_existing_children() {
+    use mmmm_owned_files::HeldDirectory;
+    use std::ffi::OsStr;
+    let fixture = Fixture::new();
+    let checks = Checks {
+        owner: &fixture.owner,
+        budget: &fixture.budget,
+    };
+    let root = HeldDirectory::open_root(&fixture.root.path.join("selected"), &checks).unwrap();
+    root.require_child_absent(OsStr::new("calibration-pack"), &checks)
+        .unwrap();
+    let pack = root
+        .create_directory_new(OsStr::new("calibration-pack"), &checks)
+        .unwrap();
+    let original: Vec<u8> = (0..CHUNK + 13).map(|index| (index % 251) as u8).collect();
+    let mut file = pack
+        .create_file_new(OsStr::new("pack.mcmeta"), original.len() as u64, &checks)
+        .unwrap();
+    file.write_all(&original, &checks).unwrap();
+    let facts = file.verify_original(&original, &checks).unwrap();
+    assert_eq!(facts.length, original.len() as u64);
+    let expected_digest: [u8; 32] = Sha256::digest(&original).into();
+    assert_eq!(facts.sha256, expected_digest);
+    file.close(&checks).unwrap();
+    assert_eq!(
+        pack.require_child_absent(OsStr::new("pack.mcmeta"), &checks)
+            .err()
+            .unwrap()
+            .kind,
+        ErrorKind::UnsafeSelection
+    );
+    let error = pack
+        .create_file_new(OsStr::new("pack.mcmeta"), 0, &checks)
+        .err()
+        .unwrap();
+    assert_eq!(error.kind, ErrorKind::Io);
+    assert_eq!(
+        error
+            .source()
+            .unwrap()
+            .downcast_ref::<io::Error>()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        root.create_directory_new(OsStr::new("calibration-pack"), &checks)
+            .err()
+            .unwrap()
+            .kind,
+        ErrorKind::Io
+    );
+    pack.close(&checks).unwrap();
+    root.close(&checks).unwrap();
+    assert_eq!(
+        fs::read(
+            fixture
+                .root
+                .path
+                .join("selected/calibration-pack/pack.mcmeta")
+        )
+        .unwrap(),
+        original
+    );
+}
+#[test]
+fn shared_create_new_mismatch_and_original_cancellation_preserve_partial_files() {
+    use mmmm_owned_files::HeldDirectory;
+    use std::ffi::OsStr;
+    let fixture = Fixture::new();
+    let checks = Checks {
+        owner: &fixture.owner,
+        budget: &fixture.budget,
+    };
+    let root = HeldDirectory::open_root(&fixture.root.path.join("selected"), &checks).unwrap();
+    let pack = root
+        .create_directory_new(OsStr::new("partial-pack"), &checks)
+        .unwrap();
+    let mut mismatch = pack
+        .create_file_new(OsStr::new("mismatch.bin"), 3, &checks)
+        .unwrap();
+    mismatch.write_all(b"abc", &checks).unwrap();
+    assert_eq!(
+        mismatch
+            .verify_original(b"abd", &checks)
+            .err()
+            .unwrap()
+            .kind,
+        ErrorKind::Changed
+    );
+    // A failed original-byte proof cannot become a successful later attempt on
+    // the same created-file object. Only close/release remains available.
+    assert_eq!(
+        mismatch
+            .verify_original(b"abc", &checks)
+            .err()
+            .unwrap()
+            .kind,
+        ErrorKind::Changed
+    );
+    mismatch.close(&checks).unwrap();
+    let mut partial = pack
+        .create_file_new(OsStr::new("partial.bin"), 6, &checks)
+        .unwrap();
+    partial.write_all(b"abc", &checks).unwrap();
+    fixture.cancelled.store(true, Ordering::Release);
+    assert_eq!(
+        partial.write_all(b"def", &checks).err().unwrap().kind,
+        ErrorKind::Request
+    );
+    assert_eq!(
+        partial.close(&checks).err().unwrap().kind,
+        ErrorKind::Request
+    );
+    drop(pack);
+    drop(root);
+    assert_eq!(
+        fs::read(fixture.root.path.join("selected/partial-pack/mismatch.bin")).unwrap(),
+        b"abc"
+    );
+    assert_eq!(
+        fs::read(fixture.root.path.join("selected/partial-pack/partial.bin")).unwrap(),
+        b"abc"
+    );
+}
+#[test]
+fn shared_child_secret_guard_precedes_original_request_and_metadata_checks() {
+    use mmmm_owned_files::HeldDirectory;
+    use std::ffi::OsStr;
+    let fixture = Fixture::new();
+    let checks = Checks {
+        owner: &fixture.owner,
+        budget: &fixture.budget,
+    };
+    let root = HeldDirectory::open_root(&fixture.root.path.join("selected"), &checks).unwrap();
+    fixture.cancelled.store(true, Ordering::Release);
+    // These selectors are never created or inspected. The expired checkpoint
+    // distinguishes lexical-first rejection from reaching any root/stat query.
+    for child in ["credentials", "api-key", ".env"] {
+        assert_eq!(
+            root.require_descendant_absent(&[OsStr::new("unopened"), OsStr::new(child)], &checks)
+                .err()
+                .unwrap()
+                .kind,
+            ErrorKind::UnsafeSelection
+        );
+        assert_eq!(
+            root.require_child_absent(OsStr::new(child), &checks)
+                .err()
+                .unwrap()
+                .kind,
+            ErrorKind::UnsafeSelection
+        );
+        assert_eq!(
+            root.create_directory_new(OsStr::new(child), &checks)
+                .err()
+                .unwrap()
+                .kind,
+            ErrorKind::UnsafeSelection
+        );
+        assert_eq!(
+            root.create_file_new(OsStr::new(child), 0, &checks)
+                .err()
+                .unwrap()
+                .kind,
+            ErrorKind::UnsafeSelection
+        );
+    }
+}
+
+#[test]
+fn shared_nested_absence_is_metadata_only_and_rejects_existing_or_non_directory_ancestors() {
+    use mmmm_owned_files::HeldDirectory;
+    use std::ffi::OsStr;
+    let fixture = Fixture::new();
+    let checks = Checks {
+        owner: &fixture.owner,
+        budget: &fixture.budget,
+    };
+    let existing = fixture.file("occupied.dat", b"preserved native fixture bytes");
+    let root = HeldDirectory::open_root(&fixture.root.path.join("selected"), &checks).unwrap();
+    let nested = root
+        .create_directory_new(OsStr::new("native-data"), &checks)
+        .unwrap();
+    nested.close(&checks).unwrap();
+    root.require_descendant_absent(
+        &[OsStr::new("missing-parent"), OsStr::new("future.dat")],
+        &checks,
+    )
+    .unwrap();
+    root.require_descendant_absent(
+        &[OsStr::new("native-data"), OsStr::new("future.dat")],
+        &checks,
+    )
+    .unwrap();
+    assert_eq!(
+        root.require_descendant_absent(&[OsStr::new("occupied.dat")], &checks)
+            .err()
+            .unwrap()
+            .kind,
+        ErrorKind::UnsafeSelection
+    );
+    assert_eq!(
+        root.require_descendant_absent(
+            &[OsStr::new("occupied.dat"), OsStr::new("future.dat")],
+            &checks
+        )
+        .err()
+        .unwrap()
+        .kind,
+        ErrorKind::UnsafeSelection
+    );
+    assert_eq!(
+        root.require_descendant_absent(&[], &checks)
+            .err()
+            .unwrap()
+            .kind,
+        ErrorKind::UnsafeSelection
+    );
+    let too_many = vec![OsStr::new("unopened"); 65];
+    assert_eq!(
+        root.require_descendant_absent(&too_many, &checks)
+            .err()
+            .unwrap()
+            .kind,
+        ErrorKind::UnsafeSelection
+    );
+    root.close(&checks).unwrap();
+    assert_eq!(
+        fs::read(existing).unwrap(),
+        b"preserved native fixture bytes"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_create_new_refuses_existing_symlink_without_opening_its_target() {
+    use mmmm_owned_files::HeldDirectory;
+    use std::ffi::OsStr;
+    let fixture = Fixture::new();
+    let checks = Checks {
+        owner: &fixture.owner,
+        budget: &fixture.budget,
+    };
+    let target = fixture.file("unchanged.bin", b"original owned target");
+    let link = fixture.root.path.join("selected/occupied.bin");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let root = HeldDirectory::open_root(&fixture.root.path.join("selected"), &checks).unwrap();
+    assert_eq!(
+        root.require_child_absent(OsStr::new("occupied.bin"), &checks)
+            .err()
+            .unwrap()
+            .kind,
+        ErrorKind::UnsafeSelection
+    );
+    let error = root
+        .create_file_new(OsStr::new("occupied.bin"), 0, &checks)
+        .err()
+        .unwrap();
+    assert_eq!(error.kind, ErrorKind::Io);
+    assert_eq!(
+        error
+            .source()
+            .unwrap()
+            .downcast_ref::<io::Error>()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    root.close(&checks).unwrap();
+    fixture.remove_owned_leaf(&link);
+    assert_eq!(fs::read(target).unwrap(), b"original owned target");
 }
 
 #[test]

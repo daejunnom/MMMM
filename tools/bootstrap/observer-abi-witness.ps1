@@ -371,9 +371,9 @@ try {
         capability_ordinals=@(3,26,30,35,37,42); capability_words_hex=@('44000008','00000428','00000000','00000000');
         individual_capability_checks=6; combined_capability_checks=1; callbacks_bytes=312; callbacks_alignment=8;
         callback_slots=@(0,1,4,5,6,17); native_method_bytes=24; native_method_alignment=8; native_method_offsets=@(0,8,16);
-        jni_slots=@(6,21,22,23,24,33,36,164,169,170,171,176,200,208,215,220,228);
+        jni_slots=@(6,15,17,21,22,23,24,31,33,36,63,164,169,170,171,172,174,176,200,208,215,220,228);
         jvmti_positions=@(2,18,47,48,49,52,57,64,65,66,75,88,89,122,133,140,142,146);
-        java_vm_get_env_slot=6; table_signature_checks=36; callback_signature_checks=6; entry_signature_checks=4;
+        java_vm_get_env_slot=6; table_signature_checks=42; callback_signature_checks=6; entry_signature_checks=4;
         set_event_variadic=$true; vm_invoked=$false; table_entries_called=$false; target_policy_granted=$false
     }
     $expectedFrame = ConvertTo-Json -InputObject $expectedWitness -Depth 8 -Compress

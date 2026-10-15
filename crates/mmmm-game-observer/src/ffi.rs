@@ -936,6 +936,182 @@ pub(crate) unsafe fn byte_array(env: *mut JNIEnv, bytes: &[u8]) -> Result<jbyteA
     }
 }
 
+// Narrow owned-file bridge helpers. Paths use UTF-16 regions, never JNI modified
+// UTF-8. Throwable local references are retained only until this JNI call exits.
+pub(crate) unsafe fn take_exception(env: *mut JNIEnv) -> Result<jobject> {
+    let occurred = unsafe { jni_fn!(env, 15, unsafe extern "C" fn(*mut JNIEnv) -> jobject) };
+    let clear = unsafe { jni_fn!(env, 17, unsafe extern "C" fn(*mut JNIEnv)) };
+    let value = unsafe { occurred(env) };
+    if !value.is_null() {
+        unsafe { clear(env) };
+    }
+    Ok(value)
+}
+pub(crate) unsafe fn object_class(env: *mut JNIEnv, object: jobject) -> Result<jclass> {
+    let function = unsafe {
+        jni_fn!(
+            env,
+            31,
+            unsafe extern "C" fn(*mut JNIEnv, jobject) -> jclass
+        )
+    };
+    if object.is_null() || unsafe { exception(env)? } {
+        return Err(FfiError::InvalidResult);
+    }
+    let value = unsafe { function(env, object) };
+    if value.is_null() || unsafe { exception(env)? } {
+        Err(FfiError::PendingException)
+    } else {
+        Ok(value)
+    }
+}
+pub(crate) unsafe fn method_id(
+    env: *mut JNIEnv,
+    class: jclass,
+    name: &std::ffi::CStr,
+    signature: &std::ffi::CStr,
+) -> Result<jmethodID> {
+    let function = unsafe {
+        jni_fn!(
+            env,
+            33,
+            unsafe extern "C" fn(*mut JNIEnv, jclass, *const c_char, *const c_char) -> jmethodID
+        )
+    };
+    let value = unsafe { function(env, class, name.as_ptr(), signature.as_ptr()) };
+    if value.is_null() || unsafe { exception(env)? } {
+        Err(FfiError::PendingException)
+    } else {
+        Ok(value)
+    }
+}
+pub(crate) unsafe fn call_object_zero(
+    env: *mut JNIEnv,
+    object: jobject,
+    method: jmethodID,
+) -> Result<jobject> {
+    let function = unsafe {
+        jni_fn!(
+            env,
+            36,
+            unsafe extern "C" fn(*mut JNIEnv, jobject, jmethodID, *const c_void) -> jobject
+        )
+    };
+    let value = unsafe { function(env, object, method, ptr::null()) };
+    if unsafe { exception(env)? } {
+        Err(FfiError::PendingException)
+    } else if value.is_null() {
+        Err(FfiError::InvalidResult)
+    } else {
+        Ok(value)
+    }
+}
+pub(crate) unsafe fn call_void_zero(
+    env: *mut JNIEnv,
+    object: jobject,
+    method: jmethodID,
+) -> Result<()> {
+    let function = unsafe {
+        jni_fn!(
+            env,
+            63,
+            unsafe extern "C" fn(*mut JNIEnv, jobject, jmethodID, *const c_void)
+        )
+    };
+    unsafe { function(env, object, method, ptr::null()) };
+    if unsafe { exception(env)? } {
+        Err(FfiError::PendingException)
+    } else {
+        Ok(())
+    }
+}
+pub(crate) unsafe fn string_utf16(
+    env: *mut JNIEnv,
+    string: jstring,
+    cap: usize,
+) -> Result<Vec<u16>> {
+    let length = unsafe { jni_fn!(env, 164, unsafe extern "C" fn(*mut JNIEnv, jstring) -> jint) };
+    let region = unsafe {
+        jni_fn!(
+            env,
+            220,
+            unsafe extern "C" fn(*mut JNIEnv, jstring, jint, jint, *mut u16)
+        )
+    };
+    if string.is_null() {
+        return Err(FfiError::InvalidResult);
+    }
+    let size = unsafe { length(env, string) };
+    if unsafe { exception(env)? } {
+        return Err(FfiError::PendingException);
+    }
+    if size < 1 || size as usize > cap {
+        return Err(FfiError::BoundExceeded);
+    }
+    let mut value = vec![0u16; size as usize];
+    unsafe { region(env, string, 0, size, value.as_mut_ptr()) };
+    if unsafe { exception(env)? } {
+        Err(FfiError::PendingException)
+    } else {
+        Ok(value)
+    }
+}
+pub(crate) unsafe fn whole_byte_array(
+    env: *mut JNIEnv,
+    value: jbyteArray,
+    cap: usize,
+) -> Result<Vec<u8>> {
+    let length = unsafe { jni_fn!(env, 171, unsafe extern "C" fn(*mut JNIEnv, jobject) -> jint) };
+    if value.is_null() {
+        return Err(FfiError::InvalidResult);
+    }
+    let size = unsafe { length(env, value) };
+    if unsafe { exception(env)? } {
+        return Err(FfiError::PendingException);
+    }
+    unsafe { selected_array(env, value, 0, size, cap) }
+}
+pub(crate) unsafe fn object_array(env: *mut JNIEnv, values: &[jobject]) -> Result<jobject> {
+    let find = unsafe {
+        jni_fn!(
+            env,
+            6,
+            unsafe extern "C" fn(*mut JNIEnv, *const c_char) -> jclass
+        )
+    };
+    let new = unsafe {
+        jni_fn!(
+            env,
+            172,
+            unsafe extern "C" fn(*mut JNIEnv, jint, jclass, jobject) -> jobject
+        )
+    };
+    let set = unsafe {
+        jni_fn!(
+            env,
+            174,
+            unsafe extern "C" fn(*mut JNIEnv, jobject, jint, jobject)
+        )
+    };
+    let class = unsafe { find(env, c"java/lang/Object".as_ptr()) };
+    if class.is_null() || unsafe { exception(env)? } {
+        return Err(FfiError::PendingException);
+    }
+    let count = jint::try_from(values.len()).map_err(|_| FfiError::BoundExceeded)?;
+    let array = unsafe { new(env, count, class, ptr::null_mut()) };
+    unsafe { delete_local(env, class)? };
+    if array.is_null() || unsafe { exception(env)? } {
+        return Err(FfiError::PendingException);
+    }
+    for (index, value) in values.iter().enumerate() {
+        unsafe { set(env, array, index as jint, *value) };
+        if unsafe { exception(env)? } {
+            return Err(FfiError::PendingException);
+        }
+    }
+    Ok(array)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

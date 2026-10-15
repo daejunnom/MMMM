@@ -66,6 +66,8 @@ const ROSTER: &[&[u8]] = &[
     b"com/mojang/brigadier/",
     b"net/minecraft/commands/",
     b"net/minecraft/server/commands/",
+    // Actual game-loader anchor for the narrow private owned-file platform port.
+    b"net/minecraft/server/MinecraftServer",
     b"net/minecraft/world/scores/",
     b"net/minecraft/nbt/",
     b"net/minecraft/world/level/storage/",
@@ -264,6 +266,121 @@ type Result<T> = std::result::Result<T, ProducerError>;
 
 pub(crate) fn status() -> jint {
     STATUS.load(Ordering::Acquire)
+}
+// Borrowed only inside an attached, current JNI call. This is an installed-VM
+// observation, not executable/source approval or permission to select a path.
+pub(crate) fn owned_files_vm() -> *mut JvmtiEnv {
+    JVMTI.load(Ordering::Acquire)
+}
+
+/// An actual issuer-held Class/loader join, scoped to one owned-file JNI call.
+/// It does not turn observed definitions into source or write approval.
+pub(crate) struct OwnedFilePortToken {
+    _operation: Operation,
+    status: jint,
+    classes: [(u64, u64); 4],
+}
+impl OwnedFilePortToken {
+    pub(crate) fn is_current(&self) -> bool {
+        status() == self.status
+            && self.status >= 0
+            && self.status & VM_LIVE != 0
+            && core(|core| {
+                Ok(self
+                    .classes
+                    .iter()
+                    .all(|(id, generation)| core.ordinary_generation(*id) == Some(*generation)))
+            })
+            .unwrap_or(false)
+    }
+}
+/// Exact actual Classes, never names or loader IDs supplied in JSON. A second
+/// observed definition with one of these names makes this acquisition ambiguous.
+/// The operation lease pins issuer globals across all following native I/O.
+pub(crate) unsafe fn owned_file_port(
+    env: *mut JNIEnv,
+    bridge: jclass,
+    port: jclass,
+    checkpoint: &impl Fn() -> ffi::Result<()>,
+) -> Result<Option<OwnedFilePortToken>> {
+    let operation =
+        Operation::acquire(METADATA_RESERVATION).ok_or(ProducerError::StateUnavailable)?;
+    let initial = status();
+    let ti = owned_files_vm();
+    if initial < 0 || ti.is_null() || unsafe { ffi::exception(env)? } {
+        return Ok(None);
+    }
+    let mut actual = [bridge, port, ptr::null_mut(), ptr::null_mut()];
+    let names: [&[u8]; 4] = [
+        b"Lio/github/daejunnom/mmmm/observer/DefinitionOwnedPackFilesBridge;",
+        b"Lio/github/daejunnom/mmmm/fabric/NativeCalibrationPackFiles$NativeCall;",
+        b"Lio/github/daejunnom/mmmm/fabric/MmmmFabricHost;",
+        b"Lnet/minecraft/server/MinecraftServer;",
+    ];
+    let references = {
+        let state = STATE
+            .get()
+            .ok_or(ProducerError::StateUnavailable)?
+            .lock()
+            .map_err(|_| ProducerError::StateUnavailable)?;
+        if state.closed {
+            return Ok(None);
+        }
+        state
+            .references
+            .iter()
+            .filter(|reference| reference.kind == ReferenceKind::Class)
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    let mut joined = [(0, 0); 4];
+    let mut counts = [0usize; 4];
+    // This bounded metadata-only scan invokes no caller method. The host/game
+    // anchors come from issuer-held actual Classes, never port-provided Classes.
+    for reference in references {
+        let class = reference.handle as jclass;
+        let signature = unsafe { ffi::class_signature(ti, class)? };
+        for index in 0..4 {
+            if signature != names[index] {
+                continue;
+            }
+            counts[index] += 1;
+            if index < 2 && !unsafe { ffi::same_object(env, class, actual[index])? } {
+                return Ok(None);
+            }
+            if index >= 2 {
+                actual[index] = class;
+            }
+            let Some(generation) = core(|core| Ok(core.ordinary_generation(reference.id)))? else {
+                return Ok(None);
+            };
+            if !unsafe { ffi::class_prepared(ti, class)? } {
+                return Ok(None);
+            }
+            joined[index] = (reference.id, generation);
+        }
+    }
+    if counts != [1; 4] {
+        return Ok(None);
+    }
+    let loaders = unsafe {
+        [
+            actual_loader(env, ti, actual[0])?,
+            actual_loader(env, ti, actual[1])?,
+            actual_loader(env, ti, actual[2])?,
+            actual_loader(env, ti, actual[3])?,
+        ]
+    };
+    if loaders[0] != 0 || loaders[1] == 0 || loaders[1] != loaders[2] || loaders[2] != loaders[3] {
+        return Ok(None);
+    }
+    checkpoint()?;
+    let token = OwnedFilePortToken {
+        _operation: operation,
+        status: initial,
+        classes: joined,
+    };
+    Ok(token.is_current().then_some(token))
 }
 fn fail(code: jint) {
     let mut prior = status();

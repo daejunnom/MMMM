@@ -540,7 +540,9 @@ try {
     $catalog = Read-Json (Join-Path ([System.IO.Path]::GetDirectoryName($slotsRoot)) 'catalog.json') 8192
     if ($catalog.schema -cne 'mmmm-managed-build/1' -or $catalog.catalog_id -cnotmatch '^[0-9a-f]{64}$') { throw 'OBSERVER_CATALOG_IDENTITY_INVALID' }
 
-    $sourceRoots = @('Cargo.toml','Cargo.lock','rust-toolchain.toml','crates/mmmm-game-observer','crates/mmmm-native-process','tools/mmmm-xtask',
+    $sourceRoots = @('Cargo.toml','Cargo.lock','rust-toolchain.toml','crates/mmmm-game-observer','crates/mmmm-native-process',
+        'crates/mmmm-owned-files','crates/mmmm-compiler','crates/mmmm-domain','crates/mmmm-contracts',
+        'contracts/mmmm.schema.json','contracts/digest-projections.json','contracts/function-index.json','tools/mmmm-xtask',
         'jvm/build.gradle','jvm/settings.gradle','jvm/definition-observer', 'tools/bootstrap/observer-ci.ps1',
         'tools/bootstrap/observer-abi-witness.c','tools/bootstrap/observer-abi-witness.ps1',
         'tools/bootstrap/jvm-ci.ps1','tools/bootstrap/jvm-runtime-probe.ps1','tools/bootstrap/jvm-archive.py',
@@ -552,6 +554,12 @@ try {
     foreach ($required in @('Cargo.toml','Cargo.lock','rust-toolchain.toml','crates/mmmm-native-process/Cargo.toml',
             'crates/mmmm-native-process/src/lib.rs','crates/mmmm-native-process/src/darwin.rs','crates/mmmm-game-observer/build.rs',
             'crates/mmmm-game-observer/Cargo.toml','crates/mmmm-game-observer/src/lib.rs','crates/mmmm-game-observer/src/ffi.rs',
+            'crates/mmmm-owned-files/Cargo.toml','crates/mmmm-owned-files/src/lib.rs','crates/mmmm-owned-files/src/unix.rs',
+            'crates/mmmm-owned-files/src/windows.rs','crates/mmmm-owned-files/src/tests.rs',
+            'crates/mmmm-compiler/Cargo.toml','crates/mmmm-compiler/src/lib.rs',
+            'crates/mmmm-domain/Cargo.toml','crates/mmmm-domain/src/lib.rs',
+            'crates/mmmm-contracts/Cargo.toml','crates/mmmm-contracts/src/lib.rs',
+            'contracts/mmmm.schema.json','contracts/digest-projections.json','contracts/function-index.json',
             'tools/bootstrap/observer-ci.ps1','tools/bootstrap/observer-abi-witness.c','tools/bootstrap/observer-abi-witness.ps1',
             '.github/workflows/jvm.yml')) {
         if ($required -cnotin $inputs) { throw 'OBSERVER_REQUIRED_SOURCE_NOT_TRACKED' }

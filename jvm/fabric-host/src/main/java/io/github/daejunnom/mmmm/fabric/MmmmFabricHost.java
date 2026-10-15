@@ -60,6 +60,7 @@ public final class MmmmFabricHost implements ModInitializer {
     private final Map<String, HostSession> invocationRoutes = new HashMap<>();
     private final Map<HostSession, Map<String, Invocation>> nativeHistory = new IdentityHashMap<>();
     private final Map<String, PendingCalibrationOffer> calibrationOffers = new HashMap<>();
+    private final Map<String, PendingBootstrapOffer> bootstrapOffers = new HashMap<>();
     private NativeCalibrationApproval.Runner calibrationRunner;
     private int nativeHistoryCount;
     private long nativeHistoryBytes;
@@ -198,9 +199,12 @@ public final class MmmmFabricHost implements ModInitializer {
     }
 
     private record SessionRoute(PairedLoopbackServer endpoint, NativePlanApproval approval,
-                                ObjectNode sourceFacts, ObjectNode profileEvidence, NativeCalibrationApproval calibration) { }
+                                ObjectNode sourceFacts, ObjectNode profileEvidence, NativeCalibrationApproval calibration,
+                                NativeCalibrationBootstrap bootstrap, HostRuntime bootstrapRuntime) { }
     private record PendingCalibrationOffer(HostSession paired, HostRuntime runtime, String offerDigest,
                                            String factsDigest, String hostArtifactDigest, long generation, long until) { }
+    private record PendingBootstrapOffer(HostSession paired, HostRuntime runtime, String offerDigest,
+                                         String factsDigest, String hostArtifactDigest, long generation, long until) { }
 
     /**
      * Trusted out-of-band composition only. The Rust authority supplies approved artifact/action digests,
@@ -368,7 +372,7 @@ public final class MmmmFabricHost implements ModInitializer {
             List<ObjectNode> admittedContexts = contexts.stream().map(ObjectNode::deepCopy).toList();
             synchronized (routes) {
                 candidateSession.checkOpen();
-                routes.put(candidateSession, new SessionRoute(listener, null, null, null, null)); routeOrder.add(candidateSession);
+                routes.put(candidateSession, new SessionRoute(listener, null, null, null, null, null, null)); routeOrder.add(candidateSession);
                 installedSources = acceptedSources; installedActions = acceptedActions; installedContexts = admittedContexts;
                 compatibilityApprovals = pendingCompatibility;
                 compatibilityMetadataResolver = resolver;
@@ -472,7 +476,7 @@ public final class MmmmFabricHost implements ModInitializer {
             synchronized (routes) {
                 previous.checkOpen(); approved.checkOpen();
                 if (session != previous || runtime != currentRuntime || !routes.containsKey(previous)) throw new ContractException("SESSION_EXPIRED", "Original approval runtime is no longer installed");
-                routes.put(approved, new SessionRoute(listener, grant, facts.deepCopy(), profileEvidence, null)); routeOrder.add(approved);
+                routes.put(approved, new SessionRoute(listener, grant, facts.deepCopy(), profileEvidence, null, null, null)); routeOrder.add(approved);
                 session = approved; endpoint = listener;
             }
             return listener.endpoint();
@@ -484,7 +488,7 @@ public final class MmmmFabricHost implements ModInitializer {
         synchronized (routes) {
             for (HostSession paired : List.copyOf(routeOrder)) {
                 SessionRoute route = routes.get(paired);
-                if (route != null && (route.approval() != null || route.calibration() != null) && installedEndpoint.equals(route.endpoint().endpoint())) {
+                if (route != null && (route.approval() != null || route.calibration() != null || route.bootstrap() != null) && installedEndpoint.equals(route.endpoint().endpoint())) {
                     route.endpoint().close(); paired.close(); routes.remove(paired); routeOrder.remove(paired);
                 }
             }
@@ -628,7 +632,7 @@ public final class MmmmFabricHost implements ModInitializer {
             current.run();
             synchronized (routes) {
                 if (routes.size() >= 8) throw new ContractException("SESSION_LIMIT", "현재 immutable route 한도가 찼습니다");
-                routes.put(approved, new SessionRoute(listener, null, facts.deepCopy(), null, grant)); routeOrder.add(approved);
+                routes.put(approved, new SessionRoute(listener, null, facts.deepCopy(), null, grant, null, null)); routeOrder.add(approved);
                 session = approved; endpoint = listener;
             }
             original.run(); checkCalibrationCurrent(approved, contexts.getFirst(), original, false); return listener.endpoint();
@@ -675,6 +679,171 @@ public final class MmmmFabricHost implements ModInitializer {
             retained.put(invocation.invocationId(), invocation); nativeHistoryCount++; nativeHistoryBytes += bytes;
         }
     }
+    ObjectNode bootstrapApprovalOffer(UUID playerId, HostSetup setup, String planId, String planHash, Runnable original, long until) {
+        original.run(); requireServerThread(); HostSession paired = requireSession(); HostRuntime actualRuntime = runtime;
+        long generation = registryGeneration;
+        Runnable current = () -> {
+            original.run(); requireServerThread(); paired.checkOpen();
+            if (until - System.nanoTime() <= 0 || session != paired || runtime != actualRuntime || generation != registryGeneration
+                    || !playerId.equals(paired.playerId()) || player(paired).createCommandSourceStack().getPermissionContext().permissionLevel() != PermissionLevel.ADMINS) throw authorityInvalid();
+        };
+        current.run();
+        if (!planId.matches("[a-z0-9][a-z0-9._:-]{0,127}") || !planHash.matches("[a-f0-9]{64}")
+                || installedContexts.isEmpty() || !setup.projectId().equals(installedContexts.getFirst().path("projectId").asText())
+                || !setup.hostArtifactDigest().equals(artifactDigest(container("mmmm_host")))) throw authorityInvalid();
+        ObjectNode facts = NativeSourceFacts.observe(server, Long.toString(generation), environment(), current::run); current.run();
+        ObjectNode offer = ContractJson.newObject().put("kind", "host_apply_approval_offer").put("protocolVersion", ContractJson.VERSION)
+                .put("nonce", "approve-" + UUID.randomUUID()).put("purpose", NativeCalibrationBootstrap.PURPOSE)
+                .put("dataRoot", setup.dataRoot().toString()).put("projectId", setup.projectId())
+                .put("principalId", paired.principalRef()).put("playerId", playerId.toString()).put("planId", planId).put("planHash", planHash)
+                .put("hostArtifactDigest", setup.hostArtifactDigest());
+        offer.set("hostHello", actualRuntime.hello()); offer.set("runtimeSourceFacts", facts);
+        var ids = offer.putArray("contextIds"); installedContexts.forEach(value -> ids.add(value.path("contextId").asText()));
+        String nonce = offer.path("nonce").asText();
+        try {
+            current.run();
+            synchronized (routes) {
+                bootstrapOffers.entrySet().removeIf(entry -> entry.getValue().until() - System.nanoTime() <= 0);
+                if (routes.size() >= 8 || bootstrapOffers.size() + calibrationOffers.size() >= 8) throw new ContractException("SESSION_LIMIT", "현재 immutable route 또는 승인 준비 한도가 찼습니다");
+                bootstrapOffers.put(nonce, new PendingBootstrapOffer(paired, actualRuntime, ContractJson.digest(offer),
+                        NativeProfileAdmission.sourceDigest(facts), setup.hostArtifactDigest(), generation, until));
+            }
+            current.run(); return offer;
+        } catch (RuntimeException failure) { releaseBootstrapOffer(nonce); throw failure; }
+    }
+
+    void releaseBootstrapOffer(String nonce) { if (nonce != null) synchronized (routes) { bootstrapOffers.remove(nonce); } }
+
+    void confirmBootstrapApproval(String address, ObjectNode offer, String selectionDigest, String manifestDigest, Runnable original) {
+        original.run(); requireServerThread(); HostSession paired = null;
+        synchronized (routes) {
+            for (var entry : routes.entrySet()) if (entry.getValue().bootstrap() != null && entry.getValue().endpoint().endpoint().equals(address)) {
+                paired = entry.getKey(); break;
+            }
+        }
+        if (paired == null) throw authorityInvalid();
+        NativeCalibrationBootstrap grant = sessionRoute(paired).bootstrap();
+        if (!grant.selectionDigest().equals(selectionDigest) || !grant.manifestDigest().equals(manifestDigest)
+                || !NativeCalibrationBootstrap.PURPOSE.equals(offer.path("purpose").asText())
+                || !offer.path("principalId").asText().equals(paired.principalRef())
+                || !offer.path("hostHello").equals(runtime.hello())) throw authorityInvalid();
+        String contextId = offer.path("contextIds").get(0).asText();
+        checkBootstrapCurrent(paired, paired.context(contextId), original, true); original.run();
+        grant.activate(); original.run(); checkBootstrapCurrent(paired, paired.context(contextId), original, true);
+    }
+
+    String installBootstrapApproval(UUID playerId, ObjectNode offer, ObjectNode authority, byte[] bearer, Runnable original) throws IOException {
+        original.run(); requireServerThread(); PendingBootstrapOffer pending;
+        synchronized (routes) { pending = bootstrapOffers.remove(offer.path("nonce").asText()); }
+        if (pending == null) throw authorityInvalid(); HostSession previous = pending.paired();
+        Runnable current = () -> {
+            original.run(); requireServerThread(); previous.checkOpen();
+            synchronized (routes) {
+                if (pending.until() - System.nanoTime() <= 0 || session != previous || runtime != pending.runtime()
+                        || !routes.containsKey(previous) || registryGeneration != pending.generation()) throw authorityInvalid();
+            }
+            if (!playerId.equals(previous.playerId()) || !pending.offerDigest().equals(ContractJson.digest(offer))
+                    || player(previous).createCommandSourceStack().getPermissionContext().permissionLevel() != PermissionLevel.ADMINS) throw authorityInvalid();
+        };
+        current.run();
+        HostDispatcher.exactFields(authority, Set.of("kind", "protocolVersion", "nonce", "purpose", "contexts", "approvedSources", "approvedActions", "permissions", "manifest"));
+        if (!"host_apply_approval_authority".equals(authority.path("kind").asText()) || !ContractJson.VERSION.equals(authority.path("protocolVersion").asText())
+                || !offer.path("nonce").equals(authority.path("nonce")) || !NativeCalibrationBootstrap.PURPOSE.equals(authority.path("purpose").asText())
+                || !offer.path("purpose").equals(authority.path("purpose")) || !offer.path("hostHello").equals(pending.runtime().hello())
+                || !authority.path("contexts").isArray() || authority.path("contexts").size() != installedContexts.size()) throw authorityInvalid();
+        List<ObjectNode> contexts = new ArrayList<>(); Set<String> ids = new java.util.HashSet<>();
+        for (JsonNode value : authority.path("contexts")) {
+            current.run(); contracts.validate("ExecutionContext", value); ObjectNode context = ContractJson.object(value); String id = context.path("contextId").asText();
+            if (!ids.add(id) || !sameExecutionIdentity(previous.context(id), context)) throw authorityInvalid(); contexts.add(context.deepCopy());
+        }
+        if (!authority.path("approvedSources").isObject() || !authority.path("approvedActions").isArray() || !authority.path("permissions").isArray()) throw authorityInvalid();
+        Map<String, String> sources = new HashMap<>(); authority.path("approvedSources").fields().forEachRemaining(entry -> {
+            if (!entry.getValue().isTextual()) throw authorityInvalid(); sources.put(entry.getKey(), entry.getValue().asText());
+        });
+        Set<String> actions = new java.util.HashSet<>(), permissions = new java.util.HashSet<>();
+        authority.path("approvedActions").forEach(value -> { if (!value.isTextual() || !actions.add(value.asText())) throw authorityInvalid(); });
+        authority.path("permissions").forEach(value -> { if (!value.isTextual() || !permissions.add(value.asText())) throw authorityInvalid(); });
+        if (!sources.equals(installedSources) || !actions.equals(installedActions) || !permissions.equals(NativeCalibrationApproval.READ_PERMISSIONS)) throw authorityInvalid();
+        ObjectNode facts = NativeSourceFacts.observe(server, Long.toString(registryGeneration), environment(), current::run); current.run();
+        if (!pending.factsDigest().equals(NativeProfileAdmission.sourceDigest(facts))
+                || !pending.hostArtifactDigest().equals(artifactDigest(container("mmmm_host")))) throw new ContractException("TARGET_DRIFT", "승인 대기 중 원 bootstrap runtime source가 바뀌었습니다");
+        ObjectNode manifest = ContractJson.object(authority.path("manifest")), inner = ContractJson.object(manifest.path("plan"));
+        if (!"native_calibration_bootstrap_approval/1".equals(manifest.path("kind").asText())
+                || !offer.path("planId").equals(inner.path("planId")) || !offer.path("planHash").equals(inner.path("planHash"))
+                || !offer.path("projectId").equals(inner.path("projectId")) || !offer.path("principalId").equals(inner.path("principalId"))
+                || !inner.path("steps").isArray() || inner.path("steps").size() != 1
+                || !inner.path("nativeExecutions").isArray() || !inner.path("nativeExecutions").isEmpty()
+                || !pending.factsDigest().equals(manifest.path("runtimeSourceFactsDigest").asText())
+                || !Long.toString(pending.generation()).equals(manifest.path("registryGeneration").asText())) throw authorityInvalid();
+        JsonNode step = inner.path("steps").get(0);
+        ObjectNode descriptor = pending.runtime().describe(step.path("bindingId").asText(), step.path("actionId").asText());
+        if (!NativeCalibrationBootstrap.ACTION_ID.equals(step.path("actionId").asText())
+                || !pending.hostArtifactDigest().equals(step.path("implementationDigest").asText())
+                || !ContractJson.digest(descriptor).equals(step.path("actionDigest").asText())) throw authorityInvalid();
+        HostSession approved = new HostSession(previous.principalRef(), previous.epoch(), previous.gameInstanceId(), previous.side(), playerId, permissions, false);
+        NativeCalibrationBootstrap grant;
+        try {
+            contexts.forEach(context -> approved.installContext(contracts, context));
+            grant = new NativeCalibrationBootstrap(contracts, manifest, approved, Clock.systemUTC(), this::gameTask,
+                    this::checkBootstrapCurrent, invocation -> retainAcceptedBootstrap(approved, invocation), server, () -> player(approved), this::level);
+            approved.whenClosed(() -> { definitionCollection.retire(approved); grant.close(); });
+        } catch (RuntimeException failure) { approved.close(); throw failure; }
+        PairedLoopbackServer listener = null;
+        try {
+            current.run();
+            listener = new PairedLoopbackServer(approved, new HostDispatcher(contracts, pending.runtime(), this::inspect, Clock.systemUTC(), grant), bearer);
+            current.run();
+            synchronized (routes) {
+                if (routes.size() >= 8) throw new ContractException("SESSION_LIMIT", "현재 immutable route 한도가 찼습니다");
+                routes.put(approved, new SessionRoute(listener, null, facts.deepCopy(), null, null, grant, pending.runtime())); routeOrder.add(approved);
+                session = approved; endpoint = listener;
+            }
+            original.run(); checkBootstrapCurrent(approved, contexts.getFirst(), original, true); return listener.endpoint();
+        } catch (IOException | RuntimeException failure) {
+            if (listener != null) listener.close(); approved.close();
+            synchronized (routes) {
+                routes.remove(approved); routeOrder.remove(approved);
+                if (session == approved) { session = previous; SessionRoute old = routes.get(previous); endpoint = old == null ? null : old.endpoint(); }
+            }
+            throw failure;
+        }
+    }
+
+    private void checkBootstrapCurrent(HostSession paired, ObjectNode context, Runnable original, boolean observeSources) {
+        original.run(); requireServerThread(); paired.checkOpen(); SessionRoute route = sessionRoute(paired);
+        NativeCalibrationBootstrap grant = route.bootstrap();
+        if (grant == null || runtime != route.bootstrapRuntime() || paired.verifiedWriteProfile() || !epoch.equals(paired.epoch())
+                || !Long.toString(registryGeneration).equals(grant.registryGeneration()) || !gameInstanceId.equals(paired.gameInstanceId())
+                || !context.equals(paired.context(context.path("contextId").asText()))
+                || !worldId.equals(context.path("environment").path("worldId").asText()) || !"server".equals(paired.side())) throw authorityInvalid();
+        ServerPlayer player = player(paired);
+        if (!context.path("executorHandle").asText().equals("player-" + paired.playerId())
+                || !player.level().dimension().identifier().toString().equals(context.path("dimension").asText())
+                || player.createCommandSourceStack().getPermissionContext().permissionLevel() != PermissionLevel.ADMINS) throw new ContractException("PERMISSION_DENIED", "현재 실제 bootstrap ADMIN 또는 실행 context 권한이 끝났습니다");
+        if (observeSources) {
+            ObjectNode facts = NativeSourceFacts.observe(server, Long.toString(registryGeneration), environment(),
+                    () -> checkBootstrapCurrent(paired, context, original, false));
+            if (sessionRoute(paired) != route || runtime != route.bootstrapRuntime()
+                    || !grant.runtimeSourceFactsDigest().equals(NativeProfileAdmission.sourceDigest(facts))
+                    || !installedSources.getOrDefault("mmmm_host", "").equals(artifactDigest(container("mmmm_host")))) throw new ContractException("TARGET_DRIFT", "원 bootstrap source pin이 현재 게임과 다릅니다");
+        }
+        original.run();
+    }
+
+    private void retainAcceptedBootstrap(HostSession paired, Invocation invocation) {
+        requireServerThread(); if (sessionRoute(paired).bootstrap() == null) throw authorityInvalid();
+        synchronized (routes) {
+            Map<String, Invocation> retained = nativeHistory.computeIfAbsent(paired, ignored -> new HashMap<>());
+            Invocation previous = retained.get(invocation.invocationId());
+            if (previous != null) { if (!previous.wire().equals(invocation.wire())) throw authorityInvalid(); return; }
+            int bytes = ContractJson.bytes(invocation.wire()).length;
+            if (nativeHistoryCount >= 512 || nativeHistoryBytes > 32L * 1024 * 1024 - bytes) throw new ContractException("HOST_HISTORY_FULL", "원 native Invocation 자료의 보존 한도가 찼습니다");
+            String key = invocationRouteKey(invocation); HostSession owner = invocationRoutes.putIfAbsent(key, paired);
+            if (owner != null && owner != paired) throw new ContractException("SESSION_ROUTE_CHANGED", "원 Invocation의 route를 바꿀 수 없습니다");
+            retained.put(invocation.invocationId(), invocation); nativeHistoryCount++; nativeHistoryBytes += bytes;
+        }
+    }
+
     private static ContractException authorityInvalid() { return new ContractException("HOST_AUTHORITY_INVALID", "Plan authority reply does not match the installed immutable host pairing"); }
     private static boolean sameExecutionIdentity(ObjectNode original, ObjectNode current) {
         ObjectNode before = original.deepCopy(); ObjectNode after = current.deepCopy();
@@ -735,6 +904,9 @@ public final class MmmmFabricHost implements ModInitializer {
                 local.requireGameThread();
                 if ("mmmm:calibration_command_execute".equals(id)) {
                     throw new ContractException("CALIBRATION_PRIVATE_ROUTE_REQUIRED", "Only the exact private normative calibration purpose can execute this action");
+                }
+                if (NativeCalibrationBootstrap.ACTION_ID.equals(id)) {
+                    throw new ContractException("CALIBRATION_BOOTSTRAP_PRIVATE_ROUTE_REQUIRED", "Only the exact private calibration bootstrap purpose can execute this action");
                 }
                 HostSession paired = invocationSession(invocation);
                 ObjectNode context = invocation.context();
@@ -931,6 +1103,17 @@ public final class MmmmFabricHost implements ModInitializer {
                             (installed, step, index, parsed, admitted) -> {
                                 throw new ContractException("NATIVE_READONLY_GUARD_UNAVAILABLE", "No admitted loaded-definition parser closure is installed");
                             }));
+                } else if ("calibration_bootstrap_target_state".equals(kind)) {
+                    HostDispatcher.exactFields(payload, Set.of("kind", "sourceBundleDigest"));
+                    NativeCalibrationBootstrap bootstrap = sessionRoute(paired).bootstrap();
+                    if (bootstrap == null) throw new ContractException("CALIBRATION_BOOTSTRAP_APPROVAL_PENDING", "No original private bootstrap approval owns this query");
+                    Runnable current = () -> {
+                        control.checkpoint();
+                        if (result.isDone()) throw new ContractException("CANCELLATION_REQUESTED", "Bootstrap inspection ended");
+                        checkBootstrapCurrent(paired, context, control::checkpoint, true);
+                    };
+                    result.complete(NativeCalibrationFunctions.checked(() -> bootstrap.observeState(paired, context,
+                            HostDispatcher.string(payload, "sourceBundleDigest"), control), current));
                 } else if ("calibration_target_state".equals(kind)) {
                     HostDispatcher.exactFields(payload, Set.of("kind", "caseId", "functionId", "targetBindings"));
                     SessionRoute originalRoute = sessionRoute(paired);
@@ -1524,6 +1707,12 @@ public final class MmmmFabricHost implements ModInitializer {
         calibrationAction.withArray("limitations").add("Only the exact immutable private normative47 calibration purpose route executes this action")
                 .add("Native queue completion and optional callbacks are factual; independent readback and explicit source checks remain required");
         contracts.validate("ActionDescriptor", calibrationAction); result.add(calibrationAction);
+        ObjectNode bootstrapAction = descriptor(NativeCalibrationBootstrap.ACTION_ID, "mmmm:calibration_bootstrap", "write",
+                NativeCalibrationBootstrap.inputSchema(), NativeCalibrationBootstrap.outputSchema(), digest,
+                "mmmm:command_execute", "independent_readback");
+        bootstrapAction.withArray("limitations").add("Only the exact immutable private numeric calibration bootstrap purpose route executes this action")
+                .add("Bootstrap approval grants no ordinary verified-profile writes; reload invalidates this route");
+        contracts.validate("ActionDescriptor", bootstrapAction); result.add(bootstrapAction);
         ObjectNode prepared = ContractJson.newObject().put("type", "object").put("additionalProperties", false);
         prepared.putArray("required").add("preparedChange");
         prepared.putObject("properties").putObject("preparedChange").put("$ref", "urn:mmmm:contracts:0.2.0#/$defs/ResourceRef");
@@ -1572,7 +1761,7 @@ public final class MmmmFabricHost implements ModInitializer {
             oldCompatibility = compatibilityApprovals; compatibilityApprovals = null;
             oldMetadata = compatibilityMetadataResolver; compatibilityMetadataResolver = null;
             owners.forEach(HostSession::close); if (oldSession != null) oldSession.close();
-            routes.clear(); routeOrder.clear(); calibrationOffers.clear(); nativeHistory.clear(); nativeHistoryCount = 0; nativeHistoryBytes = 0;
+            routes.clear(); routeOrder.clear(); calibrationOffers.clear(); bootstrapOffers.clear(); nativeHistory.clear(); nativeHistoryCount = 0; nativeHistoryBytes = 0;
             invocationRoutes.clear(); installedSources = Map.of(); installedActions = Set.of(); installedContexts = List.of();
             endpoint = null; runtime = null; session = null;
         }
