@@ -360,6 +360,7 @@ impl OwnedPlanningData {
             delta_policy: policy,
             artifact,
             source_map,
+            manual_payload: None,
             ingested_bake: None,
         })
     }
@@ -378,7 +379,7 @@ impl OwnedPlanningData {
         context: &Value,
         budget: &RequestBudget,
     ) -> AppResult<()> {
-        if source.ingested_bake.is_some() {
+        if source.ingested_bake.is_some() || source.manual_payload.is_some() {
             return Err(AppError::new(
                 "SOURCE_PROVENANCE_INVALID",
                 "A static owned source cannot issue a sealed bake",

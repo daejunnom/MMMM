@@ -725,6 +725,22 @@ fn original_fn24_selection_and_explicit_manual_files_reach_common_scene_plan_wit
     selection["projectId"] = json!(inputs.catalog.project_id());
     selection["projectRevision"] = json!(inputs.catalog.revision());
     selection["prefabs"] = json!([inputs.prefab]);
+    // The stored document retains integer 0; FN24 exports an equivalent 0.0
+    // spelling with the same complete canonical value and original revision.
+    assert_eq!(
+        inputs.prefab["nodes"][0]["transform"]["translation"][0].as_i64(),
+        Some(0)
+    );
+    selection["prefabs"][0]["nodes"][0]["transform"]["translation"][0] = json!(0.0);
+    assert_ne!(selection["prefabs"][0], inputs.prefab);
+    assert_eq!(
+        mmmm_contracts::canonical_digest(&selection["prefabs"][0]).unwrap(),
+        mmmm_contracts::canonical_digest(&inputs.prefab).unwrap()
+    );
+    assert_eq!(
+        mmmm_contracts::verify_projected_digest("Prefab", &selection["prefabs"][0]).unwrap(),
+        serde_json::from_value::<Sha256Digest>(inputs.prefab["revision"].clone()).unwrap()
+    );
     selection["instances"] = json!([inputs.instance]);
     selection["selectedNodeIds"] = json!(["door"]);
     selection["sourceMap"] = inputs.patch["sourceMap"].clone();
@@ -912,7 +928,7 @@ fn original_fn24_selection_and_explicit_manual_files_reach_common_scene_plan_wit
         .service
         .call(&fixture.authenticated, "scene.plan", &planning, &budget)
         .unwrap_err();
-    assert_eq!(unavailable.code, "CONTEXT_UNKNOWN");
+    assert_eq!(unavailable.code, "CONTEXT_UNKNOWN", "{unavailable:?}");
     assert_eq!(
         fixture
             .service

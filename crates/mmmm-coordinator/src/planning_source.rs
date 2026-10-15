@@ -84,6 +84,41 @@ impl<'a> PlanningStore<'a> {
         }
         admission.check(self)
     }
+    fn check_manual_scene_sources(
+        &self,
+        principal: &PrincipalId,
+        project: &ProjectCatalog,
+        patch: &Value,
+        source: &SceneSource,
+        context: &Value,
+    ) -> AppResult<()> {
+        let Some(payload) = source.manual_payload.as_ref() else {
+            return Ok(());
+        };
+        let pins = [
+            decode_resource(&patch["sourceArtifact"])?,
+            decode_resource(&patch["sourceMap"])?,
+            payload.resource.clone(),
+        ];
+        let context_id = context_id(context)?;
+        let context_digest = context_digest(context)?;
+        let issued = self.issued.try_borrow().map_err(|_| source_busy())?;
+        let mut distinct = BTreeSet::new();
+        for pin in pins {
+            if !distinct.insert(pin.resource_id.clone())
+                || !issued.get(&pin.resource_id).is_some_and(|witness| {
+                    witness.principal == *principal
+                        && witness.project == *project.project_id()
+                        && witness.context == context_id
+                        && witness.context_digest == context_digest
+                        && witness.resource == json!(pin)
+                })
+            {
+                return Err(forbidden());
+            }
+        }
+        Ok(())
+    }
     pub fn read(store: &'a DurableStore) -> Self {
         Self {
             store: Rc::new(RefCell::new(BorrowedStore::Read(store))),
@@ -1509,6 +1544,8 @@ impl ProjectSourcePort for BorrowedProjectSource<'_> {
                 context,
                 self.access.budget(),
             )?;
+        self.store
+            .check_manual_scene_sources(principal, project, patch, source, context)?;
         self.authorize(principal, project, Some(context))
     }
 }

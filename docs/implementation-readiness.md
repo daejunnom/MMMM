@@ -1654,6 +1654,31 @@ EX14 전체 인수 성공으로 표시하지 않는다. 마지막 두 실행은 
 원 로그·실패를 보존했고 owned-tail 정리 뒤 drain·완전한 출력·export·scratch 정리·
 lease 해제를 확인했다. 이 source의 strict Clippy와 새 고정 SHA CI는 아직 미실행이다.
 
+후속 source 수정은 원 `load_owned` cache와 selected JSON 문서 전체의 JCS digest를 비교하여
+정수/실수 표현 차이가 revision 충돌을 만들지 않게 했다. FN24의 선행 `verify_owned`도
+같은 비교를 사용한다. 원 schema·identity·self-digest와 Project revision pin 검사는
+유지하며 typed 재직렬화나 원 CAS·raw SHA·pin 재작성은 하지 않는다. protected authored
+manual record만 실제 세 번째
+payload를 SceneSource에 공급하고, 현재 principal/Project/context의 정확한 세 issued pin을
+다시 검사한다. planner는 그 실제 CAS bytes를 기존 누적 예산으로 읽고 정규 `/entries/N`,
+qualified instance/node/kind·명시적 delta·map output resource를 대조한다. legacy producer는
+기존 source 형식을 유지하고 새 payload를 임의로 발급하지 못한다. 공통 planner의 원
+AppError cause도 서비스 경계에 보존한다.
+
+수정한 7파일은 `445`에서 format을 통과했고 `446`의 planner unit 38개가 통과했다.
+command exit 0·42,423 ms, Job commit peak 597,176,320 bytes·6 process·최대 sample gap
+145 ms이며 owned-tail 정리 뒤 drain·완전한 출력·export·scratch 정리·lease 해제를
+확인했다. 원 FN24 native 통합 회귀의 수정 후 로컬 재실행은 아직 하지 않았으며 현재
+작성 중인 calibration Rust source와 함께 동결한 뒤 별도 검증한다. 이전 `442` 실패를
+소급해 성공으로 표시하지 않는다.
+
+최종 비교 교정은 기존 FN24 통합 fixture의 실제 stored 정수 `0` 한 곳을 selection에서
+`0.0`으로 표현하고 전체 JCS digest·원 revision의 동일성을 확인한다. `455`의 세 파일
+format과 `456`의 planner 38개 unit이 통과했다. 후자는 command 0·33,702 ms·Job commit
+peak 597,020,672 bytes·6 process·최대 gap 150 ms이며 owned-tail 정리 뒤 drain·완전한
+출력·export·scratch 정리·lease 해제를 확인했다. 새 FN24 통합 회귀 자체의 수정 후
+재실행은 아직 미실행이며 planner unit 통과와 구분한다.
+
 ## 공통 Invocation reservation 집중 검증
 
 D069는 기존 NativePlanApproval의 sticky 상태만 권한 중립 primitive로 분리하며 일반
@@ -1737,6 +1762,35 @@ false, 해당 scan의 leader anchor 확인은 미도달이고 Rusage도 미도�
 command exit는 null·supervisor_failure이고 drain/export는 완료했으며 slot/lease는 실패
 정책대로 보존했다. 원 Cargo stderr에는 compile 시작만 있어 compile/test 완료가 아니다.
 D060 Windows ancestry 또는 D062 Linux RSS 조건을 이 실패에 적용하지 않는다.
+
+고정 source `6c7c6ccd5fa2d7fb0b4a87b5de6985641d1c2a6c`의 JVM CI 63
+(`38797941297`)은 세 OS와 집계 실패를 관측했다. Windows 원 ZIP 66,251 bytes·SHA-256
+`2b613458e44e2a6aa8eb662e42f697d5a08420bee58fa2747c5ec233b8c4f4b7`의 source·expected·
+PR head를 대조했다. 실제 7모듈 406개 중 402개 통과·4개 실패이며 실패는 Fabric의
+`NativeCalibrationApprovalTest` 네 사례에 기록된 347행 ClassCastException이다. SDK
+108개와 host-core 96개는 통과하여 로컬 집중 `444`와 범위가 다르다. command 1·108,057 ms,
+Job commit peak 1,733,632,000 bytes·6 process이며 drain·완전한 출력·export·scratch 정리·
+lease 해제를 확인했다. Linux·macOS 원 ZIP은 이번에 감사하지 않았으므로 같은 원인으로
+실패했다고 확대하지 않는다. native observer는 skipped, 게임·릴리스는 not_run이다.
+
+source `bf0f253b5d0dcdaa2208637a6959bd6dacc2fb6b`의 JVM CI 62 (`38796054576`)
+Linux 원 ZIP 57,652 bytes·SHA-256
+`ef56ec837932510066c2a7bb8fafdab3d655b63149bca295402fa87bccc97da7`도 같은 source pin을
+대조했다. Gradle은 7모듈의 test task와 `BUILD SUCCESSFUL in 1m 28s`를 출력했지만 이후
+owned member의 RSS open ESRCH로 관리 실행이 실패했다. 원 identity가 같은 전후 Zombie·
+threads 4와 BoundValidated pidfd의 terminal_poll/not_ready를 기록했고 Pending은 없었다.
+command exit null·signal 9·98,395 ms·observation_failure이며 peak RSS 413,917,184 bytes·
+3 process·793 samples·최대 gap 167 ms다. drain·완전한 출력·export·정리는 완료했다.
+모듈 JSON/XML은 없으므로 test 개수나 정규 JVM 검증 성공을 선언하지 않는다. 이 오류를
+OOM·종료 확인·RSS 0 또는 새 유예의 회복 성공으로 바꾸지 않는다.
+
+같은 `6c7c6cc`의 Rust CI 72 (`38797940869`) Windows ZIP 32,010 bytes·SHA-256
+`bae197b2f44396aceb23e9cc681ae29edb9d292148d23b4991ccae2c12c4a17a`는 format·repository
+command 0 뒤 Coordinator 363개 통과·1개 실패·기존 1 ignored를 보존한다. 실패는 위 FN24
+native 통합 회귀의 REVISION_CONFLICT/CONTEXT_UNKNOWN 불일치이며 test command 101·
+417,859 ms, owned-tail 정리 후 drain·완전한 출력·export·scratch 정리·lease 해제다.
+후속 Clippy/native stdio 성공 근거는 없고 이후 수정이나 planner 통과를 이 과거 실행의
+성공으로 소급하지 않는다. 세 ZIP 모두 외부에 원문을 보존했으며 제품 DB/CAS는 대상이 아니다.
 
 ## 첫 공개 배포 인수
 

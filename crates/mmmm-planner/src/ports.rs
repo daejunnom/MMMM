@@ -19,11 +19,20 @@ pub struct PinnedStateSnapshot {
     pub resource: ResourceRef,
     pub snapshot: ResolvedStateSnapshot,
 }
+/// A protected native manual producer supplies the exact returned static patch.
+/// This is in-process source data, never a deserializable permission or bake.
+/// The source port must verify its producer and call-local three-resource
+/// admission; the planner independently reads this exact pin's original bytes.
+pub struct ManualScenePayload {
+    pub resource: ResourceRef,
+    pub payload: Value,
+}
 pub struct SceneSource {
     pub selection: Selection,
     pub delta_policy: DeltaPolicy,
     pub artifact: Value,
     pub source_map: Value,
+    pub manual_payload: Option<ManualScenePayload>,
     /// Sealed exchange ingestion is mandatory for baked clip attachment. Its
     /// canonical clip derivatives keep raw artifact/map provenance separately.
     pub ingested_bake: Option<mmmm_exchange::bake::IngestedBake>,

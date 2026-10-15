@@ -96,14 +96,34 @@ impl NativePlanner<'_> {
                 context,
                 sources,
             )?;
-            if wire("Instance", &before)? != *selected {
+            // Compare complete validated documents with JCS. Equivalent number
+            // spelling changes neither the source's original CAS nor its pin.
+            let actual = self.load_current(
+                principal,
+                project,
+                OwnedKind::Instance,
+                id,
+                context,
+                sources,
+            )?;
+            if canonical_digest(&actual).map_err(|_| invalid())?
+                != canonical_digest(selected).map_err(|_| invalid())?
+            {
                 return Err(conflict());
             }
             let selected_definition = array(source.selection.value(), "prefabs")?
                 .iter()
                 .find(|value| value["prefabId"].as_str() == Some(before.prefab_id.as_str()))
                 .ok_or_else(unresolved)?;
-            if wire("Prefab", &definition)? != *selected_definition {
+            let definition_pin = project.authorize_pin(
+                OwnedKind::Prefab,
+                before.prefab_id.as_str(),
+                &before.prefab_revision,
+            )?;
+            let actual = self.load_owned(principal, project, &definition_pin, context, sources)?;
+            if canonical_digest(&actual).map_err(|_| invalid())?
+                != canonical_digest(selected_definition).map_err(|_| invalid())?
+            {
                 return Err(conflict());
             }
             originals.insert(id.to_owned(), (before, definition));
@@ -113,7 +133,10 @@ impl NativePlanner<'_> {
                 serde_json::from_value(selected["revision"].clone()).map_err(|_| invalid())?;
             let pin =
                 project.authorize_pin(OwnedKind::Prefab, text(selected, "prefabId")?, &revision)?;
-            if self.load_owned(principal, project, &pin, context, sources)? != *selected {
+            let actual = self.load_owned(principal, project, &pin, context, sources)?;
+            if canonical_digest(&actual).map_err(|_| invalid())?
+                != canonical_digest(selected).map_err(|_| invalid())?
+            {
                 return Err(conflict());
             }
         }
@@ -136,6 +159,45 @@ impl NativePlanner<'_> {
             .validate_scene_provenance(principal, project, patch, &source, context)?;
         mmmm_exchange::patch::validate_scene_patch(patch, &source.selection, &source.delta_policy)
             .map_err(exchange)?;
+        let manual_entries = if let Some(manual) = source.manual_payload.as_ref() {
+            if source.ingested_bake.is_some() {
+                return Err(AppError::new(
+                    "SOURCE_PROVENANCE_INVALID",
+                    "A static manual payload cannot carry sealed bake evidence",
+                ));
+            }
+            let current_pin = self.source.resource_pin(
+                principal,
+                project,
+                manual.resource.resource_id.as_str(),
+                Some(context),
+            )?;
+            if !same_resource(&current_pin, &manual.resource) {
+                return Err(conflict());
+            }
+            let bytes =
+                self.load_resource(principal, project, &manual.resource, context, sources)?;
+            let actual = mmmm_contracts::parse_json(&bytes).map_err(|_| invalid())?;
+            validate("ScenePatch", &actual)?;
+            if actual != manual.payload
+                || actual["projectId"] != patch["projectId"]
+                || actual["baseRevision"] != patch["baseRevision"]
+                || actual["sourceArtifact"] != patch["sourceArtifact"]
+                || actual["sourceMap"] != patch["sourceMap"]
+                || actual["losses"] != patch["losses"]
+            {
+                return Err(conflict());
+            }
+            mmmm_exchange::patch::validate_scene_patch(
+                &actual,
+                &source.selection,
+                &source.delta_policy,
+            )
+            .map_err(exchange)?;
+            Some(authored_mappings(&manual.payload, &map, &manual.resource)?)
+        } else {
+            None
+        };
 
         let entries = array(patch, "entries")?;
         let mut dependencies = Vec::new();
@@ -199,7 +261,18 @@ impl NativePlanner<'_> {
             .iter()
             .filter(|entry| entry["kind"] != "attach_clip")
         {
-            manual_mapping(entry, &artifact, &map, &artifact_ref, &source.selection)?;
+            if let Some(mappings) = &manual_entries {
+                let key = (
+                    text(entry, "instanceId")?,
+                    text(entry, "nodeId")?,
+                    text(entry, "kind")?,
+                );
+                if mappings.get(&key).copied() != Some(entry) {
+                    return Err(conflict());
+                }
+            } else {
+                manual_mapping(entry, &artifact, &map, &artifact_ref, &source.selection)?;
+            }
         }
         let mut grouped = BTreeMap::<String, Vec<&Value>>::new();
         for entry in entries {
@@ -597,6 +670,56 @@ fn verified_attachments(
         return Err(unresolved());
     }
     Ok(selected)
+}
+
+type AuthoredMappings<'a> = BTreeMap<(&'a str, &'a str, &'a str), &'a Value>;
+
+fn authored_mappings<'a>(
+    payload: &'a Value,
+    map: &Value,
+    resource: &ResourceRef,
+) -> AppResult<AuthoredMappings<'a>> {
+    let entries = array(payload, "entries")?;
+    let mappings = array(map, "entries")?;
+    let mapping_error = || {
+        AppError::new(
+            "OBJECT_MAPPING_AMBIGUOUS",
+            "Static manual delta lacks its unique original payload entry locator",
+        )
+    };
+    if entries.len() > 4096 || mappings.len() != entries.len() {
+        return Err(mapping_error());
+    }
+    let mut confirmed = BTreeSet::new();
+    let mut result = BTreeMap::new();
+    for mapping in mappings {
+        if mapping["outputResourceId"].as_str() != Some(resource.resource_id.as_str()) {
+            return Err(mapping_error());
+        }
+        let suffix = text(mapping, "locator")?
+            .strip_prefix("/entries/")
+            .ok_or_else(mapping_error)?;
+        let index: usize = suffix.parse().map_err(|_| mapping_error())?;
+        if suffix != index.to_string() || !confirmed.insert(index) {
+            return Err(mapping_error());
+        }
+        let entry = entries.get(index).ok_or_else(mapping_error)?;
+        let key = (
+            text(entry, "instanceId")?,
+            text(entry, "nodeId")?,
+            text(entry, "kind")?,
+        );
+        if !matches!(
+            key.2,
+            "create_node" | "update_transform" | "update_display" | "delete_node"
+        ) || mapping["sourceObjectId"].as_str() != Some(key.0)
+            || mapping["sourceNodeId"].as_str() != Some(key.1)
+            || result.insert(key, entry).is_some()
+        {
+            return Err(mapping_error());
+        }
+    }
+    Ok(result)
 }
 
 fn manual_mapping(
@@ -1892,6 +2015,57 @@ mod tests {
                 .unwrap()
                 .code,
             "REVISION_CONFLICT"
+        );
+    }
+
+    #[test]
+    fn authored_payload_mapping_binds_exact_returned_entry_and_static_resource() {
+        // Reuse the existing scene fixture and its real node value; this checks
+        // only the static codec, not native ownership or game target readiness.
+        let (before, prefab, _, _) = source();
+        let artifact = wire("Prefab", &prefab).unwrap();
+        let node = artifact["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["nodeId"] == "door")
+            .unwrap();
+        let entry = json!({"kind":"update_transform","instanceId":before.instance_id,"nodeId":"door","transform":node["transform"]});
+        let payload = json!({"entries":[entry]});
+        let bytes = mmmm_contracts::encode_json(&payload).unwrap();
+        let resource = ResourceRef {
+            resource_id: mmmm_contracts::ResourceId::new("returned-static-payload").unwrap(),
+            sha256: mmmm_contracts::raw_digest(&bytes),
+            media_type: "application/json".into(),
+            size_bytes: bytes.len() as u64,
+        };
+        let map = json!({"entries":[{"sourceObjectId":before.instance_id,"sourceNodeId":"door","outputResourceId":resource.resource_id,"locator":"/entries/0"}]});
+        let actual = authored_mappings(&payload, &map, &resource).unwrap();
+        assert_eq!(
+            actual[&(before.instance_id.as_str(), "door", "update_transform")],
+            &payload["entries"][0]
+        );
+        for (field, replacement) in [
+            ("outputResourceId", "different-payload"),
+            ("sourceObjectId", "different-instance"),
+            ("sourceNodeId", "different-node"),
+            ("locator", "/entries/00"),
+            ("locator", "/entries/1"),
+        ] {
+            let mut changed = map.clone();
+            changed["entries"][0][field] = json!(replacement);
+            assert_eq!(
+                authored_mappings(&payload, &changed, &resource)
+                    .unwrap_err()
+                    .code,
+                "OBJECT_MAPPING_AMBIGUOUS"
+            );
+        }
+        let mut clip = payload;
+        clip["entries"][0] = json!({"kind":"attach_clip","instanceId":before.instance_id,"nodeId":"door","clipId":"clip-door"});
+        assert_eq!(
+            authored_mappings(&clip, &map, &resource).unwrap_err().code,
+            "OBJECT_MAPPING_AMBIGUOUS"
         );
     }
 }

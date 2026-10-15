@@ -1035,7 +1035,7 @@ fn common_plan(
     };
     application
         .plan_create(context.principal.principal(), request)
-        .map_err(|error| ServiceError::new(error.code, error.message))
+        .map_err(|error| ServiceError::caused_by(error.code, error.message, error))
 }
 
 fn stage_bundle(

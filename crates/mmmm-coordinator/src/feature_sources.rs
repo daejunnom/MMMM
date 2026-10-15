@@ -365,6 +365,7 @@ struct AuthoredManualRecord {
     selection_pin: ResourceRef,
     source_map_pin: ResourceRef,
     edit_payload_pin: ResourceRef,
+    edit_payload: Value,
     patch: Value,
     policy: DeltaPolicy,
     weight: usize,
@@ -591,6 +592,7 @@ impl PlanningDataPort for ManualSceneData {
             if source.selection.value() != expected.selection.value()
                 || source.artifact != expected.artifact
                 || source.source_map != expected.source_map
+                || !same_manual_payload(source, &expected)
                 || source.ingested_bake.is_some()
             {
                 return Err(conflict());
@@ -647,6 +649,7 @@ impl PlanningDataPort for ManualSceneData {
                 delta_policy: record.registration.policy,
                 artifact: record.artifact,
                 source_map: record.source_map,
+                manual_payload: None,
                 ingested_bake: None,
             });
         }
@@ -668,6 +671,7 @@ impl PlanningDataPort for ManualSceneData {
             if source.selection.value() != &record.selection
                 || source.artifact != record.artifact
                 || source.source_map != record.source_map
+                || source.manual_payload.is_some()
                 || source.ingested_bake.is_some()
             {
                 return Err(conflict());
@@ -1292,7 +1296,7 @@ impl FeatureSources for LocalFeatureSources {
                 .map_err(manual_service)?;
             let weight = record_cost(
                 context,
-                &json!({"selection":original,"map":map,"patch":patch}),
+                &json!({"selection":original,"map":map,"payload":payload,"patch":patch}),
                 &[&pins[0], &pins[1], &pins[2]],
             )
             .map_err(manual_service)?;
@@ -1309,6 +1313,7 @@ impl FeatureSources for LocalFeatureSources {
                 selection_pin: pins[0].clone(),
                 source_map_pin: pins[1].clone(),
                 edit_payload_pin: pins[2].clone(),
+                edit_payload: payload,
                 patch,
                 policy,
                 weight,
@@ -2782,6 +2787,7 @@ fn admit_authored_manual(
         && (old.patch != record.patch
             || old.selection != record.selection
             || old.source_map != record.source_map
+            || old.edit_payload != record.edit_payload
             || !same_resource(&old.selection_pin, &record.selection_pin)
             || !same_resource(&old.source_map_pin, &record.source_map_pin)
             || !same_resource(&old.edit_payload_pin, &record.edit_payload_pin))
@@ -2867,8 +2873,22 @@ fn authored_scene_source(record: &AuthoredManualRecord) -> AppResult<SceneSource
         delta_policy: record.policy.clone(),
         artifact: record.selection.clone(),
         source_map: record.source_map.clone(),
+        manual_payload: Some(mmmm_planner::ManualScenePayload {
+            resource: record.edit_payload_pin.clone(),
+            payload: record.edit_payload.clone(),
+        }),
         ingested_bake: None,
     })
+}
+fn same_manual_payload(source: &SceneSource, expected: &SceneSource) -> bool {
+    match (&source.manual_payload, &expected.manual_payload) {
+        (Some(actual), Some(expected)) => {
+            same_resource(&actual.resource, &expected.resource)
+                && actual.payload == expected.payload
+        }
+        (None, None) => true,
+        _ => false,
+    }
 }
 /// Created only after all three protected producer/input records and their
 /// exact CAS bytes were read under this original occupied service request.
@@ -3245,7 +3265,9 @@ fn verify_owned(
         Some(context),
         MAX_CODEC_BYTES,
     )?;
-    if actual != *value {
+    if canonical_digest(&actual).map_err(|_| invalid())?
+        != canonical_digest(value).map_err(|_| invalid())?
+    {
         return Err(conflict());
     }
     Ok(())
