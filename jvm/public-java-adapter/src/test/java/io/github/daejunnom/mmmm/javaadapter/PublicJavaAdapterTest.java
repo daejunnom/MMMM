@@ -251,12 +251,26 @@ final class PublicJavaAdapterTest {
                     () -> capture.callbacks.read().read(read, local)).code());
             assertFalse(local.mutation); assertTrue(local.queue.isEmpty()); assertTrue(local.handles.isEmpty());
             assertNull(System.getProperty("mmmm.javaadapter.fixture.initialized"));
-            HostQueue queue = new HostQueue(); HostAuthority live = new HostAuthority() {
+            HostQueue queue = new HostQueue();
+            class MetadataHostAuthority implements HostAuthority {
+                private int readChecks; private int writeChecks; private int preconditionChecks;
                 @Override public boolean ready() { return true; }
                 @Override public ObjectNode hello() { return ContractJson.newObject(); }
-                @Override public void check(HostSession session, ObjectNode context, Set<String> permissions, boolean write) { assertFalse(write); }
-                @Override public void checkPreconditions(HostSession session, ObjectNode context, ObjectNode arguments) { fail("Metadata cannot enter mutation"); }
-            };
+                @Override public void check(HostSession session, ObjectNode context, Set<String> permissions, boolean write) {
+                    if (write) writeChecks++; else readChecks++;
+                    assertFalse(write, "Metadata dispatch cannot request write authority");
+                }
+                @Override public void checkInvocation(HostSession session, Invocation request, boolean write) {
+                    assertFalse(write, "Metadata dispatch cannot request write invocation authority");
+                    assertEquals(invocation.wire(), request.wire());
+                }
+                @Override public void checkPreconditions(HostSession session, ObjectNode context, ObjectNode arguments) {
+                    // Dispatch checks read preconditions too; mutation is guarded by write authority.
+                    assertTrue(queue.isSameThread()); assertEquals(invocation.context(), context);
+                    assertEquals(invocation.arguments(), arguments); preconditionChecks++;
+                }
+            }
+            MetadataHostAuthority live = new MetadataHostAuthority();
             Clock clock = Clock.fixed(Instant.parse("2026-10-13T11:59:00Z"), ZoneOffset.UTC);
             try (HostRuntime runtime = new HostRuntime(contracts, queue, live, (binding, descriptor) -> assertEquals(probe.bindingId(), binding), clock)) {
                 runtime.registerProvider(probe.registrationDescriptor());
@@ -268,9 +282,14 @@ final class PublicJavaAdapterTest {
                 var pending = runtime.dispatch(session, invocation); queue.drain(); ProviderResult failed = pending.toCompletableFuture().join();
                 assertEquals("failed", failed.status()); assertEquals("none", failed.effects());
                 assertEquals("COMPATIBILITY_EXECUTION_UNAPPROVED", failed.wire().path("diagnostics").path(0).path("code").asText());
+                assertTrue(live.readChecks > 0); assertEquals(0, live.writeChecks); assertEquals(1, live.preconditionChecks);
+                assertTrue(runtime.operation(session, invocation.invocationId()).path("effectObservations").isEmpty());
                 assertNull(System.getProperty("mmmm.javaadapter.fixture.initialized"));
             }
         }
+        // This final test observation initializes the fixture only after every no-initialization assertion.
+        assertNull(System.getProperty("mmmm.javaadapter.fixture.initialized"));
+        assertEquals(0, calls());
     }
 
     @Test void metadataProfilePinsAndOriginalCancellationNeverBecomeInterfaceSuccess() throws Exception {
