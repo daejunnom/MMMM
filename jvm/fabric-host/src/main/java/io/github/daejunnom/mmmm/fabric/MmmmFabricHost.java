@@ -609,9 +609,17 @@ public final class MmmmFabricHost implements ModInitializer {
         NativeCalibrationApproval grant;
         try {
             contexts.forEach(context -> approved.installContext(contracts, context));
+            NativeCalibrationApproval.Runner actualRunner = calibrationRunner == null
+                    ? new NativeCalibrationRunner(contracts, server, approved, () -> player(approved), this::level,
+                            new NativeCalibrationRunner.Pins(environment(), NativeProfileAdmission.sourceDigest(facts),
+                                    pending.hostArtifactDigest(), Long.toString(pending.generation())))
+                    : calibrationRunner;
             grant = new NativeCalibrationApproval(contracts, manifest, approved, Clock.systemUTC(), this::gameTask,
-                    this::checkCalibrationCurrent, invocation -> retainAcceptedCalibration(approved, invocation), calibrationRunner);
-            approved.whenClosed(() -> { definitionCollection.retire(approved); grant.close(); });
+                    this::checkCalibrationCurrent, invocation -> retainAcceptedCalibration(approved, invocation), actualRunner);
+            approved.whenClosed(() -> {
+                definitionCollection.retire(approved); grant.close();
+                if (actualRunner instanceof NativeCalibrationRunner actual) actual.close();
+            });
         } catch (RuntimeException failure) { approved.close(); throw failure; }
         PairedLoopbackServer listener = null;
         try {
@@ -725,6 +733,9 @@ public final class MmmmFabricHost implements ModInitializer {
             String id = descriptor.path("actionId").asText();
             target.register(binding, descriptor, (invocation, local) -> {
                 local.requireGameThread();
+                if ("mmmm:calibration_command_execute".equals(id)) {
+                    throw new ContractException("CALIBRATION_PRIVATE_ROUTE_REQUIRED", "Only the exact private normative calibration purpose can execute this action");
+                }
                 HostSession paired = invocationSession(invocation);
                 ObjectNode context = invocation.context();
                 ServerLevel level = level(context.path("dimension").asText());
@@ -920,13 +931,55 @@ public final class MmmmFabricHost implements ModInitializer {
                             (installed, step, index, parsed, admitted) -> {
                                 throw new ContractException("NATIVE_READONLY_GUARD_UNAVAILABLE", "No admitted loaded-definition parser closure is installed");
                             }));
+                } else if ("calibration_target_state".equals(kind)) {
+                    HostDispatcher.exactFields(payload, Set.of("kind", "caseId", "functionId", "targetBindings"));
+                    SessionRoute originalRoute = sessionRoute(paired);
+                    MinecraftServer originalServer = server; HostRuntime originalRuntime = runtime; long originalGeneration = registryGeneration;
+                    Runnable current = () -> {
+                        control.checkpoint(); requireServerThread(); paired.checkOpen();
+                        if (result.isDone() || sessionRoute(paired) != originalRoute || server != originalServer || runtime != originalRuntime
+                                || registryGeneration != originalGeneration
+                                || !context.equals(paired.context(context.path("contextId").asText()))) throw authorityInvalid();
+                        new PlatformAuthority(null).check(paired, context, Set.of("mmmm:world_read"), false); control.checkpoint();
+                    };
+                    result.complete(NativeCalibrationFunctions.checked(() -> {
+                        var selected = NativeCalibrationTargetImages.select(HostDispatcher.string(payload, "caseId"),
+                                HostDispatcher.string(payload, "functionId"), payload.get("targetBindings"));
+                        ObjectNode facts = collectSourceFacts(paired, context, control, result, required);
+                        String generation = Long.toString(registryGeneration);
+                        String factsDigest = NativeProfileAdmission.sourceDigest(facts), hostDigest = artifactDigest(container("mmmm_host"));
+                        var images = NativeCalibrationTargetImages.observeSelected(server, level(context.path("dimension").asText()),
+                                paired, context, selected, current::run);
+                        ObjectNode after = collectSourceFacts(paired, context, control, result, required);
+                        if (!factsDigest.equals(NativeProfileAdmission.sourceDigest(after))
+                                || !hostDigest.equals(artifactDigest(container("mmmm_host")))) throw new ContractException("TARGET_DRIFT", "The actual read-only source changed during target capture");
+                        return NativeCalibrationRunFacts.fullImages(new NativeCalibrationRunner.Pins(environment(),
+                                factsDigest, hostDigest, generation), context, images);
+                    }, current));
+                } else if ("calibration_state".equals(kind)) {
+                    HostDispatcher.exactFields(payload, Set.of("kind", "invocationId", "invocationDigest"));
+                    Invocation originalInvocation = retainedNativeInvocation(paired, context, HostDispatcher.string(payload, "invocationId"));
+                    if (!ContractJson.digest(originalInvocation.wire()).equals(HostDispatcher.string(payload, "invocationDigest"))) throw authorityInvalid();
+                    NativeCalibrationApproval calibration = sessionRoute(paired).calibration();
+                    if (calibration == null) throw new ContractException("CALIBRATION_APPROVAL_PENDING", "No original private calibration approval owns this query");
+                    Runnable current = () -> checkCalibrationCurrent(paired, context, control::checkpoint, true);
+                    result.complete(NativeCalibrationFunctions.checked(() -> {
+                        var images = calibration.observeState(paired, context, HostDispatcher.string(payload, "invocationId"),
+                                HostDispatcher.string(payload, "invocationDigest"), control,
+                                (original, program, entered) -> NativeCalibrationTargetImages.observe(server,
+                                        level(context.path("dimension").asText()), paired, context, program, entered));
+                        return NativeCalibrationRunFacts.fullImages(new NativeCalibrationRunner.Pins(environment(),
+                                calibration.runtimeSourceFactsDigest(), artifactDigest(container("mmmm_host")), Long.toString(registryGeneration)), context, images);
+                    }, current));
                 } else if ("calibration_run_source".equals(kind)) {
                     Invocation original = retainedNativeInvocation(paired, context, HostDispatcher.string(payload, "invocationId"));
                     ObjectNode facts = collectSourceFacts(paired, context, control, result, required);
                     NativeCalibrationApproval calibration = sessionRoute(paired).calibration();
-                    result.complete(new NativeCalibrationSource(contracts).inspect(context, facts, artifactDigest(container("mmmm_host")),
+                    result.complete(NativeCalibrationFunctions.checked(() -> new NativeCalibrationSource(contracts).inspect(context, facts, artifactDigest(container("mmmm_host")),
                             Long.toString(registryGeneration), payload, original, calibration == null ? null
-                                    : (installed, id) -> calibration.lookup(paired, installed, id, control)));
+                                    : (installed, id) -> calibration.lookup(paired, installed, id, control),
+                            () -> checkCalibrationCurrent(paired, context, control::checkpoint, false)),
+                            () -> checkCalibrationCurrent(paired, context, control::checkpoint, true)));
                 } else if ("native_targets".equals(kind)) {
                     HostDispatcher.exactFields(payload, Set.of("kind", "targets", "sourceInvocationId"));
                     if (!payload.path("targets").isArray() || payload.path("targets").isEmpty() || payload.path("targets").size() > 256) {
@@ -1448,6 +1501,17 @@ public final class MmmmFabricHost implements ModInitializer {
                 .put("minimum", Integer.MIN_VALUE).put("maximum", Integer.MAX_VALUE);
         commandOutput.withObject("properties").putObject("completionClaim").put("const", "native_command_return_only");
         commandOutput.putArray("required").add("commandReturnInt32").add("completionClaim");
+        ObjectNode calibrationOutput = ContractJson.newObject().put("type", "object").put("additionalProperties", false);
+        calibrationOutput.putArray("required").add("completionClaim").add("nativeCallbackCount").add("nativeCallbackReturn");
+        calibrationOutput.putObject("properties").putObject("completionClaim").put("const", "native_function_queue_observed");
+        calibrationOutput.withObject("properties").putObject("nativeCallbackCount").put("type", "integer").put("minimum", 0).put("maximum", 256);
+        var optionalReturn = calibrationOutput.withObject("properties").putObject("nativeCallbackReturn").putArray("oneOf");
+        optionalReturn.addObject().put("type", "integer").put("minimum", Integer.MIN_VALUE).put("maximum", Integer.MAX_VALUE);
+        optionalReturn.addObject().put("type", "null");
+        ObjectNode callbackShape = calibrationOutput.putArray("allOf").addObject();
+        callbackShape.putObject("if").putObject("properties").putObject("nativeCallbackCount").put("const", 1);
+        callbackShape.putObject("then").putObject("properties").putObject("nativeCallbackReturn").put("type", "integer");
+        callbackShape.putObject("else").putObject("properties").putObject("nativeCallbackReturn").put("type", "null");
         List<ObjectNode> result = new ArrayList<>();
         result.add(descriptor("mmmm:block_read", "mmmm:block_state_read", "read", point, observed, digest, "mmmm:world_read", "provider_completion"));
         ObjectNode directPatch = descriptor("mmmm:block_patch", "mmmm:block_state_patch", "write", patch, patchOutput, digest, "mmmm:world_write", "independent_readback");
@@ -1455,6 +1519,11 @@ public final class MmmmFabricHost implements ModInitializer {
         directPatch.withArray("limitations").add(OwnedBlockPatchPreflight.LOSS);
         contracts.validate("ActionDescriptor", directPatch); result.add(directPatch);
         result.add(descriptor("mmmm:command_execute", "mmmm:raw_command", "unknown", command, commandOutput, digest, "mmmm:command_execute", "independent_readback"));
+        ObjectNode calibrationAction = descriptor("mmmm:calibration_command_execute", "mmmm:raw_command", "unknown", command,
+                calibrationOutput, digest, "mmmm:command_execute", "independent_readback");
+        calibrationAction.withArray("limitations").add("Only the exact immutable private normative47 calibration purpose route executes this action")
+                .add("Native queue completion and optional callbacks are factual; independent readback and explicit source checks remain required");
+        contracts.validate("ActionDescriptor", calibrationAction); result.add(calibrationAction);
         ObjectNode prepared = ContractJson.newObject().put("type", "object").put("additionalProperties", false);
         prepared.putArray("required").add("preparedChange");
         prepared.putObject("properties").putObject("preparedChange").put("$ref", "urn:mmmm:contracts:0.2.0#/$defs/ResourceRef");

@@ -1,6 +1,10 @@
 package io.github.daejunnom.mmmm.fabric.mixin;
 
 import com.mojang.brigadier.context.ContextChain;
+import io.github.daejunnom.mmmm.fabric.NativeCalibrationStageHooks;
+import net.minecraft.commands.ExecutionCommandSource;
+import net.minecraft.commands.execution.ExecutionContext;
+import net.minecraft.commands.execution.Frame;
 import net.minecraft.commands.execution.tasks.BuildContexts;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
@@ -19,6 +23,11 @@ public abstract class FunctionEntrySourceMixin implements FunctionEntryReadAcces
     private void mmmm$observeNativeInputs(String original, ContextChain<?> chain, CallbackInfo callback) {
         mmmm$originalCommandInput = original;
         mmmm$compiledContextChain = chain;
+    }
+
+    @Inject(method = "execute(Lnet/minecraft/commands/ExecutionCommandSource;Lnet/minecraft/commands/execution/ExecutionContext;Lnet/minecraft/commands/execution/Frame;)V", at = @At("HEAD"))
+    private void mmmm$observeNativeEntry(ExecutionCommandSource<?> source, ExecutionContext<?> context, Frame frame, CallbackInfo callback) {
+        NativeCalibrationStageHooks.nativeEntry(this, source, context, frame);
     }
 
     @Override public String mmmm$originalCommandInput() { return mmmm$originalCommandInput; }

@@ -7,6 +7,7 @@ import io.github.daejunnom.mmmm.host.HostDispatcher;
 import io.github.daejunnom.mmmm.host.HostRuntime;
 import io.github.daejunnom.mmmm.host.HostSession;
 import io.github.daejunnom.mmmm.host.NativePlanApproval;
+import io.github.daejunnom.mmmm.host.NativeInvocationReservations;
 import io.github.daejunnom.mmmm.sdk.ContractException;
 import io.github.daejunnom.mmmm.sdk.ContractJson;
 import io.github.daejunnom.mmmm.sdk.Invocation;
@@ -60,7 +61,7 @@ final class NativeCalibrationApprovalTest {
             }
             ObjectNode source = harness.manifest.deepCopy(); first(source, "programs").put("sourceBytesHex", "00".repeat(65537));
             assertThrows(ContractException.class, () -> harness.approval(source, null));
-            for (String field : List.of("commands", "preseedEndIndex", "selectedCommandStageIndex", "initializationCommands", "cleanupCommands")) {
+            for (String field : List.of("commands", "preseedEndIndex", "selectedCommandStageIndex", "initializationCommands", "cleanupCommands", "targetBindings")) {
                 ObjectNode missing = harness.manifest.deepCopy(); first(missing, "programs").remove(field);
                 assertThrows(ContractException.class, () -> harness.approval(missing, null));
             }
@@ -97,6 +98,26 @@ final class NativeCalibrationApprovalTest {
             }
             ObjectNode empty = harness.manifest.deepCopy(); first(empty, "programs").putArray("commands");
             assertThrows(ContractException.class, () -> harness.approval(empty, null));
+            ObjectNode legacy = harness.manifest.deepCopy().put("kind", "native_calibration_approval");
+            assertThrows(ContractException.class, () -> harness.approval(legacy, null));
+            ObjectNode oldAddresses = harness.manifest.deepCopy(); first(oldAddresses, "programs").putObject("readbackAddresses");
+            assertThrows(ContractException.class, () -> harness.approval(oldAddresses, null));
+            for (String field : List.of("resourcesRead", "resourcesWritten", "preconditions")) {
+                ObjectNode missing = harness.manifest.deepCopy(); first(missing.withObject("plan"), "steps").withArray(field).remove(1);
+                assertThrows(ContractException.class, () -> harness.approval(missing, null));
+            }
+            ObjectNode wrongTarget = harness.manifest.deepCopy(); first(first(wrongTarget, "programs"), "targetBindings").put("targetId", "resource-state");
+            assertThrows(ContractException.class, () -> harness.approval(wrongTarget, null));
+            ObjectNode wrongAddress = harness.manifest.deepCopy(); first(first(wrongAddress, "programs"), "targetBindings").put("objective", "unapproved");
+            assertThrows(ContractException.class, () -> harness.approval(wrongAddress, null));
+            ObjectNode wrongCoverage = harness.manifest.deepCopy(); first(first(wrongCoverage.withObject("plan"), "steps"), "preconditions").put("coverage", "partial");
+            assertThrows(ContractException.class, () -> harness.approval(wrongCoverage, null));
+            ObjectNode wrongSubtree = harness.manifest.deepCopy();
+            ContractJson.object(first(wrongSubtree, "programs").path("targetBindings").get(1)).putArray("ownedSubtrees").add("inputs").add("unowned");
+            assertThrows(ContractException.class, () -> harness.approval(wrongSubtree, null));
+            ObjectNode ordinaryAction = harness.manifest.deepCopy();
+            first(ordinaryAction.withObject("plan"), "steps").put("actionId", "mmmm:command_execute");
+            assertThrows(ContractException.class, () -> harness.approval(ordinaryAction, null));
             ObjectNode total = harness.manifest.deepCopy(); var commands = first(total, "programs").putArray("commands");
             for (int index = 0; index < 4090; index++) commands.add("say bounded");
             assertThrows(ContractException.class, () -> harness.approval(total, null));
@@ -108,7 +129,7 @@ final class NativeCalibrationApprovalTest {
     @Test void programComparisonInputsRetainOriginalOrderAndCannotBeChangedThroughGetters() throws Exception {
         var observed = new AtomicReference<NativeCalibrationApproval.Program>();
         var runner = new RejectingRunner(new AtomicInteger()) {
-            @Override public ObjectNode ready(Invocation original, NativeCalibrationApproval.Program program, NativeCalibrationApproval.Control control) {
+            @Override public NativeCalibrationPrepared ready(Invocation original, NativeCalibrationApproval.Program program, NativeCalibrationApproval.Control control) {
                 observed.set(program); return super.ready(original, program, control);
             }
         };
@@ -123,6 +144,13 @@ final class NativeCalibrationApprovalTest {
             assertEquals(cleanup, program.cleanupCommands());
             for (List<String> immutable : List.of(program.commands(), program.initializationCommands(), program.cleanupCommands()))
                 assertThrows(UnsupportedOperationException.class, () -> immutable.set(0, "changed"));
+            assertEquals(2, program.targetBindings().size());
+            assertEquals(program.resourcesRead(), program.resourcesWritten());
+            assertEquals(program.targetBindings().get(0).targetId(), program.resourcesRead().get(0));
+            assertEquals(program.targetBindings().get(1).targetId(), program.resourcesRead().get(1));
+            for (List<String> immutable : List.of(program.resourcesRead(), program.resourcesWritten(), program.targetBindings().get(1).ownedSubtrees()))
+                assertThrows(UnsupportedOperationException.class, () -> immutable.set(0, "changed"));
+            assertThrows(UnsupportedOperationException.class, () -> program.targetBindings().clear());
             byte[] source = program.sourceBytes(); source[0] = 0;
             assertEquals((byte) '#', program.sourceBytes()[0]);
             ObjectNode original = first(harness.manifest, "programs");
@@ -141,7 +169,37 @@ final class NativeCalibrationApprovalTest {
             assertUnclaimed(harness.grant); assertEquals(0, harness.retained.get());
             assertEquals("INVOCATION_UNKNOWN", harness.call("operation.get", harness.wire(0)).path("error").path("code").asText());
             assertEquals("INVOCATION_UNKNOWN", harness.call("operation.cancel", harness.wire(0)).path("error").path("code").asText());
+            AtomicInteger observations = new AtomicInteger(); ObjectNode original = harness.wire(0);
+            assertEquals("INVOCATION_UNKNOWN", assertThrows(ContractException.class, () -> harness.grant.observeState(harness.session,
+                    ContractJson.object(original.path("context")), original.path("invocationId").asText(), ContractJson.digest(original),
+                    null, (invocation, program, control) -> { observations.incrementAndGet(); return null; })).code());
+            assertEquals(0, observations.get(), "An unaccepted state query must not observe targets or manufacture an original claim");
             assertFalse(harness.session.verifiedWriteProfile());
+        }
+    }
+
+    @Test void factualNativeOutputRetainsNoCallbackAndMultipleCallbackNullReturns() throws Exception {
+        // Pure closed output codec only; this does not create Prepared, Accepted
+        // or native execution evidence from these synthetic JSON values.
+        var validate = NativeCalibrationApproval.class.getDeclaredMethod("nativeOutput", ObjectNode.class); validate.setAccessible(true);
+        for (int count : List.of(0, 2, 256)) {
+            ObjectNode output = ContractJson.newObject().put("completionClaim", "native_function_queue_observed")
+                    .put("nativeCallbackCount", count).putNull("nativeCallbackReturn");
+            assertDoesNotThrow(() -> validate.invoke(null, output));
+            output.put("nativeCallbackReturn", 0);
+            assertInstanceOf(ContractException.class, assertThrows(java.lang.reflect.InvocationTargetException.class,
+                    () -> validate.invoke(null, output)).getCause());
+        }
+        ObjectNode single = ContractJson.newObject().put("completionClaim", "native_function_queue_observed")
+                .put("nativeCallbackCount", 1).put("nativeCallbackReturn", Integer.MIN_VALUE);
+        assertDoesNotThrow(() -> validate.invoke(null, single)); single.put("nativeCallbackReturn", Integer.MAX_VALUE);
+        assertDoesNotThrow(() -> validate.invoke(null, single));
+        for (ObjectNode invalid : List.of(single.deepCopy().putNull("nativeCallbackReturn"), single.deepCopy().put("nativeCallbackReturn", 2147483648L),
+                single.deepCopy().put("nativeCallbackCount", -1), single.deepCopy().put("nativeCallbackCount", 257),
+                single.deepCopy().put("nativeCallbackCount", 1.0), single.deepCopy().put("completionClaim", "complete"),
+                single.deepCopy().put("success", true))) {
+            assertInstanceOf(ContractException.class, assertThrows(java.lang.reflect.InvocationTargetException.class,
+                    () -> validate.invoke(null, invalid)).getCause());
         }
     }
 
@@ -157,6 +215,19 @@ final class NativeCalibrationApprovalTest {
         }
     }
 
+    @Test void nullOrJsonOnlyReadinessCannotAdmitAnExternalTargetInvocation() throws Exception {
+        var runner = new RejectingRunner(new AtomicInteger()) {
+            @Override public NativeCalibrationPrepared ready(Invocation original, NativeCalibrationApproval.Program program, NativeCalibrationApproval.Control control) {
+                control.checkpoint(); return null;
+            }
+        };
+        try (Harness harness = new Harness(runner, false)) {
+            for (String method : List.of("prepare", "dispatch"))
+                assertEquals("CALIBRATION_APPROVAL_MISMATCH", harness.call(method, harness.wire(0)).path("error").path("code").asText());
+            assertUnclaimed(harness.grant); assertEquals(0, harness.retained.get());
+        }
+    }
+
     @Test void originalReplyCancellationAndRouteCloseStopLateQueuedWorkBeforeReadiness() throws Exception {
         AtomicInteger ready = new AtomicInteger();
         try (Harness harness = new Harness(new RejectingRunner(ready), true)) {
@@ -168,61 +239,47 @@ final class NativeCalibrationApprovalTest {
         }
     }
 
-    @Test void failedRunnerStagesAndReadinessKeepTheirOriginalAndCurrentSourceCauses() throws Exception {
-        var execute = new CompletableFuture<ProviderResult>();
-        var executions = new AtomicReference<>(execute);
-        var poll = new CompletableFuture<ObjectNode>(); var cancel = new CompletableFuture<ObjectNode>();
+    @Test void failedFinalizationAndReadinessKeepTheirOriginalAndCurrentSourceCauses() throws Exception {
+        // The actual Prepared capability has no synthetic positive factory.
+        // Exercise the shared production failure finalizer directly instead of
+        // admitting an Invocation with a JSON-only fake readiness result.
+        var finalize = NativeCalibrationApproval.class.getDeclaredMethod("completeChecked", CompletableFuture.class,
+                Throwable.class, Supplier.class, Runnable.class);
+        finalize.setAccessible(true);
+        for (String stage : List.of("execute", "poll", "cancel")) {
+            var result = new CompletableFuture<ObjectNode>();
+            ContractException original = new ContractException("FIXTURE_STAGE_FAILED", stage);
+            ContractException current = new ContractException("FIXTURE_SOURCE_REVOKED", "합성 현재 source 철회");
+            finalize.invoke(null, result, original, (Supplier<ObjectNode>) () -> fail("실패 stage는 성공값을 읽으면 안 됩니다"),
+                    (Runnable) () -> { throw current; });
+            assertSame(original, assertThrows(java.util.concurrent.CompletionException.class, result::join).getCause());
+            assertArrayEquals(new Throwable[] {current}, original.getSuppressed());
+        }
+        var stopped = new CompletableFuture<ObjectNode>(); assertTrue(stopped.cancel(false));
+        ContractException late = new ContractException("FIXTURE_STAGE_FAILED", "합성 늦은 stage 오류");
+        ContractException cancellation = new ContractException("CANCELLATION_REQUESTED", "합성 원 요청 취소");
+        finalize.invoke(null, stopped, late, (Supplier<ObjectNode>) ContractJson::newObject,
+                (Runnable) () -> { throw cancellation; });
+        assertTrue(stopped.isCancelled()); assertArrayEquals(new Throwable[] {cancellation}, late.getSuppressed());
         var readiness = new AtomicReference<Runnable>();
         var runner = new RejectingRunner(new AtomicInteger()) {
-            @Override public ObjectNode ready(Invocation original, NativeCalibrationApproval.Program program, NativeCalibrationApproval.Control control) {
+            @Override public NativeCalibrationPrepared ready(Invocation original, NativeCalibrationApproval.Program program, NativeCalibrationApproval.Control control) {
                 control.checkpoint(); Runnable hook = readiness.get(); if (hook != null) hook.run();
-                // This synthetic handoff admits no real source or game effect.
-                // Every execution/query stage below completes only with failure.
-                return ContractJson.newObject().put("fixtureOnly", true);
+                return super.ready(original, program, control);
             }
-            @Override public CompletionStage<ProviderResult> execute(Invocation original, NativeCalibrationApproval.Program program, NativeCalibrationApproval.Control control) { return executions.get(); }
-            @Override public CompletionStage<ObjectNode> poll(Invocation original, NativeCalibrationApproval.Control control) { return poll; }
-            @Override public CompletionStage<ObjectNode> cancel(Invocation original, NativeCalibrationApproval.Control control) { return cancel; }
         };
         try (Harness harness = new Harness(runner, false)) {
-            ObjectNode wire = harness.wire(0);
-            var dispatch = harness.begin("dispatch", wire); assertFalse(dispatch.isDone());
-            assertEquals(1, harness.retained.get());
-            ContractException executeFailure = new ContractException("FIXTURE_EXECUTE_FAILED", "합성 stage 오류");
-            ContractException sourceFailure = new ContractException("FIXTURE_SOURCE_REVOKED", "합성 현재 source 철회");
-            int before = harness.sourceChecks.get(); harness.sourceFailure.set(sourceFailure);
-            execute.completeExceptionally(executeFailure);
-            assertEquals("FIXTURE_EXECUTE_FAILED", dispatch.join().path("error").path("code").asText());
-            assertArrayEquals(new Throwable[] {sourceFailure}, executeFailure.getSuppressed());
-            assertTrue(harness.sourceChecks.get() > before);
-            for (String method : List.of("operation.get", "operation.cancel")) {
-                harness.sourceFailure.set(null);
-                var response = harness.begin(method, wire); assertFalse(response.isDone());
-                ContractException original = new ContractException("FIXTURE_QUERY_FAILED", "합성 원 query 오류");
-                ContractException current = new ContractException("FIXTURE_SOURCE_REVOKED", "합성 현재 source 철회");
-                before = harness.sourceChecks.get(); harness.sourceFailure.set(current);
-                (method.equals("operation.get") ? poll : cancel).completeExceptionally(original);
-                assertEquals("FIXTURE_QUERY_FAILED", response.join().path("error").path("code").asText());
-                assertArrayEquals(new Throwable[] {current}, original.getSuppressed());
-                assertTrue(harness.sourceChecks.get() > before);
-            }
             for (String method : List.of("prepare", "dispatch")) {
                 harness.sourceFailure.set(null);
                 ContractException original = new ContractException("FIXTURE_READY_FAILED", "합성 원 readiness 오류");
                 ContractException current = new ContractException("FIXTURE_SOURCE_REVOKED", "합성 현재 source 철회");
                 readiness.set(() -> { harness.sourceFailure.set(current); throw original; });
+                int before = harness.sourceChecks.get();
                 assertEquals("FIXTURE_READY_FAILED", harness.call(method, harness.wire(1)).path("error").path("code").asText());
                 assertArrayEquals(new Throwable[] {current}, original.getSuppressed());
-                assertEquals(1, harness.retained.get());
+                assertTrue(harness.sourceChecks.get() > before); assertEquals(0, harness.retained.get());
             }
-            readiness.set(null); harness.sourceFailure.set(null);
-            var lateStage = new CompletableFuture<ProviderResult>(); executions.set(lateStage);
-            var stopped = harness.begin("dispatch", harness.wire(1)); assertFalse(stopped.isDone());
-            assertTrue(stopped.cancel(false));
-            ContractException original = new ContractException("FIXTURE_EXECUTE_FAILED", "합성 늦은 stage 오류");
-            lateStage.completeExceptionally(original);
-            assertTrue(stopped.isCancelled()); assertEquals(1, original.getSuppressed().length);
-            assertEquals("CANCELLATION_REQUESTED", ((ContractException) original.getSuppressed()[0]).code());
+            assertUnclaimed(harness.grant);
             assertFalse(harness.session.verifiedWriteProfile());
         }
     }
@@ -230,13 +287,13 @@ final class NativeCalibrationApprovalTest {
     private static class RejectingRunner implements NativeCalibrationApproval.Runner {
         private final AtomicInteger ready;
         private RejectingRunner(AtomicInteger ready) { this.ready = ready; }
-        @Override public ObjectNode ready(Invocation original, NativeCalibrationApproval.Program program, NativeCalibrationApproval.Control control) {
+        @Override public NativeCalibrationPrepared ready(Invocation original, NativeCalibrationApproval.Program program, NativeCalibrationApproval.Control control) {
             control.checkpoint(); ready.incrementAndGet(); throw new ContractException("CALIBRATION_SOURCE_UNAVAILABLE", "합성 fixture에는 실제 loaded function이 없습니다");
         }
         @Override public CompletionStage<ProviderResult> execute(Invocation original, NativeCalibrationApproval.Program program, NativeCalibrationApproval.Control control) { return fail("준비 거절 뒤 execute를 호출하면 안 됩니다"); }
         @Override public CompletionStage<ObjectNode> poll(Invocation original, NativeCalibrationApproval.Control control) { return fail("수락되지 않은 원 Invocation을 poll하면 안 됩니다"); }
         @Override public CompletionStage<ObjectNode> cancel(Invocation original, NativeCalibrationApproval.Control control) { return fail("수락되지 않은 원 Invocation을 cancel하면 안 됩니다"); }
-        @Override public NativeCalibrationSource.IssuedReceipt lookup(Invocation original, NativeCalibrationApproval.Control control) { return fail("실제 dispatch 없이 receipt를 만들면 안 됩니다"); }
+        @Override public NativeCalibrationRunFacts lookup(Invocation original, NativeCalibrationApproval.Control control) { return fail("실제 dispatch 없이 receipt를 만들면 안 됩니다"); }
     }
 
     private final class Harness implements AutoCloseable {
@@ -252,8 +309,15 @@ final class NativeCalibrationApprovalTest {
         private final HostDispatcher dispatcher;
         private Harness(NativeCalibrationApproval.Runner runner, boolean queue) throws IOException {
             this.queue = queue; base = fixture("invocation.json");
-            base.put("deadlineAt", NOW.plusSeconds(20).toString()); base.put("actionId", "mmmm:command_execute");
+            base.put("deadlineAt", NOW.plusSeconds(20).toString()); base.put("actionId", "mmmm:calibration_command_execute");
             ObjectNode context = ContractJson.object(base.path("context"));
+            var targets = context.withObject("scope").withArray("externalTargetIds");
+            for (int index = 0; index < 47; index++) {
+                String suffix = index == 0 ? "" : Integer.toString(index);
+                targets.add("calibration-objective-fixture" + suffix);
+                targets.add("calibration-storage-" + ContractJson.sha256(("mmmm_calibration:fixture" + suffix).getBytes(StandardCharsets.UTF_8)));
+            }
+            context.put("contextDigest", ContractJson.contextDigest(context)); base.put("contextDigest", context.path("contextDigest").asText());
             session = new HostSession(context.path("principalRef").asText(), context.path("environment").path("sessionEpoch").asText(),
                     context.path("environment").path("gameInstanceId").asText(), "server", UUID.randomUUID(), NativeCalibrationApproval.READ_PERMISSIONS, false);
             session.installContext(contracts, context); manifest = manifest();
@@ -297,7 +361,7 @@ final class NativeCalibrationApprovalTest {
         }
         private ObjectNode manifest() {
             ObjectNode context = ContractJson.object(base.path("context"));
-            ObjectNode result = ContractJson.newObject().put("kind", "native_calibration_approval").put("purpose", NativeCalibrationApproval.PURPOSE)
+            ObjectNode result = ContractJson.newObject().put("kind", "native_calibration_approval/2").put("purpose", NativeCalibrationApproval.PURPOSE)
                     .put("selectionDigest", "a".repeat(64)).put("hostEpoch", session.epoch()).put("registryGeneration", "31")
                     .put("runtimeSourceFactsDigest", "b".repeat(64)).put("suiteDigest", "c".repeat(64)).put("recipeSha256", "c".repeat(64));
             ObjectNode inner = result.putObject("plan").put("kind", "native_plan_approval").put("protocolVersion", ContractJson.VERSION)
@@ -311,16 +375,28 @@ final class NativeCalibrationApprovalTest {
             for (int index = 0; index < 47; index++) {
                 ObjectNode wire = wire(index), step = steps.addObject();
                 for (String field : Set.of("stepId", "bindingId", "actionId", "actionDigest", "implementationDigest", "argumentsDigest", "contextDigest")) step.set(field, wire.path(field).deepCopy());
-                step.put("contextId", context.path("contextId").asText()); step.putArray("resourcesRead"); step.putArray("resourcesWritten"); step.putArray("preconditions");
+                String suffix = index == 0 ? "" : Integer.toString(index);
+                String objective = "fixture" + suffix, storage = "mmmm_calibration:fixture" + suffix;
+                String objectiveTarget = "calibration-objective-" + objective;
+                String storageTarget = "calibration-storage-" + ContractJson.sha256(storage.getBytes(StandardCharsets.UTF_8));
+                step.put("contextId", context.path("contextId").asText());
+                step.putArray("resourcesRead").add(objectiveTarget).add(storageTarget);
+                step.putArray("resourcesWritten").add(objectiveTarget).add(storageTarget);
+                var conditions = step.putArray("preconditions");
+                for (String target : List.of(objectiveTarget, storageTarget)) conditions.addObject().put("kind", "resource_hash")
+                        .put("subject", target).put("expected", "f".repeat(64)).put("coverage", "full_target");
                 ObjectNode program = programs.addObject().put("stepId", "step-" + index).put("caseId", "case_" + index)
                         .put("functionId", "mmmm_calibration:case_" + index + "/fixture").put("command", wire.path("arguments").path("command").asText())
-                        .put("programDigest", "e".repeat(64)).put("sourceSha256", ContractJson.sha256(source)).put("sourceBytesHex", HexFormat.of().formatHex(source))
+                        .put("programDigest", ContractJson.sha256(source)).put("sourceSha256", ContractJson.sha256(source)).put("sourceBytesHex", HexFormat.of().formatHex(source))
                         .put("preseedEndIndex", 1).put("selectedCommandStageIndex", 1);
                 program.putArray("commands").add("scoreboard players set #ok fixture 0").add("scoreboard players get #ok fixture");
                 program.putArray("initializationCommands").add("scoreboard objectives add fixture dummy");
                 program.putArray("cleanupCommands").add("scoreboard objectives remove fixture")
                         .add("data remove storage mmmm_calibration:fixture states").add("data remove storage mmmm_calibration:fixture inputs");
-                program.putObject("readbackAddresses").put("caseId", "case_" + index).put("function", program.path("functionId").asText());
+                var targets = program.putArray("targetBindings");
+                targets.addObject().put("targetId", objectiveTarget).put("kind", "objective").put("objective", objective);
+                targets.addObject().put("targetId", storageTarget).put("kind", "owned_storage").put("storage", storage)
+                        .putArray("ownedSubtrees").add("inputs").add("invocation");
             }
             return result;
         }
@@ -341,12 +417,12 @@ final class NativeCalibrationApprovalTest {
         @Override public void close() { grant.close(); session.close(); runtime.close(); }
     }
     private static void assertUnclaimed(NativeCalibrationApproval approval) throws Exception {
-        Field original = NativeCalibrationApproval.class.getDeclaredField("plan"); original.setAccessible(true);
-        NativePlanApproval plan = (NativePlanApproval) original.get(approval);
+        Field original = NativeCalibrationApproval.class.getDeclaredField("reservations"); original.setAccessible(true);
+        NativeInvocationReservations plan = (NativeInvocationReservations) original.get(approval);
         for (String name : List.of("reservations", "invocationSteps")) {
-            Field field = NativePlanApproval.class.getDeclaredField(name); field.setAccessible(true); assertTrue(((Map<?, ?>) field.get(plan)).isEmpty());
+            Field field = NativeInvocationReservations.class.getDeclaredField(name); field.setAccessible(true); assertTrue(((Map<?, ?>) field.get(plan)).isEmpty());
         }
-        Field operation = NativePlanApproval.class.getDeclaredField("operationId"); operation.setAccessible(true); assertNull(operation.get(plan));
+        Field operation = NativeInvocationReservations.class.getDeclaredField("operationId"); operation.setAccessible(true); assertNull(operation.get(plan));
     }
     private static ObjectNode first(ObjectNode value, String name) { return ContractJson.object(value.path(name).get(0)); }
     private static ObjectNode fixture(String name) throws IOException {

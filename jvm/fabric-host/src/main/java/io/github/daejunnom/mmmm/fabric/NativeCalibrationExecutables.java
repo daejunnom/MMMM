@@ -7,6 +7,7 @@ import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.function.Supplier;
 
 /**
@@ -19,6 +20,8 @@ final class NativeCalibrationExecutables {
     static final String SOURCE_KIND = "current_vm_executable";
     static final int MAX_SELECTIONS = 256;
     static final int MAX_CLASSES = 64;
+    // Native byte-array payload only. Referenced receiver/capture graphs, reflection objects and
+    // VM heap overhead are separate; no captured object graph is copied or claimed immutable.
     static final long MAX_RETAINED_BYTES = 8L * 1024 * 1024;
     private static final int MAX_METHODS = 4096;
 
@@ -66,7 +69,11 @@ final class NativeCalibrationExecutables {
         Object actualReceiver() { return selection.actualReceiver(); }
         Method selectedMethod() { return selection.selectedMethod(); }
         Method implementation() { return implementation; }
-        /** Only the original native zero-capture static-forwarder recipe can populate this. */
+        /**
+         * Only the original native zero-capture static-forwarder recipe can populate this.
+         * Null on an actual hidden receiver means that its target/captured state is unobserved;
+         * the exact SAM body remains a factual current_vm_executable, never target admission.
+         */
         Method hiddenStaticTarget() { return hidden == null ? null : hidden.target; }
         byte[] hiddenForwarderEnvelope() { return hidden == null ? new byte[0] : hidden.envelope.clone(); }
     }
@@ -98,7 +105,7 @@ final class NativeCalibrationExecutables {
                 }
                 for (var entry : hidden.entrySet()) {
                     current.check();
-                    entry.getValue().check(entry.getKey(), classes, current);
+                    if (entry.getValue() != null) entry.getValue().check(entry.getKey(), classes, current);
                 }
                 recheckClasses(classes, current);
                 return null;
@@ -122,11 +129,11 @@ final class NativeCalibrationExecutables {
                 HiddenLink hidden = null;
                 if (receiver.isHidden()) {
                     HiddenLink link = builder.hidden.get(receiver);
-                    if (link == null) {
+                    if (!builder.hidden.containsKey(receiver)) {
                         link = acquireHidden(receiver, implementation, builder, current);
                         builder.hidden.put(receiver, link);
                     }
-                    link.requireSam(implementation);
+                    if (link != null) link.requireSam(implementation);
                     hidden = link;
                 }
                 builder.facts.add(new Fact(selection, implementation, hidden));
@@ -177,11 +184,16 @@ final class NativeCalibrationExecutables {
     }
 
     private static HiddenLink acquireHidden(Class<?> receiver, Method sam, Builder builder, Current current) {
-        // The existing native matcher supports its complete zero-capture, one-SAM, direct static
-        // forwarder recipe only. Captures/virtual targets and unsupported recipes remain unavailable
-        // here. This joins that factual match to the selected SAM; it admits neither dispatch nor
-        // the semantic closure of every symbolic referenced class.
-        var forwarder = observeForwarder(receiver, current);
+        // Every selected hidden SAM already has its actual receiver, exact method-table entry and
+        // issuer-acquired current Class envelope above. A captured/other recipe may have no matched
+        // static target. Preserve that exact body fact without reading fields or claiming capture
+        // values, virtual-target equivalence or closure. The function observer must still bind the
+        // same compiled entry/context/receiver to its actual execution-stage observations.
+        var matched = queryForwarder(receiver, current);
+        if (matched.isEmpty()) return null;
+        // Only the existing native zero-capture, one-SAM direct-static matcher can add target facts.
+        // This join still admits neither dispatch nor all symbolic referenced-class semantics.
+        var forwarder = matched.orElseThrow();
         sameSource(builder.classes.get(receiver), forwarder.source(), current);
         if (!sam.getName().equals(forwarder.samName()) || !descriptor(sam).equals(forwarder.samDescriptor())) {
             throw failure(Status.UNSUPPORTED, Reason.HIDDEN_SAM_MISMATCH);
@@ -268,8 +280,11 @@ final class NativeCalibrationExecutables {
     }
 
     private static DefinitionObserverBridge.ObservedHiddenForwarder observeForwarder(Class<?> receiver, Current current) {
+        return queryForwarder(receiver, current).orElseThrow(() -> failure(Status.CHANGED, Reason.HIDDEN_RECIPE_UNSUPPORTED));
+    }
+    private static Optional<DefinitionObserverBridge.ObservedHiddenForwarder> queryForwarder(Class<?> receiver, Current current) {
         return checked(current, () -> {
-            try { return DefinitionObserverBridge.observeHiddenForwarder(receiver).orElseThrow(() -> failure(Status.UNSUPPORTED, Reason.HIDDEN_RECIPE_UNSUPPORTED)); }
+            try { return DefinitionObserverBridge.observeHiddenForwarder(receiver); }
             catch (Failure failure) { throw failure; }
             catch (RuntimeException | LinkageError cause) { throw new Failure(Status.UNAVAILABLE, Reason.NATIVE_OBSERVER_FAILED, cause); }
         });

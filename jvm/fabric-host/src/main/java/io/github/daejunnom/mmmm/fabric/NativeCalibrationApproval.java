@@ -7,6 +7,7 @@ import io.github.daejunnom.mmmm.host.HostDispatcher;
 import io.github.daejunnom.mmmm.host.HostRuntime;
 import io.github.daejunnom.mmmm.host.HostSession;
 import io.github.daejunnom.mmmm.host.NativePlanApproval;
+import io.github.daejunnom.mmmm.host.NativeInvocationReservations;
 import io.github.daejunnom.mmmm.sdk.ContractException;
 import io.github.daejunnom.mmmm.sdk.ContractJson;
 import io.github.daejunnom.mmmm.sdk.Invocation;
@@ -38,7 +39,7 @@ final class NativeCalibrationApproval implements HostDispatcher.PurposeRoute, Au
     private static final Set<String> MANIFEST_FIELDS = Set.of("kind", "purpose", "selectionDigest", "hostEpoch", "registryGeneration",
             "runtimeSourceFactsDigest", "suiteDigest", "recipeSha256", "plan", "programs");
     private static final Set<String> PROGRAM_FIELDS = Set.of("stepId", "caseId", "functionId", "command", "programDigest",
-            "sourceSha256", "sourceBytesHex", "readbackAddresses", "commands", "preseedEndIndex",
+            "sourceSha256", "sourceBytesHex", "targetBindings", "commands", "preseedEndIndex",
             "selectedCommandStageIndex", "initializationCommands", "cleanupCommands");
     private static final int MAX_RECIPE_COMMANDS = 4096;
     private static final int MAX_COMMAND_BYTES = 8192;
@@ -47,6 +48,7 @@ final class NativeCalibrationApproval implements HostDispatcher.PurposeRoute, Au
     private final Clock clock;
     // 일반 route에 노출하거나 prepare에서 소비하지 않는다. one-operation/step binding은 기존 구현이 소유한다.
     private final NativePlanApproval plan;
+    private final NativeInvocationReservations reservations;
     private final ObjectNode manifest;
     private final String manifestDigest;
     private final Map<String, Program> programs = new HashMap<>();
@@ -65,11 +67,14 @@ final class NativeCalibrationApproval implements HostDispatcher.PurposeRoute, Au
     }
     /** 실제 finite runner만 주입한다. absent runner를 성공 handler나 inspect 실행으로 대체하지 않는다. */
     interface Runner {
-        ObjectNode ready(Invocation original, Program program, Control control);
+        NativeCalibrationPrepared ready(Invocation original, Program program, Control control);
         CompletionStage<ProviderResult> execute(Invocation original, Program program, Control control);
         CompletionStage<ObjectNode> poll(Invocation original, Control control);
         CompletionStage<ObjectNode> cancel(Invocation original, Control control);
-        NativeCalibrationSource.IssuedReceipt lookup(Invocation original, Control control);
+        NativeCalibrationRunFacts lookup(Invocation original, Control control);
+    }
+    @FunctionalInterface interface StateObserver {
+        NativeCalibrationTargetImages.ImagePair observe(Invocation original, Program program, Control control);
     }
     static final class Control {
         private final Runnable check;
@@ -84,11 +89,16 @@ final class NativeCalibrationApproval implements HostDispatcher.PurposeRoute, Au
         private final List<String> commands;
         private final List<String> initializationCommands;
         private final List<String> cleanupCommands;
+        private final List<String> resourcesRead, resourcesWritten;
+        private final List<TargetBinding> targetBindings;
         private Program(ObjectNode value, byte[] sourceBytes, List<String> commands,
-                        List<String> initializationCommands, List<String> cleanupCommands) {
+                        List<String> initializationCommands, List<String> cleanupCommands,
+                        ObjectNode step, ObjectNode context) {
             this.value = value.deepCopy(); this.sourceBytes = sourceBytes;
             this.commands = List.copyOf(commands); this.initializationCommands = List.copyOf(initializationCommands);
             this.cleanupCommands = List.copyOf(cleanupCommands);
+            this.resourcesRead = footprint(step, "resourcesRead"); this.resourcesWritten = footprint(step, "resourcesWritten");
+            this.targetBindings = NativeCalibrationApproval.targetBindings(value, step, context, resourcesRead, resourcesWritten);
         }
         String stepId() { return text(value, "stepId"); }
         String caseId() { return text(value, "caseId"); }
@@ -106,7 +116,22 @@ final class NativeCalibrationApproval implements HostDispatcher.PurposeRoute, Au
         // 초기화·정리 원문도 비교 입력이며 이 accessor가 별도 실행이나 수명을 승인하지 않는다.
         List<String> initializationCommands() { return initializationCommands; }
         List<String> cleanupCommands() { return cleanupCommands; }
-        ObjectNode readbackAddresses() { return ContractJson.object(value.path("readbackAddresses")).deepCopy(); }
+        List<String> resourcesRead() { return resourcesRead; }
+        List<String> resourcesWritten() { return resourcesWritten; }
+        List<TargetBinding> targetBindings() { return targetBindings; }
+    }
+    /** Closed typed associations; these are external targets, never resource ACL grants. */
+    static final class TargetBinding {
+        private final String targetId, kind, objective, storage, expectedDigest;
+        private final List<String> ownedSubtrees;
+        private TargetBinding(String targetId, String kind, String objective, String storage,
+                              List<String> ownedSubtrees, String expectedDigest) {
+            this.targetId = targetId; this.kind = kind; this.objective = objective; this.storage = storage;
+            this.ownedSubtrees = List.copyOf(ownedSubtrees); this.expectedDigest = expectedDigest;
+        }
+        String targetId() { return targetId; } String kind() { return kind; }
+        String objective() { return objective; } String storage() { return storage; }
+        List<String> ownedSubtrees() { return ownedSubtrees; } String expectedDigest() { return expectedDigest; }
     }
     private static final class Accepted {
         private final Invocation original;
@@ -125,7 +150,7 @@ final class NativeCalibrationApproval implements HostDispatcher.PurposeRoute, Au
         if (bytes.length > AnonymousBridge.MAX_FRAME) throw invalid();
         manifest = ContractJson.object(ContractJson.parse(bytes)); nodeLimit(manifest);
         HostDispatcher.exactFields(manifest, MANIFEST_FIELDS);
-        if (!"native_calibration_approval".equals(text(manifest, "kind")) || !PURPOSE.equals(text(manifest, "purpose"))
+        if (!"native_calibration_approval/2".equals(text(manifest, "kind")) || !PURPOSE.equals(text(manifest, "purpose"))
                 || !session.epoch().equals(text(manifest, "hostEpoch")) || session.verifiedWriteProfile()) throw invalid();
         for (String field : Set.of("selectionDigest", "runtimeSourceFactsDigest", "suiteDigest", "recipeSha256")) sha(manifest, field);
         if (!text(manifest, "suiteDigest").equals(text(manifest, "recipeSha256"))
@@ -136,13 +161,17 @@ final class NativeCalibrationApproval implements HostDispatcher.PurposeRoute, Au
         if (!inner.path("nativeExecutions").isArray() || !inner.path("nativeExecutions").isEmpty()
                 || !inner.path("steps").isArray() || inner.path("steps").size() != 47
                 || !manifest.path("programs").isArray() || manifest.path("programs").size() != 47) throw invalid();
-        plan = new NativePlanApproval(contracts, inner, clock); plan.checkSession(session);
+        // Reuse the immutable projection parser, not its ordinary resource ACL.
+        // The external target proof is checked separately for this purpose.
+        plan = new NativePlanApproval(contracts, inner, clock);
+        reservations = new NativeInvocationReservations(plan.expiresAt(), clock);
+        checkInstalledContext(inner);
         for (JsonNode value : inner.path("steps")) {
             ObjectNode step = ContractJson.object(value);
-            if (!"mmmm:command_execute".equals(text(step, "actionId"))) throw invalid();
+            if (!"mmmm:calibration_command_execute".equals(text(step, "actionId"))) throw invalid();
             steps.put(text(step, "stepId"), step.deepCopy());
         }
-        Set<String> cases = new HashSet<>(), functions = new HashSet<>(); int totalBytes = 0, totalCommands = 0;
+        Set<String> cases = new HashSet<>(), functions = new HashSet<>(), targets = new HashSet<>(); int totalBytes = 0, totalCommands = 0;
         for (JsonNode value : manifest.path("programs")) {
             ObjectNode program = ContractJson.object(value); HostDispatcher.exactFields(program, PROGRAM_FIELDS);
             String step = text(program, "stepId"), caseId = text(program, "caseId"), function = text(program, "functionId");
@@ -154,7 +183,8 @@ final class NativeCalibrationApproval implements HostDispatcher.PurposeRoute, Au
             byte[] source = HexFormat.of().parseHex(hex); totalBytes += source.length;
             if (totalBytes > 1024 * 1024) throw invalid();
             sha(program, "programDigest"); sha(program, "sourceSha256");
-            if (!ContractJson.sha256(source).equals(text(program, "sourceSha256"))) throw invalid();
+            if (!ContractJson.sha256(source).equals(text(program, "sourceSha256"))
+                    || !text(program, "programDigest").equals(text(program, "sourceSha256"))) throw invalid();
             List<String> commands = commandInputs(program, "commands", false);
             List<String> initialization = commandInputs(program, "initializationCommands", true);
             List<String> cleanup = commandInputs(program, "cleanupCommands", true);
@@ -162,14 +192,80 @@ final class NativeCalibrationApproval implements HostDispatcher.PurposeRoute, Au
             if (totalCommands > MAX_RECIPE_COMMANDS) throw invalid();
             int preseed = commandIndex(program, "preseedEndIndex"), selected = commandIndex(program, "selectedCommandStageIndex");
             if (preseed > selected || selected >= commands.size()) throw invalid();
-            ObjectNode addresses = ContractJson.object(program.path("readbackAddresses"));
-            if (!caseId.equals(addresses.path("caseId").asText()) || !function.equals(addresses.path("function").asText())) throw invalid();
             ObjectNode arguments = ContractJson.newObject().put("command", text(program, "command"));
-            if (!ContractJson.digest(arguments).equals(steps.get(step).path("argumentsDigest").asText())
-                    || programs.putIfAbsent(step, new Program(program, source, commands, initialization, cleanup)) != null) throw invalid();
+            if (!ContractJson.digest(arguments).equals(steps.get(step).path("argumentsDigest").asText())) throw invalid();
+            Program parsed = new Program(program, source, commands, initialization, cleanup,
+                    steps.get(step), session.context(steps.get(step).path("contextId").asText()));
+            for (TargetBinding target : parsed.targetBindings()) if (!targets.add(target.targetId())) throw invalid();
+            if (programs.putIfAbsent(step, parsed) != null) throw invalid();
         }
         if (!programs.keySet().equals(steps.keySet())) throw invalid();
         manifestDigest = ContractJson.digest(manifest);
+    }
+
+    private void checkInstalledContext(ObjectNode inner) {
+        session.checkOpen();
+        if (!inner.path("contextPins").isArray() || inner.path("contextPins").size() != 1) throw invalid();
+        ObjectNode pin = ContractJson.object(inner.path("contextPins").get(0));
+        ObjectNode context = session.context(text(pin, "contextId"));
+        if (!plan.principalId().equals(session.principalRef()) || !plan.principalId().equals(text(context, "principalRef"))
+                || !plan.projectId().equals(text(context, "projectId")) || !plan.policyRevision().equals(text(context, "policyRevision"))
+                || !pin.path("contextDigest").equals(context.path("contextDigest"))
+                || !pin.path("environment").equals(context.path("environment"))) throw invalid();
+        if (!clock.instant().isBefore(plan.expiresAt())) throw new ContractException("NATIVE_APPROVAL_EXPIRED", "The frozen plan approval has expired");
+    }
+
+    private static List<String> footprint(ObjectNode step, String field) {
+        if (!step.path(field).isArray() || step.path(field).size() != 2) throw invalid();
+        List<String> result = new ArrayList<>();
+        for (JsonNode id : step.path(field)) {
+            if (!id.isTextual() || !id.textValue().matches("[a-z0-9][a-z0-9._:-]{0,127}") || result.contains(id.textValue())) throw invalid();
+            result.add(id.textValue());
+        }
+        return List.copyOf(result);
+    }
+
+    private static List<TargetBinding> targetBindings(ObjectNode program, ObjectNode step, ObjectNode context,
+                                                       List<String> read, List<String> written) {
+        if (!read.equals(written) || !program.path("targetBindings").isArray() || program.path("targetBindings").size() != 2
+                || !step.path("preconditions").isArray() || step.path("preconditions").size() != 2) throw invalid();
+        Map<String, String> expected = new HashMap<>();
+        for (JsonNode value : step.path("preconditions")) {
+            ObjectNode condition = ContractJson.object(value);
+            if (!"resource_hash".equals(text(condition, "kind")) || !"full_target".equals(text(condition, "coverage"))) throw invalid();
+            sha(condition, "expected");
+            if (expected.putIfAbsent(text(condition, "subject"), text(condition, "expected")) != null) throw invalid();
+        }
+        List<TargetBinding> result = new ArrayList<>();
+        for (int index = 0; index < 2; index++) {
+            ObjectNode binding = ContractJson.object(program.path("targetBindings").get(index));
+            boolean objective = index == 0;
+            HostDispatcher.exactFields(binding, objective ? Set.of("targetId", "kind", "objective")
+                    : Set.of("targetId", "kind", "storage", "ownedSubtrees"));
+            String address = text(binding, objective ? "objective" : "storage");
+            if (objective ? !address.matches("[a-zA-Z0-9_.-]{1,16}")
+                    : address.length() > 256 || !address.matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) throw invalid();
+            String target = objective ? "calibration-objective-" + address
+                    : "calibration-storage-" + ContractJson.sha256(address.getBytes(StandardCharsets.UTF_8));
+            if (!target.equals(text(binding, "targetId")) || !target.equals(read.get(index))
+                    || !expected.containsKey(target) || !context.path("scope").path("externalTargetIds").isArray()
+                    || !contains(context.path("scope").path("externalTargetIds"), target)
+                    || !(objective ? "objective" : "owned_storage").equals(text(binding, "kind"))) throw invalid();
+            List<String> subtrees = List.of();
+            if (!objective) {
+                JsonNode trees = binding.path("ownedSubtrees");
+                if (!trees.isArray() || trees.size() != 2 || !"inputs".equals(trees.get(0).asText())
+                        || !"invocation".equals(trees.get(1).asText())) throw invalid();
+                subtrees = List.of("inputs", "invocation");
+            }
+            result.add(new TargetBinding(target, objective ? "objective" : "owned_storage", objective ? address : null,
+                    objective ? null : address, subtrees, expected.get(target)));
+        }
+        return List.copyOf(result);
+    }
+    private static boolean contains(JsonNode values, String expected) {
+        for (JsonNode value : values) if (value.isTextual() && expected.equals(value.textValue())) return true;
+        return false;
     }
 
     String selectionDigest() { return text(manifest, "selectionDigest"); }
@@ -193,11 +289,14 @@ final class NativeCalibrationApproval implements HostDispatcher.PurposeRoute, Au
             try {
                 Control control = control(owner, invocation, request, new AtomicBoolean(), false);
                 check(invocation, control, true); Program program = validate(invocation);
-                ObjectNode ready = checked(() -> {
-                    ObjectNode value = requireRunner().ready(invocation, program, control); bounded(value); return value;
+                NativeCalibrationPrepared ready = checked(() -> {
+                    NativeCalibrationPrepared value = requireRunner().ready(invocation, program, control);
+                    verifyPrepared(value, invocation, program, control); return value;
                 }, () -> check(invocation, control, true));
                 // 준비는 immutable pin 검증만 한다. 기존 NativePlanApproval의 sticky admission은 dispatch만 호출한다.
-                result.complete(ready.deepCopy());
+                ObjectNode wire = checked(() -> { ObjectNode value = ready.wire(control); bounded(value); return value; },
+                        () -> check(invocation, control, true));
+                result.complete(wire.deepCopy());
             } catch (RuntimeException | Error failure) { result.completeExceptionally(failure); }
             return null;
         }).whenComplete((ignored, failure) -> { if (failure != null) result.completeExceptionally(failure); });
@@ -211,23 +310,42 @@ final class NativeCalibrationApproval implements HostDispatcher.PurposeRoute, Au
             try {
                 Control admission = control(owner, invocation, request, new AtomicBoolean(), false);
                 check(invocation, admission, true); Program program = validate(invocation); Runner actual = requireRunner();
-                checked(() -> { bounded(actual.ready(invocation, program, admission)); return null; },
-                        () -> check(invocation, admission, true));
                 Accepted previous = accepted.get(invocation.invocationId());
                 if (previous != null) {
                     if (!previous.digest.equals(ContractJson.digest(invocation.wire()))) throw invalid();
+                    requireReservation(invocation, true);
                     active.set(previous); copy(previous.result, result); return null;
                 }
-                if (accepted.size() == 47) throw invalid();
-                plan.checkInvocation(session, invocation, true);
-                retainAccepted.accept(invocation);
-                Accepted admitted = new Accepted(invocation); accepted.put(invocation.invocationId(), admitted); active.set(admitted);
+                NativeCalibrationPrepared prepared = checked(() -> actual.ready(invocation, program, admission),
+                        () -> check(invocation, admission, true));
+                Accepted admitted;
+                synchronized (this) {
+                    previous = accepted.get(invocation.invocationId());
+                    if (previous != null) {
+                        if (!previous.digest.equals(ContractJson.digest(invocation.wire()))) throw invalid();
+                        requireReservation(invocation, true); active.set(previous); copy(previous.result, result); return null;
+                    }
+                    if (accepted.size() == 47) throw invalid();
+                    checked(() -> { verifyPrepared(prepared, invocation, program, admission); return null; },
+                            () -> check(invocation, admission, true));
+                    NativeInvocationReservations.Candidate candidate = reservations.inspect(invocation, true);
+                    reservations.admit(candidate);
+                    admitted = new Accepted(invocation); accepted.put(invocation.invocationId(), admitted); active.set(admitted);
+                    // A failing publication leaves the exact sticky claim and
+                    // failed Accepted record; it cannot be rebound or executed.
+                    retainAccepted.accept(invocation);
+                }
                 Control execution = control(owner, invocation, request, admitted.cancellation, false);
                 copy(admitted.result, result);
                 CompletionStage<ProviderResult> stage = stage(() -> actual.execute(invocation, program, execution),
                         () -> check(invocation, execution, true));
                 finishStage(stage, admitted.result, value -> {
-                    if (value == null) throw invalid(); bounded(value.wire()); contracts.validate("ProviderResult", value.wire()); return value;
+                    if (value == null) throw invalid(); bounded(value.wire()); contracts.validate("ProviderResult", value.wire());
+                    if ("complete".equals(value.status())) {
+                        if (!"unknown".equals(value.effects())) throw invalid();
+                        nativeOutput(value.data());
+                    } else if (!"failed".equals(value.status())) throw invalid();
+                    return value;
                 }, () -> check(invocation, execution, true));
             } catch (RuntimeException | Error failure) {
                 Accepted admitted = active.get(); if (admitted != null) admitted.result.completeExceptionally(failure);
@@ -246,7 +364,7 @@ final class NativeCalibrationApproval implements HostDispatcher.PurposeRoute, Au
         tasks.submit(() -> {
             try {
                 Accepted original = requireAccepted(owner, id); Control control = control(owner, original.original, request, original.cancellation, true);
-                check(original.original, control, true); plan.checkInvocation(session, original.original, false); Runner actual = requireRunner();
+                check(original.original, control, true); requireReservation(original.original, false); Runner actual = requireRunner();
                 if (cancel) original.cancellation.set(true);
                 CompletionStage<ObjectNode> stage = stage(() -> cancel ? actual.cancel(original.original, control) : actual.poll(original.original, control),
                         () -> check(original.original, control, true));
@@ -257,13 +375,64 @@ final class NativeCalibrationApproval implements HostDispatcher.PurposeRoute, Au
         return result.minimalCompletionStage();
     }
 
-    NativeCalibrationSource.IssuedReceipt lookup(HostSession owner, ObjectNode context, String id, HostDispatcher.InspectionControl request) {
+    NativeCalibrationRunFacts lookup(HostSession owner, ObjectNode context, String id, HostDispatcher.InspectionControl request) {
         Accepted original = requireAccepted(owner, id);
         if (!context.equals(original.original.context())) throw invalid();
         Control control = control(owner, original.original, request, original.cancellation, true);
-        check(original.original, control, false); plan.checkInvocation(session, original.original, false);
+        check(original.original, control, false); requireReservation(original.original, false);
         return checked(() -> requireRunner().lookup(original.original, control),
                 () -> check(original.original, control, false));
+    }
+
+    /** An original Accepted query only; it cannot prepare, admit or run another Invocation. */
+    NativeCalibrationTargetImages.ImagePair observeState(HostSession owner, ObjectNode context, String id, String digest,
+                                                        HostDispatcher.InspectionControl request, StateObserver observer) {
+        Accepted original = requireAccepted(owner, id);
+        if (!original.digest.equals(digest) || !original.original.context().equals(context) || observer == null) throw invalid();
+        Program program = programs.get(original.original.stepId()); if (program == null) throw invalid();
+        Control control = control(owner, original.original, request, original.cancellation, true);
+        check(original.original, control, true); requireReservation(original.original, false);
+        return checked(() -> {
+            NativeCalibrationTargetImages.ImagePair images = observer.observe(original.original, program, control);
+            if (images == null || !program.targetBindings().get(0).targetId().equals(images.objectiveTargetId())
+                    || !program.targetBindings().get(1).targetId().equals(images.storageTargetId())
+                    || !ContractJson.sha256(images.objectiveBytes()).equals(images.objectiveSha256())
+                    || !ContractJson.sha256(images.storageBytes()).equals(images.storageSha256())
+                    || images.observedToTick() < images.observedFromTick()) throw invalid();
+            // This is a fresh after/history image. Never compare it with the
+            // frozen before condition or replace the Prepared before image.
+            return images;
+        }, () -> check(original.original, control, true));
+    }
+
+    /** Factual callback reporting is separate from recipe correctness and readback. */
+    private static void nativeOutput(ObjectNode output) {
+        HostDispatcher.exactFields(output, Set.of("completionClaim", "nativeCallbackCount", "nativeCallbackReturn"));
+        JsonNode count = output.path("nativeCallbackCount"), returned = output.path("nativeCallbackReturn");
+        if (!"native_function_queue_observed".equals(text(output, "completionClaim")) || !count.isIntegralNumber()
+                || !count.canConvertToInt() || count.intValue() < 0 || count.intValue() > 256
+                || (count.intValue() == 1 ? !returned.isIntegralNumber() || !returned.canConvertToInt() : !returned.isNull())) throw invalid();
+    }
+
+    private void requireReservation(Invocation original, boolean write) {
+        if (!reservations.containsExact(original)) throw invalid();
+        reservations.inspect(original, write);
+    }
+    private void verifyPrepared(NativeCalibrationPrepared prepared, Invocation original, Program program, Control control) {
+        if (prepared == null) throw invalid();
+        prepared.checkCurrent(original, program, control);
+        if (!ContractJson.digest(original.wire()).equals(prepared.invocationDigest())
+                || !program.programDigest().equals(prepared.programDigest())
+                || !original.contextDigest().equals(prepared.contextDigest())) throw invalid();
+        NativeCalibrationTargetImages.ImagePair images = prepared.images();
+        TargetBinding objective = program.targetBindings().get(0), storage = program.targetBindings().get(1);
+        if (images == null || !images.objectiveFullTargetKnown() || !images.storageFullTargetKnown()
+                || !objective.targetId().equals(images.objectiveTargetId()) || !storage.targetId().equals(images.storageTargetId())
+                || !objective.expectedDigest().equals(images.objectiveSha256()) || !storage.expectedDigest().equals(images.storageSha256())
+                || !ContractJson.sha256(images.objectiveBytes()).equals(images.objectiveSha256())
+                || !ContractJson.sha256(images.storageBytes()).equals(images.storageSha256())
+                || images.observedToTick() < images.observedFromTick()) throw invalid();
+        control.checkpoint();
     }
 
     private Accepted requireAccepted(HostSession owner, String id) {

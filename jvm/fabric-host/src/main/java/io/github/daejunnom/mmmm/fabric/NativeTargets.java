@@ -12,14 +12,19 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.DoubleTag;
+import net.minecraft.nbt.FloatTag;
 import net.minecraft.nbt.CollectionTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.NbtIo;
@@ -55,6 +60,25 @@ final class NativeTargets {
             "net.minecraft.nbt.ByteArrayTag", "net.minecraft.nbt.IntArrayTag", "net.minecraft.nbt.LongArrayTag",
             "net.minecraft.nbt.StringTag", "net.minecraft.nbt.EndTag");
     private NativeTargets() { }
+
+    /** Factual encoder only: no resource/ACL, target binding or admission is issued here. */
+    static ObjectNode readObjectiveImage(ServerLevel level, String name, Runnable checkpoint) {
+        Objects.requireNonNull(checkpoint).run(); requireThread(level);
+        if (name == null || name.isEmpty() || name.length() > 128 || !name.matches("[A-Za-z0-9_.#-]+")) throw invalid();
+        return checked(() -> {
+            ObjectNode selector = ContractJson.newObject().put("kind", "objective").put("objective", name);
+            ObjectNode raw = base(selector);
+            objective(level, selector, raw, checkpoint, true);
+            if (ContractJson.canonical(raw).length > MAX_RAW_BYTES) throw limit();
+            return raw;
+        }, checkpoint);
+    }
+
+    /** Whole native encoding plus raw floating-field sidecar; neither grants reads nor promises restore support. */
+    static ObjectNode encodeNativeTag(Tag actual, Runnable checkpoint) {
+        Objects.requireNonNull(checkpoint).run();
+        return checked(() -> serializeTag(Objects.requireNonNull(actual), checkpoint, true), checkpoint);
+    }
 
     /** Trusted composition must check an approved exact resource-to-native-target mapping. */
     @FunctionalInterface
@@ -287,9 +311,17 @@ final class NativeTargets {
     }
 
     private static void objective(ServerLevel level, ObjectNode selector, ObjectNode raw) {
+        objective(level, selector, raw, () -> { }, false);
+    }
+
+    private static void objective(ServerLevel level, ObjectNode selector, ObjectNode raw, Runnable checkpoint, boolean floatingBits) {
+        checkpoint.run();
         var scoreboard = level.getScoreboard(); Objective actual = scoreboard.getObjective(text(selector, "objective"));
         if (actual == null) {
             known(raw, "absent", "current_native_scoreboard", "native_objective_and_all_scores", "full_target", ContractJson.newObject()); return;
+        }
+        if (floatingBits && actual.getClass() != Objective.class) {
+            unknown(raw, "native_objective_type_not_admitted", "native_objective_and_all_scores"); return;
         }
         if (!text(selector, "objective").equals(actual.getName())) throw new ContractException("TARGET_IDENTITY_MISMATCH", "Native objective name differs from the selected map membership");
         if (!(scoreboard instanceof ScoreboardReadAccess access)) {
@@ -302,6 +334,7 @@ final class NativeTargets {
         if (currentHolders.size() > MAX_SCORE_HOLDERS || currentSlots.size() > MAX_DISPLAY_SLOTS) throw limit();
         int holderCount = currentHolders.size(); var holders = new ArrayList<String>(holderCount); int holderBytes = 0;
         for (String holder : currentHolders.keySet()) {
+            checkpoint.run();
             if (holders.size() >= MAX_SCORE_HOLDERS || holder == null || holder.length() > MAX_TAG_BYTES / 3) throw limit();
             holderBytes = Math.addExact(holderBytes, holder.getBytes(StandardCharsets.UTF_8).length);
             if (holderBytes > MAX_RAW_BYTES / 2) throw limit(); holders.add(holder);
@@ -310,17 +343,19 @@ final class NativeTargets {
         holders.sort(String::compareTo);
         ObjectNode payload = ContractJson.newObject(); var budget = new RawBudget();
         try {
-            ObjectNode metadata = serialize(level, output -> output.store("objective", Objective.Packed.CODEC, actual.pack()));
+            ObjectNode metadata = serialize(level, output -> output.store("objective", Objective.Packed.CODEC, actual.pack()), checkpoint, floatingBits);
             budget.add(metadata); payload.set("nativeObjectiveNbt", metadata);
             var entries = payload.putArray("scores");
             for (String holder : holders) {
+                checkpoint.run();
                 ReadOnlyScoreInfo score = scoreboard.getPlayerScoreInfo(ScoreHolder.forNameOnly(holder), actual);
                 if (score == null) continue;
                 ObjectNode entry = ContractJson.newObject().put("holder", holder).put("value", score.value()).put("locked", score.isLocked());
-                entry.set("nativeScoreNbt", scoreNbt(level, actual, holder, score)); budget.add(entry); entries.add(entry);
+                entry.set("nativeScoreNbt", scoreNbt(level, actual, holder, score, checkpoint, floatingBits)); budget.add(entry); entries.add(entry);
             }
         } catch (ContractException exception) {
             if (!"NATIVE_SERIALIZATION_INCOMPLETE".equals(exception.code())) throw exception;
+            if (floatingBits) throw exception;
             unknown(raw, "native_objective_or_score_codec_incomplete", "native_objective_and_all_scores"); return;
         }
         var slots = payload.putArray("displaySlots"); int slotCount = 0;
@@ -328,24 +363,31 @@ final class NativeTargets {
         // its cardinality budget. Only references to this exact objective are
         // affected by its removal.
         for (DisplaySlot slot : DisplaySlot.values()) {
+            checkpoint.run();
             if (++slotCount > MAX_DISPLAY_SLOTS) throw limit();
             if (currentSlots.get(slot) == actual) slots.add(ContractJson.newObject().put("id", slot.id()).put("name", slot.getSerializedName()));
         }
         for (DisplaySlot slot : currentSlots.keySet()) if (slot == null) throw new ContractException("NATIVE_SERIALIZATION_INCOMPLETE", "Native scoreboard has an invalid display slot");
         budget.add(slots);
+        checkpoint.run();
         if (scoreboard.getObjective(text(selector, "objective")) != actual || currentHolders.size() != holderCount
                 || !currentHolders.keySet().containsAll(holders)) throw new ContractException("TARGET_DRIFT", "Native objective membership changed during serialization");
         known(raw, "present", "current_native_scoreboard", "native_objective_and_all_scores", "full_target", payload);
     }
 
     private static ObjectNode scoreNbt(ServerLevel level, Objective objective, String holder, ReadOnlyScoreInfo info) {
+        return scoreNbt(level, objective, holder, info, () -> { }, false);
+    }
+
+    private static ObjectNode scoreNbt(ServerLevel level, Objective objective, String holder, ReadOnlyScoreInfo info,
+                                       Runnable checkpoint, boolean floatingBits) {
         if (!(info instanceof Score actual) || actual.getClass() != Score.class) {
             throw new ContractException("NATIVE_SERIALIZATION_INCOMPLETE", "Native score implementation is outside the admitted persisted codec");
         }
         // This is the same native record/codec used by Scoreboard.packPlayerScores:
         // it retains value, lock, display component and number-format metadata.
         var packed = new Scoreboard.PackedScore(holder, objective.getName(), actual.pack());
-        return serialize(level, output -> output.store("score", Scoreboard.PackedScore.CODEC, packed));
+        return serialize(level, output -> output.store("score", Scoreboard.PackedScore.CODEC, packed), checkpoint, floatingBits);
     }
 
     private static void storage(ServerLevel level, ObjectNode selector, ObjectNode raw, CommandStorage storage) {
@@ -389,6 +431,10 @@ final class NativeTargets {
     }
 
     private static ObjectNode serialize(ServerLevel level, Consumer<TagValueOutput> nativeSave) {
+        return serialize(level, nativeSave, () -> { }, false);
+    }
+
+    private static ObjectNode serialize(ServerLevel level, Consumer<TagValueOutput> nativeSave, Runnable checkpoint, boolean floatingBits) {
         ProblemReporter reporter = new ProblemReporter() {
             @Override public ProblemReporter forChild(PathElement path) { return this; }
             @Override public void report(Problem problem) {
@@ -396,37 +442,62 @@ final class NativeTargets {
             }
         };
         TagValueOutput output = TagValueOutput.createWithContext(reporter, level.registryAccess());
+        checkpoint.run();
         try { nativeSave.accept(output); }
         catch (ContractException exception) { throw exception; }
-        catch (RuntimeException exception) { throw new ContractException("NATIVE_SERIALIZATION_INCOMPLETE", "Native codec failed to encode its actual persisted state"); }
+        catch (RuntimeException exception) {
+            var failure = new ContractException("NATIVE_SERIALIZATION_INCOMPLETE", "Native codec failed to encode its actual persisted state");
+            if (floatingBits) failure.initCause(exception);
+            throw failure;
+        }
         CompoundTag nativeTag = output.buildResult();
-        requireNbtBudget(nativeTag);
-        BoundedOutput bytes = new BoundedOutput();
+        FloatingBits bits = floatingBits ? new FloatingBits() : null;
+        requireNbtBudget(nativeTag, checkpoint, bits);
+        BoundedOutput bytes = new BoundedOutput(checkpoint);
         try (DataOutputStream writer = new DataOutputStream(bytes)) { NbtIo.write(nativeTag, writer); }
-        catch (IOException exception) { throw new ContractException("NATIVE_SERIALIZATION_INCOMPLETE", "Native NBT could not be serialized"); }
+        catch (IOException exception) {
+            var failure = new ContractException("NATIVE_SERIALIZATION_INCOMPLETE", "Native NBT could not be serialized");
+            if (floatingBits) failure.initCause(exception);
+            throw failure;
+        }
         byte[] value = bytes.bytes();
-        return ContractJson.newObject().put("format", "minecraft.nbt.named-compound/uncompressed")
+        ObjectNode result = ContractJson.newObject().put("format", "minecraft.nbt.named-compound/uncompressed")
                 .put("bytesHex", HexFormat.of().formatHex(value)).put("sha256", ContractJson.sha256(value));
+        if (bits != null) result.set("rawFloatingBits", bits.wire());
+        return result;
     }
 
     private static ObjectNode serializeTag(Tag actual) {
-        requireNbtBudget(actual);
-        BoundedOutput bytes = new BoundedOutput();
+        return serializeTag(actual, () -> { }, false);
+    }
+
+    private static ObjectNode serializeTag(Tag actual, Runnable checkpoint, boolean floatingBits) {
+        FloatingBits bits = floatingBits ? new FloatingBits() : null;
+        requireNbtBudget(actual, checkpoint, bits);
+        BoundedOutput bytes = new BoundedOutput(checkpoint);
         try (DataOutputStream writer = new DataOutputStream(bytes)) { NbtIo.writeAnyTag(actual, writer); }
-        catch (IOException exception) { throw new ContractException("NATIVE_SERIALIZATION_INCOMPLETE", "Native tag could not be serialized"); }
+        catch (IOException exception) {
+            var failure = new ContractException("NATIVE_SERIALIZATION_INCOMPLETE", "Native tag could not be serialized");
+            if (floatingBits) failure.initCause(exception);
+            throw failure;
+        }
         byte[] value = bytes.bytes();
-        return ContractJson.newObject().put("format", "minecraft.nbt.any-tag/uncompressed")
+        ObjectNode result = ContractJson.newObject().put("format", "minecraft.nbt.any-tag/uncompressed")
                 .put("bytesHex", HexFormat.of().formatHex(value)).put("sha256", ContractJson.sha256(value));
+        if (bits != null) result.set("rawFloatingBits", bits.wire());
+        return result;
     }
 
     /** Bound recursive native writer input without performing recursive traversal ourselves. */
-    private static void requireNbtBudget(Tag root) {
-        record Pending(Tag tag, int depth) { }
-        var pending = new ArrayDeque<Pending>(); pending.add(new Pending(root, 0)); int nodes = 0;
+    private static void requireNbtBudget(Tag root, Runnable checkpoint, FloatingBits floatingBits) {
+        record Pending(Tag tag, int depth, List<Object> path) { }
+        var pending = new ArrayDeque<Pending>(); pending.add(new Pending(root, 0, floatingBits == null ? null : List.of())); int nodes = 0;
         while (!pending.isEmpty()) {
+            checkpoint.run();
             Pending current = pending.removeLast();
             if (++nodes > MAX_NBT_NODES || current.depth() > MAX_NBT_DEPTH) throw limit();
             Tag tag = current.tag();
+            if (floatingBits != null) floatingBits.add(current.path(), tag);
             if (tag.getClass().getClassLoader() != Tag.class.getClassLoader()
                     || tag.getClass().getProtectionDomain().getCodeSource() == null
                     || Tag.class.getProtectionDomain().getCodeSource() == null
@@ -437,12 +508,14 @@ final class NativeTargets {
             if (tag instanceof CompoundTag compound) {
                 if (compound.size() > MAX_NBT_CONTAINER_ENTRIES) throw limit();
                 for (var entry : compound.entrySet()) {
+                    checkpoint.run();
                     if (entry.getKey().length() > MAX_NATIVE_BYTES / 3) throw limit();
-                    pending.add(new Pending(entry.getValue(), current.depth() + 1));
+                    pending.add(new Pending(entry.getValue(), current.depth() + 1, path(current.path(), entry.getKey())));
                 }
             } else if (tag instanceof ListTag children) {
                 if (children.size() > MAX_NBT_CONTAINER_ENTRIES) throw limit();
-                for (Tag child : children) pending.add(new Pending(child, current.depth() + 1));
+                int index = 0;
+                for (Tag child : children) pending.add(new Pending(child, current.depth() + 1, path(current.path(), index++)));
             } else if (tag instanceof StringTag string) {
                 if (string.value().length() > MAX_NATIVE_BYTES / 3) throw limit();
             } else if (tag instanceof CollectionTag array && NATIVE_LEAF_CLASSES.contains(tag.getClass().getName())) {
@@ -451,6 +524,47 @@ final class NativeTargets {
                 throw new ContractException("NATIVE_SERIALIZATION_INCOMPLETE", "Native tag implementation is not an admitted bounded observation type");
             }
             if (pending.size() > MAX_NBT_NODES - nodes) throw limit();
+        }
+    }
+
+    private static List<Object> path(List<Object> parent, Object segment) {
+        if (parent == null) return null;
+        var value = new ArrayList<Object>(parent.size() + 1); value.addAll(parent); value.add(segment); return List.copyOf(value);
+    }
+
+    /** Additional raw fields are exclusive to the calibration factual ports. Legacy codec is unchanged. */
+    private static final class FloatingBits {
+        private final List<ObjectNode> entries = new ArrayList<>();
+        private int bytes = 2; // The complete sidecar array includes '[' and ']'.
+        private void add(List<Object> segments, Tag tag) {
+            String kind, bits;
+            if (tag.getClass() == FloatTag.class) {
+                kind = "float_tag"; bits = HexFormat.of().toHexDigits(Float.floatToRawIntBits(((FloatTag) tag).floatValue()));
+            } else if (tag.getClass() == DoubleTag.class) {
+                kind = "double_tag"; bits = HexFormat.of().toHexDigits(Double.doubleToRawLongBits(((DoubleTag) tag).doubleValue()));
+            } else return;
+            ObjectNode entry = ContractJson.newObject().put("kind", kind).put("bits", bits); var path = entry.putArray("path");
+            for (Object segment : segments) {
+                if (segment instanceof String key) path.add(ContractJson.newObject().put("key", key));
+                else path.add(ContractJson.newObject().put("index", (Integer) segment));
+            }
+            int length = ContractJson.bytes(entry).length + (entries.isEmpty() ? 0 : 1);
+            if (length > MAX_NATIVE_BYTES - bytes) throw limit();
+            bytes += length; entries.add(entry);
+        }
+        private JsonNode wire() {
+            entries.sort(Comparator.comparing(value -> new String(ContractJson.canonical(value.path("path")), StandardCharsets.UTF_8)));
+            var result = ContractJson.newObject().putArray("rawFloatingBits"); entries.forEach(result::add); return result;
+        }
+    }
+
+    private static <T> T checked(Supplier<T> read, Runnable checkpoint) {
+        Throwable primary = null;
+        try { return read.get(); }
+        catch (RuntimeException | Error failure) { primary = failure; throw failure; }
+        finally {
+            try { checkpoint.run(); }
+            catch (RuntimeException | Error after) { if (primary == null) throw after; if (after != primary) primary.addSuppressed(after); }
         }
     }
 
@@ -544,11 +658,18 @@ final class NativeTargets {
     }
     private static final class BoundedOutput extends OutputStream {
         private final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        private final Runnable checkpoint;
+        private int untilCheckpoint = 8192;
+        private BoundedOutput(Runnable checkpoint) { this.checkpoint = checkpoint; }
         @Override public void write(int value) { charge(1); bytes.write(value); }
         @Override public void write(byte[] value, int offset, int length) {
             Objects.checkFromIndexSize(offset, length, value.length); charge(length); bytes.write(value, offset, length);
         }
-        private void charge(int amount) { if (amount > MAX_NATIVE_BYTES - bytes.size()) throw limit(); }
+        private void charge(int amount) {
+            if (amount > MAX_NATIVE_BYTES - bytes.size()) throw limit();
+            if (amount >= untilCheckpoint) { checkpoint.run(); untilCheckpoint = 8192; }
+            else untilCheckpoint -= amount;
+        }
         byte[] bytes() { return bytes.toByteArray(); }
     }
     private static final class RawBudget {

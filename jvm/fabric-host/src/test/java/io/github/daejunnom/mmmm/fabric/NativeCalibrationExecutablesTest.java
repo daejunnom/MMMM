@@ -64,8 +64,16 @@ final class NativeCalibrationExecutablesTest {
         assertSame(receiver.getClass(), actual.getDeclaringClass());
         assertEquals("()V", NativeCalibrationExecutables.descriptor(actual));
         assertEquals(0, Parent.invocations);
-        // acquire() still requires the real native recipe, Class identity and target record.
-        // The reflection result above has no factory that can manufacture that witness.
+        AtomicInteger captured = new AtomicInteger(37);
+        Runnable capturedReceiver = () -> captured.incrementAndGet();
+        assertTrue(capturedReceiver.getClass().isHidden());
+        Method capturedSam = NativeCalibrationExecutables.resolveVirtual(selection(capturedReceiver, Runnable.class.getMethod("run")), true);
+        assertSame(capturedReceiver.getClass(), capturedSam.getDeclaringClass());
+        assertEquals("()V", NativeCalibrationExecutables.descriptor(capturedSam));
+        assertEquals(37, captured.get());
+        // acquire() still requires the real native Class identity and executable envelope.
+        // Its SAM-body fact may have no matched target; this metadata test cannot issue either
+        // native body evidence or capture/target equivalence. No captured field is inspected.
     }
 
     @Test void originalMethodFailureRemainsPrimaryWhenTheSameControlStopsAfterIt() throws Exception {
