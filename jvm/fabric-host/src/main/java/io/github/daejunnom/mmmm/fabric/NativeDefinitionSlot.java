@@ -1,7 +1,9 @@
 package io.github.daejunnom.mmmm.fabric;
 
 import io.github.daejunnom.mmmm.host.HostSession;
+import io.github.daejunnom.mmmm.observer.DefinitionObserverBridge;
 import java.util.Objects;
+import java.util.Optional;
 
 /** 원래 collection ticket만 게시할 수 있는 단일 private 원자료 소유 슬롯이다. */
 final class NativeDefinitionSlot {
@@ -41,10 +43,47 @@ final class NativeDefinitionSlot {
     }
     synchronized void retireAll() { current = null; snapshot = null; }
     synchronized boolean hasRawObservation(HostSession owner, Object server, String contextId, String contextDigest, String epoch, long generation) {
+        return matches(owner, server, contextId, contextDigest, epoch, generation)
+                && snapshot != null && snapshot.completed() && snapshot.hasRawObservation();
+    }
+    private boolean matches(HostSession owner, Object server, String contextId, String contextDigest, String epoch, long generation) {
         return current != null && current.owner == owner && !owner.closed() && current.server == server
                 && current.contextId.equals(contextId) && current.contextDigest.equals(contextDigest)
-                && current.epoch.equals(epoch) && current.generation == generation
-                && snapshot != null && snapshot.completed() && snapshot.hasRawObservation();
+                && current.epoch.equals(epoch) && current.generation == generation;
+    }
+
+    /** Exact-Class factual lookup only. JNI and original request control run outside the slot monitor. */
+    Optional<DefinitionObserverBridge.CurrentLoadedExecutable> currentExecutable(
+            HostSession owner, Object server, String contextId, String contextDigest, String epoch, long generation,
+            Class<?> actualClass, NativeDefinitionCollector.Checkpoint control) {
+        Objects.requireNonNull(owner); Objects.requireNonNull(actualClass); Objects.requireNonNull(control);
+        control.check();
+        Ticket selectedTicket;
+        NativeDefinitionCollector.Snapshot selectedSnapshot;
+        DefinitionObserverBridge.CurrentLoadedExecutable selected;
+        synchronized (this) {
+            selectedTicket = current; selectedSnapshot = snapshot;
+            selected = matches(owner, server, contextId, contextDigest, epoch, generation) && snapshot != null
+                    ? snapshot.executable(actualClass) : null;
+        }
+        boolean observedCurrent = false;
+        Throwable primary = null;
+        try {
+            if (selected != null) observedCurrent = selected.isCurrent();
+        } catch (RuntimeException | LinkageError failure) { primary = failure; }
+        try { control.check(); }
+        catch (RuntimeException | LinkageError failure) {
+            if (primary == null) primary = failure;
+            else if (primary != failure) primary.addSuppressed(failure);
+        }
+        boolean stillOwned;
+        synchronized (this) {
+            stillOwned = current == selectedTicket && snapshot == selectedSnapshot
+                    && matches(owner, server, contextId, contextDigest, epoch, generation);
+        }
+        if (primary instanceof RuntimeException failure) throw failure;
+        if (primary instanceof LinkageError failure) throw failure;
+        return observedCurrent && stillOwned ? Optional.of(selected) : Optional.empty();
     }
     synchronized long retainedBytes() { return snapshot == null ? 0 : snapshot.retainedBytes(); }
 }

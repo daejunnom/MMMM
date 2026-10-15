@@ -6,7 +6,7 @@
 
 ## 채택한 결정
 
-기준일은 2026-10-15이다.
+기준일은 2026-10-16이다.
 
 | ID | 결정 | 적용 및 재검토 조건 |
 |---|---|---|
@@ -90,6 +90,10 @@
 | MMMM-D056 | Calibration의 실제 반환 부재를 0과 구분하는 private v2 관측 계약을 사용한다. | 실제 26.3 함수 실행기의 조건 불성립·오류 분기는 명령 시작 뒤 반환 callback 없이 끝날 수 있다. `mmmm.native.calibration-run-source/2`의 `nativeReturn`과 `mmmm.target-case-readback/2`의 `commandReturn`은 필수 nullable Int32이며 누락과 v1은 거절한다. 선택 stage의 두 관측은 null까지 정확히 일치해야 한다. 정본 성공 또는 명시적 기대 반환이 있는 case는 실제 Int32가 필수이고 0·-2 기대값을 유지한다. 반환 부재만으로 skipped·오류·완료를 단정하지 않는다. 원 source·전체 명령·durable operation·독립 수치 상태 검사는 유지하며 공개 저장/wire `0.2.0`과 별도 버전이다. |
 
 | MMMM-D057 | FN19의 실제 public interface metadata와 Java 실행 승인을 타입으로 분리한다. | 보호된 승인에서 실제 Fabric mod의 단일 일반 JAR·버전·loader·CodeSource와 초기화 없는 public static signature를 확인한다. metadata의 class digest는 승인 JAR 입력의 digest이며 loaded/transformed/final definition을 주장하지 않는다. 실제 inventory에는 interface_checked와 incompatible/ready=false를 등록하고 execute·prepare·read는 효과 전에 거절한다. 기존 LoadedClassApproval과 실행 Candidate로의 변환은 없다. 같은 원 기한·취소와 요청 scope 안에서 snapshot/I/O 상한·원 크기 예약·전후 source 검사를 적용한다. 등록 전 용량 초과만 전체 metadata unavailable로 남기며 current/control 오류와 commit 실패는 candidate를 폐기한다. 실제 FN33 실행·게임 인수는 별도다. |
+
+| MMMM-D058 | 실제 `main`과 `develop`에 PR 및 두 집계 검사를 요구하는 원격 보호를 적용한다. | 성공 이력이 있는 `foundation-result`·`jvm-result`를 실제 GitHub Actions app `15368`에 고정하고 최신 대상 기준·관리자 적용·대화 해결을 요구한다. force push·삭제·bypass는 허용하지 않는다. 단독 유지보수에서는 외부 승인 수 0, code-owner 및 마지막 push의 타인 승인 false로 하며 실제 리뷰를 받은 것처럼 기록하지 않는다. 팀 리뷰어가 확정되면 승인 수·CODEOWNERS를 다시 검토한다. 최초 422 거절과 수정한 실제 PUT·GET readback 및 소유 실행의 종료·정리 근거를 별도 보존한다. |
+
+| MMMM-D059 | 기존 native issuer의 실제 Class 조회로만 `CurrentLoadedExecutable` 관측 view를 발급한다. | 실제 Class와 loader 객체, issuer·identity·generation·attempt 및 전체 원 envelope를 보존·재검사한다. ordinary frame의 loader 0을 bootstrap으로 해석하지 않는다. raw decode·순수 fixture에는 발급 경로가 없고 collector는 기존 64 Class/8 MiB 한도에 decoded byte payload까지 계상한다. slot은 JNI·원 checkpoint를 monitor 밖에서 수행한 뒤 원 ticket·snapshot·owner/context/epoch/generation을 재검사하며 원 native 오류와 후속 제어 오류를 보존한다. 현재 lookup은 이미 수집한 Class에 한정한다. 이 view는 기존 producer record의 사실이며 새 VM snapshot 취득·final classfile·parser 의미·SourceAdmission·profile·쓰기나 calibration 승인이 아니다. 실제 startup과 slot 양성 및 경합의 실행 근거는 별도로 확인한다. |
 
 ## 구현 전에 확인할 항목
 

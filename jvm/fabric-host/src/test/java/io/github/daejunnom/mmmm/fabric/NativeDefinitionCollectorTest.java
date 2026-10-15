@@ -163,6 +163,49 @@ final class NativeDefinitionCollectorTest {
         NativeDefinitionCollector collector = new NativeDefinitionCollector(new NativeDefinitionCollector.Limits(2, 8), () -> { }, new Port());
         collector.observe(NativeDefinitionCollectorTest.class, BLOCK); collector.finish(); return collector.snapshot();
     }
+    @Test void rawOnlyPublishedDataCannotIssueAnExecutableViewAndLookupControlRunsOutsideTheMonitor() {
+        NativeDefinitionSlot slot = new NativeDefinitionSlot(); Object server = new Object(); HostSession owner = owner(slot);
+        var ticket = slot.begin(owner, server, "context", "digest", "epoch", 1);
+        assertTrue(slot.publish(ticket, completedRaw()));
+        assertTrue(slot.hasRawObservation(owner, server, "context", "digest", "epoch", 1));
+        AtomicInteger checkpoints = new AtomicInteger();
+        NativeDefinitionCollector.Checkpoint control = () -> {
+            assertFalse(Thread.holdsLock(slot)); checkpoints.incrementAndGet();
+        };
+        assertTrue(slot.currentExecutable(owner, server, "context", "digest", "epoch", 1, getClass(), control).isEmpty());
+        assertEquals(2, checkpoints.get());
+        assertTrue(slot.currentExecutable(owner, server, "context", "digest", "epoch", 1, String.class, control).isEmpty());
+        assertTrue(slot.currentExecutable(owner, new Object(), "context", "digest", "epoch", 1, getClass(), control).isEmpty());
+        assertTrue(slot.currentExecutable(owner, server, "changed", "digest", "epoch", 1, getClass(), control).isEmpty());
+        assertTrue(slot.currentExecutable(owner, server, "context", "digest", "epoch", 2, getClass(), control).isEmpty());
+        assertEquals(3, slot.retainedBytes()); owner.close(); assertEquals(0, slot.retainedBytes());
+    }
+    @Test void executableLookupPreservesOriginalStopAndCannotRetireAReplacedOwnersSnapshot() {
+        NativeDefinitionSlot slot = new NativeDefinitionSlot(); Object server = new Object(); HostSession owner = owner(slot);
+        var ticket = slot.begin(owner, server, "context", "digest", "epoch", 1);
+        var raw = completedRaw(); assertTrue(slot.publish(ticket, raw));
+        ContractException before = new ContractException("DEADLINE_EXCEEDED", "Original lookup deadline");
+        assertSame(before, assertThrows(ContractException.class, () -> slot.currentExecutable(owner, server,
+                "context", "digest", "epoch", 1, getClass(), () -> { throw before; })));
+        AtomicInteger checkpoints = new AtomicInteger();
+        ContractException after = new ContractException("CANCELLATION_REQUESTED", "Original lookup cancellation");
+        assertSame(after, assertThrows(ContractException.class, () -> slot.currentExecutable(owner, server,
+                "context", "digest", "epoch", 1, getClass(), () -> {
+                    assertFalse(Thread.holdsLock(slot)); if (checkpoints.incrementAndGet() == 2) throw after;
+                })));
+        assertEquals(2, checkpoints.get()); assertEquals(3, slot.retainedBytes());
+        HostSession replacement = owner(slot); checkpoints.set(0);
+        assertTrue(slot.currentExecutable(owner, server, "context", "digest", "epoch", 1, getClass(), () -> {
+            assertFalse(Thread.holdsLock(slot));
+            if (checkpoints.incrementAndGet() == 2) {
+                var next = slot.begin(replacement, server, "context", "digest", "epoch", 2);
+                assertTrue(slot.publish(next, raw));
+            }
+        }).isEmpty());
+        slot.retire(ticket); owner.close();
+        assertTrue(slot.hasRawObservation(replacement, server, "context", "digest", "epoch", 2));
+        assertEquals(3, slot.retainedBytes()); replacement.close(); assertEquals(0, slot.retainedBytes());
+    }
     @Test void retiredCollectorCannotPublishAfterClearOrDeleteANewerOwnersSnapshot() {
         NativeDefinitionSlot slot = new NativeDefinitionSlot(); Object server = new Object();
         HostSession oldOwner = owner(slot); HostSession newOwner = owner(slot);

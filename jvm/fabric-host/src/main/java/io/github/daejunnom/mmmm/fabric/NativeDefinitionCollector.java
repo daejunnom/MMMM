@@ -29,27 +29,56 @@ final class NativeDefinitionCollector implements NativeRegistry.ClassSink {
         private static final long serialVersionUID = 1L;
         private final int status;
         ProducerStateFailure(int status) { super("Native observer producer is unavailable or changed"); this.status = status; }
+        ProducerStateFailure(DefinitionObserverBridge.CurrentObservationException cause) {
+            super("Native observer producer is unavailable or changed", cause); this.status = cause.afterStatus();
+        }
     }
     static final class RawObservation {
         private final Class<?> actualClass;
+        private final ClassLoader actualLoader;
         private final Stamp stamp;
         private final byte[] envelope;
         private final byte[] forwarder;
+        private final DefinitionObserverBridge.CurrentLoadedExecutable executable;
+        // A codec/test observation has no issuer view and cannot satisfy executable lookup.
         RawObservation(Class<?> actualClass, Stamp stamp, byte[] envelope, byte[] forwarder) {
             this.actualClass = Objects.requireNonNull(actualClass); this.stamp = Objects.requireNonNull(stamp);
+            this.actualLoader = actualClass.getClassLoader(); this.executable = null;
             if (envelope.length == 0 || envelope.length > MAX_BYTES || forwarder.length > 1024 * 1024) throw new ContractException("OBSERVATION_BYTE_LIMIT", "Definition observation exceeds its bound");
             this.envelope = envelope.clone(); this.forwarder = forwarder.clone();
         }
-        long bytes() { return (long) envelope.length + forwarder.length; }
+        private RawObservation(DefinitionObserverBridge.CurrentLoadedExecutable executable, byte[] forwarder) {
+            this.executable = Objects.requireNonNull(executable);
+            this.actualClass = executable.actualClass(); this.actualLoader = executable.definingLoader();
+            var observed = executable.observation();
+            this.stamp = new Stamp(observed.issuerEpoch(), observed.classIdentity(), observed.generation(),
+                    observed.attempt(), observed.definingLoaderIdentity(), observed.hidden());
+            // The view already owns the envelope and decoded byte payloads; do not retain another copy.
+            this.envelope = null;
+            if (executable.retainedPayloadBytes() > MAX_BYTES || forwarder.length > 1024 * 1024) {
+                throw new ContractException("OBSERVATION_BYTE_LIMIT", "Definition observation exceeds its bound");
+            }
+            this.forwarder = forwarder.clone();
+        }
+        long bytes() { return (executable == null ? (long) envelope.length : executable.retainedPayloadBytes()) + forwarder.length; }
+        private byte[] envelope() { return executable == null ? envelope : executable.observation().envelope(); }
         boolean same(RawObservation other) {
-            return actualClass == other.actualClass && stamp.equals(other.stamp)
-                    && Arrays.equals(envelope, other.envelope) && Arrays.equals(forwarder, other.forwarder);
+            return actualClass == other.actualClass && actualLoader == other.actualLoader && stamp.equals(other.stamp)
+                    && (executable == null) == (other.executable == null)
+                    && Arrays.equals(envelope(), other.envelope()) && Arrays.equals(forwarder, other.forwarder);
         }
     }
     record Observation(Class<?> actualClass, Set<NativeRegistry.ClassRole> roles, RawObservation raw,
                        String reasonCode, String failureClass, Integer nativeStatus) { }
     record Snapshot(List<Observation> observations, long retainedBytes, long omittedInputs, String overflowReason, String stopReason, boolean completed) {
         boolean hasRawObservation() { return observations.stream().anyMatch(item -> item.raw() != null); }
+        DefinitionObserverBridge.CurrentLoadedExecutable executable(Class<?> actualClass) {
+            if (!completed || stopReason != null || omittedInputs != 0 || overflowReason != null) return null;
+            for (Observation item : observations) {
+                if (item.actualClass() == actualClass && item.raw() != null) return item.raw().executable;
+            }
+            return null;
+        }
     }
     private static final class Entry {
         private final Class<?> actualClass;
@@ -155,13 +184,15 @@ final class NativeDefinitionCollector implements NativeRegistry.ClassSink {
         @Override public RawObservation observe(Class<?> actualClass) {
             int before = DefinitionObserverBridge.observedStatus();
             if (before < 0 || (before & DefinitionObserverBridge.VM_LIVE) == 0) throw new ProducerStateFailure(before);
-            var found = DefinitionObserverBridge.observe(actualClass);
+            java.util.Optional<DefinitionObserverBridge.CurrentLoadedExecutable> found;
+            try { found = DefinitionObserverBridge.observeCurrentExecutable(actualClass); }
+            catch (DefinitionObserverBridge.CurrentObservationException failure) { throw new ProducerStateFailure(failure); }
             if (found.isEmpty()) {
                 int after = DefinitionObserverBridge.observedStatus();
                 if (after != before) throw new ProducerStateFailure(after);
                 return null;
             }
-            var definition = found.orElseThrow();
+            var executable = found.orElseThrow();
             byte[] forwarder = new byte[0];
             if (actualClass.isHidden()) {
                 var matched = DefinitionObserverBridge.observeHiddenForwarder(actualClass);
@@ -169,10 +200,10 @@ final class NativeDefinitionCollector implements NativeRegistry.ClassSink {
             }
             int after = DefinitionObserverBridge.observedStatus();
             if (after != before) throw new ProducerStateFailure(after);
-            return new RawObservation(actualClass, new Stamp(definition.issuerEpoch(), definition.classIdentity(), definition.generation(),
-                    definition.attempt(), definition.definingLoaderIdentity(), definition.hidden()), definition.envelope(), forwarder);
+            return new RawObservation(executable, forwarder);
         }
         @Override public boolean current(RawObservation original) {
+            if (original.executable == null) return false;
             RawObservation now = observe(original.actualClass);
             return now != null && original.same(now);
         }

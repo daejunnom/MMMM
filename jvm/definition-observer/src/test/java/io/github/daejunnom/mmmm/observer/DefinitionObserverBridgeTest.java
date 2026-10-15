@@ -80,6 +80,31 @@ final class DefinitionObserverBridgeTest {
         assertEquals(2, abstractMethod.methods().getFirst().codeKind());
     }
 
+    @Test void nonReferenceSubjectsCannotAcquireAnExecutableViewWithoutTheNativeProducer() {
+        assertThrows(NullPointerException.class, () -> DefinitionObserverBridge.observeCurrentExecutable(null));
+        assertTrue(DefinitionObserverBridge.observeCurrentExecutable(int.class).isEmpty());
+        assertTrue(DefinitionObserverBridge.observeCurrentExecutable(String[].class).isEmpty());
+    }
+
+    @Test void currentComparisonRequiresActualLoaderIdentityAndTheWholeOriginalObservation() throws Exception {
+        // These decoded frames exercise comparison only; none can construct an issuer-acquired view.
+        byte[] frame = ordinary(getClass(), 1, 0, 0, new byte[] {(byte) 0xb1});
+        var original = DefinitionObserverBridge.decode(getClass(), frame);
+        var copy = DefinitionObserverBridge.decode(getClass(), frame.clone());
+        ClassLoader loader = getClass().getClassLoader();
+        assertTrue(DefinitionObserverBridge.sameExecutableObservation(original, loader, copy, loader));
+        assertFalse(DefinitionObserverBridge.sameExecutableObservation(original, loader, copy, null));
+        assertFalse(DefinitionObserverBridge.sameExecutableObservation(original, null, copy, null));
+        assertFalse(DefinitionObserverBridge.sameExecutableObservation(original, loader, copy, new ClassLoader(loader) { }));
+        byte[] changedGeneration = frame.clone(); java.nio.ByteBuffer.wrap(changedGeneration).putLong(20, 20);
+        var changed = DefinitionObserverBridge.decode(getClass(), changedGeneration);
+        assertFalse(DefinitionObserverBridge.sameExecutableObservation(original, loader, changed, loader));
+        var changedCode = DefinitionObserverBridge.decode(getClass(), ordinary(getClass(), 1, 0, 0, new byte[] {0, (byte) 0xb1}));
+        assertFalse(DefinitionObserverBridge.sameExecutableObservation(original, loader, changedCode, loader));
+        var differentClass = DefinitionObserverBridge.decode(String.class, ordinary(String.class, 1, 0, 0, new byte[] {(byte) 0xb1}));
+        assertFalse(DefinitionObserverBridge.sameExecutableObservation(original, loader, differentClass, String.class.getClassLoader()));
+    }
+
     @Test void canonicalJniModifiedUtf8PreservesNulAndSupplementaryCodeUnits() throws Exception {
         byte[] rawName = new byte[] {'x', (byte) 0xc0, (byte) 0x80,
                 (byte) 0xed, (byte) 0xa0, (byte) 0xbd, (byte) 0xed, (byte) 0xb8, (byte) 0x80};

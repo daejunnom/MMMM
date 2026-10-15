@@ -107,7 +107,8 @@ jobs:
             run_id = $env:GITHUB_RUN_ID; run_attempt = $env:GITHUB_RUN_ATTEMPT;
             target = $env:MATRIX_TARGET; os = $actualOS; arch = $actualArch;
             runner_image = $env:ImageOS; runner_image_version = $env:ImageVersion;
-            rust_toolchain = '1.96.0'; rust_target = $env:MMMM_RUST_TARGET; build_jobs = 2; test_threads = 2;
+            rust_toolchain = '1.96.0'; rust_target = $env:MMMM_RUST_TARGET;
+            build_jobs = $(if ($IsWindows) { 1 } else { 2 }); bootstrap_build_jobs = 2; test_threads = 2;
             command_timeout_seconds = 1200; artifact_retention_days = 14
           }
           $record | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $evidenceRoot 'ci-context.json') -Encoding utf8NoBOM

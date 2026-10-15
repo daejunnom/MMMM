@@ -63,6 +63,89 @@ public final class DefinitionObserverBridge {
         return bytes == null ? Optional.empty() : Optional.of(decode(actualClass, bytes));
     }
 
+    /**
+     * Acquires a factual view only through the original actual-Class JNI query.
+     * This is neither final-classfile evidence nor parser, profile or write admission.
+     * A stable empty result means no usable observation, never class absence.
+     */
+    public static Optional<CurrentLoadedExecutable> observeCurrentExecutable(Class<?> actualClass) {
+        Objects.requireNonNull(actualClass);
+        if (actualClass.isArray() || actualClass.isPrimitive()) return Optional.empty();
+        int before = observedStatus();
+        requireCurrentProducer(before, before);
+        ClassLoader loader = actualClass.getClassLoader();
+        Optional<ObservedDefinition> observed = observe(actualClass);
+        int after = observedStatus();
+        requireCurrentProducer(before, after);
+        if (actualClass.getClassLoader() != loader) throw invalid();
+        return observed.map(value -> new CurrentLoadedExecutable(value, loader));
+    }
+
+    private static void requireCurrentProducer(int before, int after) {
+        int required = INSTALLED | CLASS_FILE_HOOK_ENABLED | CLASS_PREPARE_ENABLED | EXECUTABLE_READ_CAPABILITIES | VM_LIVE;
+        if (before < 0 || after != before || (after & required) != required) {
+            throw new CurrentObservationException(before, after);
+        }
+    }
+
+    /** Preserves actual native status without replacing it with an empty observation. */
+    public static final class CurrentObservationException extends IllegalStateException {
+        private static final long serialVersionUID = 1L;
+        private final int beforeStatus;
+        private final int afterStatus;
+        private CurrentObservationException(int beforeStatus, int afterStatus) {
+            super("Native executable observation is unavailable or changed");
+            this.beforeStatus = beforeStatus; this.afterStatus = afterStatus;
+        }
+        public int beforeStatus() { return beforeStatus; }
+        public int afterStatus() { return afterStatus; }
+    }
+
+    public enum SourceInputRole { ORDINARY_HOOK_INPUT, HIDDEN_DEFINE_RECIPE }
+
+    /**
+     * An issuer-acquired Class view, not a caller-created receipt or an authority grant.
+     * The CP and method bytes were read by the existing native producer. Revalidation
+     * checks that original record; it does not claim another fresh VM snapshot.
+     */
+    public static final class CurrentLoadedExecutable {
+        private final ObservedDefinition observation;
+        private final ClassLoader definingLoader;
+        private CurrentLoadedExecutable(ObservedDefinition observation, ClassLoader definingLoader) {
+            this.observation = observation; this.definingLoader = definingLoader;
+        }
+        public Class<?> actualClass() { return observation.actualClass(); }
+        /** Actual loader object; ordinary frame loader zero is not bootstrap evidence. */
+        public ClassLoader definingLoader() { return definingLoader; }
+        public ObservedDefinition observation() { return observation; }
+        public SourceInputRole sourceInputRole() {
+            return observation.hidden() ? SourceInputRole.HIDDEN_DEFINE_RECIPE : SourceInputRole.ORDINARY_HOOK_INPUT;
+        }
+        public boolean isCurrent() {
+            Optional<CurrentLoadedExecutable> current = observeCurrentExecutable(actualClass());
+            return current.isPresent() && sameExecutableObservation(observation, definingLoader,
+                    current.orElseThrow().observation, current.orElseThrow().definingLoader);
+        }
+        /** Retained byte-array payload only; VM heap and Java object overhead are separate. */
+        public long retainedPayloadBytes() {
+            long bytes = (long) observation.envelope.length + observation.terminalObservedBytes.length
+                    + observation.hiddenInputBytes.length + observation.constantPoolBytes.length;
+            for (ObservedMethod method : observation.methods) bytes += method.bytecodes.length;
+            return bytes;
+        }
+    }
+
+    // Pure comparison is useful for codec regressions, but never constructs the issuer view.
+    static boolean sameExecutableObservation(ObservedDefinition original, ClassLoader originalLoader,
+                                             ObservedDefinition current, ClassLoader currentLoader) {
+        return original.actualClass == current.actualClass && originalLoader == currentLoader
+                && original.actualClass.getClassLoader() == originalLoader
+                && current.actualClass.getClassLoader() == currentLoader
+                && original.issuerEpoch == current.issuerEpoch && original.classIdentity == current.classIdentity
+                && original.generation == current.generation && original.attempt == current.attempt
+                && Arrays.equals(original.envelope, current.envelope);
+    }
+
     private static native int nativeStatus();
     private static native byte[] nativeEvidence(Class<?> actualClass);
     private static native byte[] nativeHiddenForwarder(Class<?> actualClass);

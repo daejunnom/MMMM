@@ -60,11 +60,17 @@ public final class DefinitionStartupFixtures {
         Class<?> ordinary = new ProbeLoader().define(input);
         // Preparation of our fixed probe does not initialize it or run a callback.
         ordinary.getDeclaredMethods();
-        var ordinaryObservation = DefinitionObserverBridge.observe(ordinary)
+        var ordinaryExecutable = DefinitionObserverBridge.observeCurrentExecutable(ordinary)
                 .orElseThrow(() -> unavailable("ORDINARY_OBSERVATION_UNAVAILABLE"));
+        var ordinaryObservation = ordinaryExecutable.observation();
         requireObservation(ordinaryObservation, ordinary, false);
+        if (ordinaryExecutable.definingLoader() != ordinary.getClassLoader()
+                || ordinaryExecutable.definingLoader() == null || ordinaryObservation.definingLoaderIdentity() != 0
+                || ordinaryExecutable.sourceInputRole() != DefinitionObserverBridge.SourceInputRole.ORDINARY_HOOK_INPUT) {
+            throw unavailable("ORDINARY_ACTUAL_LOADER_UNAVAILABLE");
+        }
         // Preserve the raw definition before initializing only this owned class.
-        var savedOrdinary = new ClassObservation(ordinaryObservation);
+        var savedOrdinary = new ClassObservation(ordinaryExecutable);
 
         Class<?> direct = new ProbeLoader().defineDirect(input);
         direct.getDeclaredMethods();
@@ -72,8 +78,9 @@ public final class DefinitionStartupFixtures {
 
         Class<?> hidden = MethodHandles.lookup().defineHiddenClass(input, false).lookupClass();
         hidden.getDeclaredMethods();
-        var hiddenObservation = DefinitionObserverBridge.observe(hidden)
+        var hiddenExecutable = DefinitionObserverBridge.observeCurrentExecutable(hidden)
                 .orElseThrow(() -> unavailable("HIDDEN_OBSERVATION_UNAVAILABLE"));
+        var hiddenObservation = hiddenExecutable.observation();
         requireObservation(hiddenObservation, hidden, true);
         if (DefinitionObserverBridge.observeHiddenForwarder(hidden).isPresent()) {
             throw unavailable("SAMLESS_PROBE_HAS_FORWARDER");
@@ -86,8 +93,9 @@ public final class DefinitionStartupFixtures {
         Runnable runnable = ownedRunnable(ordinary);
         Class<?> positive = runnable.getClass();
         positive.getDeclaredMethods();
-        var positiveObservation = DefinitionObserverBridge.observe(positive)
+        var positiveExecutable = DefinitionObserverBridge.observeCurrentExecutable(positive)
                 .orElseThrow(() -> unavailable("POSITIVE_OBSERVATION_UNAVAILABLE"));
+        var positiveObservation = positiveExecutable.observation();
         requireObservation(positiveObservation, positive, true);
         if (positive == hidden || positive == ordinary
                 || positiveObservation.classIdentity() == hiddenObservation.classIdentity()
@@ -95,13 +103,13 @@ public final class DefinitionStartupFixtures {
                 || positiveObservation.issuerEpoch() != savedOrdinary.issuerEpoch) {
             throw unavailable("POSITIVE_IDENTITIES_DISAGREE");
         }
-        var savedPositive = new ClassObservation(positiveObservation);
+        var savedPositive = new ClassObservation(positiveExecutable);
         var forwarder = DefinitionObserverBridge.observeHiddenForwarder(positive)
                 .orElseThrow(() -> unavailable("POSITIVE_FORWARDER_UNAVAILABLE"));
         requirePositiveForwarder(forwarder, savedPositive, savedOrdinary);
         int observedStatus = requireCurrentStatus();
         var snapshot = new StartupSnapshot(
-                savedOrdinary, new ClassObservation(hiddenObservation), direct,
+                savedOrdinary, new ClassObservation(hiddenExecutable), direct,
                 new ForwarderObservation(savedPositive, forwarder), observedStatus);
         // A short Java monitor publishes only immutable data. No JNI operation
         // runs while this monitor is held.
@@ -214,7 +222,8 @@ public final class DefinitionStartupFixtures {
 
     private static void requireDirectUnobserved(Class<?> actualClass) {
         if (actualClass.isHidden() || !FIXTURE_NAME.equals(actualClass.getName())
-                || DefinitionObserverBridge.observe(actualClass).isPresent()) {
+                || DefinitionObserverBridge.observe(actualClass).isPresent()
+                || DefinitionObserverBridge.observeCurrentExecutable(actualClass).isPresent()) {
             throw unavailable("DIRECT_PATH_ISSUED_EVIDENCE");
         }
     }
@@ -296,6 +305,7 @@ public final class DefinitionStartupFixtures {
     }
 
     private static final class ClassObservation {
+        private final DefinitionObserverBridge.CurrentLoadedExecutable executable;
         private final Class<?> actualClass;
         private final boolean hidden;
         private final long classIdentity;
@@ -304,7 +314,9 @@ public final class DefinitionStartupFixtures {
         private final long issuerEpoch;
         private final byte[] envelope;
 
-        private ClassObservation(DefinitionObserverBridge.ObservedDefinition observed) {
+        private ClassObservation(DefinitionObserverBridge.CurrentLoadedExecutable executable) {
+            this.executable = executable;
+            var observed = executable.observation();
             this.actualClass = observed.actualClass();
             this.hidden = observed.hidden();
             this.classIdentity = observed.classIdentity();
@@ -315,14 +327,20 @@ public final class DefinitionStartupFixtures {
             if (envelope.length == 0 || envelope.length > MAX_ENVELOPE_BYTES) {
                 throw unavailable("ENVELOPE_BOUND");
             }
+            if (executable.definingLoader() != actualClass.getClassLoader()
+                    || executable.sourceInputRole() != (hidden ? DefinitionObserverBridge.SourceInputRole.HIDDEN_DEFINE_RECIPE
+                                                              : DefinitionObserverBridge.SourceInputRole.ORDINARY_HOOK_INPUT)) {
+                throw unavailable("ACTUAL_EXECUTABLE_IDENTITY_CHANGED");
+            }
         }
 
         private void verifyCurrent() {
-            var observed = DefinitionObserverBridge.observe(actualClass)
-                    .orElseThrow(() -> unavailable("CURRENT_OBSERVATION_UNAVAILABLE"));
+            if (!executable.isCurrent()) throw unavailable("CURRENT_OBSERVATION_UNAVAILABLE");
+            var observed = executable.observation();
             requireObservation(observed, actualClass, hidden);
             if (observed.classIdentity() != classIdentity || observed.generation() != generation
                     || observed.attempt() != attempt || observed.issuerEpoch() != issuerEpoch
+                    || executable.actualClass() != actualClass || executable.definingLoader() != actualClass.getClassLoader()
                     || !Arrays.equals(envelope, observed.envelope())) {
                 throw unavailable("CURRENT_OBSERVATION_CHANGED");
             }

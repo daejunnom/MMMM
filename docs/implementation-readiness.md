@@ -8,8 +8,9 @@
 
 현재 구성은 작업 규약, 구현 및 수명 기준, PR 템플릿, 선언 구조 정책, 원본 계약과
 Rust 구현 기반이다. 원격 `main`, `develop`과 기능 브랜치에 기준선을 반영했고,
-제품 구현은 Draft PR #1에서 진행한다. 원격 보호 설정은 아직 완료되지 않았다.
-Windows의 빌드 관리 도구 bootstrap은 실제로 통과했으며, 제품 인수와 CI는 미완료다.
+제품 구현은 Draft PR #1에서 진행한다. 원격 `main`과 `develop` 보호는 2026-10-15에
+적용하고 실제 API readback을 확인했다. Windows의 빌드 관리 도구 bootstrap은
+실제로 통과했으며, 제품 인수와 현재 통합 검증은 미완료다.
 
 ## G0 선행 조건
 
@@ -21,13 +22,24 @@ Windows의 빌드 관리 도구 bootstrap은 실제로 통과했으며, 제품 �
 - [ ] Windows, Linux와 macOS에서 성공, 실패, timeout, 취소 및 자식 종료 확인을 검증한다.
 - [ ] lease, 한도, 경로 이탈, cache 회수와 증거 내보내기 실패를 검증한다.
 - [ ] Rust 구조 검사기를 도입하고 metadata만 읽는 범위와 거절 경로를 검증한다.
-- [ ] 원격 구성이 배정되면 실제 검사 등록과 `main` 및 `develop` 보호 설정을 확인한다.
+- [x] 원격 구성이 배정되면 실제 검사 등록과 `main` 및 `develop` 보호 설정을 확인한다.
 - [ ] 담당자와 리뷰 구성을 확인하고 필요한 CODEOWNERS를 등록한다.
 
 원본 70개 파일의 SHA-256 무결성을 확인했고 선택 도입한 61개 파일은
 `contracts/handoff-input.json`에 기록했다. 계약의 의미, DTO와 공식 JCS 검증은
 별도로 진행한다. 관리 도구와 구조 검사를 검증하기 전 실행 명령 또는 자동 정리의
 완료를 보고하지 않는다.
+
+D058의 원격 보호는 실제 성공 이력이 있는 `foundation-result`와 `jvm-result`를
+GitHub Actions app `15368`에 고정하고, 최신 대상 기준과 관리자 적용·PR·대화 해결을
+요구한다. force push와 삭제는 금지하며 bypass는 없다. 초기 단독 유지보수이므로
+필수 외부 승인 수는 0이고 code-owner 및 마지막 push의 타인 승인은 요구하지 않는다.
+이를 타인의 리뷰를 받은 것으로 보고하지 않는다. 관리 실행 `368`의 첫 API 요청은
+`contexts`와 `checks` 동시 사용으로 HTTP 422를 받아 적용되지 않았다. 원 요청·오류와
+정리 기록을 보존했고, 구형 `contexts`를 제외한 `369`는 두 branch의 적용 및 독립 GET
+대조 후 exit 0·drain·출력·export·scratch 정리·lease 해제를 완료했다. readback SHA는
+main `47c47a6e538bc144aa8ce9f4b99ae37872a015598293ac2e0af8d958274b3a12`,
+develop `93b0597475b808a096ebb6d443d05b9fca0eabb11fc6c784fe1f8a92809e635c`다.
 
 ## 2026-10-14~15 로컬 구현 검증
 
@@ -1141,6 +1153,42 @@ Java 컴파일과 Gradle 33개 task를 실제 실행했지만 public adapter 29�
 쓰기 권한 요청 0회, 효과 관측 0개, 대상 API 호출 0회 및 초기화 부재를 각각 확인하도록
 수정한다. 원 실패·출력과 정상 drain·export·scratch 정리·lease 해제를 보존하며,
 다른 모듈의 성공을 전체 JVM 성공으로 집계하지 않는다.
+
+수정한 `0cedbf05d948319c5fc6cc9eb694d88bfc5b5027`의 Windows JVM `367`은 같은
+고정 JDK·Gradle 및 원 7모듈 범위에서 374개 테스트/30개 reports와 33개 executed
+tasks를 통과했다. 모듈별 tests는 SDK 108, host-core 92, public-java-adapter 29,
+Fabric host 94, definition-observer 22, legacy fixture 18, provider fixture 11이며
+실패·오류·skip은 모두 0이다. 원 stdout·stderr와 XML digest 목록을 외부 증거로
+보존한 로컬 요약 SHA는
+`5654bdf7f9c463b7f957622781c4687b49896990fe1efb676799c5be8af1543f`다.
+command 0·32,304 ms, Job commit peak 1,396,297,728 bytes·peak process 6개·최대
+표본 간격 146 ms였고 기존 2 GiB/32 process 상한을 유지했다. drain·완전한 출력·
+export·scratch 정리·lease 해제를 확인했다. 이 결과는 metadata source·서명 확인과
+실행 차단을 포함한 로컬 검사이며 실제 게임 metadata·실행 adapter·CI 전체 인수나
+공개 배포 성공으로 확대하지 않는다. 같은 SHA의 Rust CI 56 (`38754198908`)과
+JVM CI 47 (`38754199266`)은 등록을 확인했다. 이후 같은 JVM CI의 세 OS와 집계 성공을
+관측했고 실제 ZIP 3개를 외부 보존하여 감사를 진행한다. 이전 `be6cc8e`의 JVM CI 46
+(`38752720205`)은 세 OS 모두 같은 metadata test 이름과 258행의 AssertionFailedError를
+기록했다. 원 XML은 artifact에 없어 전체 stack은 CI ZIP에서 독립 재확인하지 못했다.
+당시 원 stdout·stderr, source/expected/PR head 및 별도 event SHA, 374개 중 실패 1개와
+원 종료·정리 연결을 대조했다. 해당 SHA의 Rust CI 55 (`38752720231`)는 Linux·macOS
+전체 job이 성공했지만 Windows는 `NotFound` 이후 surviving ancestry의 metadata
+조회에서 native 오류 5를 받아 `observation_failure`로 중단됐고 집계가 실패했다.
+완료된 test summary를 전체 test 성공으로 집계하지 않는다. Windows의 원 오류와
+출력·drain·export·scratch 정리·lease 해제는 보존했으며 어느 component의 삭제 경합인지
+ACL 거절인지는 현 진단만으로 확정하지 않는다.
+
+후속 D059 구현은 실제 JNI Class 조회에서만 private `CurrentLoadedExecutable`을
+발급하고 collector와 현재 owner slot에 보존한다. Class·실제 loader 객체·원 native
+stamp와 전체 envelope를 재검사하며, ordinary frame의 loader 0과 실제 bootstrap
+loader를 구분한다. raw fixture에는 view가 없어 executable 조회를 만족시키지 못한다.
+기존 startup fixture의 실제 ordinary·hidden 세 Class는 새 발급 및 현재성 경로를
+사용하도록 연결했다. 기존 64 Class/8 MiB 안에 decoded byte payload까지 계상하고
+slot의 JNI와 원 checkpoint는 monitor 밖에서 실행한 뒤 현재 ticket·owner를 다시
+확인한다. 현재 입력은 registry의 기존 다섯 Class 역할이므로 parser·predicate·handler·
+source factory의 수집과 admission 양성은 아직 연결하지 않았다. 새 VM snapshot이나
+최종 classfile, 일반 쓰기·profile·calibration 승인을 발급한 것으로 보고하지 않으며
+수정한 소스의 실제 JVM·native startup 검증은 후속 실행에서 확인한다.
 
 고정 `b854b617846036bcb09058ca7da3eed303a1e680`의 Rust CI 50
 (`38698720838`)과 JVM CI 41 (`38698720798`)은 세 OS 및 집계가 모두 성공했다.
