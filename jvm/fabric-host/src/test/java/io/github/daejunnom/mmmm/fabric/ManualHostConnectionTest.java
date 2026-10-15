@@ -30,6 +30,25 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 final class ManualHostConnectionTest {
     @TempDir Path temporary;
+    @Test void calibrationCompletionBindsTheExactPurposeSelectionManifestAndOriginalHostContext() {
+        ObjectNode offer = ContractJson.newObject().put("nonce", "approve-fixture");
+        offer.putObject("hostHello").putObject("environment").put("sessionEpoch", "epoch-fixture-01"); offer.putArray("contextIds").add("context-fixture-01");
+        ObjectNode completed = ContractJson.newObject().put("kind", "host_apply_approval_complete").put("protocolVersion", ContractJson.VERSION)
+                .put("nonce", "approve-fixture").put("ready", true).put("coordinatorEpoch", "coordinator-fixture")
+                .put("hostEpoch", "epoch-fixture-01").put("contextId", "context-fixture-01").put("purpose", NativeCalibrationApproval.PURPOSE)
+                .put("selectionDigest", "a".repeat(64)).put("manifestDigest", "b".repeat(64));
+        assertDoesNotThrow(() -> ManualHostConnection.validateCalibrationCompletion(offer, completed, "a".repeat(64), "b".repeat(64)));
+        for (String field : List.of("kind", "protocolVersion", "nonce", "coordinatorEpoch", "hostEpoch", "contextId", "purpose", "selectionDigest", "manifestDigest")) {
+            ObjectNode changed = completed.deepCopy().put(field, "changed value");
+            assertThrows(ContractException.class, () -> ManualHostConnection.validateCalibrationCompletion(offer, changed, "a".repeat(64), "b".repeat(64)));
+        }
+        assertThrows(ContractException.class, () -> ManualHostConnection.validateCalibrationCompletion(offer, completed.deepCopy().put("ready", false), "a".repeat(64), "b".repeat(64)));
+        ObjectNode omitted = completed.deepCopy(); omitted.remove("manifestDigest");
+        assertThrows(ContractException.class, () -> ManualHostConnection.validateCalibrationCompletion(offer, omitted, "a".repeat(64), "b".repeat(64)));
+        assertThrows(ContractException.class, () -> ManualHostConnection.validateCalibrationCompletion(offer, completed.deepCopy().put("admin", true), "a".repeat(64), "b".repeat(64)));
+        assertThrows(ContractException.class, () -> ManualHostConnection.validateCalibrationCompletion(offer, completed, null, "b".repeat(64)));
+    }
+
     @Test void boundedOriginalProfileBytesRemainSeparateFromArtifactAndInterfacePins() throws IOException {
         byte[] raw = profileBytes(); ObjectNode entry = entry("owner.approval:1", HexFormat.of().formatHex(raw));
         entry.put("profileDigest", ContractJson.digest(ContractJson.parse(raw)));

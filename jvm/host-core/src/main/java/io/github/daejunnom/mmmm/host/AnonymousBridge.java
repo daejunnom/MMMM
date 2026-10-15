@@ -41,6 +41,10 @@ public final class AnonymousBridge {
     private AnonymousBridge() { }
 
     public static void verifyExecutable(Path executable, String expectedSha256) {
+        verifyExecutable(executable, expectedSha256, () -> { });
+    }
+    private static void verifyExecutable(Path executable, String expectedSha256, Runnable checkpoint) {
+        checkpoint.run();
         if (!executable.isAbsolute() || !expectedSha256.matches("[a-f0-9]{64}")) {
             throw new ContractException("BRIDGE_SETUP_INVALID", "An exact approved executable is required");
         }
@@ -54,11 +58,16 @@ public final class AnonymousBridge {
             MessageDigest digest = MessageDigest.getInstance("SHA-256"); long count = 0;
             try (var input = Files.newInputStream(normalized)) {
                 byte[] buffer = new byte[32 * 1024]; int read;
-                while ((read = input.read(buffer)) >= 0) { count += read; if (count > length) throw new IOException(); digest.update(buffer, 0, read); }
+                while (true) {
+                    checkpoint.run(); read = input.read(buffer); checkpoint.run();
+                    if (read < 0) break;
+                    count += read; if (count > length) throw new IOException(); digest.update(buffer, 0, read);
+                }
             }
             if (count != length || length != Files.size(normalized) || !expectedSha256.equals(HexFormat.of().formatHex(digest.digest()))) {
                 throw new ContractException("BRIDGE_SOURCE_UNAPPROVED", "Executable source does not match the approved digest");
             }
+            checkpoint.run();
         } catch (IOException exception) { throw new ContractException("BRIDGE_SOURCE_UNAPPROVED", "Approved executable source could not be observed"); }
         catch (NoSuchAlgorithmException exception) { throw new AssertionError(exception); }
     }
@@ -71,11 +80,31 @@ public final class AnonymousBridge {
 
     public static ObjectNode exchange(Mode mode, Path executable, String expectedSha256, ObjectNode offer,
                                       byte[] rawCapability, Installer installer) {
+        return exchange(mode, executable, expectedSha256, offer, rawCapability, installer, () -> { },
+                System.nanoTime() + Duration.ofSeconds(30).toNanos());
+    }
+
+    /** 원 요청의 절대 monotonic 기한과 현재성 callback을 재사용한다. 이 overload도 30초 상한을 늘리지 않는다. */
+    public static ObjectNode exchange(Mode mode, Path executable, String expectedSha256, ObjectNode offer,
+                                      byte[] rawCapability, Installer installer, Runnable originalControl, long originalDeadlineNanos) {
+        java.util.Objects.requireNonNull(originalControl);
+        long started = System.nanoTime();
+        long originalRemaining = Math.min(Duration.ofSeconds(30).toNanos(), originalDeadlineNanos - started);
+        if (originalRemaining <= 0) throw failure();
+        long until = started + originalRemaining;
+        Runnable control = () -> {
+            originalControl.run();
+            if (until - System.nanoTime() <= 0) throw failure();
+        };
+        control.run();
         if (rawCapability.length != 32) throw new IllegalArgumentException("Capability must contain 32 bytes");
         envelope(offer, mode.offerKind, offer.path("nonce").asText());
+        boolean calibration = mode == Mode.APPLY_APPROVAL && "numeric_calibration_normative47/1".equals(offer.path("purpose").asText());
+        if (offer.has("purpose") && !calibration) throw failure();
         if (!offer.path("nonce").isTextual() || !offer.path("nonce").asText().matches("[a-z0-9][a-z0-9._:-]{0,127}")) throw failure();
         ObjectNode immutableOffer = offer.deepCopy();
-        verifyExecutable(executable, expectedSha256);
+        verifyExecutable(executable, expectedSha256, control);
+        control.run();
         byte[] ownedCapability = rawCapability.clone();
         Process process = null;
         var watchdog = Executors.newSingleThreadScheduledExecutor(task -> {
@@ -85,17 +114,17 @@ public final class AnonymousBridge {
             Thread thread = new Thread(task, "mmmm-host-bridge-stderr"); thread.setDaemon(true); return thread;
         });
         AtomicBoolean overflow = new AtomicBoolean();
-        long until = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+        Throwable originalFailure = null;
         try {
             ProcessBuilder builder = new ProcessBuilder(executable.toString(), "host-bridge", mode.argument);
             // No bearer or secret is placed in process arguments or environment.
-            process = builder.start(); Process child = process;
+            control.run(); process = builder.start(); Process child = process;
             var timer = watchdog.schedule(() -> {
                 overflow.set(true);
                 try { child.getInputStream().close(); child.getOutputStream().close(); child.getErrorStream().close(); }
                 catch (IOException exception) { /* The deadline already makes the handshake fail closed. */ }
                 terminateOwned(child);
-            }, 30, TimeUnit.SECONDS);
+            }, Math.max(1, until - System.nanoTime()), TimeUnit.NANOSECONDS);
             CompletableFuture<Void> stderr = CompletableFuture.runAsync(() -> {
                 try (var input = child.getErrorStream()) {
                     byte[] buffer = new byte[4096]; int read; int count = 0;
@@ -108,31 +137,59 @@ public final class AnonymousBridge {
             }, drains);
             try (var input = new DataInputStream(child.getInputStream())) {
                 var output = new DataOutputStream(child.getOutputStream());
+                Throwable frameFailure = null;
                 try {
-                output.write("MMMMHST1".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                control.run(); output.write("MMMMHST1".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
                 write(output, immutableOffer); output.write(ownedCapability); output.flush(); Arrays.fill(ownedCapability, (byte) 0);
+                control.run();
                 ObjectNode authority = read(input); envelope(authority, mode.authorityKind, immutableOffer.path("nonce").asText());
+                control.run();
                 byte[] installCapability = rawCapability.clone();
                 ObjectNode installed;
                 try { installed = installer.install(authority.deepCopy(), installCapability).toCompletableFuture()
                         .get(remaining(until), TimeUnit.NANOSECONDS); }
                 finally { Arrays.fill(installCapability, (byte) 0); }
-                envelope(installed, "host_pairing_installed", immutableOffer.path("nonce").asText()); write(output, installed);
-                ObjectNode completed = read(input); envelope(completed, "host_pairing_complete", immutableOffer.path("nonce").asText());
+                control.run();
+                envelope(installed, calibration ? "host_apply_approval_installed" : "host_pairing_installed", immutableOffer.path("nonce").asText());
+                if (calibration && (!immutableOffer.path("purpose").equals(installed.path("purpose"))
+                        || !installed.path("selectionDigest").asText().matches("[a-f0-9]{64}")
+                        || !installed.path("manifestDigest").asText().matches("[a-f0-9]{64}"))) throw failure();
+                write(output, installed);
+                ObjectNode completed = read(input); envelope(completed, calibration ? "host_apply_approval_complete" : "host_pairing_complete", immutableOffer.path("nonce").asText());
+                if (calibration && (!installed.path("purpose").equals(completed.path("purpose"))
+                        || !installed.path("selectionDigest").equals(completed.path("selectionDigest"))
+                        || !installed.path("manifestDigest").equals(completed.path("manifestDigest")))) throw failure();
+                control.run();
                 if (!completed.path("ready").isBoolean() || !completed.path("ready").asBoolean()) throw failure();
                 output.close();
                 if (input.read() != -1 || !child.waitFor(remaining(until), TimeUnit.NANOSECONDS) || child.exitValue() != 0) throw failure();
                 stderr.get(remaining(until), TimeUnit.NANOSECONDS);
                 if (overflow.get()) throw failure();
-                timer.cancel(false); return completed.deepCopy();
-                } finally { output.close(); }
+                control.run(); timer.cancel(false); return completed.deepCopy();
+                } catch (IOException | InterruptedException | java.util.concurrent.ExecutionException
+                         | java.util.concurrent.TimeoutException | RuntimeException | Error failure) {
+                    frameFailure = failure; throw failure;
+                } finally { closeOutput(output, frameFailure); }
             }
-        } catch (IOException | java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException exception) { throw failure(); }
-        catch (InterruptedException exception) { Thread.currentThread().interrupt(); throw failure(); }
+        } catch (IOException | java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException exception) {
+            ContractException failed = failure(exception); originalFailure = failed; throw failed;
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt(); ContractException failed = failure(exception); originalFailure = failed; throw failed;
+        } catch (RuntimeException | Error exception) { originalFailure = exception; throw exception; }
         finally {
             Arrays.fill(ownedCapability, (byte) 0);
-            if (process != null) terminateOwned(process);
-            watchdog.shutdownNow(); drains.shutdownNow();
+            try { if (process != null) terminateOwned(process); }
+            catch (RuntimeException cleanup) {
+                if (originalFailure != null && cleanup != originalFailure) originalFailure.addSuppressed(cleanup); else throw cleanup;
+            } finally { watchdog.shutdownNow(); drains.shutdownNow(); }
+        }
+    }
+    /** Closing an owned output must not replace the original install/current failure. */
+    static void closeOutput(DataOutputStream output, Throwable original) throws IOException {
+        try { output.close(); }
+        catch (IOException | RuntimeException | Error failure) {
+            if (original == null) throw failure;
+            if (failure != original) original.addSuppressed(failure);
         }
     }
     private static long remaining(long until) throws java.util.concurrent.TimeoutException {
@@ -153,6 +210,7 @@ public final class AnonymousBridge {
                 || !nonce.equals(frame.path("nonce").asText())) throw failure();
     }
     private static ContractException failure() { return new ContractException("HOST_PAIRING_FAILED", "The approved host bridge did not complete its bounded handshake"); }
+    private static ContractException failure(Throwable cause) { ContractException failed = failure(); failed.initCause(cause); return failed; }
     private static void terminateOwned(Process child) {
         if (!child.isAlive()) return;
         var owned = child.descendants().toList(); owned.forEach(ProcessHandle::destroy); child.destroy();

@@ -3,7 +3,11 @@ package io.github.daejunnom.mmmm.host;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.daejunnom.mmmm.sdk.ContractException;
 import io.github.daejunnom.mmmm.sdk.ContractJson;
+import io.github.daejunnom.mmmm.sdk.Invocation;
+import io.github.daejunnom.mmmm.sdk.ProviderResult;
 import java.io.IOException;
+import java.io.DataOutputStream;
+import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
@@ -117,6 +121,72 @@ final class HostInspectionControlTest {
             }
         } finally { session.close(); }
     }
+    @Test void installedPurposeOwnsAllInvocationMethodsWithoutAFallbackToTheGeneralRuntime() throws IOException {
+        ContractJson contracts = new ContractJson(); MutableClock clock = new MutableClock();
+        ObjectNode hello = fixture("host-hello.json"), wire = fixture("invocation.json");
+        wire.put("deadlineAt", NOW.plusSeconds(20).toString());
+        HostSession session = new HostSession("principal-fixture", "epoch-fixture-01", "game-fixture-01", "server", UUID.randomUUID(), Set.of(), false);
+        session.installContext(contracts, wire.path("context"));
+        GameThread thread = new GameThread() {
+            @Override public boolean isSameThread() { return true; }
+            @Override public void execute(Runnable action) { action.run(); }
+        };
+        HostAuthority authority = new HostAuthority() {
+            @Override public boolean ready() { return true; }
+            @Override public ObjectNode hello() { return hello.deepCopy(); }
+            @Override public void check(HostSession owner, ObjectNode installed, Set<String> permissions, boolean write) { fail("일반 runtime 권한 경로를 선택하면 안 됩니다"); }
+            @Override public void checkPreconditions(HostSession owner, ObjectNode installed, ObjectNode arguments) { fail("일반 mutation 경로를 선택하면 안 됩니다"); }
+        };
+        List<String> calls = new ArrayList<>(); List<HostDispatcher.InspectionControl> controls = new ArrayList<>();
+        HostDispatcher.PurposeRoute route = new HostDispatcher.PurposeRoute() {
+            private <T> CompletionStage<T> unavailable(String method, HostDispatcher.InspectionControl control) {
+                calls.add(method); controls.add(control); control.checkpoint();
+                assertEquals(NOW.plusSeconds(30), control.deadlineAt());
+                return CompletableFuture.failedFuture(new ContractException("CALIBRATION_RUNNER_UNAVAILABLE", "실제 runner 없음"));
+            }
+            @Override public CompletionStage<ObjectNode> prepare(HostSession owner, Invocation invocation, HostDispatcher.InspectionControl control) { return unavailable("prepare", control); }
+            @Override public CompletionStage<ProviderResult> dispatch(HostSession owner, Invocation invocation, HostDispatcher.InspectionControl control) { return unavailable("dispatch", control); }
+            @Override public CompletionStage<ObjectNode> poll(HostSession owner, String id, HostDispatcher.InspectionControl control) { return unavailable("operation.get", control); }
+            @Override public CompletionStage<ObjectNode> cancel(HostSession owner, String id, HostDispatcher.InspectionControl control) { return unavailable("operation.cancel", control); }
+        };
+        try (HostRuntime runtime = new HostRuntime(contracts, thread, authority, (binding, descriptor) -> { }, clock)) {
+            HostDispatcher dispatcher = new HostDispatcher(contracts, runtime, (owner, installed, payload, control) -> fail("inspect 실행을 선택하면 안 됩니다"), clock, route);
+            dispatcher.handle(session, request("hello", "hello-purpose")).toCompletableFuture().join();
+            for (String method : List.of("prepare", "dispatch", "operation.get", "operation.cancel")) {
+                ObjectNode request = request(method, "purpose-" + calls.size()).put("contextId", wire.path("context").path("contextId").asText());
+                if (Set.of("prepare", "dispatch").contains(method)) request.set("payload", wire.deepCopy());
+                else request.withObject("payload").put("invocationId", wire.path("invocationId").asText());
+                ObjectNode response = dispatcher.handle(session, request).toCompletableFuture().join();
+                assertEquals("CALIBRATION_RUNNER_UNAVAILABLE", response.path("error").path("code").asText());
+                assertEquals(method.equals("dispatch") ? "unknown" : "none_confirmed", response.path("error").path("effects").asText());
+            }
+            assertEquals(List.of("prepare", "dispatch", "operation.get", "operation.cancel"), calls);
+            for (var control : controls) assertEquals("CANCELLATION_REQUESTED", assertThrows(ContractException.class, control::checkpoint).code());
+            assertFalse(session.verifiedWriteProfile());
+        }
+    }
+    @Test void bridgeOutputCleanupPreservesOriginalInstallerCurrentAndDeadlineFailures() throws Exception {
+        // Real processes are unnecessary for this close boundary: a controlled
+        // owned stream exercises the exact production cleanup helper directly.
+        for (Throwable original : List.of(
+                new java.util.concurrent.ExecutionException(new ContractException("FIXTURE_INSTALL_FAILED", "합성 installer 오류")),
+                new ContractException("FIXTURE_CONTEXT_STALE", "합성 현재성 오류"),
+                new java.util.concurrent.TimeoutException("합성 원 기한 오류"))) {
+            IOException closing = new IOException("합성 broken pipe close 오류");
+            AtomicInteger closes = new AtomicInteger();
+            var output = new DataOutputStream(OutputStream.nullOutputStream()) {
+                @Override public void close() throws IOException { closes.incrementAndGet(); throw closing; }
+            };
+            assertDoesNotThrow(() -> AnonymousBridge.closeOutput(output, original));
+            assertEquals(1, closes.get()); assertArrayEquals(new Throwable[] {closing}, original.getSuppressed());
+        }
+        IOException closing = new IOException("합성 단독 close 오류");
+        var output = new DataOutputStream(OutputStream.nullOutputStream()) {
+            @Override public void close() throws IOException { throw closing; }
+        };
+        assertSame(closing, assertThrows(IOException.class, () -> AnonymousBridge.closeOutput(output, null)));
+    }
+
     private static ObjectNode request(String method, String id) {
         ObjectNode request = ContractJson.newObject().put("protocolVersion", ContractJson.VERSION).put("requestId", id)
                 .put("method", method).put("deadlineAt", NOW.plusSeconds(30).toString());

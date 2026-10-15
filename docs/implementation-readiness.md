@@ -1428,6 +1428,16 @@ Runtime claim·Application hook source의 CI 결과다. 이후 미커밋 Coordin
 연결이나 위 진단 오류 보존 보완의 CI 성공으로 재사용하지 않는다. 이 두 실행의 원 ZIP
 감사는 아직 수행하지 않았다.
 
+Java host에는 고정 normative47 plan만 받는 별도 calibration purpose 승인 route를
+작성했다. 원 player ADMIN·pairing·runtime source·epoch/generation 및 30초 원 기한을
+전후 검사하며, exact Complete·EOF·소유 bridge 자식 exit 0·stderr drain 뒤에만 listener를
+활성화한다. 일반 read route와 `verifiedWriteProfile=false`는 유지한다. prepare는 plan을
+소비하지 않으며 실제 runner가 없으면 `CALIBRATION_RUNNER_UNAVAILABLE`로 거절한다.
+runner failure와 후행 현재성 오류 및 bridge output close 오류의 원인 보존 두 건은
+독립 소스 리뷰로 보완을 확인했다. 이 checkpoint의 Java compile·JUnit·실제 ADMIN과
+게임 실행은 아직 미검증이다. Coordinator publisher와 실제 execution consumer는 별도
+미커밋 작업이며, Java source만으로 plan 생성·로드·실행·readback 성공을 주장하지 않는다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

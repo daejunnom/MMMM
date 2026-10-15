@@ -70,7 +70,97 @@ final class ManualHostConnection {
                                                             ? "MMMM plan approval installed" : "MMMM plan approval failed; the frozen plan, current policy and runtime evidence must match"));
                                                 });
                                             }); return 1;
-                                        }))))));
+                                        }))))
+                        .then(calibrationCommand())));
+    }
+
+    private LiteralArgumentBuilder<CommandSourceStack> calibrationCommand() {
+        return LiteralArgumentBuilder.<CommandSourceStack>literal("calibration")
+                .then(LiteralArgumentBuilder.<CommandSourceStack>literal("approve")
+                        .then(RequiredArgumentBuilder.<CommandSourceStack, String>argument("planId", StringArgumentType.word())
+                                .then(RequiredArgumentBuilder.<CommandSourceStack, String>argument("planHash", StringArgumentType.word()).executes(command -> {
+                                    var player = command.getSource().getPlayer();
+                                    if (player == null || !connecting.compareAndSet(false, true)) return 0;
+                                    UUID playerId = player.getUUID(); String planId = StringArgumentType.getString(command, "planId");
+                                    String planHash = StringArgumentType.getString(command, "planHash");
+                                    var worker = Executors.newSingleThreadExecutor(task -> { Thread thread = new Thread(task, "mmmm-calibration-approval"); thread.setDaemon(true); return thread; });
+                                    CompletableFuture.runAsync(() -> approveCalibration(playerId, planId, planHash), worker).whenComplete((value, failure) -> {
+                                        connecting.set(false); worker.shutdown();
+                                        host.gameTask(() -> {
+                                            var current = host.pairedCandidate(playerId);
+                                            if (current != null) current.sendSystemMessage(Component.literal(failure == null
+                                                    ? "MMMM calibration 목적 승인을 설치했습니다; 실행 준비는 별도로 검사합니다"
+                                                    : "MMMM calibration 승인에 실패했습니다; 원 plan과 현재 권한을 확인하세요"));
+                                        });
+                                    }); return 1;
+                                }))));
+    }
+
+    private void approveCalibration(UUID playerId, String planId, String planHash) {
+        long started = System.nanoTime(), until = started + java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
+        byte[] raw = new byte[32]; new SecureRandom().nextBytes(raw); AtomicBoolean cancelled = new AtomicBoolean();
+        Runnable control = () -> {
+            if (cancelled.get() || Thread.currentThread().isInterrupted()) throw new ContractException("HOST_PAIRING_CANCELLED", "원 calibration 승인 요청이 끝났습니다");
+            if (until - System.nanoTime() <= 0) throw new ContractException("HOST_PAIRING_TIMEOUT", "원 calibration 승인 기한이 끝났습니다");
+        };
+        var installedEndpoint = new java.util.concurrent.atomic.AtomicReference<String>();
+        var nonce = new java.util.concurrent.atomic.AtomicReference<String>();
+        var installedSelection = new java.util.concurrent.atomic.AtomicReference<String>();
+        var installedManifest = new java.util.concurrent.atomic.AtomicReference<String>();
+        try {
+            control.run(); HostSetup setup = HostSetup.read(contracts, FabricLoader.getInstance().getGameDir().resolve("config/mmmm-host.json")); control.run();
+            ObjectNode offer = host.gameTask(() -> {
+                control.run(); ObjectNode actual = host.calibrationApprovalOffer(playerId, setup, planId, planHash, control, until);
+                nonce.set(actual.path("nonce").asText()); control.run(); return actual;
+            }).toCompletableFuture().orTimeout(Math.max(1, Math.min(java.util.concurrent.TimeUnit.SECONDS.toNanos(10), until - System.nanoTime())), java.util.concurrent.TimeUnit.NANOSECONDS).join();
+            control.run();
+            ObjectNode completed = AnonymousBridge.exchange(AnonymousBridge.Mode.APPLY_APPROVAL, setup.executable(), setup.executableSha256(), offer, raw,
+                    (authority, capability) -> {
+                        control.run(); String expectedCapabilityDigest = ContractJson.sha256(capability);
+                        return host.gameTask(() -> {
+                            control.run(); byte[] privateCapability = capability.clone();
+                            try {
+                                if (!expectedCapabilityDigest.equals(ContractJson.sha256(privateCapability))) throw new ContractException("HOST_PAIRING_CANCELLED", "원 calibration capability 수명이 끝났습니다");
+                                byte[] bearer = HexFormat.of().formatHex(privateCapability).getBytes(StandardCharsets.US_ASCII);
+                                String installed;
+                                try { installed = host.installCalibrationApproval(playerId, offer, authority, bearer, control); }
+                                catch (java.io.IOException exception) { throw new ContractException("HOST_PAIRING_FAILED", "Calibration 목적 listener를 설치하지 못했습니다"); }
+                                finally { Arrays.fill(bearer, (byte) 0); }
+                                installedEndpoint.set(installed); control.run();
+                                ObjectNode manifest = ContractJson.object(authority.path("manifest"));
+                                installedSelection.set(manifest.path("selectionDigest").asText()); installedManifest.set(ContractJson.digest(manifest));
+                                var uri = java.net.URI.create(installed);
+                                ObjectNode frame = ContractJson.newObject().put("kind", "host_apply_approval_installed").put("protocolVersion", ContractJson.VERSION)
+                                        .put("nonce", offer.path("nonce").asText()).put("purpose", NativeCalibrationApproval.PURPOSE)
+                                        .put("selectionDigest", installedSelection.get()).put("manifestDigest", installedManifest.get());
+                                frame.putObject("hostEndpoint").put("address", "127.0.0.1:" + uri.getPort()).put("path", "/rpc")
+                                        .put("hostEpoch", offer.path("hostHello").path("environment").path("sessionEpoch").asText());
+                                control.run(); return frame;
+                            } catch (RuntimeException failure) { host.revokeApproval(installedEndpoint.get()); throw failure; }
+                            finally { Arrays.fill(privateCapability, (byte) 0); }
+                        });
+                    }, control, until);
+            control.run(); validateCalibrationCompletion(offer, completed, installedSelection.get(), installedManifest.get()); control.run();
+            host.gameTask(() -> host.confirmCalibrationApproval(installedEndpoint.get(), offer, installedSelection.get(), installedManifest.get(), control))
+                    .toCompletableFuture().orTimeout(Math.max(1, Math.min(java.util.concurrent.TimeUnit.SECONDS.toNanos(10), until - System.nanoTime())), java.util.concurrent.TimeUnit.NANOSECONDS).join();
+            control.run();
+        } catch (RuntimeException failure) { cancelled.set(true); host.revokeApproval(installedEndpoint.get()); throw failure; }
+        finally { host.releaseCalibrationOffer(nonce.get()); Arrays.fill(raw, (byte) 0); }
+    }
+
+    static void validateCalibrationCompletion(ObjectNode offer, ObjectNode completed, String selectionDigest, String manifestDigest) {
+        HostDispatcher.exactFields(completed, Set.of("kind", "protocolVersion", "nonce", "ready", "coordinatorEpoch", "hostEpoch", "contextId", "purpose", "selectionDigest", "manifestDigest"));
+        if (!"host_apply_approval_complete".equals(completed.path("kind").asText()) || !ContractJson.VERSION.equals(completed.path("protocolVersion").asText())
+                || !offer.path("nonce").equals(completed.path("nonce")) || !NativeCalibrationApproval.PURPOSE.equals(completed.path("purpose").asText())
+                || !completed.path("ready").isBoolean() || !completed.path("ready").asBoolean()
+                || selectionDigest == null || manifestDigest == null || !selectionDigest.matches("[a-f0-9]{64}") || !manifestDigest.matches("[a-f0-9]{64}")
+                || !completed.path("selectionDigest").isTextual() || !completed.path("manifestDigest").isTextual()
+                || !selectionDigest.equals(completed.path("selectionDigest").asText())
+                || !manifestDigest.equals(completed.path("manifestDigest").asText())
+                || !offer.path("hostHello").path("environment").path("sessionEpoch").equals(completed.path("hostEpoch"))
+                || !completed.path("coordinatorEpoch").isTextual() || !completed.path("coordinatorEpoch").asText().matches("[a-z0-9][a-z0-9._:-]{0,127}")) throw invalid();
+        boolean context = false; for (JsonNode id : offer.path("contextIds")) context |= id.equals(completed.path("contextId"));
+        if (!context) throw invalid();
     }
 
     private void approve(UUID playerId, String planId, String planHash) {

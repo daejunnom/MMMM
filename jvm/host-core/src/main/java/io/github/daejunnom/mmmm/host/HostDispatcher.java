@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.daejunnom.mmmm.sdk.ContractException;
 import io.github.daejunnom.mmmm.sdk.ContractJson;
 import io.github.daejunnom.mmmm.sdk.Invocation;
+import io.github.daejunnom.mmmm.sdk.ProviderResult;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.Duration;
@@ -21,6 +22,13 @@ import java.util.function.LongSupplier;
 public final class HostDispatcher {
     @FunctionalInterface public interface Inspection {
         CompletionStage<ObjectNode> inspect(HostSession session, ObjectNode context, ObjectNode payload, InspectionControl control);
+    }
+    /** out-of-band 설치된 목적 route 전용이다. wire 입력으로 이 port를 선택하거나 설치할 수 없다. */
+    public interface PurposeRoute {
+        CompletionStage<ObjectNode> prepare(HostSession session, Invocation invocation, InspectionControl control);
+        CompletionStage<ProviderResult> dispatch(HostSession session, Invocation invocation, InspectionControl control);
+        CompletionStage<ObjectNode> poll(HostSession session, String invocationId, InspectionControl control);
+        CompletionStage<ObjectNode> cancel(HostSession session, String invocationId, InspectionControl control);
     }
     /** 원래 요청의 기한과 해당 응답의 종료만 전달하며 별도 실행 권한을 주지 않는다. */
     public static final class InspectionControl {
@@ -69,10 +77,14 @@ public final class HostDispatcher {
     private final ContractJson contracts;
     private final HostRuntime runtime;
     private final Inspection inspection;
+    private final PurposeRoute purposeRoute;
     private final Clock clock;
     private final Set<HostSession> negotiated = ConcurrentHashMap.newKeySet();
     public HostDispatcher(ContractJson contracts, HostRuntime runtime, Inspection inspection, Clock clock) {
-        this.contracts = contracts; this.runtime = runtime; this.inspection = inspection; this.clock = clock;
+        this(contracts, runtime, inspection, clock, null);
+    }
+    public HostDispatcher(ContractJson contracts, HostRuntime runtime, Inspection inspection, Clock clock, PurposeRoute purposeRoute) {
+        this.contracts = contracts; this.runtime = runtime; this.inspection = inspection; this.clock = clock; this.purposeRoute = purposeRoute;
     }
     public CompletionStage<ObjectNode> handle(HostSession session, JsonNode value) {
         contracts.validate("HostRequest", value);
@@ -90,7 +102,8 @@ public final class HostDispatcher {
             throw new ContractException("HANDSHAKE_REQUIRED", "Exact host protocol handshake is required");
         }
         ObjectNode payload = ContractJson.object(request.get("payload"));
-        InspectionControl control = "inspect".equals(method)
+        InspectionControl control = ("inspect".equals(method) || purposeRoute != null
+                && Set.of("prepare", "dispatch", "operation.get", "operation.cancel").contains(method))
                 ? new InspectionControl(clock, deadline, now, admittedNanos, System::nanoTime) : null;
         CompletionStage<? extends JsonNode> result;
         switch (method) {
@@ -114,13 +127,25 @@ public final class HostDispatcher {
                 if (!invocation.contextId().equals(request.path("contextId").asText()) || invocation.deadlineAt().isAfter(deadline)) {
                     throw new ContractException("INVOCATION_PIN_MISMATCH", "Invocation context or deadline differs from its host envelope");
                 }
-                result = "dispatch".equals(method) ? runtime.dispatch(session, invocation).thenApply(report -> report.wire())
-                        : runtime.prepare(session, invocation);
+                if (purposeRoute == null) {
+                    result = "dispatch".equals(method) ? runtime.dispatch(session, invocation).thenApply(report -> report.wire())
+                            : runtime.prepare(session, invocation);
+                } else {
+                    control.checkpoint();
+                    result = "dispatch".equals(method) ? purposeRoute.dispatch(session, invocation, control).thenApply(report -> report.wire())
+                            : purposeRoute.prepare(session, invocation, control);
+                }
             }
             case "operation.get", "operation.cancel" -> {
                 exactFields(payload, Set.of("invocationId"));
-                result = "operation.get".equals(method) ? runtime.poll(session, string(payload, "invocationId"))
-                        : runtime.cancel(session, string(payload, "invocationId"));
+                if (purposeRoute == null) {
+                    result = "operation.get".equals(method) ? runtime.poll(session, string(payload, "invocationId"))
+                            : runtime.cancel(session, string(payload, "invocationId"));
+                } else {
+                    control.checkpoint();
+                    result = "operation.get".equals(method) ? purposeRoute.poll(session, string(payload, "invocationId"), control)
+                            : purposeRoute.cancel(session, string(payload, "invocationId"), control);
+                }
             }
             case "events.since" -> {
                 exactFields(payload, Set.of("sequence"));
