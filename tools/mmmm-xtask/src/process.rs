@@ -821,10 +821,10 @@ fn supervise_bound(
                 outcome.termination_reason = TerminationReason::SupervisorFailure;
             }
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let resource_observation_pending =
             failure_checks_active(&outcome, stopping_at) && process.resource_observation_pending();
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let resource_observation_pending = false;
         // A count-only empty observation cannot complete an unresolved RSS
         // sample. Keep the reservation until the next normally scheduled
@@ -2363,6 +2363,12 @@ mod native {
             &mut self,
             resources: Option<&mut darwin_resources::Sample>,
         ) -> Result<darwin_resources::GroupObservation, ProcessError> {
+            if self.reaped || !self.reservation_valid {
+                return Err(ProcessError::new(
+                    "process_identity",
+                    "reserved macOS leader is no longer held",
+                ));
+            }
             let Some(identity) = self.mac_leader_identity else {
                 self.reservation_valid = false;
                 return Err(ProcessError::new(
@@ -2372,6 +2378,7 @@ mod native {
             };
             let mut memory_exits = None;
             let mut pending = darwin_resources::PendingObservations::default();
+            let allow_missing = self.resources.missing_allowed();
             let result = live_group_members(
                 self.pid,
                 identity,
@@ -2379,6 +2386,8 @@ mod native {
                 resources,
                 &mut memory_exits,
                 &mut pending,
+                &mut self.resources.missing,
+                allow_missing,
             );
             // Retain native exit facts even if a later member/identity check
             // fails before this partial group sample can be completed.
@@ -2418,9 +2427,16 @@ mod native {
             })();
             result.map_err(|error| self.resources.with_linux_pending_diagnostics(error))
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         pub(super) fn resource_observation_pending(&self) -> bool {
-            self.resources.linux_pending()
+            #[cfg(target_os = "linux")]
+            {
+                self.resources.linux_pending()
+            }
+            #[cfg(target_os = "macos")]
+            {
+                self.resources.pending()
+            }
         }
         #[cfg(target_os = "linux")]
         fn linux_sample(
@@ -2670,6 +2686,8 @@ mod native {
         mut resources: Option<&mut darwin_resources::Sample>,
         memory_exits: &mut Option<darwin_resources::ExitObservationEvidence>,
         pending: &mut darwin_resources::PendingObservations,
+        missing: &mut darwin_resources::MissingMembers,
+        allow_missing: bool,
     ) -> Result<darwin_resources::GroupObservation, ProcessError> {
         #[link(name = "proc")]
         unsafe extern "C" {
@@ -2681,7 +2699,7 @@ mod native {
             ) -> i32;
         }
         let mut capacity = 1024usize;
-        let pids = loop {
+        let mut pids = loop {
             let mut pids = vec![0i32; capacity];
             let bytes =
                 unsafe { proc_listpids(1, 0, pids.as_mut_ptr().cast(), (capacity * 4) as i32) };
@@ -2712,6 +2730,13 @@ mod native {
             pids.truncate(bytes as usize / 4);
             break pids;
         };
+        // Reuse the existing leader branch after all member candidates. This
+        // changes scan order, not the native queries of a complete scan.
+        pids.sort_by_key(|pid| *pid == group);
+        let resource_scan = resources.is_some();
+        if resource_scan {
+            missing.begin_scan();
+        }
         let mut members = 0;
         let mut leader_seen = false;
         let result = (|| {
@@ -2784,6 +2809,14 @@ mod native {
                                         pending.record(diagnostic);
                                         leader_pending = true;
                                         None
+                                    }
+                                    darwin_resources::MemoryObservation::MissingAfterTaskExit(
+                                        diagnostic,
+                                    ) => {
+                                        return Err(diagnostic.attach(ProcessError::new(
+                                            "process_identity",
+                                            "reserved leader cannot use missing-member admission",
+                                        )));
                                     }
                                 }
                             }
@@ -2871,19 +2904,35 @@ mod native {
                     continue;
                 }
                 let session = unsafe { libc::getsid(pid) };
+                let latched = missing.contains_pid(pid as u32);
                 if session == -1 {
                     let error = std::io::Error::last_os_error();
                     if error.raw_os_error() == Some(libc::ESRCH) {
+                        if resource_scan && latched {
+                            missing.unavailable(pid as u32);
+                        }
                         continue;
                     }
                     return Err(ProcessError::io("observe macOS process session", error));
                 }
                 if session != group {
+                    if latched {
+                        return Err(ProcessError::new(
+                            "scope_escape",
+                            "latched Darwin member changed session",
+                        ));
+                    }
                     continue;
                 }
                 let Some(before) = mac_bsd_info(pid, false)? else {
+                    if resource_scan && latched {
+                        missing.unavailable(pid as u32);
+                    }
                     continue;
                 };
+                if latched {
+                    missing.verify(pid as u32, before.observation())?;
+                }
                 let memory = if resources.is_some() && before.status != 5 {
                     match memory_or_confirmed_zombie(pid, &before, None)? {
                         darwin_resources::MemoryObservation::Measured(memory) => Some(memory),
@@ -2902,19 +2951,68 @@ mod native {
                             pending.record(diagnostic);
                             None
                         }
+                        darwin_resources::MemoryObservation::MissingAfterTaskExit(diagnostic) => {
+                            darwin_resources::ExitObservationEvidence::record(
+                                memory_exits,
+                                diagnostic,
+                            );
+                            // The producer checked the actual current UID; the
+                            // scan supplies the original session/group binding.
+                            if before.pid != pid as u32 || before.pgid != group as u32 {
+                                return Err(diagnostic.attach(ProcessError::new(
+                                    "process_identity",
+                                    "missing Darwin member has no original owned identity",
+                                )));
+                            }
+                            missing.record(diagnostic)?;
+                            None
+                        }
                     }
                 } else {
                     None
                 };
                 let session_after = unsafe { libc::getsid(pid) };
-                if session_after == -1
-                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-                {
-                    continue;
+                if session_after == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::ESRCH) {
+                        if resource_scan {
+                            missing.unavailable(pid as u32);
+                        }
+                        continue;
+                    }
+                    if missing.contains_pid(pid as u32) {
+                        return Err(ProcessError::io(
+                            "observe latched Darwin member session",
+                            error,
+                        ));
+                    }
+                }
+                let latched = missing.contains_pid(pid as u32);
+                if latched && session_after != group {
+                    return Err(ProcessError::new(
+                        "scope_escape",
+                        "latched Darwin member changed session",
+                    ));
                 }
                 let Some(after) = mac_bsd_info(pid, false)? else {
+                    if resource_scan && latched {
+                        missing.unavailable(pid as u32);
+                    }
                     continue;
                 };
+                if latched {
+                    missing.verify(pid as u32, after.observation())?;
+                    if resource_scan
+                        && memory.is_none()
+                        && after.status != darwin_resources::SZOMB
+                        && after.flags & darwin_resources::PROC_FLAG_INEXIT == 0
+                    {
+                        return Err(ProcessError::new(
+                            "resource_observation",
+                            "latched Darwin member no longer has the observed exit transition",
+                        ));
+                    }
+                }
                 if session_after != group
                     || before.pid != pid as u32
                     || after.pid != pid as u32
@@ -2937,6 +3035,9 @@ mod native {
                     members += 1;
                     if let Some(memory) = memory {
                         verify_memory_identity(Some(&before), Some(&after), pid)?;
+                        if resource_scan {
+                            missing.measured(before.observation().identity);
+                        }
                         if let Some(sample) = resources.as_deref_mut() {
                             sample.push(memory)?;
                         }
@@ -2948,6 +3049,9 @@ mod native {
                     "process_identity",
                     "reserved macOS group leader missing from native snapshot",
                 ));
+            }
+            if resource_scan {
+                missing.admit(allow_missing, leader_seen && *reservation_valid, pending)?;
             }
             Ok(())
         })();
@@ -3016,6 +3120,18 @@ mod native {
             return Err(diagnostic(None).attach(darwin_resources::native_error(native)));
         }
         let after = mac_bsd_info(pid, true).map_err(|error| diagnostic(None).attach(error))?;
+        if reserved.is_none() && after.is_none() {
+            let uid = unsafe { libc::geteuid() };
+            if before.pid != pid as u32 || before.uid != uid {
+                return Err(diagnostic(None).attach(ProcessError::new(
+                    "resource_observation",
+                    "Darwin resource process identity changed or unavailable",
+                )));
+            }
+            // None is produced only by this actual native 0/ESRCH query. It is
+            // a deferred resource candidate, never a same-identity sandwich.
+            return darwin_resources::missing_after_task_exit(before.observation(), native);
+        }
         // The typed native result and actual same-birth BSD facts are both
         // retained. Classification can close a definitively lost reservation
         // before the original current-UID sandwich returns its primary error.

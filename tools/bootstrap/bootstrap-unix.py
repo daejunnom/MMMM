@@ -461,10 +461,27 @@ class DarwinProcessExited(RuntimeError):
         }
 
 
+class DarwinMissingAfterTaskExit:
+    """Private deferred resource facts, never an exit or ownership proof."""
+
+    def __init__(self, identity, observation):
+        self.identity, self.observation = identity, observation
+
+
+class DarwinPendingObservation:
+    """An incomplete whole scope has deliberately no numeric member count."""
+
+
 class NativeSnapshot:
     def __init__(self, target_os):
         self.target_os = target_os
         self.leader_start = None
+        self.leader_identity = None
+        self.last_attempt = None
+        self._held_leader = None
+        self._effective_uid = None
+        self._missing = {}
+        self._pending = False
         if target_os == "macos":
             self.libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
             self.libproc.proc_listpids.argtypes = [ctypes.c_uint32, ctypes.c_uint32,
@@ -495,6 +512,9 @@ class NativeSnapshot:
             values = self.memory_info(os.getpid())
             after = self.bsd_info(os.getpid())
             self.verify_memory_identity(before, after, os.getpid())
+            # Reuse the UID already checked by the native preflight sandwich;
+            # candidate/anchor validation must not add another native lookup.
+            self._effective_uid = before.uid
             self.check_resources(*values, 0)
             self.resources["preflight_self_adjusted_vm_bytes"] = values[0]
             self.resources["preflight_self_rss_bytes"] = values[1]
@@ -540,7 +560,7 @@ class NativeSnapshot:
         return task.virtual_size, max(task.resident_size, usage.resident_size), usage.phys_footprint
 
     def memory_or_confirmed_zombie(self, pid, before, reserved_leader,
-                                   leader_anchor_checked, leader_anchor_match):
+                                   leader_anchor_checked, leader_anchor_match, defer_missing=False):
         try:
             return self.memory_info(pid)
         except DarwinProcessExited as error:
@@ -562,6 +582,19 @@ class NativeSnapshot:
                 if after is not None:
                     observation["after_status"] = after.status
                     observation["after_inexit"] = bool(after.flags & PROC_FLAG_INEXIT)
+                elif defer_missing and not reserved_leader:
+                    # bsd_info None is exclusively the actual native 0/ESRCH
+                    # return, captured before another native operation can run.
+                    observation.update(after_bsd_kind="missing_esrch", after_bsd_native_result=0,
+                                       after_bsd_native_errno=errno.ESRCH,
+                                       pending_admission_anchor_match=None)
+                    if (error.observation["stage"] == "task_info"
+                            and error.observation["native_result"] == 0
+                            and error.observation["native_errno"] == errno.ESRCH
+                            and before is not None and before.pid == pid and before.pid != before.pgid
+                            and before.uid == self._effective_uid and before.status != 5
+                            and before.flags & PROC_FLAG_INEXIT):
+                        return DarwinMissingAfterTaskExit(self.bsd_identity(before), observation)
                 observation["memory_identity_check_performed"] = True
                 observation["memory_identity_match"] = False
                 self.verify_memory_identity(before, after, pid)
@@ -603,7 +636,39 @@ class NativeSnapshot:
         self.resources["max_observed_sample_gap_ms"] = max(
             self.resources["max_observed_sample_gap_ms"], int(gap * 1000))
         if gap > DARWIN_SAMPLE_GAP:
+            if self._missing:
+                raise RuntimeError("Darwin resource process identity changed or unavailable; "
+                                   "successful resource sample gap exceeded 1000ms")
             raise RuntimeError("Darwin successful resource sample gap exceeded 1000ms")
+
+    @staticmethod
+    def bsd_identity(info):
+        return info.pid, info.uid, info.pgid, info.start_sec, info.start_usec
+
+    def bind_reserved_leader(self, leader):
+        # Called only in the parent after its actual fork. No PID read DTO can
+        # adopt an unrelated row as an owned, unreaped child reservation.
+        if self._held_leader is not None:
+            raise RuntimeError("Darwin leader reservation was already bound")
+        self._held_leader = leader
+
+    def release_reserved_leader(self):
+        self._held_leader = None
+
+    def resource_due(self):
+        now = time.monotonic()
+        if self.last_sample is not None:
+            self.sample_gap(now, now)
+        previous = self.last_attempt if self.last_attempt is not None else self.last_sample
+        return previous is None or now - previous >= DARWIN_SAMPLE_TARGET
+
+    def normal_scope_empty(self, observation):
+        return not self._pending and not isinstance(observation, DarwinPendingObservation) and observation == 0
+
+    def verify_latched_member(self, pid, info):
+        old = self._missing.get(pid)
+        if old is not None and old["identity"] != self.bsd_identity(info):
+            raise RuntimeError("latched Darwin member identity changed")
 
     def observe(self, leader, resources=True):
         if self.target_os == "linux":
@@ -640,9 +705,12 @@ class NativeSnapshot:
                 raise RuntimeError("reserved leader missing from native snapshot")
             return count
         sample_started = time.monotonic()
-        sample_memory = resources and (self.last_sample is None or sample_started - self.last_sample >= DARWIN_SAMPLE_TARGET)
+        previous = self.last_attempt if self.last_attempt is not None else self.last_sample
+        sample_memory = resources and (previous is None or sample_started - previous >= DARWIN_SAMPLE_TARGET)
         if resources and self.last_sample is not None:
             self.sample_gap(sample_started, sample_started)
+        if sample_memory:
+            self.last_attempt = sample_started
         vm_peak, rss_sum, footprint_sum = 0, 0, 0
         capacity = 1024
         while True:
@@ -656,8 +724,16 @@ class NativeSnapshot:
                 raise RuntimeError("Darwin native PID snapshot bound exceeded")
             capacity = min(MAX_ENTRIES, capacity * 2)
         count, seen = 0, False
+        # Dict insertion order retains actual scan order for bounded first/last
+        # diagnostics, even when a prior latch was created in another order.
+        missing_this_scan = {}
+        fresh_missing = set()
+        known_workers = set()
         leader_anchor_checked, leader_anchor_match = False, None
-        for pid in pids[:size // 4]:
+        # Finish the existing leader branch after every deferred member. This
+        # reorders the captured PID list; it adds no retry or leader query.
+        ordered = sorted(pids[:size // 4], key=lambda pid: pid == leader)
+        for pid in ordered:
             if pid <= 0:
                 continue
             if pid == leader:
@@ -675,11 +751,16 @@ class NativeSnapshot:
                         or start != (after.start_sec, after.start_usec)
                         or self.leader_start is not None and self.leader_start != start):
                     raise RuntimeError("reserved Darwin leader changed identity")
+                identity = self.bsd_identity(before)
+                if (before.uid != self._effective_uid or self.bsd_identity(after) != identity
+                        or self.leader_identity is not None and self.leader_identity != identity):
+                    raise RuntimeError("reserved Darwin leader changed identity")
                 # The preceding, original short-circuit check reached its
                 # stored-anchor comparison only when an anchor already existed.
                 leader_anchor_checked = self.leader_start is not None
                 leader_anchor_match = True if leader_anchor_checked else None
                 self.leader_start, seen = start, True
+                self.leader_identity = identity
                 if values is not None:
                     self.verify_memory_identity(before, after, pid)
                     if after.status == 5:
@@ -693,22 +774,49 @@ class NativeSnapshot:
             try:
                 session = os.getsid(pid)
             except ProcessLookupError:
+                if sample_memory and pid in self._missing:
+                    missing_this_scan[pid] = None
                 continue
             if session != leader:
+                if pid in self._missing:
+                    raise RuntimeError("latched Darwin member changed session")
                 continue
             before = self.bsd_info(pid)
             if before is None:
+                if sample_memory and pid in self._missing:
+                    missing_this_scan[pid] = None
                 continue
+            self.verify_latched_member(pid, before)
             values = self.memory_or_confirmed_zombie(
-                pid, before, False, leader_anchor_checked, leader_anchor_match
+                pid, before, False, leader_anchor_checked, leader_anchor_match, defer_missing=True
             ) if sample_memory and before.status != 5 else None
+            if isinstance(values, DarwinMissingAfterTaskExit):
+                if before.pgid != leader:
+                    raise RuntimeError("missing Darwin member has no original owned identity")
+                if pid not in self._missing and len(self._missing) >= PROCESS_LIMIT + 1:
+                    raise RuntimeError("Darwin pending worker bound exceeded")
+                self._missing.setdefault(pid, {"identity": values.identity, "observation": values.observation})
+                self._missing[pid]["observation"] = values.observation
+                missing_this_scan[pid] = None
+                fresh_missing.add(pid)
+                values = None
             try:
                 session_after = os.getsid(pid)
             except ProcessLookupError:
+                if sample_memory and pid in self._missing:
+                    missing_this_scan[pid] = None
                 continue
+            if pid in self._missing and session_after != leader:
+                raise RuntimeError("latched Darwin member changed session")
             after = self.bsd_info(pid)
             if after is None:
+                if sample_memory and pid in self._missing:
+                    missing_this_scan[pid] = None
                 continue
+            if pid in self._missing:
+                self.verify_latched_member(pid, after)
+                if sample_memory and values is None and after.status != 5 and not after.flags & PROC_FLAG_INEXIT:
+                    raise RuntimeError("latched Darwin member no longer has the observed exit transition")
             if (session_after != leader or before.pid != pid or after.pid != pid
                     or (before.start_sec, before.start_usec) != (after.start_sec, after.start_usec)
                     or before.pgid != after.pgid):
@@ -717,8 +825,11 @@ class NativeSnapshot:
                 raise RuntimeError("owned Darwin session member changed process group")
             if after.pgid == leader and after.status != 5:
                 count += 1
+                known_workers.add(self.bsd_identity(after))
                 if values is not None:
                     self.verify_memory_identity(before, after, pid)
+                    if sample_memory:
+                        self._missing.pop(pid, None)
                     vm_peak = max(vm_peak, values[0])
                     rss_sum = checked_resource_sum(rss_sum, values[1])
                     footprint_sum = checked_resource_sum(footprint_sum, values[2])
@@ -726,6 +837,33 @@ class NativeSnapshot:
             raise RuntimeError("reserved Darwin leader missing from snapshot")
         if sample_memory:
             finished = time.monotonic()
+            if missing_this_scan:
+                if (self.resources["sample_count"] == 0 or self.last_sample is None
+                        or self._held_leader != leader or not seen or self.leader_identity is None):
+                    raise RuntimeError("Darwin resource process identity changed or unavailable")
+                for pid in missing_this_scan:
+                    # Keep the memory-boundary history unchanged. This later
+                    # admission proves only the held leader, not the missing
+                    # member's death or identity after the failed BSD query.
+                    admitted = dict(self._missing[pid]["observation"], pending_admission_anchor_match=True,
+                                    pending_admission_kind=("fresh_missing_after_task_exit" if pid in fresh_missing
+                                                            else "retained_missing_after_task_exit"))
+                    history = self.resources.get("pending_member_exit")
+                    if history is None:
+                        self.resources["pending_member_exit"] = {"observations": 1, "first": admitted, "last": admitted}
+                    else:
+                        history["observations"] = min(U64_MAX, history["observations"] + 1)
+                        history["last"] = admitted
+                workers = count + sum(entry["identity"] not in known_workers for entry in self._missing.values())
+                self.check_resources(vm_peak, rss_sum, footprint_sum, workers)
+                self.sample_gap(sample_started, finished)
+                self._pending = True
+                self.resources["incomplete_samples"] = min(U64_MAX, self.resources.get("incomplete_samples", 0) + 1)
+                return DarwinPendingObservation()
+            # A Pending window remains open even if this scan measured its
+            # last latched member. Reject late Complete before changing peaks.
+            if self._pending:
+                self.sample_gap(sample_started, finished)
             self.resources["sample_count"] += 1
             for name, value in (("peak_observed_adjusted_vm_bytes", vm_peak),
                                 ("peak_observed_aggregate_rss_bytes", rss_sum),
@@ -735,6 +873,8 @@ class NativeSnapshot:
             self.sample_gap(sample_started, finished)
             self.last_sample = finished
             self.check_resources(vm_peak, rss_sum, footprint_sum, count)
+            self._pending = False
+            self._missing.clear()
         return count
 
 
@@ -912,6 +1052,7 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
     for descriptor in (out_write, err_write, report_write, release_read, start_read):
         close(descriptor)
     errors, report, command_exit = [], bytearray(), None
+    snapshot.bind_reserved_leader(leader)
     ready, approved, killed, drained, empty = False, False, False, False, 0
     resource_proved = target_os != "macos"
     started, observed, kill_started = time.monotonic(), time.monotonic(), None
@@ -922,11 +1063,11 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
 
     def checkpoint():
         # A cooperative checkpoint observes the complete native owned scope.
-        # Its throttle uses only the last successfully completed resource
-        # sample; a blocked syscall or late sample still fails the 1s limit.
+        # Attempts keep the existing 100ms cadence; freshness still uses only
+        # the last successful complete sample and its original 1s limit.
         if target_os != "macos" or not approved or killed:
             return
-        if snapshot.last_sample is None or time.monotonic() - snapshot.last_sample >= DARWIN_SAMPLE_TARGET:
+        if snapshot.resource_due():
             native_call("observe resources during bounded parent work", snapshot.observe, leader, True)
         if cancelled:
             if "command cancelled" not in errors:
@@ -992,15 +1133,17 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
                 observed = time.monotonic()
             if ready:
                 members = native_call("observe reserved session membership", snapshot.observe, leader, not killed)
+                if isinstance(members, DarwinPendingObservation):
+                    members = None
                 if not approved and not errors and resource_proved:
                     native_call("admit verified session build worker", os.write, start_write, b"x")
                     close(start_write)
                     approved = True
-                if members > PROCESS_LIMIT and "owned process limit exceeded" not in errors:
+                if members is not None and members > PROCESS_LIMIT and "owned process limit exceeded" not in errors:
                     errors.append("owned process limit exceeded")
                 if not resource_proved and now - started >= 5:
                     raise RuntimeError("Darwin address space limit proof unavailable before admission")
-                if command_exit is not None and members and not killed:
+                if command_exit is not None and members is not None and members and not killed:
                     if tail_started is None:
                         tail_started = now
                     if now - tail_started >= 2:
@@ -1014,7 +1157,7 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
                             errors.append("command left running owned descendants")
                 pipes_closed = all(key.data == 2 for key in selector.get_map().values())
                 if command_exit is not None or killed:
-                    empty = empty + 1 if members == 0 and pipes_closed else 0
+                    empty = empty + 1 if members == 0 and pipes_closed and (killed or snapshot.normal_scope_empty(members)) else 0
                     if empty >= 2:
                         drained = True
                         break
@@ -1038,6 +1181,7 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
                 finished, _ = native_call("reap drained session leader", os.waitpid, leader, os.WNOHANG)
                 if finished == leader:
                     reaped = True
+                    snapshot.release_reserved_leader()
                     break
                 if time.monotonic() >= deadline:
                     drained = False
@@ -1090,6 +1234,8 @@ def supervise(program, args, cwd, environment, stdout, stderr, timeout, observe,
                         drained = True
                         finished, _ = native_call("reap errored session leader", os.waitpid, leader, os.WNOHANG)
                         reaped = finished == leader
+                        if reaped:
+                            snapshot.release_reserved_leader()
                         if not reaped:
                             drained = False
                             errors.append("terminated reserved leader was not reapable")

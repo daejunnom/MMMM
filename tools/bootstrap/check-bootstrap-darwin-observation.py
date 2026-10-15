@@ -43,7 +43,7 @@ def load_production():
     }
     definitions = {
         "BsdInfo", "TaskInfo", "RusageInfoV0", "DarwinProcessExited", "NativeSnapshot",
-        "native_call", "checked_resource_sum",
+        "DarwinMissingAfterTaskExit", "DarwinPendingObservation", "native_call", "checked_resource_sum",
     }
     selected = []
     found = set()
@@ -88,9 +88,11 @@ def bsd(namespace, pid=MEMBER, status=2, flags=4, **changes):
 
 
 class FakeLibproc:
-    def __init__(self, namespace, mode, after, failure_pid=MEMBER, pids=()):
+    def __init__(self, namespace, mode, after, failure_pid=MEMBER, pids=(), bsd_rows=None):
         self.namespace, self.mode, self.after = namespace, mode, after
         self.failure_pid, self.pids, self.calls = failure_pid, pids, []
+        self.bsd_rows = {pid: list(rows) for pid, rows in (bsd_rows or {}).items()}
+        self.queries = []
 
     def proc_listpids(self, _kind, _argument, buffer, _size):
         self.calls.append("list_pids")
@@ -99,9 +101,12 @@ class FakeLibproc:
         return 4 * len(self.pids)
 
     def proc_pidinfo(self, pid, flavor, _argument, buffer, _size):
+        self.queries.append((pid, flavor))
         if flavor == 3:
             self.calls.append("bsd_info")
-            value = self.after if pid == self.failure_pid else bsd(self.namespace, pid=pid, flags=0)
+            rows = self.bsd_rows.get(pid)
+            value = rows.pop(0) if rows else (
+                self.after if pid == self.failure_pid else bsd(self.namespace, pid=pid, flags=0))
             if value is None:
                 ctypes.set_errno(errno.ESRCH)
                 return 0
@@ -115,8 +120,8 @@ class FakeLibproc:
         require(flavor == 4, "unexpected native flavor in pure fixture")
         self.calls.append("task_info")
         mode = self.mode if pid == self.failure_pid else {}
-        buffer._obj.virtual_size = 4096
-        buffer._obj.resident_size = 512
+        buffer._obj.virtual_size = mode.get("vm", 4096)
+        buffer._obj.resident_size = mode.get("rss", 512)
         ctypes.set_errno(mode.get("task_errno", 0))
         return mode.get("task_size", ctypes.sizeof(self.namespace["TaskInfo"]))
 
@@ -135,6 +140,9 @@ class FakeLibproc:
 def snapshot(namespace, mode, after, **options):
     value = namespace["NativeSnapshot"].__new__(namespace["NativeSnapshot"])
     value.target_os, value.leader_start, value.last_sample = "macos", None, None
+    value.leader_identity, value.last_attempt, value._held_leader = None, None, None
+    value._effective_uid = MOCK_UID
+    value._missing, value._pending = {}, False
     value.resources = {
         "sample_count": 0, "max_observed_sample_gap_ms": 0,
         "peak_observed_adjusted_vm_bytes": 0, "peak_observed_aggregate_rss_bytes": 0,
@@ -149,6 +157,190 @@ def capture(function):
         return function(), None
     except RuntimeError as error:
         return None, str(error)
+
+
+def owned_scope(namespace):
+    # Reuse the same fake native boundary and actual reducer for prior Complete;
+    # no hand-authored counter or caller DTO can substitute for that observation.
+    clock = [10.0]
+    namespace["time"].monotonic = lambda: clock[0]
+    native = snapshot(namespace, {}, bsd(namespace, flags=0), pids=(LEADER, MEMBER))
+    native.bind_reserved_leader(LEADER)
+    require(native.observe(LEADER, True) == 1 and native.resources["sample_count"] == 1,
+            "prior owned complete fixture failed")
+    native.libproc.calls.clear()
+    native.libproc.queries.clear()
+    clock[0] = 10.125
+    return native, clock
+
+
+def missing_scope(namespace):
+    native, clock = owned_scope(namespace)
+    native.libproc.mode = {"task_size": 0, "task_errno": errno.ESRCH}
+    native.libproc.after = None
+    native.libproc.bsd_rows = {MEMBER: [bsd(namespace), None, None]}
+    return native, clock
+
+
+def missing_cases(namespace):
+    pending_type = namespace["DarwinPendingObservation"]
+    native, clock = missing_scope(namespace)
+    result = native.observe(LEADER, True)
+    require(isinstance(result, pending_type) and not native.normal_scope_empty(result),
+            "missing resource observation became numeric count or drain")
+    require(native.resources["sample_count"] == 1 and native.last_sample == 10.0 and native._pending,
+            "Pending refreshed successful count or timestamp")
+    facts = native.resources["native_memory_exits"]["last"]
+    require(set(facts) == FIELDS | {"after_bsd_kind", "after_bsd_native_result", "after_bsd_native_errno",
+                                   "pending_admission_anchor_match"}, "missing facts are not closed")
+    require((facts["after_bsd_kind"], facts["after_bsd_native_result"], facts["after_bsd_native_errno"]) ==
+            ("missing_esrch", 0, errno.ESRCH), "actual missing BSD result lost")
+    require(facts["after_status"] is None and facts["memory_identity_check_performed"] is False and
+            facts["memory_identity_match"] is None and facts["leader_anchor_check_performed"] is False and
+            facts["leader_anchor_match"] is None and facts["pending_admission_anchor_match"] is None,
+            "missing boundary invented an identity or earlier anchor comparison")
+    history = native.resources["pending_member_exit"]
+    require(history["last"]["pending_admission_anchor_match"] is True and history["observations"] == 1 and
+            history["last"]["pending_admission_kind"] == "fresh_missing_after_task_exit",
+            "later held leader admission was not recorded separately")
+    encoded = json.dumps({"native": native.resources["native_memory_exits"], "pending": history}, separators=(",", ":"))
+    require(len(encoded) < 8192, "missing history exceeded its closed bounded shape")
+    for identity in (LEADER, MEMBER, MOCK_UID, *MOCK_BIRTH):
+        require(str(identity) not in encoded, "private pending identity entered shared history")
+    require(native.libproc.queries[-1] == (LEADER, 3) and
+            native.libproc.queries[0] == (MEMBER, 3), "leader branch did not finish captured scan")
+    previous_calls = len(native.libproc.calls)
+    clock[0] = 10.224
+    require(not native.resource_due(), "Pending triggered an immediate same-read retry")
+    require(native.observe(LEADER, True) == 0 and native._missing and native._pending and
+            not native.normal_scope_empty(0), "NotDue membership scan cleared missing latch or reap fence")
+    require(native.observe(LEADER, False) == 0 and native._missing and native._pending and
+            not native.normal_scope_empty(0), "membership-only cleanup observation cleared normal reap fence")
+    require("task_info" not in native.libproc.calls[previous_calls:], "NotDue added memory queries")
+    clock[0] = 10.226
+    require(native.resource_due(), "Pending attempt cadence was extended")
+    require(isinstance(native.observe(LEADER, True), pending_type) and
+            history["observations"] == 2 and native.last_sample == 10.0 and
+            history["last"]["pending_admission_kind"] == "retained_missing_after_task_exit" and
+            native.resources["native_memory_exits"]["observations"] == 1,
+            "later unavailable same candidate lost bounded history or reset Complete age")
+    clock[0] = 11.001
+    _, error = capture(native.resource_due)
+    require(error is not None and "1000ms" in error and native.resources["sample_count"] == 1,
+            "original complete gap was reset by Pending")
+
+    for failure in ("initial", "reservation", "leader", "flags", "uid", "group", "rusage", "malformed",
+                    "permission", "after_unknown", "after_identity", "outer_unknown", "outer_identity"):
+        native, _ = missing_scope(namespace)
+        if failure == "initial":
+            native.resources["sample_count"], native.last_sample = 0, None
+        elif failure == "reservation":
+            native.release_reserved_leader()
+        elif failure == "leader":
+            native.libproc.bsd_rows[LEADER] = [bsd(namespace, pid=LEADER), bsd(namespace, pid=LEADER, start_usec=1)]
+        elif failure in ("flags", "uid", "group"):
+            changes = {"flags": {"flags": 0}, "uid": {"uid": MOCK_UID + 1}, "group": {"pgid": MEMBER}}[failure]
+            native.libproc.bsd_rows[MEMBER][0] = bsd(namespace, **changes)
+        elif failure == "rusage":
+            native.libproc.mode = {"usage_result": -1, "usage_errno": errno.ESRCH}
+        elif failure == "malformed":
+            native.libproc.mode = {"task_size": 8, "task_errno": errno.ESRCH}
+        elif failure == "permission":
+            native.libproc.mode = {"task_size": 0, "task_errno": errno.EPERM}
+        elif failure == "after_unknown":
+            native.libproc.bsd_rows[MEMBER][1] = "unavailable"
+        elif failure == "after_identity":
+            native.libproc.bsd_rows[MEMBER][1] = bsd(namespace, start_usec=1)
+        elif failure == "outer_unknown":
+            native.libproc.bsd_rows[MEMBER][2] = "unavailable"
+        else:
+            native.libproc.bsd_rows[MEMBER][2] = bsd(namespace, uid=MOCK_UID + 1)
+        _, error = capture(lambda: native.observe(LEADER, True))
+        require(error is not None and native.resources["sample_count"] <= 1 and
+                "pending_member_exit" not in native.resources, "unsafe missing condition was admitted: " + failure)
+        if failure in ("leader", "initial", "reservation", "group"):
+            require(native.resources["native_memory_exits"]["observations"] == 1,
+                    "later hard failure lost original native exit facts")
+
+    for changed in ("identity", "pid", "session"):
+        for mode in ("resource", "not_due", "membership"):
+            native, clock = missing_scope(namespace)
+            native.observe(LEADER, True)
+            clock[0] = 10.224 if mode == "not_due" else 10.25
+            if changed == "identity":
+                native.libproc.bsd_rows[MEMBER] = [bsd(namespace, start_sec=1)]
+            elif changed == "pid":
+                native.libproc.bsd_rows[MEMBER] = [bsd(namespace, pid=MEMBER + 1)]
+            else:
+                namespace["os"].getsid = lambda pid: LEADER + 1 if pid == MEMBER else LEADER
+            try:
+                _, error = capture(lambda: native.observe(LEADER, mode != "membership"))
+                require(error is not None and "latched Darwin member" in error and native._pending,
+                        "latched identity or foreign session was silently skipped")
+            finally:
+                namespace["os"].getsid = lambda _pid: LEADER
+
+    native, clock = missing_scope(namespace)
+    native.observe(LEADER, True)
+    clock[0] = 10.25
+    native.libproc.mode = {"rss": namespace["MEMORY_LIMIT"] + 1}
+    native.libproc.bsd_rows = {MEMBER: [bsd(namespace, flags=0), None]}
+    require(isinstance(native.observe(LEADER, True), pending_type) and native._missing and
+            native.resources["sample_count"] == 1 and native.last_sample == 10.0 and
+            native.resources["peak_observed_aggregate_rss_bytes"] == 1536 and
+            native.resources["native_memory_exits"]["observations"] == 1,
+            "memory without after identity became an owned value, zero, or fresh native exit")
+
+    for resolution in ("measured", "absent", "late"):
+        native, clock = missing_scope(namespace)
+        native.observe(LEADER, True)
+        clock[0] = 10.25
+        native.libproc.mode = {}
+        native.libproc.after = bsd(namespace, flags=0)
+        native.libproc.bsd_rows.clear()
+        if resolution == "absent":
+            native.libproc.pids = (LEADER,)
+        if resolution == "late":
+            # Begin within the original window, finish after it. The real
+            # reducer must reject before count/peak/last-success mutation.
+            times = iter((10.9, 11.001))
+            namespace["time"].monotonic = lambda: next(times)
+        result, error = capture(lambda: native.observe(LEADER, True))
+        if resolution == "late":
+            require(error is not None and "1000ms" in error and native._pending and
+                    native.resources["sample_count"] == 1 and native.last_sample == 10.0,
+                    "late Complete changed metrics or cleared normal reap fence")
+        else:
+            require(error is None and result == (0 if resolution == "absent" else 1) and
+                    not native._pending and not native._missing and native.resources["sample_count"] == 2,
+                    "actual full Complete did not resolve missing latch")
+
+    for bound in ("rss", "vm", "workers", "latch"):
+        native, _ = missing_scope(namespace)
+        if bound in ("rss", "vm"):
+            # A different actually measured row exceeds the unchanged budget;
+            # the missing member cannot replace its usage with zero.
+            native.libproc.failure_pid = LEADER
+            native.libproc.after = bsd(namespace, pid=LEADER, flags=0)
+            native.libproc.mode = {bound: namespace["MEMORY_LIMIT" if bound == "rss" else "DARWIN_VM_LIMIT"] + 1}
+            original = native.memory_info
+            def observe_memory(pid):
+                if pid == MEMBER:
+                    raise namespace["DarwinProcessExited"]("fixture task exit", "task_info", 0, errno.ESRCH)
+                return original(pid)
+            native.memory_info = observe_memory
+        elif bound == "workers":
+            others = tuple(range(MEMBER + 1, MEMBER + namespace["PROCESS_LIMIT"] + 1))
+            native.libproc.pids = (LEADER, MEMBER, *others)
+        else:
+            prototype = {"identity": native.bsd_identity(bsd(namespace)), "observation": {}}
+            native._missing = {pid: dict(prototype, identity=(pid, MOCK_UID, LEADER, *MOCK_BIRTH))
+                               for pid in range(MEMBER + 1, MEMBER + namespace["PROCESS_LIMIT"] + 2)}
+        _, error = capture(lambda: native.observe(LEADER, True))
+        require(error is not None and ("budget exceeded" in error or "bound exceeded" in error) and
+                native.resources["sample_count"] == 1 and native.last_sample == 10.0,
+                "partial usage or unique pending workers bypassed original cap")
+    namespace["time"].monotonic = lambda: 10.0
 
 
 def run():
@@ -229,7 +421,7 @@ def run():
 
     contexts = [
         ((MEMBER, LEADER), MOCK_BIRTH, MEMBER, False, None),
-        ((LEADER, MEMBER), MOCK_BIRTH, MEMBER, True, True),
+        ((LEADER, MEMBER), MOCK_BIRTH, MEMBER, False, None),
         ((LEADER, MEMBER), None, MEMBER, False, None),
         ((LEADER, MEMBER), (1, 2), LEADER, False, None),
     ]
@@ -241,7 +433,7 @@ def run():
         require(error == UNCONFIRMED, "memory exit no longer fails before the original anchor check")
         facts = native.resources["native_memory_exits"]["last"]
         require((facts["leader_anchor_check_performed"], facts["leader_anchor_match"]) ==
-                (checked, matched), "anchor reachability facts do not follow the actual PID order")
+                (checked, matched), "memory boundary claimed the later leader-last anchor")
         require(native.resources["sample_count"] == 0, "partial scope became a complete sample")
 
     native = snapshot(namespace, exits[0][0], before)
@@ -270,10 +462,14 @@ def run():
         require(str(value) not in encoded, "raw native identity or timestamp escaped into evidence")
     require(len(encoded) < 8192 and set(history["first"]) == set(history["last"]) == FIELDS,
             "diagnostic history is not a closed bounded record")
+    missing_cases(namespace)
     print(json.dumps({"schema": "mmmm-bootstrap-darwin-pure/1", "exit_source_role_cases": 6,
                       "strict_failure_cases": 4, "live_case": 1, "confirmation_cases": 4,
                       "complete_scope_case": 1, "anchor_order_cases": 4, "history_case": 1,
-                      "error_cleanup_case": 1, "native_execution": False},
+                      "error_cleanup_case": 1, "missing_pending_case": 1, "missing_rejection_cases": 13,
+                      "latched_identity_cases": 9, "unattributed_memory_case": 1,
+                      "missing_resolution_cases": 3, "missing_budget_cases": 4,
+                      "native_execution": False},
                      separators=(",", ":")))
 
 

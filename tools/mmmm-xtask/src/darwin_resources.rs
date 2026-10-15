@@ -21,7 +21,7 @@ const MAX_GAP: Duration = Duration::from_secs(1);
 const DARWIN_ESRCH: i32 = 3;
 // Apple XNU xnu-11417.140.69 bsd/sys/proc_info.h, pbi_flags.
 // PROC_FLAG_INEXIT = 4 means the process is working its way through exit().
-const PROC_FLAG_INEXIT: u32 = 4;
+pub(super) const PROC_FLAG_INEXIT: u32 = 4;
 pub(super) const SZOMB: u32 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,6 +160,16 @@ pub(super) struct LeaderDiagnostic {
     memory_role: Option<MemoryRole>,
     memory_task_lower_bound: Option<TaskMemoryLowerBound>,
     memory_rusage_timestamps: Option<RusageTimestamps>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after_bsd_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after_bsd_native_result: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after_bsd_native_errno: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_admission_anchor_match: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_admission_kind: Option<&'static str>,
     #[serde(skip)]
     pending_worker: Option<PendingWorkerIdentity>,
 }
@@ -191,6 +201,11 @@ impl LeaderDiagnostic {
             memory_role: None,
             memory_task_lower_bound: None,
             memory_rusage_timestamps: None,
+            after_bsd_kind: None,
+            after_bsd_native_result: None,
+            after_bsd_native_errno: None,
+            pending_admission_anchor_match: None,
+            pending_admission_kind: None,
             pending_worker: None,
         }
     }
@@ -259,6 +274,16 @@ impl fmt::Display for LeaderDiagnostic {
                 timestamps.start_observed, timestamps.exit_observed
             )?;
         }
+        if let Some(kind) = self.after_bsd_kind {
+            write!(
+                f,
+                ",after_bsd_kind={kind},after_bsd_native_result={:?},after_bsd_native_errno={:?},pending_admission_anchor_match={:?},pending_admission_kind={:?}",
+                self.after_bsd_native_result,
+                self.after_bsd_native_errno,
+                self.pending_admission_anchor_match,
+                self.pending_admission_kind
+            )?;
+        }
         Ok(())
     }
 }
@@ -274,6 +299,195 @@ pub(super) enum MemoryObservation {
     Measured(Memory),
     Zombie(LeaderDiagnostic),
     Pending(LeaderDiagnostic),
+    // Only the actual BSD query's 0/ESRCH path may produce this candidate.
+    // The group reducer must still validate its held leader before admission.
+    MissingAfterTaskExit(LeaderDiagnostic),
+}
+
+#[derive(Clone, Copy)]
+struct MissingMember {
+    diagnostic: LeaderDiagnostic,
+    fresh: bool,
+}
+/// A bounded, private uncertainty latch, never a process or signal authority.
+/// Birth/PID values are used only for equality and never leave this type.
+pub(super) struct MissingMembers {
+    entries: [Option<MissingMember>; WORKER_LIMIT + 1],
+    current: PendingWorkers,
+}
+impl Default for MissingMembers {
+    fn default() -> Self {
+        Self {
+            entries: [None; WORKER_LIMIT + 1],
+            current: PendingWorkers::default(),
+        }
+    }
+}
+impl MissingMembers {
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.iter().all(Option::is_none)
+    }
+    pub(super) fn begin_scan(&mut self) {
+        self.current = PendingWorkers::default();
+        for entry in self.entries.iter_mut().flatten() {
+            entry.fresh = false;
+        }
+    }
+    pub(super) fn contains_pid(&self, pid: u32) -> bool {
+        self.entries.iter().flatten().any(|entry| {
+            entry
+                .diagnostic
+                .pending_worker
+                .is_some_and(|id| id.0.pid == pid)
+        })
+    }
+    pub(super) fn verify(&self, pid: u32, before: LeaderBsd) -> Result<(), ProcessError> {
+        if self.entries.iter().flatten().any(|entry| {
+            entry
+                .diagnostic
+                .pending_worker
+                .is_some_and(|id| id.0.pid == pid && id.0 != before.identity)
+        }) {
+            return Err(ProcessError::new(
+                "process_identity",
+                "latched Darwin member identity changed",
+            ));
+        }
+        Ok(())
+    }
+    pub(super) fn unavailable(&mut self, pid: u32) {
+        for entry in self.entries.iter_mut().flatten() {
+            if let Some(identity) = entry.diagnostic.pending_worker.filter(|id| id.0.pid == pid) {
+                let _ = self.current.record(identity, None);
+            }
+        }
+    }
+    pub(super) fn record(&mut self, diagnostic: LeaderDiagnostic) -> Result<(), ProcessError> {
+        let identity = diagnostic.pending_worker.ok_or_else(sum_overflow)?;
+        for entry in self.entries.iter_mut().flatten() {
+            if entry.diagnostic.pending_worker == Some(identity) {
+                entry.diagnostic = diagnostic;
+                entry.fresh = true;
+                let _ = self.current.record(identity, None);
+                return Ok(());
+            }
+        }
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.is_none())
+            .ok_or_else(sum_overflow)?;
+        *entry = Some(MissingMember {
+            diagnostic,
+            fresh: true,
+        });
+        let _ = self.current.record(identity, None);
+        Ok(())
+    }
+    pub(super) fn measured(&mut self, identity: LeaderIdentity) {
+        for entry in &mut self.entries {
+            if entry.is_some_and(|entry| {
+                entry.diagnostic.pending_worker == Some(PendingWorkerIdentity(identity))
+            }) {
+                *entry = None;
+            }
+        }
+        if let Some(index) = self.current.entries[..self.current.len]
+            .iter()
+            .position(|worker| {
+                worker.is_some_and(|worker| worker.identity == PendingWorkerIdentity(identity))
+            })
+        {
+            self.current
+                .entries
+                .copy_within(index + 1..self.current.len, index);
+            self.current.len -= 1;
+            self.current.entries[self.current.len] = None;
+        }
+    }
+    pub(super) fn admit(
+        &self,
+        allowed: bool,
+        anchor_verified: bool,
+        pending: &mut PendingObservations,
+    ) -> Result<(), ProcessError> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        // Preserve this scan's actual observation order in first/last facts,
+        // independently of the order in which older latch entries originated.
+        for worker in self.current.entries[..self.current.len].iter().flatten() {
+            let entry = self
+                .entries
+                .iter()
+                .flatten()
+                .find(|entry| entry.diagnostic.pending_worker == Some(worker.identity))
+                .ok_or_else(sum_overflow)?;
+            if !allowed || !anchor_verified {
+                return Err(entry.diagnostic.attach(ProcessError::new(
+                    "resource_observation",
+                    "Darwin resource process identity changed or unavailable",
+                )));
+            }
+            let mut diagnostic = entry.diagnostic;
+            diagnostic.pending_admission_anchor_match = Some(true);
+            diagnostic.pending_admission_kind = Some(if entry.fresh {
+                "fresh_missing_after_task_exit"
+            } else {
+                "retained_missing_after_task_exit"
+            });
+            pending.record(diagnostic);
+        }
+        if pending.last().is_some() {
+            // Include unresolved earlier identities conservatively. A measured
+            // same identity was removed above; absent rows clear only at Complete.
+            for entry in self.entries.iter().flatten() {
+                if let Some(identity) = entry.diagnostic.pending_worker {
+                    let _ = pending.workers.record(identity, None);
+                }
+            }
+        }
+        Ok(())
+    }
+    fn clear(&mut self) {
+        self.entries.fill(None);
+        self.current = PendingWorkers::default();
+    }
+}
+
+/// Separate producer entry for actual BSD MissingEsrch. Ordinary Option::None
+/// in classify_memory_exit retains its strict historical meaning.
+pub(super) fn missing_after_task_exit(
+    before: LeaderBsd,
+    native: MemoryFailure,
+) -> Result<MemoryObservation, ProcessError> {
+    let mut diagnostic = LeaderDiagnostic::observe(
+        before.identity,
+        Some(before),
+        None,
+        LeaderPhase::MemoryResult,
+        LeaderSession::NotObserved,
+    )
+    .with_memory_error(native, false);
+    diagnostic.after_bsd_kind = Some("missing_esrch");
+    diagnostic.after_bsd_native_result = Some(0);
+    diagnostic.after_bsd_native_errno = Some(DARWIN_ESRCH);
+    if native.failure == NativeResourceFailure::Exited
+        && native.stage == NativeResourceStage::TaskInfo
+        && native.native_result == 0
+        && native.native_errno == DARWIN_ESRCH
+        && before.identity.pid != before.identity.pgid
+        && before.status != SZOMB
+        && before.flags & PROC_FLAG_INEXIT != 0
+    {
+        return Ok(MemoryObservation::MissingAfterTaskExit(
+            diagnostic.with_pending_worker(before.identity),
+        ));
+    }
+    Err(diagnostic.attach(ProcessError::new(
+        "resource_observation",
+        "Darwin resource process identity changed or unavailable",
+    )))
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum GroupObservation {
@@ -617,6 +831,8 @@ pub(super) struct Tracker {
     pub(super) evidence: Evidence,
     last_success: Instant,
     last_attempt: Option<Instant>,
+    pub(super) missing: MissingMembers,
+    pending: bool,
 }
 impl Tracker {
     pub(super) fn new(preflight: Memory) -> Result<Self, ProcessError> {
@@ -626,6 +842,8 @@ impl Tracker {
         Ok(Self {
             last_success: Instant::now(),
             last_attempt: None,
+            missing: MissingMembers::default(),
+            pending: false,
             evidence: Evidence {
                 policy: "managed-darwin-resources/1",
                 configured_rlimit_as_bytes: VM_LIMIT,
@@ -697,6 +915,10 @@ impl Tracker {
     }
     pub(super) fn finish(&mut self, sample: Sample) -> Result<(), ProcessError> {
         let finished = Instant::now();
+        // A late complete observation cannot refresh a missing-member window.
+        if self.pending {
+            self.gap(finished)?;
+        }
         self.evidence.sample_count += 1;
         self.evidence.peak_observed_adjusted_vm_bytes = self
             .evidence
@@ -715,7 +937,10 @@ impl Tracker {
         // Preserve a complete observed sample even when its freshness fails.
         self.gap(finished)?;
         self.last_success = finished;
-        sample.check()
+        sample.check()?;
+        self.pending = false;
+        self.missing.clear();
+        Ok(())
     }
     pub(super) fn finish_observation(
         &mut self,
@@ -728,6 +953,7 @@ impl Tracker {
                 Ok(ResourceObservation::Complete)
             }
             GroupObservation::Pending(observations) => {
+                self.pending = true;
                 self.record_pending_observations(*observations);
                 // Other observed members still provide a lower bound: a known
                 // over-budget partial sample remains fatal. No partial sample
@@ -745,6 +971,12 @@ impl Tracker {
                 Ok(ResourceObservation::Pending)
             }
         }
+    }
+    pub(super) fn missing_allowed(&self) -> bool {
+        self.evidence.sample_count != 0
+    }
+    pub(super) fn pending(&self) -> bool {
+        self.pending
     }
     pub(super) fn record_pending_observations(&mut self, observations: PendingObservations) {
         if let Some(leader) = observations.leader {
@@ -955,6 +1187,297 @@ mod tests {
     }
     fn observed_member_pending_diagnostic() -> LeaderDiagnostic {
         member_memory_pending(18, native_exit_results()[0])
+    }
+    fn missing_member_candidate(pid: u32) -> LeaderDiagnostic {
+        let before = LeaderBsd {
+            identity: LeaderIdentity {
+                pid,
+                ..reserved_leader().identity
+            },
+            flags: PROC_FLAG_INEXIT,
+            ..reserved_leader()
+        };
+        let MemoryObservation::MissingAfterTaskExit(diagnostic) =
+            missing_after_task_exit(before, native_exit_results()[0].into()).unwrap()
+        else {
+            panic!("actual missing member was not a deferred candidate")
+        };
+        diagnostic
+    }
+    #[test]
+    fn missing_after_task_exit_requires_the_exact_nonleader_native_result() {
+        let diagnostic = missing_member_candidate(18);
+        assert_eq!(diagnostic.after_bsd_kind, Some("missing_esrch"));
+        assert_eq!(diagnostic.after_bsd_native_result, Some(0));
+        assert_eq!(diagnostic.after_bsd_native_errno, Some(DARWIN_ESRCH));
+        assert_eq!(diagnostic.pending_admission_anchor_match, None);
+        assert_eq!(diagnostic.after_status, None);
+        assert_eq!(diagnostic.memory_role, Some(MemoryRole::ObservedMember));
+        let before = LeaderBsd {
+            identity: LeaderIdentity {
+                pid: 18,
+                ..reserved_leader().identity
+            },
+            flags: PROC_FLAG_INEXIT,
+            ..reserved_leader()
+        };
+        // Bare None remains unavailable. Only the producer reached after an
+        // actual BSD 0/ESRCH can construct the separate deferred variant.
+        assert!(classify_memory_exit(None, before, None, native_exit_results()[0]).is_err());
+        for native in [
+            native_exit_results()[1],
+            native_exit_results()[2],
+            NativeResourceError {
+                native_errno: 1,
+                ..native_exit_results()[0]
+            },
+            NativeResourceError {
+                native_result: -1,
+                ..native_exit_results()[0]
+            },
+            NativeResourceError {
+                failure: NativeResourceFailure::Malformed,
+                ..native_exit_results()[0]
+            },
+        ] {
+            let error = missing_after_task_exit(before, native.into()).unwrap_err();
+            assert!(
+                error
+                    .message
+                    .contains("Darwin resource process identity changed or unavailable")
+            );
+            assert!(
+                error
+                    .message
+                    .contains(&format!("memory_native_errno={}", native.native_errno))
+            );
+        }
+        for invalid in [
+            LeaderBsd { flags: 0, ..before },
+            LeaderBsd {
+                status: SZOMB,
+                ..before
+            },
+            LeaderBsd {
+                identity: reserved_leader().identity,
+                ..before
+            },
+        ] {
+            assert!(missing_after_task_exit(invalid, native_exit_results()[0].into()).is_err());
+        }
+        let encoded = serde_json::to_string(&diagnostic).unwrap();
+        for forbidden in [
+            "pending_worker",
+            "start_sec",
+            "start_usec",
+            "uid",
+            "pid",
+            "pgid",
+        ] {
+            assert!(!encoded.contains(forbidden));
+        }
+    }
+    #[test]
+    fn missing_member_latch_requires_fresh_admission_and_never_adopts_reused_identity() {
+        let diagnostic = missing_member_candidate(18);
+        let identity = diagnostic.pending_worker.unwrap().0;
+        let mut latch = MissingMembers::default();
+        latch.record(diagnostic).unwrap();
+        latch.record(diagnostic).unwrap();
+        assert_eq!(latch.entries.iter().flatten().count(), 1);
+        for (previous_complete, anchor) in [(false, true), (true, false), (false, false)] {
+            let mut scan = PendingObservations::default();
+            let error = latch
+                .admit(previous_complete, anchor, &mut scan)
+                .unwrap_err();
+            assert!(error.message.contains("memory_stage=task_info"));
+            assert!(scan.last().is_none());
+        }
+        let mut scan = PendingObservations::default();
+        latch.admit(true, true, &mut scan).unwrap();
+        assert_eq!(scan.workers.len, 1);
+        assert_eq!(scan.member.unwrap().observations, 1);
+        assert_eq!(
+            scan.last().unwrap().pending_admission_anchor_match,
+            Some(true)
+        );
+        assert_eq!(
+            scan.last().unwrap().pending_admission_kind,
+            Some("fresh_missing_after_task_exit")
+        );
+        assert_eq!(diagnostic.pending_admission_anchor_match, None);
+        for changed in [
+            LeaderIdentity {
+                pid: identity.pid + 1,
+                ..identity
+            },
+            LeaderIdentity {
+                uid: identity.uid + 1,
+                ..identity
+            },
+            LeaderIdentity {
+                pgid: identity.pgid + 1,
+                ..identity
+            },
+            LeaderIdentity {
+                start_sec: identity.start_sec + 1,
+                ..identity
+            },
+            LeaderIdentity {
+                start_usec: identity.start_usec + 1,
+                ..identity
+            },
+        ] {
+            assert!(
+                latch
+                    .verify(
+                        identity.pid,
+                        LeaderBsd {
+                            identity: changed,
+                            ..reserved_leader()
+                        }
+                    )
+                    .is_err()
+            );
+            latch.measured(changed);
+            assert!(latch.contains_pid(identity.pid));
+        }
+        latch.begin_scan();
+        let mut absent = PendingObservations::default();
+        latch.admit(true, true, &mut absent).unwrap();
+        assert!(absent.last().is_none());
+        assert!(!latch.is_empty()); // A membership-only/NotDue scan cannot clear it.
+        latch.unavailable(identity.pid);
+        let mut again = PendingObservations::default();
+        latch.admit(true, true, &mut again).unwrap();
+        assert_eq!(again.workers.len, 1);
+        assert_eq!(
+            again.last().unwrap().pending_admission_kind,
+            Some("retained_missing_after_task_exit")
+        );
+        latch.measured(identity);
+        assert!(latch.is_empty());
+
+        latch.record(missing_member_candidate(19)).unwrap();
+        latch.record(diagnostic).unwrap();
+        latch.begin_scan();
+        latch.unavailable(18);
+        latch.unavailable(19);
+        let mut reordered = PendingObservations::default();
+        latch.admit(true, true, &mut reordered).unwrap();
+        assert_eq!(
+            reordered.member.unwrap().first.pending_worker,
+            diagnostic.pending_worker
+        );
+        assert_eq!(
+            reordered.member.unwrap().last.pending_worker,
+            missing_member_candidate(19).pending_worker
+        );
+        latch.measured(identity);
+        latch.measured(missing_member_candidate(19).pending_worker.unwrap().0);
+        assert!(latch.is_empty());
+
+        for pid in 100..100 + WORKER_LIMIT as u32 + 1 {
+            latch.record(missing_member_candidate(pid)).unwrap();
+        }
+        assert_eq!(latch.entries.iter().flatten().count(), WORKER_LIMIT + 1);
+        assert!(latch.record(missing_member_candidate(1000)).is_err());
+        let mut scan = PendingObservations::default();
+        latch.admit(true, true, &mut scan).unwrap();
+        assert_eq!(scan.workers.len, WORKER_LIMIT + 1);
+        let mut tracker = Tracker::new(small()).unwrap();
+        assert_eq!(
+            tracker
+                .finish_observation(GroupObservation::Pending(Box::new(scan)), Sample::default())
+                .unwrap_err()
+                .kind,
+            "resource_budget"
+        );
+        assert_eq!(tracker.evidence.sample_count, 0);
+    }
+    #[test]
+    fn missing_pending_retains_complete_age_partial_caps_and_normal_reap_fence() {
+        let mut tracker = Tracker::new(small()).unwrap();
+        assert!(!tracker.missing_allowed());
+        tracker.finish(Sample::default()).unwrap();
+        assert!(tracker.missing_allowed());
+        let previous = tracker.last_success;
+        tracker.last_attempt = Some(previous);
+        let diagnostic = missing_member_candidate(18);
+        let identity = diagnostic.pending_worker.unwrap().0;
+        tracker.missing.record(diagnostic).unwrap();
+        let mut scan = PendingObservations::default();
+        tracker
+            .missing
+            .admit(tracker.missing_allowed(), true, &mut scan)
+            .unwrap();
+        let group = GroupObservation::Pending(Box::new(scan));
+        assert!(!group.scope_empty());
+        tracker
+            .finish_observation(group, Sample::default())
+            .unwrap();
+        assert!(tracker.pending());
+        assert_eq!(tracker.evidence.sample_count, 1);
+        assert_eq!(tracker.last_success, previous);
+        assert!(
+            tracker
+                .begin_at(previous + Duration::from_millis(99))
+                .unwrap()
+                .is_none()
+        );
+        assert!(tracker.pending()); // NotDue plus a membership zero is fenced.
+        assert!(
+            tracker
+                .begin_at(previous + Duration::from_millis(100))
+                .unwrap()
+                .is_some()
+        );
+        tracker.missing.measured(identity);
+        assert!(tracker.missing.is_empty());
+        assert!(tracker.pending()); // Measured identity alone is not whole Complete.
+        tracker.last_success = Instant::now() - Duration::from_millis(1001);
+        let old_success = tracker.last_success;
+        let mut late = Sample::default();
+        late.push(small()).unwrap();
+        let error = tracker
+            .finish_observation(GroupObservation::Complete(1), late)
+            .unwrap_err();
+        assert_eq!(error.kind, "resource_observation");
+        assert_eq!(tracker.evidence.sample_count, 1);
+        assert_eq!(tracker.evidence.peak_observed_aggregate_rss_bytes, 0);
+        assert_eq!(tracker.last_success, old_success);
+        assert!(tracker.pending());
+
+        let mut bounded = Tracker::new(small()).unwrap();
+        bounded.finish(Sample::default()).unwrap();
+        bounded.missing.record(diagnostic).unwrap();
+        let mut scan = PendingObservations::default();
+        bounded.missing.admit(true, true, &mut scan).unwrap();
+        let mut partial = Sample::default();
+        partial
+            .push(Memory {
+                rss: MEMORY_LIMIT + 1,
+                ..small()
+            })
+            .unwrap();
+        assert_eq!(
+            bounded
+                .finish_observation(GroupObservation::Pending(Box::new(scan)), partial)
+                .unwrap_err()
+                .kind,
+            "resource_budget"
+        );
+        assert_eq!(bounded.evidence.sample_count, 1);
+        assert!(bounded.pending());
+        // An independent full Complete resolves absence; neither an old
+        // diagnostic nor an empty membership scan can perform this step.
+        bounded
+            .finish_observation(GroupObservation::Complete(0), Sample::default())
+            .unwrap();
+        assert!(!bounded.pending());
+        assert!(bounded.missing.is_empty());
+        assert_eq!(bounded.evidence.sample_count, 2);
+        assert!(bounded.evidence.pending_member_exit.is_some());
     }
     fn rusage_failure() -> MemoryFailure {
         // Authored adapter facts exercise policy only; the production adapter

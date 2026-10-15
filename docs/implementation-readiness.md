@@ -1674,6 +1674,27 @@ drain·완전한 출력·export·scratch 정리·lease 해제를 확인했다. �
 작성 중인 Fabric 승인 binding·full image·실제 runner/Source3는 이 집중 검사의 입력이나
 성공 범위에 포함하지 않는다. 전체 JVM 및 게임 검증은 조합 source 동결 뒤 별도다.
 
+## Darwin member의 불완전 자원 관측
+
+D070은 원 nonleader의 TaskInfo 0/ESRCH 뒤 실제 BSD 0/ESRCH가 나온 경우에만 deferred
+candidate를 만들고, 캡처한 원 순회의 leader를 마지막에 처리하여 실제 held/unreaped
+anchor를 대조한 뒤 Pending으로 받는다. 이전 owned scope의 실제 Complete, 원 100ms
+시도와 1000ms 창·상한을 유지한다. PID/UID/PGID/birth latch는 최대 33개이며 다른 SID나
+identity를 새 member로 받아들이지 않는다. membership/NotDue만으로 해소하지 않고,
+늦은 Complete는 count/peak/last-success 수정 전에 거절한다. Mac 정상 reap에도 fence를
+연결했다. 후속 identity가 불완전한 memory는 owned 합계에 넣지 않으며 원 native 오류와
+나중의 admission anchor를 별도 사실로 남긴다.
+
+독립 source 리뷰와 Root `448`의 두 Rust 파일 format을 거쳐 `449` Windows Python
+AST/mock 검사가 통과했다. 정확한 missing 조건·거절 13개·latch drift 9개·해소 3개·부분
+예산 4개와 cadence/reap/오류 보존을 검사했으며 native_execution=false다. `450`의 도구
+lib 235개·bin 4개가 통과했고 기존 isolated 1개는 ignored다. `451`의 같은 도구
+all-targets strict Clippy도 통과했다. 명령 exit는 모두 0이며 `450`은 32,339 ms·Job
+commit peak 491,098,112 bytes·10 process·최대 sample gap 150 ms, `451`은 4,805 ms·
+358,440,960 bytes·7 process다. 전자는 owned-tail 정리 뒤, 후자는 자연 종료 뒤 drain·
+완전한 출력·export·scratch 정리·lease 해제를 확인했다. 실제 macOS 전이·회복은 미관측이며
+새 supervisor를 로컬 관리 parent로 교체한 검사도 아니다. 후속 고정 source CI와 구분한다.
+
 ## 공유 고정 SHA의 CI 실패 구분
 
 추가 Windows API 관측 `438`은 Brigadier/native custom 실행 interface 10개,
