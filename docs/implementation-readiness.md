@@ -1198,6 +1198,39 @@ testImplementation에도 추가한다. 외부 의존성이나 생산 JAR의 포�
 Gradle 32 executed tasks와 원 진단·출력을 보존하고 drain·export·scratch 정리·lease
 해제를 확인했다. Fabric의 오래된 XML 결과를 이 실패 실행의 성공으로 집계하지 않는다.
 
+같은 내부 test classpath를 보완한 `ffb9b1bb1b11b4f7f88095677f3dccfb8ea895ed`의
+Windows JVM `375`는 7모듈 378 tests/30 reports 및 33 executed tasks를 통과했다.
+SDK 108, host-core 92, public-java-adapter 29, Fabric host 96, definition-observer
+24, legacy fixture 18, provider fixture 11이며 failure/error/skipped는 모두 0이다.
+외부 로컬 요약 SHA는
+`7a57da902f5ce806d59510fe757c5cf9ac802c15ed69b4b8d5cbf899c88a5e3a`다.
+command 0·29,473 ms, Job commit peak 1,392,861,184 bytes·peak process 6개·최대
+표본 간격 126 ms였고 원 2 GiB/32 process 상한·drain·완전한 출력·export·scratch
+정리·lease 해제를 확인했다. 실제 새 view 발급의 native startup과 slot 양성·JNI 중
+owner 교체는 이 순수 JVM 검사에서 미실행이며 별도 근거를 요구한다.
+
+앞선 고정 `0cedbf0`의 JVM CI 47 실제 ZIP 3개 감사는 완료했다. 각 OS 374 tests와
+필수 task 11개, observer native build·ABI·startup의 raw receipt 및 pin 연결과 정상
+종료·정리가 일치했다. 원 XML·owner 및 일부 JDK/JAR 원문은 포함되지 않아 모두의
+원 bytes를 독립 hash한 것으로 보고하지 않는다. JVM source inventory 175개 중
+`jvm/gradle.properties`만 Windows 271 bytes/CRLF, Linux·macOS 264 bytes/LF였고
+고정 Git blob의 LF→CRLF 변환 SHA가 Windows pin과 정확히 일치했다. 같은 source
+SHA의 성공과 OS 사이 전체 입력 bytes의 동일성을 구분한다. 후속 `45789e9`는 소유
+작성 properties의 LF 규칙과 실제 test/Clippy jobs 1·bootstrap jobs 2의 CI metadata
+구분을 반영했다. 이는 앞선 artifact를 변경한 것이 아니며 새 CI에서 다시 관측한다.
+
+D060의 Windows vanished ancestry 보완은 원 `NotFound`와 component native 5를 함께
+보존하고 기존 Running 공유 재관측 예산만 사용한다. 실제 재등장 metadata를 측정
+경로로 돌려주며 directory 열거 재개는 미처리 pending 자식만 되돌린다. 새 fixture
+파일 없이 기존 실제 임시 파일·owner 및 주입 port를 사용한 검사 3개와 기존 취소·
+link·owner 교체·공유 예산 검사를 확장했다. Windows 관리 실행 `377`의 소유 두 파일
+formatting, `378`의 xtask lib 232 PASS/1 ignored 및 `379`의 같은 package/all-target
+strict Clippy가 통과했다. `378`은 command 0·28,152 ms, Job commit peak 447,070,208
+bytes·peak process 10개·최대 표본 간격 123 ms였고 명시한 소유 잔여 자식 정리 뒤
+drain·완전한 출력·export·scratch 정리·lease 해제를 확인했다. 앞선 감독 EXE가 이
+검사를 실행했으며 새 코드로 부모 관리 도구를 교체했다고 기록하지 않는다. 실제
+CI의 native 5 경합 회복과 OS별 새 소스 검증은 아직 별도 결과가 필요하다.
+
 고정 `b854b617846036bcb09058ca7da3eed303a1e680`의 Rust CI 50
 (`38698720838`)과 JVM CI 41 (`38698720798`)은 세 OS 및 집계가 모두 성공했다.
 실제 ZIP 6개를 별도 보존하여 크기·SHA와 source/expected/PR head, 별도 event SHA

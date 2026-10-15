@@ -95,6 +95,8 @@
 
 | MMMM-D059 | 기존 native issuer의 실제 Class 조회로만 `CurrentLoadedExecutable` 관측 view를 발급한다. | 실제 Class와 loader 객체, issuer·identity·generation·attempt 및 전체 원 envelope를 보존·재검사한다. ordinary frame의 loader 0을 bootstrap으로 해석하지 않는다. raw decode·순수 fixture에는 발급 경로가 없고 collector는 기존 64 Class/8 MiB 한도에 decoded byte payload까지 계상한다. slot은 JNI·원 checkpoint를 monitor 밖에서 수행한 뒤 원 ticket·snapshot·owner/context/epoch/generation을 재검사하며 원 native 오류와 후속 제어 오류를 보존한다. 현재 lookup은 이미 수집한 Class에 한정한다. 이 view는 기존 producer record의 사실이며 새 VM snapshot 취득·final classfile·parser 의미·SourceAdmission·profile·쓰기나 calibration 승인이 아니다. 실제 startup과 slot 양성 및 경합의 실행 근거는 별도로 확인한다. |
 
+| MMMM-D060 | Running 생성물 관측의 원 `NotFound` 뒤 surviving ancestry component가 실제 Windows native 5를 반환하면 기존 공유 예산 안에서만 재관측한다. | 실제 CI55의 관측 실패를 근거로 자신의 active slot과 기존 6개 ephemeral root의 strict descendant에 한정한다. 원 NotFound의 단계·상대 식별자와 component 5를 함께 보존하며, 추가 metadata 16회·대기 32 ms·wall 100 ms·증거 64개/128 KiB를 재설정하지 않는다. nested missing proof는 한 번만 검사한다. 새 metadata·전체 ancestry 및 root·owner 검사가 통과해야 Present 또는 MissingValidated를 사용하고, 재등장 target의 실제 크기를 다시 측정한다. 열거 재개는 해당 directory의 미처리 pending suffix만 되돌리고 누적 bytes와 walk 예산을 유지한다. 지속 5·다른 오류·link·owner 변경·원 취소는 실패이며 fixed root·lease·완료 cache·제품 자료로 allowance를 넓히지 않는다. cooperative 관측이며 atomic filesystem 보장은 아니다. 원 CI 실패와 후속 순수 검증·실제 OS 회복 증거는 구분한다. |
+
 ## 구현 전에 확인할 항목
 
 - 원본 계약과 예제 패키지의 내용, 버전 및 digest.

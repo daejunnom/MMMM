@@ -511,6 +511,223 @@ fn running_metadata_recovery_retains_first_native_error_and_verified_present_or_
 }
 
 #[test]
+fn vanished_ancestry_recovery_remeasures_present_target_and_proves_missing() {
+    use std::cell::Cell;
+    for remove in [false, true] {
+        let fixture = Fixture::new("vanished-ancestry-recovery");
+        let build = fixture.acquire();
+        let nested = build.paths().cargo_target.join("nested");
+        let leaf = nested.join("transient-output");
+        fs::create_dir(&nested).unwrap();
+        fs::write(&leaf, b"old").unwrap();
+        let triggered = Cell::new(false);
+        let component_calls = Cell::new(0);
+        let mut metadata = |path: &Path| {
+            if path == leaf && !triggered.replace(true) {
+                return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+            }
+            if path == nested && triggered.get() {
+                component_calls.set(component_calls.get() + 1);
+                if component_calls.get() == 1 {
+                    return Err(std::io::Error::from_raw_os_error(5));
+                }
+            }
+            fs::symlink_metadata(path)
+        };
+        let mut delays = Vec::new();
+        let mut wait = |delay| {
+            delays.push(delay);
+            if remove {
+                fs::remove_file(&leaf).unwrap();
+                fs::remove_dir(&nested).unwrap();
+            } else {
+                fs::write(&leaf, b"the present target has a new actual byte length").unwrap();
+            }
+        };
+        let mut diagnostics = ObservationRetryLog::default();
+        let measured = retry_measurement(
+            &build,
+            &mut diagnostics,
+            &mut metadata,
+            &mut wait,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(measured.slot_bytes, build.measure().unwrap().slot_bytes);
+        assert_eq!(delays, [Duration::from_millis(2)]);
+        assert_eq!(component_calls.get(), 2);
+        assert_eq!(diagnostics.records.len(), 1);
+        let record = &diagnostics.records[0];
+        assert_eq!(record.stage, "vanished_ancestry_metadata");
+        assert_eq!(record.first.raw_os_error, Some(5));
+        assert_eq!(record.attempts, 2);
+        assert!(record.generated_relative.ends_with("nested"));
+        let trigger = record.not_found_trigger.as_ref().unwrap();
+        assert_eq!(trigger.stage, "entry_metadata");
+        assert_eq!(trigger.first.kind, "NotFound");
+        assert!(trigger.generated_relative.ends_with("transient-output"));
+        let encoded = String::from_utf8(diagnostics.encoded_evidence().unwrap()).unwrap();
+        assert!(!encoded.contains(fixture.root.to_string_lossy().as_ref()));
+        if remove {
+            assert!(matches!(
+                record.final_observation,
+                RetryFinalObservation::MissingValidated { .. }
+            ));
+        } else {
+            assert!(matches!(
+                record.final_observation,
+                RetryFinalObservation::Present {
+                    file_type: "directory",
+                    ..
+                }
+            ));
+        }
+        build.finish(outcome(0)).unwrap();
+    }
+}
+
+#[test]
+fn vanished_ancestry_denial_preserves_trigger_component_and_final_native_error() {
+    use std::cell::Cell;
+    for last in [5, 32] {
+        let fixture = Fixture::new("vanished-ancestry-denial");
+        let build = fixture.acquire();
+        let nested = build.paths().scratch.join("nested");
+        let leaf = nested.join("ordinary-output");
+        fs::create_dir(&nested).unwrap();
+        fs::write(&leaf, b"unchanged").unwrap();
+        let triggered = Cell::new(false);
+        let component_calls = Cell::new(0);
+        let mut metadata = |path: &Path| {
+            if path == leaf && !triggered.replace(true) {
+                return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+            }
+            if path == nested && triggered.get() {
+                component_calls.set(component_calls.get() + 1);
+                return Err(std::io::Error::from_raw_os_error(
+                    if component_calls.get() == 1 { 5 } else { last },
+                ));
+            }
+            fs::symlink_metadata(path)
+        };
+        let mut delays = Vec::new();
+        let mut diagnostics = ObservationRetryLog::default();
+        let error = retry_measurement(
+            &build,
+            &mut diagnostics,
+            &mut metadata,
+            &mut |delay| delays.push(delay),
+            &mut || Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, "io");
+        assert!(error.message.contains("first_raw_os_error=Some(5)"));
+        assert!(
+            error
+                .message
+                .contains(&format!("final_raw_os_error=Some({last})"))
+        );
+        assert!(error.message.contains("not_found_kind=NotFound"));
+        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(component_calls.get(), if last == 5 { 3 } else { 2 });
+        assert_eq!(delays.len(), component_calls.get() - 1);
+        assert_eq!(
+            diagnostics.records[0]
+                .not_found_trigger
+                .as_ref()
+                .unwrap()
+                .first
+                .kind,
+            "NotFound"
+        );
+        assert_eq!(fs::read(&leaf).unwrap(), b"unchanged");
+        build.finish(outcome(0)).unwrap();
+    }
+}
+
+#[test]
+fn vanished_ancestry_recovery_cannot_reset_the_running_retry_budget() {
+    use std::cell::Cell;
+    let fixture = Fixture::new("vanished-shared-budget");
+    let build = fixture.acquire();
+    let direct = build.paths().scratch.join("direct-output");
+    let nested = build.paths().scratch.join("nested");
+    let leaf = nested.join("ordinary-output");
+    fs::create_dir(&nested).unwrap();
+    fs::write(&direct, b"direct").unwrap();
+    fs::write(&leaf, b"nested").unwrap();
+    let deny_direct = Cell::new(false);
+    let missing_target = Cell::new(false);
+    let deny_component = Cell::new(false);
+    let mut metadata = |path: &Path| {
+        if path == direct && deny_direct.replace(false) {
+            return Err(std::io::Error::from_raw_os_error(5));
+        }
+        if path == leaf && missing_target.replace(false) {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        }
+        if path == nested && deny_component.replace(false) {
+            return Err(std::io::Error::from_raw_os_error(5));
+        }
+        fs::symlink_metadata(path)
+    };
+    let owner = || build.verify_ownership();
+    let now = Instant::now();
+    let clock = || now;
+    let mut diagnostics = ObservationRetryLog::default();
+    let mut delays = Vec::new();
+    let mut wait = |delay| delays.push(delay);
+    let mut retry = MetadataReobservation::new(
+        &mut diagnostics,
+        &owner,
+        &mut metadata,
+        &mut wait,
+        true,
+        &clock,
+    );
+    for _ in 0..MAX_EXTRA_METADATA_CALLS {
+        deny_direct.set(true);
+        assert!(
+            retry
+                .observe(
+                    &direct,
+                    &build.paths().slot,
+                    &build.observation_roots(),
+                    &mut || Ok(())
+                )
+                .unwrap()
+                .is_some()
+        );
+    }
+    missing_target.set(true);
+    deny_component.set(true);
+    let error = retry
+        .observe(
+            &leaf,
+            &build.paths().slot,
+            &build.observation_roots(),
+            &mut || Ok(()),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind, "retry_budget");
+    assert_eq!(retry.extra_calls, MAX_EXTRA_METADATA_CALLS);
+    assert_eq!(retry.planned_wait, MAX_RETRY_WAIT);
+    assert_eq!(delays.len(), MAX_EXTRA_METADATA_CALLS);
+    assert_eq!(diagnostics.records.len(), MAX_EXTRA_METADATA_CALLS + 1);
+    let last = diagnostics.records.last().unwrap();
+    assert_eq!(last.attempts, 1);
+    assert!(last.not_found_trigger.is_some());
+    assert!(matches!(
+        last.final_observation,
+        RetryFinalObservation::Failed {
+            category: "retry_budget",
+            ..
+        }
+    ));
+    build.finish(outcome(0)).unwrap();
+}
+
+#[test]
 fn repeated_native5_and_other_errno_remain_fatal_with_first_and_final_codes() {
     use std::cell::Cell;
     for last in [5, 32] {
@@ -558,49 +775,64 @@ fn repeated_native5_and_other_errno_remain_fatal_with_first_and_final_codes() {
 #[test]
 fn retry_wait_checkpoint_failure_keeps_original_native5_and_original_cause() {
     use std::cell::Cell;
-    let fixture = Fixture::new("metadata-cancel");
-    let build = fixture.acquire();
-    let leaf = build.paths().scratch.join("transient-output");
-    fs::write(&leaf, b"unchanged").unwrap();
-    let stopped = Cell::new(false);
-    let calls = Cell::new(0);
-    let mut metadata = |path: &Path| {
-        if path == leaf {
-            calls.set(calls.get() + 1);
-            return Err(std::io::Error::from_raw_os_error(5));
-        }
-        fs::symlink_metadata(path)
-    };
-    let mut diagnostics = ObservationRetryLog::default();
-    let error = retry_measurement(
-        &build,
-        &mut diagnostics,
-        &mut metadata,
-        &mut |_| stopped.set(true),
-        &mut || {
-            if stopped.get() {
-                Err("original managed deadline expired".into())
-            } else {
-                Ok(())
+    for missing_trigger in [false, true] {
+        let fixture = Fixture::new("metadata-cancel");
+        let build = fixture.acquire();
+        let nested = build.paths().scratch.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let leaf = nested.join("transient-output");
+        fs::write(&leaf, b"unchanged").unwrap();
+        let stopped = Cell::new(false);
+        let calls = Cell::new(0);
+        let mut metadata = |path: &Path| {
+            if path == leaf {
+                calls.set(calls.get() + 1);
+                return Err(if missing_trigger {
+                    std::io::Error::from(std::io::ErrorKind::NotFound)
+                } else {
+                    std::io::Error::from_raw_os_error(5)
+                });
             }
-        },
-    )
-    .unwrap_err();
-    assert_eq!(calls.get(), 1);
-    assert_eq!(error.kind, "observation_failed");
-    assert!(error.message.contains("first_raw_os_error=Some(5)"));
-    assert_eq!(
-        std::error::Error::source(&error).unwrap().to_string(),
-        "observation_failed: original managed deadline expired"
-    );
-    assert!(matches!(
-        diagnostics.records[0].final_observation,
-        RetryFinalObservation::Failed {
-            category: "observation_failed",
-            ..
-        }
-    ));
-    build.finish(outcome(0)).unwrap();
+            if missing_trigger && path == nested && calls.get() != 0 {
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            fs::symlink_metadata(path)
+        };
+        let mut diagnostics = ObservationRetryLog::default();
+        let error = retry_measurement(
+            &build,
+            &mut diagnostics,
+            &mut metadata,
+            &mut |_| stopped.set(true),
+            &mut || {
+                if stopped.get() {
+                    Err("original managed deadline expired".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(error.kind, "observation_failed");
+        assert!(error.message.contains("first_raw_os_error=Some(5)"));
+        assert_eq!(
+            diagnostics.records[0].not_found_trigger.is_some(),
+            missing_trigger
+        );
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            "observation_failed: original managed deadline expired"
+        );
+        assert!(matches!(
+            diagnostics.records[0].final_observation,
+            RetryFinalObservation::Failed {
+                category: "observation_failed",
+                ..
+            }
+        ));
+        build.finish(outcome(0)).unwrap();
+    }
 }
 
 #[test]
@@ -812,59 +1044,89 @@ fn retry_refuses_fixed_foreign_disabled_and_secret_selectors() {
 #[test]
 fn retry_rechecks_owner_and_rejects_parent_link_before_another_target_lookup() {
     use std::cell::Cell;
-    for owner_removed in [false, true] {
-        let fixture = Fixture::new("metadata-boundary");
-        let build = fixture.acquire();
-        let nested = build.paths().scratch.join("nested");
-        let moved = build.paths().scratch.join("original-nested");
-        fs::create_dir(&nested).unwrap();
-        let leaf = nested.join("ordinary-output");
-        fs::write(&leaf, b"owned original").unwrap();
-        let outside = fixture.root.join("outside-original");
-        fs::create_dir(&outside).unwrap();
-        fs::write(outside.join("keep"), b"unchanged outside").unwrap();
-        let calls = Cell::new(0);
-        let mut metadata = |path: &Path| {
-            if path == leaf {
-                calls.set(calls.get() + 1);
-                return Err(std::io::Error::from_raw_os_error(5));
-            }
-            fs::symlink_metadata(path)
-        };
-        let mut wait = |_| {
-            if owner_removed {
-                fs::remove_file(build.paths().slot.join("owner.json")).unwrap();
-            } else {
-                fs::rename(&nested, &moved).unwrap();
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(&outside, &nested).unwrap();
+    for missing_trigger in [false, true] {
+        for (owner_removed, owner_replaced) in [(false, false), (true, false), (false, true)] {
+            let fixture = Fixture::new("metadata-boundary");
+            let build = fixture.acquire();
+            let nested = build.paths().scratch.join("nested");
+            let moved = build.paths().scratch.join("original-nested");
+            fs::create_dir(&nested).unwrap();
+            let leaf = nested.join("ordinary-output");
+            fs::write(&leaf, b"owned original").unwrap();
+            let outside = fixture.root.join("outside-original");
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("keep"), b"unchanged outside").unwrap();
+            let calls = Cell::new(0);
+            let component_calls = Cell::new(0);
+            let mut metadata = |path: &Path| {
+                if path == leaf {
+                    calls.set(calls.get() + 1);
+                    return Err(if missing_trigger {
+                        std::io::Error::from(std::io::ErrorKind::NotFound)
+                    } else {
+                        std::io::Error::from_raw_os_error(5)
+                    });
+                }
+                if missing_trigger && path == nested && calls.get() != 0 {
+                    component_calls.set(component_calls.get() + 1);
+                    if component_calls.get() == 1 {
+                        return Err(std::io::Error::from_raw_os_error(5));
+                    }
+                }
+                fs::symlink_metadata(path)
+            };
+            let mut wait = |_| {
+                if owner_removed {
+                    fs::remove_file(build.paths().slot.join("owner.json")).unwrap();
+                } else if owner_replaced {
+                    fs::write(build.paths().slot.join("owner.json"), b"changed owner").unwrap();
+                } else {
+                    fs::rename(&nested, &moved).unwrap();
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&outside, &nested).unwrap();
+                    #[cfg(windows)]
+                    create_junction(&nested, &outside);
+                }
+            };
+            let mut diagnostics = ObservationRetryLog::default();
+            let error = retry_measurement(
+                &build,
+                &mut diagnostics,
+                &mut metadata,
+                &mut wait,
+                &mut || Ok(()),
+            )
+            .unwrap_err();
+            assert_eq!(calls.get(), 1);
+            assert_eq!(
+                error.kind,
+                if owner_removed {
+                    "io"
+                } else if owner_replaced {
+                    "ownership"
+                } else if missing_trigger {
+                    "file_type"
+                } else {
+                    "link"
+                }
+            );
+            assert!(error.message.contains("first_raw_os_error=Some(5)"));
+            assert_eq!(
+                diagnostics.records[0].not_found_trigger.is_some(),
+                missing_trigger
+            );
+            assert_eq!(
+                fs::read(outside.join("keep")).unwrap(),
+                b"unchanged outside"
+            );
+            assert!(build.paths().catalog.join("lease.json").exists());
+            if !owner_removed && !owner_replaced {
                 #[cfg(windows)]
-                create_junction(&nested, &outside);
+                fs::remove_dir(&nested).unwrap();
+                #[cfg(unix)]
+                fs::remove_file(&nested).unwrap();
+                build.finish(outcome(0)).unwrap();
             }
-        };
-        let mut diagnostics = ObservationRetryLog::default();
-        let error = retry_measurement(
-            &build,
-            &mut diagnostics,
-            &mut metadata,
-            &mut wait,
-            &mut || Ok(()),
-        )
-        .unwrap_err();
-        assert_eq!(calls.get(), 1);
-        assert_eq!(error.kind, if owner_removed { "io" } else { "link" });
-        assert!(error.message.contains("first_raw_os_error=Some(5)"));
-        assert_eq!(
-            fs::read(outside.join("keep")).unwrap(),
-            b"unchanged outside"
-        );
-        assert!(build.paths().catalog.join("lease.json").exists());
-        if !owner_removed {
-            #[cfg(windows)]
-            fs::remove_dir(&nested).unwrap();
-            #[cfg(unix)]
-            fs::remove_file(&nested).unwrap();
-            build.finish(outcome(0)).unwrap();
         }
     }
 }

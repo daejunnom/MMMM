@@ -180,6 +180,14 @@ struct ObservationRetryRecord {
     elapsed_ms: u64,
     final_observation: RetryFinalObservation,
     generated_relative: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    not_found_trigger: Option<ObservationNotFoundTrigger>,
+}
+#[derive(Clone, Debug, Serialize)]
+struct ObservationNotFoundTrigger {
+    stage: &'static str,
+    first: NativeIoDiagnostic,
+    generated_relative: String,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
@@ -1739,6 +1747,18 @@ impl<'a> MetadataReobservation<'a> {
         let root = roots
             .iter()
             .find(|root| path != root.as_path() && path.starts_with(root));
+        if first.kind() == std::io::ErrorKind::NotFound && root.is_some() {
+            return match self.vanished(path, boundary, roots, &first, "entry_metadata", progress)? {
+                VanishedEntryObservation::MissingValidated => Ok(None),
+                VanishedEntryObservation::Present(metadata) => Ok(Some(metadata)),
+                VanishedEntryObservation::Ineligible => Err(measurement_io_error(
+                    "managed entry metadata",
+                    path,
+                    boundary,
+                    first,
+                )),
+            };
+        }
         // Native Win32 5 has PermissionDenied semantics on Windows. Tests may
         // inject that native code on another OS without changing production.
         if !self.windows_native5 || first.raw_os_error() != Some(5) || root.is_none() {
@@ -1753,14 +1773,81 @@ impl<'a> MetadataReobservation<'a> {
             ));
         }
         let root = root.expect("strict descendant was selected above");
+        self.recorded_reobserve(path, boundary, root, &first, None, progress)
+    }
+    fn vanished(
+        &mut self,
+        path: &Path,
+        boundary: &Path,
+        roots: &[PathBuf],
+        first: &std::io::Error,
+        stage: &'static str,
+        progress: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<VanishedEntryObservation, StorageError> {
+        let trigger = ObservationNotFoundTrigger {
+            stage,
+            first: NativeIoDiagnostic::from_error(first),
+            generated_relative: generated_entry_context(String::new(), path, boundary),
+        };
+        observation_checkpoint(progress)?;
+        (self.owner)()?;
+        let observed = vanished_ephemeral_observation_with_progress(
+            path,
+            first,
+            roots,
+            progress,
+            &mut |component, root, progress| {
+                match (self.metadata)(component) {
+                    Ok(metadata) => Ok(Some(metadata)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(error) if self.windows_native5 && error.raw_os_error() == Some(5) => {
+                        // Only this strict descendant component enters the existing shared
+                        // budget. Its nested missing proof remains one-attempt, not recursive.
+                        self.recorded_reobserve(
+                            component,
+                            boundary,
+                            root,
+                            &error,
+                            Some(trigger.clone()),
+                            progress,
+                        )
+                    }
+                    Err(error) => Err(measurement_io_error(
+                        "vanished-entry surviving ancestry",
+                        component,
+                        boundary,
+                        error,
+                    )),
+                }
+            },
+        )?;
+        observation_checkpoint(progress)?;
+        (self.owner)()?;
+        observation_checkpoint(progress)?;
+        Ok(observed)
+    }
+    fn recorded_reobserve(
+        &mut self,
+        path: &Path,
+        boundary: &Path,
+        root: &Path,
+        first: &std::io::Error,
+        not_found_trigger: Option<ObservationNotFoundTrigger>,
+        progress: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<Option<fs::Metadata>, StorageError> {
         let started = (self.clock)();
         let mut record = ObservationRetryRecord {
-            stage: "entry_metadata",
-            first: NativeIoDiagnostic::from_error(&first),
+            stage: if not_found_trigger.is_some() {
+                "vanished_ancestry_metadata"
+            } else {
+                "entry_metadata"
+            },
+            first: NativeIoDiagnostic::from_error(first),
             attempts: 1,
             elapsed_ms: 0,
             final_observation: RetryFinalObservation::Pending,
             generated_relative: generated_entry_context(String::new(), path, boundary),
+            not_found_trigger,
         };
         let mut last_io = Some(record.first.clone());
         let result = if self.diagnostics.records.len() >= MAX_RETRY_RECORDS {
@@ -1842,19 +1929,31 @@ impl<'a> MetadataReobservation<'a> {
                 Err(error) => {
                     // This is a newly observed NotFound, never a conversion
                     // of the original native 5 into a vanished allowance.
-                    if error.kind() == std::io::ErrorKind::NotFound
-                        && vanished_ephemeral_entry_with_progress(
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        let vanished = vanished_ephemeral_one_attempt_with_progress(
                             path,
                             &error,
                             &[root.to_path_buf()],
                             progress,
-                        )?
-                    {
+                        )?;
                         self.guard(path, root, progress, started)?;
-                        record.final_observation = RetryFinalObservation::MissingValidated {
-                            last: NativeIoDiagnostic::from_error(&error),
-                        };
-                        return Ok(None);
+                        match vanished {
+                            VanishedEntryObservation::MissingValidated => {
+                                record.final_observation =
+                                    RetryFinalObservation::MissingValidated {
+                                        last: NativeIoDiagnostic::from_error(&error),
+                                    };
+                                return Ok(None);
+                            }
+                            VanishedEntryObservation::Present(metadata) => {
+                                record.final_observation = RetryFinalObservation::Present {
+                                    file_type: native_file_kind(&metadata),
+                                    byte_length: metadata.len(),
+                                };
+                                return Ok(Some(metadata));
+                            }
+                            VanishedEntryObservation::Ineligible => {}
+                        }
                     }
                     if error.raw_os_error() != Some(5) || record.attempts == 3 {
                         return Err(measurement_io_error(
@@ -1882,14 +1981,19 @@ fn retry_failure(record: &ObservationRetryRecord, cause: StorageError) -> Storag
     };
     // Preserve the final original error behind source(), but do not copy an
     // arbitrary checkpoint/path message into shared evidence or diagnostics.
+    let trigger = record.not_found_trigger.as_ref().map(|trigger| format!(
+        "; not_found_stage={}; not_found_kind={}; not_found_raw_os_error={:?}; not_found_generated_relative={}",
+        trigger.stage, trigger.first.kind, trigger.first.raw_os_error, trigger.generated_relative,
+    )).unwrap_or_default();
     let message = format!(
-        "metadata reobservation; first_kind={}; first_raw_os_error={:?}; attempts={}; final_kind={}; final_raw_os_error={:?}; generated_relative={}",
+        "metadata reobservation; first_kind={}; first_raw_os_error={:?}; attempts={}; final_kind={}; final_raw_os_error={:?}; generated_relative={}{}",
         record.first.kind,
         record.first.raw_os_error,
         record.attempts,
         cause.kind,
         last_io.and_then(|last| last.raw_os_error),
-        record.generated_relative
+        record.generated_relative,
+        trigger,
     );
     StorageError {
         kind: cause.kind,
@@ -1995,6 +2099,28 @@ fn tree_bytes_observed_with_progress(
     )
 }
 
+fn vanished_during_measurement(
+    path: &Path,
+    boundary: &Path,
+    roots: &[PathBuf],
+    error: &std::io::Error,
+    stage: &'static str,
+    progress: &mut dyn FnMut() -> Result<(), String>,
+    retry: Option<&mut MetadataReobservation<'_>>,
+) -> Result<VanishedEntryObservation, StorageError> {
+    if let Some(retry) = retry {
+        retry.vanished(path, boundary, roots, error, stage, progress)
+    } else {
+        // Pre-spawn, completed slots and other callers retain their existing
+        // one-attempt policy; only Running receives the typed recovery path.
+        Ok(if vanished_ephemeral_entry(path, error, roots)? {
+            VanishedEntryObservation::MissingValidated
+        } else {
+            VanishedEntryObservation::Ineligible
+        })
+    }
+}
+
 fn tree_bytes_observed_with_retry(
     path: &Path,
     boundary: &Path,
@@ -2049,8 +2175,23 @@ fn tree_bytes_observed_with_retry(
         } else if metadata.is_dir() {
             let mut directory = match fs::read_dir(&path) {
                 Ok(directory) => directory,
-                Err(error) if vanished_ephemeral_entry(&path, &error, ephemeral_roots)? => continue,
                 Err(error) => {
+                    match vanished_during_measurement(
+                        &path,
+                        &boundary,
+                        ephemeral_roots,
+                        &error,
+                        "directory_open",
+                        progress,
+                        retry.as_deref_mut(),
+                    )? {
+                        VanishedEntryObservation::MissingValidated => continue,
+                        VanishedEntryObservation::Present(_) => {
+                            pending.push((path, depth));
+                            continue;
+                        }
+                        VanishedEntryObservation::Ineligible => {}
+                    }
                     return Err(measurement_io_error(
                         "directory open",
                         &path,
@@ -2060,6 +2201,7 @@ fn tree_bytes_observed_with_retry(
                 }
             };
             observation_checkpoint(progress)?;
+            let pending_before_directory = pending.len();
             loop {
                 observation_checkpoint(progress)?;
                 let entry = directory.next();
@@ -2073,10 +2215,26 @@ fn tree_bytes_observed_with_retry(
                 }
                 let entry = match entry {
                     Ok(entry) => entry,
-                    Err(error) if vanished_ephemeral_entry(&path, &error, ephemeral_roots)? => {
-                        break;
-                    }
                     Err(error) => {
+                        match vanished_during_measurement(
+                            &path,
+                            &boundary,
+                            ephemeral_roots,
+                            &error,
+                            "directory_enumeration",
+                            progress,
+                            retry.as_deref_mut(),
+                        )? {
+                            VanishedEntryObservation::MissingValidated => break,
+                            VanishedEntryObservation::Present(_) => {
+                                // These children have not been measured yet. Keep all other
+                                // pending work, accumulated bytes and consumed walk budget.
+                                pending.truncate(pending_before_directory);
+                                pending.push((path.clone(), depth));
+                                break;
+                            }
+                            VanishedEntryObservation::Ineligible => {}
+                        }
                         return Err(measurement_io_error(
                             "directory enumeration",
                             &path,
@@ -2209,14 +2367,62 @@ fn vanished_ephemeral_entry_with_progress(
     roots: &[PathBuf],
     progress: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<bool, StorageError> {
+    Ok(!matches!(
+        vanished_ephemeral_one_attempt_with_progress(path, error, roots, progress)?,
+        VanishedEntryObservation::Ineligible
+    ))
+}
+
+fn vanished_ephemeral_one_attempt_with_progress(
+    path: &Path,
+    error: &std::io::Error,
+    roots: &[PathBuf],
+    progress: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<VanishedEntryObservation, StorageError> {
+    vanished_ephemeral_observation_with_progress(
+        path,
+        error,
+        roots,
+        progress,
+        &mut |component, _, _| match fs::symlink_metadata(component) {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(StorageError::io(
+                "verify vanished-entry surviving ancestry",
+                error,
+            )),
+        },
+    )
+}
+
+enum VanishedEntryObservation {
+    Ineligible,
+    MissingValidated,
+    Present(fs::Metadata),
+}
+
+/// This remains a cooperative path observation, not an atomic filesystem
+/// snapshot. The Running callback alone may use the shared bounded native-5
+/// recovery; nested missing proofs use the one-attempt callback above.
+fn vanished_ephemeral_observation_with_progress(
+    path: &Path,
+    error: &std::io::Error,
+    roots: &[PathBuf],
+    progress: &mut dyn FnMut() -> Result<(), String>,
+    metadata: &mut impl FnMut(
+        &Path,
+        &Path,
+        &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<Option<fs::Metadata>, StorageError>,
+) -> Result<VanishedEntryObservation, StorageError> {
     if error.kind() != std::io::ErrorKind::NotFound {
-        return Ok(false);
+        return Ok(VanishedEntryObservation::Ineligible);
     }
     let Some(root) = roots
         .iter()
         .find(|root| path != root.as_path() && path.starts_with(root))
     else {
-        return Ok(false);
+        return Ok(VanishedEntryObservation::Ineligible);
     };
     observation_checkpoint(progress)?;
     verify_directory(root)?;
@@ -2244,19 +2450,14 @@ fn vanished_ephemeral_entry_with_progress(
         ));
     }
     let mut current = root.clone();
+    let mut target_metadata = None;
     for (index, component) in components.iter().enumerate() {
         observation_checkpoint(progress)?;
         current.push(component.as_os_str());
         reject_secret_path(&current)?;
-        let metadata = match fs::symlink_metadata(&current) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-            Err(error) => {
-                return Err(StorageError::io(
-                    "verify vanished-entry surviving ancestry",
-                    error,
-                ));
-            }
+        let metadata = match metadata(&current, root, progress)? {
+            Some(metadata) => metadata,
+            None => break,
         };
         observation_checkpoint(progress)?;
         if is_link(&metadata) {
@@ -2293,6 +2494,9 @@ fn vanished_ephemeral_entry_with_progress(
                 "vanished entry surviving ancestry left owned root",
             ));
         }
+        if index + 1 == components.len() {
+            target_metadata = Some(metadata);
+        }
     }
     observation_checkpoint(progress)?;
     verify_directory(root)?;
@@ -2305,7 +2509,10 @@ fn vanished_ephemeral_entry_with_progress(
             "observation fixed root physical identity changed",
         ));
     }
-    Ok(true)
+    Ok(match target_metadata {
+        Some(metadata) => VanishedEntryObservation::Present(metadata),
+        None => VanishedEntryObservation::MissingValidated,
+    })
 }
 
 fn validate_internal_link(path: &Path, boundary: &Path) -> Result<(), StorageError> {
