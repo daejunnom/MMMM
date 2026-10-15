@@ -79,8 +79,9 @@ final class NativeCalibrationTargetImages {
 
     interface ReadPort {
         ObjectNode objective(String objective, NativeCalibrationStateReader.Checkpoint checkpoint);
-        NativeCalibrationStateReader.StorageRead storage(String storage, NativeCalibrationStateReader.Checkpoint checkpoint);
+        NativeCommandStorageCache.Facts storage(String storage, NativeCalibrationStateReader.Checkpoint checkpoint);
         void checkCurrent();
+        default void checkComplete(NativeCalibrationStateReader.Checkpoint checkpoint) { checkpoint.check(); }
     }
 
     static ImagePair observe(MinecraftServer server, ServerLevel level, HostSession owner, ObjectNode context,
@@ -137,7 +138,9 @@ final class NativeCalibrationTargetImages {
             ObjectNode objective = objective(selected, objectiveFacts);
             checkpoint.check(); var cached = port.storage(selected.storage, checkpoint); checkpoint.check();
             ObjectNode storage = storage(selected, cached, checkpoint);
-            checkpoint.check(); requireScope(context, selected, original); return new RawPair(selected, objective, storage);
+            checkpoint.check(); requireScope(context, selected, original);
+            RawPair images = new RawPair(selected, objective, storage);
+            port.checkComplete(checkpoint); checkpoint.check(); return images;
         }, checkpoint);
     }
 
@@ -157,21 +160,21 @@ final class NativeCalibrationTargetImages {
         return image;
     }
 
-    private static ObjectNode storage(ReadonlySelection selected, NativeCalibrationStateReader.StorageRead storage,
+    private static ObjectNode storage(ReadonlySelection selected, NativeCommandStorageCache.Facts storage,
                                       NativeCalibrationStateReader.Checkpoint checkpoint) {
         ObjectNode image = base(selected.storageSelector());
-        if (storage.cachedRoot() == null) {
+        if (storage.state() == NativeCommandStorageCache.State.NAMESPACE_UNKNOWN || storage.state() == NativeCommandStorageCache.State.NOT_ADMITTED) {
             return image.put("captureScope", "native_owned_storage_subtrees").put("reason",
-                    storage.unknown() == NativeCalibrationStateReader.Unknown.STORAGE_NOT_CACHED ? "native_storage_namespace_not_observed" : "native_storage_source_not_admitted");
+                    storage.state() == NativeCommandStorageCache.State.NAMESPACE_UNKNOWN ? "native_storage_namespace_not_observed" : "native_storage_source_not_admitted");
         }
-        ObjectNode payload = ContractJson.newObject().put("storagePresent", true); boolean present = false;
+        ObjectNode payload = ContractJson.newObject().put("storagePresent", storage.state() == NativeCommandStorageCache.State.PRESENT); boolean present = false;
         for (String subtree : List.of("inputs", "invocation")) {
-            checkpoint.check(); Tag actual = storage.cachedRoot().get(subtree);
+            checkpoint.check(); Tag actual = storage.cachedRoot() == null ? null : storage.cachedRoot().get(subtree);
             ObjectNode value = ContractJson.newObject().put("presence", actual == null ? "absent" : "present");
             if (actual == null) value.putNull("nativeValueNbt");
             else { value.set("nativeValueNbt", NativeTargets.encodeNativeTag(actual, checkpoint::check)); present = true; }
             payload.set(subtree, value);
-            if (storage.cachedRoot().get(subtree) != actual) throw failure("CALIBRATION_STATE_CHANGED");
+            if (storage.cachedRoot() != null && storage.cachedRoot().get(subtree) != actual) throw failure("CALIBRATION_STATE_CHANGED");
             checkpoint.check();
         }
         image.put("status", "known").put("presence", present ? "present" : "absent")
@@ -195,14 +198,21 @@ final class NativeCalibrationTargetImages {
         private final ServerLevel level;
         private final Scoreboard scoreboard;
         private final CommandStorage storage;
+        private NativeCommandStorageCache.Read cached;
         private ActualPort(MinecraftServer server, ServerLevel level) {
             this.server = server; this.level = level; scoreboard = level.getScoreboard(); storage = server.getCommandStorage();
         }
         @Override public ObjectNode objective(String name, NativeCalibrationStateReader.Checkpoint checkpoint) { return NativeTargets.readObjectiveImage(level, name, checkpoint::check); }
-        @Override public NativeCalibrationStateReader.StorageRead storage(String name, NativeCalibrationStateReader.Checkpoint checkpoint) { return NativeCalibrationStateReader.cachedStorage(server, name, checkpoint); }
+        @Override public NativeCommandStorageCache.Facts storage(String name, NativeCalibrationStateReader.Checkpoint checkpoint) {
+            cached = NativeCalibrationStateReader.cachedStorage(server, name, checkpoint); return cached.facts();
+        }
+        @Override public void checkComplete(NativeCalibrationStateReader.Checkpoint checkpoint) {
+            if (cached == null) throw failure("CALIBRATION_STATE_CHANGED"); cached.checkComplete(checkpoint);
+        }
         @Override public void checkCurrent() {
             if (!server.isSameThread() || level.getServer() != server || server.getLevel(level.dimension()) != level
                     || level.getScoreboard() != scoreboard || server.getCommandStorage() != storage) throw failure("CALIBRATION_STATE_CHANGED");
+            if (cached != null) cached.checkCurrent();
         }
     }
 

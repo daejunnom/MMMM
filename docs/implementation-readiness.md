@@ -1847,6 +1847,25 @@ extra·stale 거절 회귀를 작성하고 독립 리뷰/`466` format 뒤 `471`�
 
 ## 공유 고정 SHA의 CI 실패 구분
 
+후속 cache-only source는 실제 `CommandStorage.namespaces`와 Container의 `storage` map을
+두 read accessor로 관측한다. 실제 cached namespace 안의 key 부재만 기존 full image의
+storagePresent=false/양 subtree absent/null로 발급하며 namespace 미관측은 unknown이다.
+get/getContainer·SavedData load·dirty·새 CompoundTag를 사용하지 않는다. 원 callback을
+보관하지 않고 실제 map/container/root identity와 원 control을 전후 확인하며, namespace
+4096개·전체 cached key 합계 4096개를 끝까지 검사한다. 일반 NativeTargets는 조기 일치 후
+검사 중단만 제거했으며 일반 knownness와 ACL·wire를 확장하지 않는다.
+
+Rust calibration validator는 bool 타입을 유지하고 false이면 양 subtree 부재/null과 top
+absence를 요구한다. 원 false/true·bytes·digest 차이와 unknown/full-scope·source pin 검사를
+유지한다. `475` format 뒤 base `021ad5a`+수정 Rust 두 파일을 구분한 `476`에서 기존
+집중 회귀 1개와 Coordinator all-target strict Clippy가 통과했다. 전후 manifest SHA-256은
+`b49b6b09c695b929534c11842294134a65053a5a84ea541a059c27ffdf4153e6`로 같으며 개별 목록도
+보존했다. command 0·83,315 ms·Job commit peak 1,550,729,216 bytes·9 process·최대 gap
+148 ms이며 owned-tail 정리 후 drain·완전한 출력·export·scratch 정리·lease 해제다.
+독립 source 리뷰 후 Java 9파일을 동결했고 Rust와 동일 shape도 대조했지만 새 Java의
+컴파일·단위 검사와 실제 Mixin·cache 관측은 아직 미실행이다. `148b2af`의 411 PASS는
+이 후속 Java 소스의 성공 근거가 아니다.
+
 추가 Windows API 관측 `438`은 Brigadier/native custom 실행 interface 10개,
 `439`는 DoubleTag 1개를 각각 원 JAR과 고정 JDK의 javap로 확인했다. 두 실행은 command
 0·stderr 0, 각각 7,951/3,977 ms와 Job commit peak 177,094,656/171,249,664 bytes·

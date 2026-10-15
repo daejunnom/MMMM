@@ -408,7 +408,7 @@ pub(crate) fn validate_calibration_image(raw: &Value, selector: &Value) -> Resul
             )?;
             let payload = &raw["payload"];
             fields(payload, &["storagePresent", "inputs", "invocation"])?;
-            require(boolean(payload, "storagePresent")?)?;
+            let storage_present = boolean(payload, "storagePresent")?;
             for key in ["inputs", "invocation"] {
                 let subtree = &payload[key];
                 fields(subtree, &["presence", "nativeValueNbt"])?;
@@ -418,16 +418,10 @@ pub(crate) fn validate_calibration_image(raw: &Value, selector: &Value) -> Resul
                     _ => return Err(NativePayloadError),
                 }
             }
-            require(
-                raw["presence"]
-                    == if payload["inputs"]["presence"] == "absent"
-                        && payload["invocation"]["presence"] == "absent"
-                    {
-                        "absent"
-                    } else {
-                        "present"
-                    },
-            )?;
+            let subtrees_absent = payload["inputs"]["presence"] == "absent"
+                && payload["invocation"]["presence"] == "absent";
+            require(storage_present || subtrees_absent)?;
+            require(raw["presence"] == if subtrees_absent { "absent" } else { "present" })?;
             Ok(())
         }
         _ => Err(NativePayloadError),

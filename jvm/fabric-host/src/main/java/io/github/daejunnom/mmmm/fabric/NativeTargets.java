@@ -402,7 +402,7 @@ final class NativeTargets {
             while (iterator.hasNext()) {
                 if (++scanned > 4096) throw limit();
                 var id = iterator.next();
-                if (text(selector, "storage").equals(id.toString())) { observedId = id; break; }
+                if (text(selector, "storage").equals(id.toString())) observedId = id;
             }
         }
         if (observedId == null) {

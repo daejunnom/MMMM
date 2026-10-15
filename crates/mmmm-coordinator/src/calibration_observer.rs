@@ -1847,10 +1847,70 @@ mod tests {
         let original = pair(&program);
         let decoded = decode_pair(&original, &program, &|| Ok(())).unwrap();
         assert_eq!(decoded.images.len(), 2);
-        let mut changed = original.clone();
+        let mut missing = original.clone();
+        replace_raw(&mut missing, 1, |raw| {
+            raw["payload"]["storagePresent"] = json!(false)
+        });
+        let missing_decoded = decode_pair(&missing, &program, &|| Ok(())).unwrap();
+        let missing_raw = mmmm_contracts::parse_json(&missing_decoded.images[1].bytes).unwrap();
+        assert_eq!(missing_raw["payload"]["storagePresent"], json!(false));
+        assert_eq!(
+            missing_decoded.images[1].bytes,
+            hex(
+                missing["targets"][1]["rawBytesHex"].as_str().unwrap(),
+                IMAGE_BYTES,
+                &|| Ok(())
+            )
+            .unwrap()
+        );
+        assert_ne!(missing_decoded.images[1].bytes, decoded.images[1].bytes);
+        let missing_digest = raw_digest(&missing_decoded.images[1].bytes);
+        assert_eq!(
+            missing_digest.as_str(),
+            missing["targets"][1]["rawSha256"].as_str().unwrap()
+        );
+        assert_ne!(missing_digest, raw_digest(&decoded.images[1].bytes));
+        for key in ["inputs", "invocation"] {
+            let mut present = original.clone();
+            replace_raw(&mut present, 1, |raw| {
+                raw["presence"] = json!("present");
+                raw["payload"][key] = json!({
+                    "presence":"present",
+                    "nativeValueNbt":nbt(&[3, 0, 0, 0, 1], json!([]))
+                });
+            });
+            assert!(decode_pair(&present, &program, &|| Ok(())).is_ok());
+            replace_raw(&mut present, 1, |raw| {
+                raw["payload"]["storagePresent"] = json!(false)
+            });
+            assert!(decode_pair(&present, &program, &|| Ok(())).is_err());
+            let mut changed = missing.clone();
+            replace_raw(&mut changed, 1, |raw| {
+                raw["payload"][key]["nativeValueNbt"] = nbt(&[3, 0, 0, 0, 1], json!([]))
+            });
+            assert!(decode_pair(&changed, &program, &|| Ok(())).is_err());
+        }
+        for value in [Value::Null, json!("false"), json!(0)] {
+            let mut changed = missing.clone();
+            replace_raw(&mut changed, 1, |raw| {
+                raw["payload"]["storagePresent"] = value
+            });
+            assert!(decode_pair(&changed, &program, &|| Ok(())).is_err());
+        }
+        for (field, value) in [
+            ("membershipScope", json!("unknown")),
+            ("captureScope", json!("native_storage_key")),
+            ("coverage", json!("best_effort")),
+            ("reason", json!("native_storage_namespace_not_observed")),
+        ] {
+            let mut changed = missing.clone();
+            replace_raw(&mut changed, 1, |raw| raw[field] = value);
+            assert!(decode_pair(&changed, &program, &|| Ok(())).is_err());
+        }
+        let mut changed = missing.clone();
         replace_raw(&mut changed, 1, |raw| raw["presence"] = json!("present"));
         assert!(decode_pair(&changed, &program, &|| Ok(())).is_err());
-        let mut changed = original.clone();
+        let mut changed = missing.clone();
         replace_raw(&mut changed, 1, |raw| {
             raw["status"] = json!("unknown");
             raw["presence"] = json!("unknown");
@@ -1878,7 +1938,7 @@ mod tests {
         changed["targets"].as_array_mut().unwrap().swap(0, 1);
         assert!(decode_pair(&changed, &program, &|| Ok(())).is_err());
         assert_eq!(
-            decode_pair(&original, &program, &|| Err(AppError::new(
+            decode_pair(&missing, &program, &|| Err(AppError::new(
                 "CANCELLED",
                 "Original request ended"
             )))
@@ -1890,7 +1950,7 @@ mod tests {
         let mut context =
             mmmm_contracts::parse_json(include_bytes!("../../../examples/execution-context.json"))
                 .unwrap();
-        let mut full = original.clone();
+        let mut full = missing.clone();
         let object = full.as_object_mut().unwrap();
         object.insert(
             "format".into(),

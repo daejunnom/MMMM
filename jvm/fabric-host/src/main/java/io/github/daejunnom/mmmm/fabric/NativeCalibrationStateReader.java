@@ -3,28 +3,17 @@ package io.github.daejunnom.mmmm.fabric;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.daejunnom.mmmm.host.HostSession;
 import io.github.daejunnom.mmmm.sdk.ContractException;
-import java.util.Iterator;
 import java.util.Objects;
 import java.util.function.Function;
 import java.util.function.Supplier;
-import net.minecraft.nbt.CompoundTag;
-import net.minecraft.resources.Identifier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.world.level.storage.CommandStorage;
 
 /** Actual current context and cache-only storage reads shared by full calibration images. */
 final class NativeCalibrationStateReader {
-    private static final int MAX_STORAGE_KEYS = 4096;
     private NativeCalibrationStateReader() { }
     @FunctionalInterface interface Checkpoint { void check(); }
     @FunctionalInterface interface ContextRead<T> { T read(ObjectNode context, Checkpoint checkpoint); }
-    enum Unknown { STORAGE_NOT_CACHED, STORAGE_NOT_ADMITTED }
-    record StorageRead(CompoundTag cachedRoot, Unknown unknown) {
-        StorageRead {
-            if ((cachedRoot == null) == (unknown == null)) throw new IllegalArgumentException("Exactly one storage observation is required");
-        }
-    }
 
     static <T> T currentContext(MinecraftServer server, ServerLevel level, HostSession owner, ObjectNode supplied,
                                 Checkpoint control, ContextRead<T> read) {
@@ -52,22 +41,9 @@ final class NativeCalibrationStateReader {
         });
     }
 
-    /** No get() until the complete bounded cached-key membership has succeeded. */
-    static StorageRead cachedStorage(MinecraftServer server, String expected, Checkpoint checkpoint) {
-        checkpoint.check();
-        return checked(() -> {
-            CommandStorage storage = server.getCommandStorage();
-            if (storage == null || storage.getClass() != CommandStorage.class) return new StorageRead(null, Unknown.STORAGE_NOT_ADMITTED);
-            Identifier observed;
-            try (var keys = storage.keys()) { observed = cachedKey(keys.iterator(), expected, checkpoint); }
-            checkpoint.check();
-            if (observed == null) return new StorageRead(null, Unknown.STORAGE_NOT_CACHED);
-            if (server.getCommandStorage() != storage) throw failure("CALIBRATION_STATE_CHANGED");
-            CompoundTag root = storage.get(observed);
-            checkpoint.check();
-            if (root == null || root.getClass() != CompoundTag.class) return new StorageRead(null, Unknown.STORAGE_NOT_ADMITTED);
-            return new StorageRead(root, null);
-        }, checkpoint);
+    /** Actual cached namespace and key membership, without get/load or a synthetic root. */
+    static NativeCommandStorageCache.Read cachedStorage(MinecraftServer server, String expected, Checkpoint checkpoint) {
+        return NativeCommandStorageCache.observe(server, expected, checkpoint);
     }
 
     /** Comparison test port; only currentContext() supplies the actual owner lookup. */
@@ -78,17 +54,6 @@ final class NativeCalibrationStateReader {
             if (!context.equals(supplied)) throw failure("CALIBRATION_STATE_CONTEXT_CHANGED");
             original.check(); return read.apply(context);
         }, original);
-    }
-
-    /** An early match cannot skip the finite complete-membership check. */
-    static <K> K cachedKey(Iterator<K> keys, String expected, Checkpoint checkpoint) {
-        K observed = null; int count = 0;
-        while (keys.hasNext()) {
-            checkpoint.check(); if (++count > MAX_STORAGE_KEYS) throw failure("CALIBRATION_STATE_LIMIT");
-            K key = keys.next(); if (key == null) throw failure("CALIBRATION_STATE_CHANGED");
-            if (expected.equals(key.toString())) { if (observed != null) throw failure("CALIBRATION_STATE_CHANGED"); observed = key; }
-        }
-        checkpoint.check(); return observed;
     }
 
     static <T> T checked(Supplier<T> read, Checkpoint checkpoint) {

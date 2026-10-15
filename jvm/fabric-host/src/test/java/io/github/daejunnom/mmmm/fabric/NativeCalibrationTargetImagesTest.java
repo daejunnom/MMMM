@@ -75,6 +75,15 @@ final class NativeCalibrationTargetImagesTest {
         assertEquals("absent", empty.path("presence").asText()); assertEquals("absent", empty.path("payload").path("inputs").path("presence").asText());
         assertEquals("absent", empty.path("payload").path("invocation").path("presence").asText());
         assertTrue(empty.path("payload").path("invocation").path("nativeValueNbt").isNull());
+        assertTrue(empty.path("payload").path("storagePresent").booleanValue());
+        port.keyAbsent = true; var missingKey = scan(port); ObjectNode missing = image(missingKey.storageBytes());
+        assertTrue(missingKey.storageFullTargetKnown()); assertEquals("known", missing.path("status").asText());
+        assertEquals("absent", missing.path("presence").asText()); assertFalse(missing.path("payload").path("storagePresent").booleanValue());
+        for (String subtree : List.of("inputs", "invocation")) {
+            assertEquals("absent", missing.path("payload").path(subtree).path("presence").asText());
+            assertTrue(missing.path("payload").path(subtree).path("nativeValueNbt").isNull());
+        }
+        assertNotEquals(first.storageSha256(), missingKey.storageSha256()); port.keyAbsent = false;
         port.objectivePayload.withArray("scores").add(ContractJson.newObject().put("holder", "unfamiliar-holder").put("value", -2147483648).put("locked", true));
         port.objectivePayload.put("nativeObjectiveNbt", "changed-factual-port-metadata");
         port.objectivePayload.withArray("displaySlots").add(ContractJson.newObject().put("name", "fixture-slot"));
@@ -100,7 +109,7 @@ final class NativeCalibrationTargetImagesTest {
         var primary = new ContractException("NATIVE_READ_FAILED", "actual target read failed");
         var revoked = new ContractException("SOURCE_REVOKED", "actual source revoked"); var stopped = new AtomicBoolean();
         var failing = new Port(new CompoundTag()) {
-            @Override public NativeCalibrationStateReader.StorageRead storage(String storage, NativeCalibrationStateReader.Checkpoint checkpoint) {
+            @Override public NativeCommandStorageCache.Facts storage(String storage, NativeCalibrationStateReader.Checkpoint checkpoint) {
                 reads.incrementAndGet(); stopped.set(true); throw primary;
             }
         };
@@ -108,6 +117,12 @@ final class NativeCalibrationTargetImagesTest {
         assertArrayEquals(new Throwable[]{revoked}, primary.getSuppressed()); assertEquals(2, failing.reads.get());
         assertSame(revoked, assertThrows(ContractException.class, () -> NativeCalibrationTargetImages.scan(port, context(), selected(), () -> { throw revoked; })));
         assertEquals(0, port.reads.get());
+        var finalPrimary = new ContractException("CACHE_CHANGED", "actual cache changed after image encoding"); var finalRead = new AtomicBoolean();
+        var late = new Port(new CompoundTag()) {
+            @Override public void checkComplete(NativeCalibrationStateReader.Checkpoint checkpoint) { finalRead.set(true); throw finalPrimary; }
+        };
+        assertSame(finalPrimary, assertThrows(ContractException.class, () -> NativeCalibrationTargetImages.scan(late, context(), selected(), () -> { if (finalRead.get()) throw revoked; })));
+        assertArrayEquals(new Throwable[]{revoked}, finalPrimary.getSuppressed()); assertEquals(2, late.reads.get());
     }
 
     @Test void boundedWholeCodecRejectsExcessiveDepthAndImageSizeAndKeepsCheckpointFailure() {
@@ -128,6 +143,7 @@ final class NativeCalibrationTargetImagesTest {
 
     private static class Port implements NativeCalibrationTargetImages.ReadPort {
         CompoundTag root;
+        boolean keyAbsent;
         final AtomicInteger reads = new AtomicInteger();
         final ObjectNode objectivePayload = ContractJson.newObject();
         Port(CompoundTag root) {
@@ -141,9 +157,10 @@ final class NativeCalibrationTargetImagesTest {
                     .put("captureScope", "native_objective_and_all_scores").put("coverage", "full_target").putNull("reason");
             value.set("payload", objectivePayload.deepCopy()); return value;
         }
-        @Override public NativeCalibrationStateReader.StorageRead storage(String name, NativeCalibrationStateReader.Checkpoint checkpoint) {
+        @Override public NativeCommandStorageCache.Facts storage(String name, NativeCalibrationStateReader.Checkpoint checkpoint) {
             assertEquals(STORAGE, name); reads.incrementAndGet();
-            return new NativeCalibrationStateReader.StorageRead(root, root == null ? NativeCalibrationStateReader.Unknown.STORAGE_NOT_CACHED : null);
+            return new NativeCommandStorageCache.Facts(keyAbsent ? NativeCommandStorageCache.State.KEY_ABSENT
+                    : root == null ? NativeCommandStorageCache.State.NAMESPACE_UNKNOWN : NativeCommandStorageCache.State.PRESENT, keyAbsent ? null : root);
         }
         @Override public void checkCurrent() { }
     }
