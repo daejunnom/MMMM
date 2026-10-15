@@ -203,6 +203,58 @@ fn block_scene(block: &str, origin_x: i32) -> (SceneDraft, Value, Value, Value) 
 }
 
 #[test]
+fn static_owned_pack_uses_only_sealed_scene_coverage() {
+    let (draft, project, _, _) = block_scene("minecraft:stone", 128);
+    let request = |project: &Value| {
+        json!({"contextId":"static-pack-context","projectId":project["projectId"],
+            "expectedRevision":project["revision"],"targetProfileId":project["targetProfileId"],
+            "outputPolicy":"private_staging_only"})
+    };
+    let pack = mmmm_compiler::pack_build(
+        &request(&project),
+        &source_only_target(),
+        static_scene_pack_inputs(&project, draft),
+    )
+    .unwrap();
+    // This existing authored fixture verifies the production coverage adapter,
+    // not a live target, pack installation, reload or world execution.
+    assert_eq!(pack.manifest().validation_stage, "statically_checked");
+    assert!(pack.manifest().entry_points.contains_key("scene_stage"));
+    for (case, expected) in [
+        ("missing", "UNOWNED_REQUIRED_CAPABILITY"),
+        ("extra", "UNOWNED_REQUIRED_CAPABILITY"),
+        ("stale", "REVISION_CONFLICT"),
+    ] {
+        let (draft, mut changed, _, _) = block_scene("minecraft:stone", 128);
+        match case {
+            "missing" => {
+                changed["ownedResources"].as_array_mut().unwrap().remove(0);
+            }
+            "extra" => changed["ownedResources"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "kind":"asset","objectId":"unlowered-asset","revision":"ab".repeat(32)
+                })),
+            "stale" => changed["ownedResources"][0]["revision"] = json!("ab".repeat(32)),
+            _ => unreachable!(),
+        }
+        revise("Project", &mut changed);
+        assert_eq!(
+            mmmm_compiler::pack_build(
+                &request(&changed),
+                &source_only_target(),
+                static_scene_pack_inputs(&changed, draft),
+            )
+            .unwrap_err()
+            .code,
+            expected,
+            "{case} owned coverage must retain the existing compiler rejection"
+        );
+    }
+}
+
+#[test]
 fn changed_block_uses_one_exact_stage_delta_and_loaded_subject_pair() {
     let (before, _, _, instance) = block_scene("minecraft:stone", 128);
     let (after, _, _, _) = block_scene("minecraft:dirt", 128);

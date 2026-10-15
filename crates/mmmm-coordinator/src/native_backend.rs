@@ -801,13 +801,7 @@ impl PlanningBackendPort for HostNativeBackend {
         }
         access.authorize_project(principal, project.project_id(), Some(context), Access::Plan)?;
         check_budget(budget)?;
-        Ok(PackBuildInputs::new(
-            project.project().clone(),
-            vec![],
-            BTreeMap::new(),
-            BTreeSet::new(),
-        )
-        .with_scene(draft))
+        Ok(static_scene_pack_inputs(project.project(), draft))
     }
     fn snapshot_native_targets_with_store(
         &mut self,
@@ -1349,6 +1343,17 @@ impl PlanningEnvironmentPort for HostNativeBackend {
         check_budget(&budget)?;
         Ok(false)
     }
+}
+
+fn static_scene_pack_inputs(project: &Value, draft: SceneDraft) -> PackBuildInputs {
+    // Only the sealed lowering result supplies coverage. The compiler still
+    // checks its exact kind/object/revision against the immutable Project.
+    let covered = draft
+        .covered_owned_sources()
+        .iter()
+        .map(|source| source.object_id.to_string())
+        .collect();
+    PackBuildInputs::new(project.clone(), vec![], BTreeMap::new(), covered).with_scene(draft)
 }
 
 pub(crate) fn world_route(kind: NativeKind) -> Option<(&'static str, &'static str)> {
