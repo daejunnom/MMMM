@@ -68,10 +68,11 @@ final class NativeCalibrationStateReaderTest {
 
     @Test void cachedFixedNativeTagsKeepRawFloatBitsIntegersMarkersAbsenceAndImmutableFacts() {
         var root = new CompoundTag(); var invocation = new CompoundTag(); var inputs = new CompoundTag();
-        // valueOf/putFloat normalize signed zero in 26.3; the public constructor
-        // retains the actual float field bits used by this read-only fixture.
-        invocation.put("result", new FloatTag(-0.0f)); invocation.put("stale", new ByteTag((byte) 1));
-        inputs.put("n1", new IntTag(Integer.MAX_VALUE)); root.put("invocation", invocation); root.put("inputs", inputs);
+        // Fixed 26.3 factory and native decoder fold -0: one raw ABI compatibility input.
+        @SuppressWarnings("removal")
+        FloatTag negativeZero = new FloatTag(-0F);
+        invocation.put("result", negativeZero); invocation.put("stale", ByteTag.valueOf((byte) 1));
+        inputs.put("n1", IntTag.valueOf(Integer.MAX_VALUE)); root.put("invocation", invocation); root.put("inputs", inputs);
         var port = new Port() {
             @Override public NativeCalibrationStateReader.StorageRead storage(String id, NativeCalibrationStateReader.Checkpoint checkpoint) {
                 assertEquals(STORAGE, id); storageCalls.incrementAndGet(); return new NativeCalibrationStateReader.StorageRead(root, null);
@@ -85,10 +86,10 @@ final class NativeCalibrationStateReaderTest {
         assertEquals(0x80000000, raw.staleStorage().rawFloatBits());
         assertEquals(NativeCalibrationStateReader.Kind.BYTE_TAG, raw.staleMarker().kind()); assertEquals(1, raw.staleMarker().int32());
         assertEquals(NativeCalibrationStateReader.Kind.INT_TAG, raw.inputs().get(1).kind()); assertEquals(Integer.MAX_VALUE, raw.inputs().get(1).int32());
-        invocation.put("result", new FloatTag(Float.intBitsToFloat(0x7fc12345)));
+        invocation.put("result", FloatTag.valueOf(Float.intBitsToFloat(0x7fc12345)));
         var nan = NativeCalibrationStateReader.scan(port, CASE, FUNCTION, addresses(), () -> { });
         assertEquals(0x7fc12345, nan.result().rawFloatBits()); assertEquals(0x80000000, raw.result().rawFloatBits());
-        invocation.put("result", new IntTag(-19));
+        invocation.put("result", IntTag.valueOf(-19));
         assertEquals(-19, NativeCalibrationStateReader.scan(port, CASE, FUNCTION, addresses(), () -> { }).result().int32());
         root.put("invocation", new CompoundTag()); root.put("inputs", new CompoundTag());
         var empty = NativeCalibrationStateReader.scan(port, CASE, FUNCTION, addresses(), () -> { });
@@ -103,7 +104,7 @@ final class NativeCalibrationStateReaderTest {
         };
         var absent = NativeCalibrationStateReader.scan(emptyPort, CASE, FUNCTION, addresses(), () -> { });
         assertEquals(NativeCalibrationStateReader.Presence.ABSENT, absent.scratchPresence());
-        root.put("invocation", new IntTag(7));
+        root.put("invocation", IntTag.valueOf(7));
         var wrongParent = NativeCalibrationStateReader.scan(port, CASE, FUNCTION, addresses(), () -> { });
         assertEquals(NativeCalibrationStateReader.Presence.PRESENT, wrongParent.scratchPresence());
         assertEquals(NativeCalibrationStateReader.Unknown.PARENT_NOT_COMPOUND, wrongParent.result().unknown());

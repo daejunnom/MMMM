@@ -109,6 +109,8 @@
 
 | MMMM-D066 | Calibration 원문, native constructor 입력과 현재 VM executable 관측을 별도 사실로 유지한다. | Rust sealed program의 원 body 명령·exclusive preseed 경계·선택 command 위치·초기화/정리 배열을 private manifest에 그대로 전달한다. Java는 원문을 split·재parse·flatten하지 않는다. 실제 Unbound constructor의 String/ContextChain 참조 관측은 내부 chain의 완전 소비·선택 parser/handler 증명과 구분한다. 실제 receiver/Method를 D059의 actual Class/loader/native stamp와 묶은 current_vm_executable도 loaded_definition_bytes·최종 classfile·전체 JDK closure나 실행 권한으로 바꾸지 않는다. 지원한 native zero-capture static-forwarder 외 hidden recipe는 미지원으로 남긴다. 실제 stage 실행·독립 상태 관측·원 journal/readback 연결 및 최초 profile 인수는 별도 검증하며 과거 load 사건의 기록만을 유일한 함수 동일성 근거로 요구하지 않는다. |
 
+| MMMM-D067 | 실제 FloatTag 원 비트 관측 테스트의 음수 0 입력 한 곳에만 제거 예정 생성자의 호환성 예외를 둔다. | 고정 26.3의 valueOf와 FloatTag를 만드는 TYPE.load가 모두 음수 0을 양수 0으로 정규화함을 관리 434 원 bytecode에서 확인했다. 원 0x80000000을 담은 실제 Tag getter 검사를 유지하기 위해 해당 local 변수에만 removal 경고 예외를 명시하며 normal Int/Byte/NaN 입력은 factory를 쓴다. 제품 코드·method/class 전체·compiler flag에는 예외를 두지 않고 reflection으로 경고를 우회하지 않는다. 지원 factory가 원 bits를 보존하거나 고정 API의 생성자가 제거되면 이 단일 fixture를 재검토한다. |
+
 D061의 Rust 비교 입력은 같은 sealed `CalibrationDispatchPlan`의
 `loaded_source_expectations()`에서만 투영한다. 원 function ID·logical entry bytes와
 program digest는 plan에서 빌리고, native resource lookup ID는 별도로 구분한다.

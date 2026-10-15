@@ -1593,7 +1593,26 @@ quota/overflow 때 정상 반환할 수 있어 drain 반환도 전체 entry 완�
 stage/preseed/selected return·v3 issuer·독립 readback consumer는 후속 연결 중이며 이 부분
 관측 producer만으로 dispatch를 활성화하지 않는다.
 
-## 현재 고정 SHA의 CI 실패 구분
+`3b74916c605c5d1711a35f6ad1329c27f74ece6a`를 공유한 Windows 관리 JVM `433`은 원
+source 181개와 JDK/Gradle pin의 전후 일치를 확인했다. production Fabric compile은
+실제 통과했지만 새 state reader 테스트의 제거 예정 NBT 생성자 6곳이 Werror로 거절돼
+Fabric unit test에는 도달하지 않았다. 명령 exit 1·39,284 ms, Job commit peak
+1,429,372,928 bytes·6 process·최대 sample gap 134 ms이고 자연 종료·drain·완전한 출력·
+export·scratch 정리·lease 해제는 정상이다. Gradle task 10개가 실제 실행된 부분 결과이며
+11개 필수 작업 전체 성공이나 새 테스트 통과로 표시하지 않는다.
+
+후속 관리 `434`는 같은 원 JAR/owner 경계를 재대조하고 실제 NBT API 7개를 읽었다.
+FloatTag의 factory뿐 아니라 TYPE.load도 readFloat 뒤 valueOf를 호출해 음수 0을 양수 0으로
+정규화한다. streaming visitor의 primitive 전달은 FloatTag 생성과 구분한다. 명령 exit 0·
+6,155 ms, Job commit peak 174,866,432 bytes·4 process이며 정상 drain/export/scratch/lease를
+확인했다. 원 stdout 71,205 bytes·SHA-256
+`6dd4a1445a50cd5d39497fab30022afb00933e055a9b311ffe0a307d684f6f74`를 보존했다.
+D067에 따라 normal Int/Byte/NaN 다섯 입력은 factory로 고치고 raw negative-zero 한 입력의
+local 변수에만 근거를 적은 removal 경고 예외를 뒀다. 원 bits와 NaN payload 기대값은
+유지하며 실제 getter의 관측 계약을 검사한다. production reader는 변경하지 않았다.
+소스 리뷰와 이후 새 JVM 실행 결과는 구분한다.
+
+## 공유 고정 SHA의 CI 실패 구분
 
 `54af8a8708d399b3e7044f036828bdd0e40219b1`의 JVM CI 59 (`38787591379`)는 세 OS와
 집계 성공을 관측했다. 원 ZIP 감사는 선행 고정 source의 CI 57과 구분하며 이번 원본은
