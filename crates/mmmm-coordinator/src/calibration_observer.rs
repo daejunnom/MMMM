@@ -1004,7 +1004,7 @@ pub(crate) fn state(
 }
 
 #[derive(Clone, Debug)]
-enum Tag {
+pub(crate) enum Tag {
     End,
     Byte(i8),
     Short,
@@ -1013,8 +1013,9 @@ enum Tag {
     Float(u32),
     Double(u64),
     Array,
+    IntArray(Vec<i32>),
     List(Vec<Tag>),
-    String,
+    String(Vec<u16>),
     Compound(BTreeMap<Vec<u16>, Tag>),
 }
 impl Tag {
@@ -1047,6 +1048,36 @@ fn validate_image_nbt(image: &Value, check: &dyn Fn() -> AppResult<()>) -> AppRe
 }
 fn decode_nbt(value: &Value, check: &dyn Fn() -> AppResult<()>) -> AppResult<Tag> {
     exact(value, &["format", "bytesHex", "sha256", "rawFloatingBits"])?;
+    let mut tag = decode_nbt_core(value, check)?;
+    let entries = value["rawFloatingBits"].as_array().ok_or_else(invalid)?;
+    if encode_json(&value["rawFloatingBits"])
+        .map_err(|_| invalid())?
+        .len()
+        > NATIVE_BYTES
+    {
+        return Err(limit());
+    }
+    apply_raw_floating_bits(&mut tag, entries, check)?;
+    check()?;
+    Ok(tag)
+}
+
+/// A pure persisted-byte decoder, shared with the native display reader. It
+/// issues no acquisition, source, completeness or current-authority witness.
+pub(crate) fn decode_persisted_named_nbt(
+    value: &Value,
+    check: &dyn Fn() -> AppResult<()>,
+) -> AppResult<Tag> {
+    exact(value, &["format", "bytesHex", "sha256"])?;
+    if value["format"] != "minecraft.nbt.named-compound/uncompressed" {
+        return Err(invalid());
+    }
+    let tag = decode_nbt_core(value, check)?;
+    check()?;
+    Ok(tag)
+}
+
+fn decode_nbt_core(value: &Value, check: &dyn Fn() -> AppResult<()>) -> AppResult<Tag> {
     let bytes = hex(text(value, "bytesHex")?, NATIVE_BYTES, check)?;
     if raw_digest(&bytes) != digest_field(value, "sha256")? {
         return Err(invalid());
@@ -1068,7 +1099,7 @@ fn decode_nbt(value: &Value, check: &dyn Fn() -> AppResult<()>) -> AppResult<Tag
         "minecraft.nbt.any-tag/uncompressed" => {}
         _ => return Err(invalid()),
     }
-    let mut tag = if kind == 0 {
+    let tag = if kind == 0 {
         Tag::End
     } else {
         reader.tag(kind, 0)?
@@ -1077,14 +1108,13 @@ fn decode_nbt(value: &Value, check: &dyn Fn() -> AppResult<()>) -> AppResult<Tag
     if reader.offset != bytes.len() {
         return Err(invalid());
     }
-    let entries = value["rawFloatingBits"].as_array().ok_or_else(invalid)?;
-    if encode_json(&value["rawFloatingBits"])
-        .map_err(|_| invalid())?
-        .len()
-        > NATIVE_BYTES
-    {
-        return Err(limit());
-    }
+    Ok(tag)
+}
+fn apply_raw_floating_bits(
+    tag: &mut Tag,
+    entries: &[Value],
+    check: &dyn Fn() -> AppResult<()>,
+) -> AppResult<()> {
     let mut seen = BTreeSet::new();
     for entry in entries {
         exact(entry, &["path", "kind", "bits"])?;
@@ -1096,7 +1126,7 @@ fn decode_nbt(value: &Value, check: &dyn Fn() -> AppResult<()>) -> AppResult<Tag
         if !seen.insert(encoded) {
             return Err(invalid());
         }
-        let mut current = &mut tag;
+        let mut current = &mut *tag;
         for part in path {
             if let Some(key) = part.get("key").and_then(Value::as_str) {
                 exact(part, &["key"])?;
@@ -1157,11 +1187,10 @@ fn decode_nbt(value: &Value, check: &dyn Fn() -> AppResult<()>) -> AppResult<Tag
             _ => 0,
         }
     }
-    if floats(&tag) != entries.len() {
+    if floats(tag) != entries.len() {
         return Err(invalid());
     }
-    check()?;
-    Ok(tag)
+    Ok(())
 }
 struct Nbt<'a> {
     bytes: &'a [u8],
@@ -1278,22 +1307,21 @@ impl Nbt<'_> {
             6 => Tag::Double(u64::from_be_bytes(
                 self.take(8)?.try_into().map_err(|_| invalid())?,
             )),
-            7 | 11 | 12 => {
+            7 | 12 => {
                 let n = self.length()?;
-                self.take(
-                    n * if kind == 7 {
-                        1
-                    } else if kind == 11 {
-                        4
-                    } else {
-                        8
-                    },
-                )?;
+                self.take(n * if kind == 7 { 1 } else { 8 })?;
                 Tag::Array
             }
-            8 => {
-                self.units()?;
-                Tag::String
+            8 => Tag::String(self.units()?),
+            11 => {
+                let n = self.length()?;
+                let mut values = Vec::with_capacity(n);
+                for _ in 0..n {
+                    values.push(i32::from_be_bytes(
+                        self.take(4)?.try_into().map_err(|_| invalid())?,
+                    ));
+                }
+                Tag::IntArray(values)
             }
             9 => {
                 let child = self.byte()?;
@@ -1722,7 +1750,7 @@ mod tests {
         ));
         assert!(matches!(
             decode_nbt(&nbt(&[8, 0, 3, 0xed, 0xa0, 0x80], json!([])), &|| Ok(())).unwrap(),
-            Tag::String
+            Tag::String(_)
         ));
         assert!(decode_nbt(&nbt(&[9, 255, 0, 0, 0, 0], json!([])), &|| Ok(())).is_err());
         assert!(decode_nbt(&nbt(&[9, 0, 0, 0, 0, 1], json!([])), &|| Ok(())).is_err());

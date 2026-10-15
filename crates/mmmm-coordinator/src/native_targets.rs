@@ -4,6 +4,9 @@
 use crate::{
     authority::LocalAuthority,
     host::{HostBridge, HostContextWitness},
+    native_display_readback::{
+        DisplayProvenance, NativeDisplayReadError, NativeDisplaySnapshot, finish, parse_display,
+    },
     native_payload::{OriginalTargetPins, validate_payload},
     service::{RequestBudget, RequestContextSlot, RequestContextWitness},
 };
@@ -534,6 +537,106 @@ impl NativeTargetReader {
             None,
         )?;
         self.retain(store, read)
+    }
+    /// Acquire through the original paired reader, then interpret only that
+    /// exact received entity. This does not establish scene/pose admission.
+    pub fn observe_display_retained(
+        &self,
+        store: &mut DurableStore,
+        context: &Value,
+        selector: &NativeSelector,
+        registry_generation: &str,
+        owner_tag: &str,
+    ) -> Result<NativeDisplaySnapshot, NativeDisplayReadError> {
+        let read = self.observe_retained(
+            store,
+            context,
+            std::slice::from_ref(selector),
+            registry_generation,
+        )?;
+        self.display_snapshot(store, &read, selector, owner_tag)
+    }
+
+    /// Interpret an actual private-issued read under its same Store and still
+    /// current request/paired owner. Neither a raw JSON value nor a CAS hash
+    /// can enter this method in place of NativeRead.
+    pub fn display_snapshot(
+        &self,
+        store: &DurableStore,
+        read: &NativeRead,
+        selector: &NativeSelector,
+        owner_tag: &str,
+    ) -> Result<NativeDisplaySnapshot, NativeDisplayReadError> {
+        read.owner.check_store(store)?;
+        self.check_owner(&read.owner)?;
+        let checkpoint_error = std::cell::RefCell::new(None);
+        let checkpoint = || {
+            self.check_display_local(store, &read.owner)
+                .map_err(|error| {
+                    *checkpoint_error.borrow_mut() = Some(error);
+                    AppError::new(
+                        "NATIVE_DISPLAY_READ_ENDED",
+                        "Original native display read is no longer current",
+                    )
+                })
+        };
+        let result = (|| {
+            let target = read
+                .targets
+                .iter()
+                .find(|target| target.selector.value() == selector.value())
+                .ok_or(NativeDisplayReadError::Native(NativeTargetError::Invalid))?;
+            if raw_digest(target.bytes()) != *target.digest() {
+                return Err(NativeDisplayReadError::Native(NativeTargetError::Invalid));
+            }
+            let state = parse_display(target.raw(), selector, owner_tag, &checkpoint)
+                .map_err(NativeDisplayReadError::Decode)?;
+            let digest = |value: &Value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|_| NativeDisplayReadError::Native(NativeTargetError::Invalid))
+            };
+            let provenance = DisplayProvenance {
+                response: read.response.clone(),
+                observation_digest: target.digest().clone(),
+                native_nbt_digest: digest(&target.raw()["payload"]["nativeNbt"]["sha256"])?,
+                context_digest: digest(&read.wrapper["contextDigest"])?,
+                current_context_digest: digest(&read.owner.context["contextDigest"])?,
+                registry_generation: string(&read.wrapper, "registryGeneration")?.to_owned(),
+            };
+            Ok((state, provenance))
+        })();
+        let result = match checkpoint_error.into_inner() {
+            Some(error) => Err(NativeDisplayReadError::Native(error)),
+            None => result,
+        };
+        let current = (|| {
+            read.owner.check_store(store)?;
+            self.check_owner(&read.owner)?;
+            Ok(())
+        })();
+        let (state, provenance) = finish(result, current)?;
+        Ok(NativeDisplaySnapshot::from_acquired(state, provenance))
+    }
+
+    fn check_display_local(
+        &self,
+        store: &DurableStore,
+        owner: &ObservationOwner,
+    ) -> TargetResult<()> {
+        owner.check_store(store)?;
+        owner.request.check_local().map_err(service_error)?;
+        owner
+            .paired
+            .check_local()
+            .map_err(NativeTargetError::Authority)?;
+        let (current, budget) = self.current()?;
+        if !current.same_session(&owner.authenticated)
+            || budget.deadline() != owner.budget.deadline()
+            || !std::ptr::eq(budget.cancellation(), owner.budget.cancellation())
+        {
+            return Err(NativeTargetError::Invalid);
+        }
+        Ok(())
     }
     /// Post-dispatch history selects only the actual original durable invocation,
     /// exact operation owner/full scope and original native epoch. A public

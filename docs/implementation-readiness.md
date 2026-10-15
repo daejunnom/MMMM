@@ -1962,6 +1962,40 @@ Windows 도구 all-target strict Clippy가 통과했다. `480`은 command 0·4,5
 peak 360,484,864 bytes·7 process·최대 gap 102 ms이며 자연 종료·drain·완전한 출력·export·
 scratch 정리·lease 해제다. 실제 macOS 컴파일·lint 통과는 이 Windows 검사로 주장하지 않는다.
 
+JVM 70의 세 원 ZIP도 exact bytes·SHA-256과 같은 source/expected/PR head·별도 event
+`4d2793a6d6cfa8d00104fcf4ab34e41ec78a7e30`를 대조했다. 각 jvm-result의 7모듈 411개·
+36 report metadata·실패/오류/skip 0·필수 11 executed task와 실제 Gradle 성공 stdout을
+확인했다. 원 XML을 감사한 것으로 확대하지 않는다. Windows/Linux/macOS managed는 각각
+command 0·121,744/129,224/114,710 ms이며 drain·완전한 출력이다. 각 OS의 bootstrap·managed·
+native-build·header-managed·definition-startup finish 다섯 개는 모두 command 0·supervisor/
+cleanup 오류 0·scratch 정리·lease 해제다. Windows native-build/header의 owned-tail 정리와
+자연 종료는 구분한다. Linux와 macOS의 Pending 및 관측 회복 자료는 null/0으로 회복 분기
+실증이 아니다. Linux의 native `.so` 6,533,176 bytes는 개별 entry 4 MiB 한도 때문에 내용
+열람을 제외했으며 inner binary의 독립 digest 검증을 주장하지 않는다. startup은 모두
+`development_fixture` 관측이며 game/release는 `not_run`이다. 새 bootstrap·display 소비자
+구현과 이 이전 고정 source의 성공을 구분한다.
+
+## 실제 display readback의 의미 소비자
+
+새 `native_display_readback`은 기존 public `observe_display_retained`를 통해 실제 paired
+관측·보존의 private NativeRead를 취득한다. 같은 Store·원 요청/session·deadline/cancel·
+paired owner·현재 ACL을 전후 검사하고 최종 현재성 검사 후에만 factual snapshot을 만든다.
+파싱 중의 원 NativeTargetError와 decode 이후 권한 실패를 함께 보존한다. 원 HostResponse·
+관측/NBT digest·원/현재 context digest와 registry generation을 구분해 남긴다.
+
+기존 bounded NBT decoder를 공유하여 실제 signed UUID 네 단어·Double 위치 세 값·정확한
+태그와 owner tag를 교차 대조한다. 원 UTF-16·floating type/bits, matrix/decomposed 변환과
+billboard·세 interpolation 필드를 해석하고 생략 값은 None으로 유지한다. 기존 calibration
+4필드/rawFloatingBits·452 one-layer unwrap·byte/depth/node 한도와 별도 persisted 3필드
+seam을 구분한다. scene·animation·client·profile·write 권한을 발급하지 않는다.
+
+5파일의 독립 source 리뷰는 추가 P0–P2 및 명백한 type/lint 문제를 찾지 못했다. `482`의
+명시 5파일 format은 command 0·3,212 ms·자연 종료·drain·완전한 출력·export·scratch 정리·
+lease 해제다. 순수 해석 3개와 실제 Store/public reader의 no-entered-request 거절 1개를
+작성했지만 아직 compile/test는 미실행이다. 다른 코호트와의 통합 검사 전 WIP로 공유하며
+가짜 NativeRead·ADMIN·양성 snapshot fixture로 실제 발급을 대신하지 않았다. 실제 게임
+display·geometry·시각 관측은 별도 미실행이다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

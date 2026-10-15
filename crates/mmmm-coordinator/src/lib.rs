@@ -25,6 +25,7 @@ pub mod lifecycle;
 pub mod local_setup;
 pub mod native_backend;
 mod native_catalog;
+pub mod native_display_readback;
 pub mod native_entry;
 mod native_import_files;
 pub mod native_manual_exchange;
