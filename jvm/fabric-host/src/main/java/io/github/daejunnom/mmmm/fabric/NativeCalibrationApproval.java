@@ -11,11 +11,14 @@ import io.github.daejunnom.mmmm.sdk.ContractException;
 import io.github.daejunnom.mmmm.sdk.ContractJson;
 import io.github.daejunnom.mmmm.sdk.Invocation;
 import io.github.daejunnom.mmmm.sdk.ProviderResult;
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -35,7 +38,10 @@ final class NativeCalibrationApproval implements HostDispatcher.PurposeRoute, Au
     private static final Set<String> MANIFEST_FIELDS = Set.of("kind", "purpose", "selectionDigest", "hostEpoch", "registryGeneration",
             "runtimeSourceFactsDigest", "suiteDigest", "recipeSha256", "plan", "programs");
     private static final Set<String> PROGRAM_FIELDS = Set.of("stepId", "caseId", "functionId", "command", "programDigest",
-            "sourceSha256", "sourceBytesHex", "readbackAddresses");
+            "sourceSha256", "sourceBytesHex", "readbackAddresses", "commands", "preseedEndIndex",
+            "selectedCommandStageIndex", "initializationCommands", "cleanupCommands");
+    private static final int MAX_RECIPE_COMMANDS = 4096;
+    private static final int MAX_COMMAND_BYTES = 8192;
     private final ContractJson contracts;
     private final HostSession session;
     private final Clock clock;
@@ -75,7 +81,15 @@ final class NativeCalibrationApproval implements HostDispatcher.PurposeRoute, Au
     static final class Program {
         private final ObjectNode value;
         private final byte[] sourceBytes;
-        private Program(ObjectNode value, byte[] sourceBytes) { this.value = value.deepCopy(); this.sourceBytes = sourceBytes; }
+        private final List<String> commands;
+        private final List<String> initializationCommands;
+        private final List<String> cleanupCommands;
+        private Program(ObjectNode value, byte[] sourceBytes, List<String> commands,
+                        List<String> initializationCommands, List<String> cleanupCommands) {
+            this.value = value.deepCopy(); this.sourceBytes = sourceBytes;
+            this.commands = List.copyOf(commands); this.initializationCommands = List.copyOf(initializationCommands);
+            this.cleanupCommands = List.copyOf(cleanupCommands);
+        }
         String stepId() { return text(value, "stepId"); }
         String caseId() { return text(value, "caseId"); }
         String functionId() { return text(value, "functionId"); }
@@ -83,6 +97,15 @@ final class NativeCalibrationApproval implements HostDispatcher.PurposeRoute, Au
         String programDigest() { return text(value, "programDigest"); }
         String sourceSha256() { return text(value, "sourceSha256"); }
         byte[] sourceBytes() { return sourceBytes.clone(); }
+        /** Rust sealed recipe의 비교 입력이다. 원 source를 재구성하거나 실행할 권한이 아니다. */
+        List<String> commands() { return commands; }
+        /** 원 commands의 exclusive prefix [0, end) 뒤에서 preseed를 capture한다. */
+        int preseedEndIndex() { return value.path("preseedEndIndex").intValue(); }
+        /** 원 commands 안의 zero-based arithmetic/finite-check site다. */
+        int selectedCommandStageIndex() { return value.path("selectedCommandStageIndex").intValue(); }
+        // 초기화·정리 원문도 비교 입력이며 이 accessor가 별도 실행이나 수명을 승인하지 않는다.
+        List<String> initializationCommands() { return initializationCommands; }
+        List<String> cleanupCommands() { return cleanupCommands; }
         ObjectNode readbackAddresses() { return ContractJson.object(value.path("readbackAddresses")).deepCopy(); }
     }
     private static final class Accepted {
@@ -119,7 +142,7 @@ final class NativeCalibrationApproval implements HostDispatcher.PurposeRoute, Au
             if (!"mmmm:command_execute".equals(text(step, "actionId"))) throw invalid();
             steps.put(text(step, "stepId"), step.deepCopy());
         }
-        Set<String> cases = new HashSet<>(), functions = new HashSet<>(); int totalBytes = 0;
+        Set<String> cases = new HashSet<>(), functions = new HashSet<>(); int totalBytes = 0, totalCommands = 0;
         for (JsonNode value : manifest.path("programs")) {
             ObjectNode program = ContractJson.object(value); HostDispatcher.exactFields(program, PROGRAM_FIELDS);
             String step = text(program, "stepId"), caseId = text(program, "caseId"), function = text(program, "functionId");
@@ -132,11 +155,18 @@ final class NativeCalibrationApproval implements HostDispatcher.PurposeRoute, Au
             if (totalBytes > 1024 * 1024) throw invalid();
             sha(program, "programDigest"); sha(program, "sourceSha256");
             if (!ContractJson.sha256(source).equals(text(program, "sourceSha256"))) throw invalid();
+            List<String> commands = commandInputs(program, "commands", false);
+            List<String> initialization = commandInputs(program, "initializationCommands", true);
+            List<String> cleanup = commandInputs(program, "cleanupCommands", true);
+            totalCommands += commands.size() + initialization.size() + cleanup.size();
+            if (totalCommands > MAX_RECIPE_COMMANDS) throw invalid();
+            int preseed = commandIndex(program, "preseedEndIndex"), selected = commandIndex(program, "selectedCommandStageIndex");
+            if (preseed > selected || selected >= commands.size()) throw invalid();
             ObjectNode addresses = ContractJson.object(program.path("readbackAddresses"));
             if (!caseId.equals(addresses.path("caseId").asText()) || !function.equals(addresses.path("function").asText())) throw invalid();
             ObjectNode arguments = ContractJson.newObject().put("command", text(program, "command"));
             if (!ContractJson.digest(arguments).equals(steps.get(step).path("argumentsDigest").asText())
-                    || programs.putIfAbsent(step, new Program(program, source)) != null) throw invalid();
+                    || programs.putIfAbsent(step, new Program(program, source, commands, initialization, cleanup)) != null) throw invalid();
         }
         if (!programs.keySet().equals(steps.keySet())) throw invalid();
         manifestDigest = ContractJson.digest(manifest);
@@ -344,6 +374,25 @@ final class NativeCalibrationApproval implements HostDispatcher.PurposeRoute, Au
             JsonNode node = pending.pop(); if (++nodes > 4096) throw invalid();
             if (node.isContainerNode()) node.elements().forEachRemaining(pending::push);
         }
+    }
+    private static List<String> commandInputs(ObjectNode program, String field, boolean allowEmpty) {
+        JsonNode values = program.path(field);
+        if (!values.isArray() || (!allowEmpty && values.isEmpty()) || values.size() > MAX_RECIPE_COMMANDS) throw invalid();
+        var commands = new ArrayList<String>(values.size());
+        for (JsonNode value : values) {
+            if (!value.isTextual()) throw invalid();
+            String command = value.textValue();
+            if (command.isEmpty() || command.startsWith("#") || command.indexOf('\r') >= 0
+                    || command.indexOf('\n') >= 0 || command.indexOf('\0') >= 0
+                    || command.getBytes(StandardCharsets.UTF_8).length > MAX_COMMAND_BYTES) throw invalid();
+            commands.add(command);
+        }
+        return List.copyOf(commands);
+    }
+    private static int commandIndex(ObjectNode program, String field) {
+        JsonNode value = program.path(field);
+        if (!value.isIntegralNumber() || !value.canConvertToInt() || value.intValue() < 0) throw invalid();
+        return value.intValue();
     }
     private static String text(ObjectNode value, String key) { return HostDispatcher.string(value, key); }
     private static void sha(ObjectNode value, String key) { if (!text(value, key).matches("[a-f0-9]{64}")) throw invalid(); }

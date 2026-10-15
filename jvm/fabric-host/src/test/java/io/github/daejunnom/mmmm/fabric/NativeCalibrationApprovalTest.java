@@ -60,8 +60,75 @@ final class NativeCalibrationApprovalTest {
             }
             ObjectNode source = harness.manifest.deepCopy(); first(source, "programs").put("sourceBytesHex", "00".repeat(65537));
             assertThrows(ContractException.class, () -> harness.approval(source, null));
+            for (String field : List.of("commands", "preseedEndIndex", "selectedCommandStageIndex", "initializationCommands", "cleanupCommands")) {
+                ObjectNode missing = harness.manifest.deepCopy(); first(missing, "programs").remove(field);
+                assertThrows(ContractException.class, () -> harness.approval(missing, null));
+            }
+            for (String field : List.of("preseedEndIndex", "selectedCommandStageIndex")) {
+                ObjectNode negative = harness.manifest.deepCopy(); first(negative, "programs").put(field, -1);
+                assertThrows(ContractException.class, () -> harness.approval(negative, null));
+                ObjectNode decimal = harness.manifest.deepCopy(); first(decimal, "programs").put(field, 1.0);
+                assertThrows(ContractException.class, () -> harness.approval(decimal, null));
+                ObjectNode coerced = harness.manifest.deepCopy(); first(coerced, "programs").put(field, "1");
+                assertThrows(ContractException.class, () -> harness.approval(coerced, null));
+                ObjectNode oversized = harness.manifest.deepCopy(); first(oversized, "programs").put(field, 2147483648L);
+                assertThrows(ContractException.class, () -> harness.approval(oversized, null));
+            }
+            ObjectNode prefix = harness.manifest.deepCopy(); first(prefix, "programs").put("preseedEndIndex", 2);
+            assertThrows(ContractException.class, () -> harness.approval(prefix, null));
+            ObjectNode selected = harness.manifest.deepCopy(); first(selected, "programs").put("selectedCommandStageIndex", 2);
+            assertThrows(ContractException.class, () -> harness.approval(selected, null));
+            ObjectNode zero = harness.manifest.deepCopy(); first(zero, "programs").put("preseedEndIndex", 0).put("selectedCommandStageIndex", 0);
+            try (NativeCalibrationApproval comparisonOnly = harness.approval(zero, null)) {
+                assertNotNull(comparisonOnly); // codec 범위 검사이며 Rust 원 recipe의 수치나 실행 승인이 아니다.
+            }
+            for (String field : List.of("commands", "initializationCommands", "cleanupCommands")) {
+                ObjectNode wrongType = harness.manifest.deepCopy(); first(wrongType, "programs").put(field, "command");
+                assertThrows(ContractException.class, () -> harness.approval(wrongType, null));
+                ObjectNode wrongEntry = harness.manifest.deepCopy(); first(wrongEntry, "programs").putArray(field).add(1);
+                assertThrows(ContractException.class, () -> harness.approval(wrongEntry, null));
+                for (String command : List.of("", "# comment", "say one\nsay two", "say one\rsay two", "say\0two", "é".repeat(4097), "\uD800")) {
+                    ObjectNode invalidCommand = harness.manifest.deepCopy(); first(invalidCommand, "programs").putArray(field).add(command);
+                    assertThrows(ContractException.class, () -> harness.approval(invalidCommand, null));
+                }
+                ObjectNode oversized = harness.manifest.deepCopy(); var commands = first(oversized, "programs").putArray(field);
+                for (int index = 0; index < 4097; index++) commands.add("say bounded");
+                assertThrows(ContractException.class, () -> harness.approval(oversized, null));
+            }
+            ObjectNode empty = harness.manifest.deepCopy(); first(empty, "programs").putArray("commands");
+            assertThrows(ContractException.class, () -> harness.approval(empty, null));
+            ObjectNode total = harness.manifest.deepCopy(); var commands = first(total, "programs").putArray("commands");
+            for (int index = 0; index < 4090; index++) commands.add("say bounded");
+            assertThrows(ContractException.class, () -> harness.approval(total, null));
             assertThrows(ContractException.class, () -> harness.approval(harness.manifest.deepCopy().put("verified", true), null));
             assertFalse(harness.session.verifiedWriteProfile()); assertEquals(0, harness.retained.get());
+        }
+    }
+
+    @Test void programComparisonInputsRetainOriginalOrderAndCannotBeChangedThroughGetters() throws Exception {
+        var observed = new AtomicReference<NativeCalibrationApproval.Program>();
+        var runner = new RejectingRunner(new AtomicInteger()) {
+            @Override public ObjectNode ready(Invocation original, NativeCalibrationApproval.Program program, NativeCalibrationApproval.Control control) {
+                observed.set(program); return super.ready(original, program, control);
+            }
+        };
+        try (Harness harness = new Harness(runner, false)) {
+            assertEquals("CALIBRATION_SOURCE_UNAVAILABLE", harness.call("prepare", harness.wire(0)).path("error").path("code").asText());
+            NativeCalibrationApproval.Program program = observed.get(); assertNotNull(program);
+            List<String> commands = List.of("scoreboard players set #ok fixture 0", "scoreboard players get #ok fixture");
+            List<String> initialization = List.of("scoreboard objectives add fixture dummy");
+            List<String> cleanup = List.of("scoreboard objectives remove fixture", "data remove storage mmmm_calibration:fixture states", "data remove storage mmmm_calibration:fixture inputs");
+            assertEquals(commands, program.commands()); assertEquals(1, program.preseedEndIndex());
+            assertEquals(1, program.selectedCommandStageIndex()); assertEquals(initialization, program.initializationCommands());
+            assertEquals(cleanup, program.cleanupCommands());
+            for (List<String> immutable : List.of(program.commands(), program.initializationCommands(), program.cleanupCommands()))
+                assertThrows(UnsupportedOperationException.class, () -> immutable.set(0, "changed"));
+            byte[] source = program.sourceBytes(); source[0] = 0;
+            assertEquals((byte) '#', program.sourceBytes()[0]);
+            ObjectNode original = first(harness.manifest, "programs");
+            original.putArray("commands").add("changed"); original.putArray("initializationCommands"); original.putArray("cleanupCommands");
+            assertEquals(commands, program.commands()); assertEquals(initialization, program.initializationCommands()); assertEquals(cleanup, program.cleanupCommands());
+            assertUnclaimed(harness.grant); assertEquals(0, harness.retained.get()); assertFalse(harness.session.verifiedWriteProfile());
         }
     }
 
@@ -240,14 +307,19 @@ final class NativeCalibrationApprovalTest {
             ObjectNode pin = inner.putArray("contextPins").addObject().put("contextId", context.path("contextId").asText()).put("contextDigest", context.path("contextDigest").asText());
             pin.set("environment", context.path("environment").deepCopy()); inner.putArray("nativeExecutions");
             var steps = inner.putArray("steps"); var programs = result.putArray("programs");
-            byte[] source = "scoreboard players set #ok fixture 0\n".getBytes(StandardCharsets.UTF_8);
+            byte[] source = "# storage-only comparison fixture\nscoreboard players set #ok fixture 0\nscoreboard players get #ok fixture\n".getBytes(StandardCharsets.UTF_8);
             for (int index = 0; index < 47; index++) {
                 ObjectNode wire = wire(index), step = steps.addObject();
                 for (String field : Set.of("stepId", "bindingId", "actionId", "actionDigest", "implementationDigest", "argumentsDigest", "contextDigest")) step.set(field, wire.path(field).deepCopy());
                 step.put("contextId", context.path("contextId").asText()); step.putArray("resourcesRead"); step.putArray("resourcesWritten"); step.putArray("preconditions");
                 ObjectNode program = programs.addObject().put("stepId", "step-" + index).put("caseId", "case_" + index)
                         .put("functionId", "mmmm_calibration:case_" + index + "/fixture").put("command", wire.path("arguments").path("command").asText())
-                        .put("programDigest", "e".repeat(64)).put("sourceSha256", ContractJson.sha256(source)).put("sourceBytesHex", HexFormat.of().formatHex(source));
+                        .put("programDigest", "e".repeat(64)).put("sourceSha256", ContractJson.sha256(source)).put("sourceBytesHex", HexFormat.of().formatHex(source))
+                        .put("preseedEndIndex", 1).put("selectedCommandStageIndex", 1);
+                program.putArray("commands").add("scoreboard players set #ok fixture 0").add("scoreboard players get #ok fixture");
+                program.putArray("initializationCommands").add("scoreboard objectives add fixture dummy");
+                program.putArray("cleanupCommands").add("scoreboard objectives remove fixture")
+                        .add("data remove storage mmmm_calibration:fixture states").add("data remove storage mmmm_calibration:fixture inputs");
                 program.putObject("readbackAddresses").put("caseId", "case_" + index).put("function", program.path("functionId").asText());
             }
             return result;

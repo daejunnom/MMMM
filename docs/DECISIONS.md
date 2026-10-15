@@ -107,6 +107,8 @@
 
 | MMMM-D065 | 완료된 calibration 승인 소비자는 새로 들어온 실제 요청과 원 durable intent를 매번 검사한다. | daemon·bootstrap·Production/Composite는 동일한 제한된 registry를 공유하며 원 bootstrap budget을 장기 실행 권한으로 보관하지 않는다. 기존 LocalAuthority의 현재 권한·Project/Policy 의미·원 Store/plan/recipe·host private generation을 대조하고 일치하지만 무효인 calibration을 일반 dispatch로 우회하지 않는다. 실제 readiness는 intent transaction 전에 검사하고 transaction 안에서는 로컬 현재성·원 claim만 대조한다. durable commit 뒤 실패를 intent 거절로 바꾸지 않으며 acquired host 응답은 후행 취소 검사 전에 기존 CAS evidence로 보존한다. 실패한 발행·원 응답과 후행 오류를 함께 보존하며 실제 capture/readback 부재는 명시적 unavailable이다. |
 
+| MMMM-D066 | Calibration 원문, native constructor 입력과 현재 VM executable 관측을 별도 사실로 유지한다. | Rust sealed program의 원 body 명령·exclusive preseed 경계·선택 command 위치·초기화/정리 배열을 private manifest에 그대로 전달한다. Java는 원문을 split·재parse·flatten하지 않는다. 실제 Unbound constructor의 String/ContextChain 참조 관측은 내부 chain의 완전 소비·선택 parser/handler 증명과 구분한다. 실제 receiver/Method를 D059의 actual Class/loader/native stamp와 묶은 current_vm_executable도 loaded_definition_bytes·최종 classfile·전체 JDK closure나 실행 권한으로 바꾸지 않는다. 지원한 native zero-capture static-forwarder 외 hidden recipe는 미지원으로 남긴다. 실제 stage 실행·독립 상태 관측·원 journal/readback 연결 및 최초 profile 인수는 별도 검증하며 과거 load 사건의 기록만을 유일한 함수 동일성 근거로 요구하지 않는다. |
+
 D061의 Rust 비교 입력은 같은 sealed `CalibrationDispatchPlan`의
 `loaded_source_expectations()`에서만 투영한다. 원 function ID·logical entry bytes와
 program digest는 plan에서 빌리고, native resource lookup ID는 별도로 구분한다.

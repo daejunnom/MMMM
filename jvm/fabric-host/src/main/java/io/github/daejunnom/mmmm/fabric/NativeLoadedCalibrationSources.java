@@ -51,11 +51,15 @@ final class NativeLoadedCalibrationSources {
 
     /** 실제 server adapter만 이 production view를 생성한다. test port의 RawFacts는 변환할 수 없다. */
     static final class ObservedSources {
+        private final MinecraftServer owner;
+        private final View view;
         private final List<LoadedFunction> functions;
         private final long sourceBytes;
         private final long readBytes;
 
-        private ObservedSources(RawFacts<Identifier, CommandFunction<CommandSourceStack>> facts) {
+        private ObservedSources(MinecraftServer owner, View view,
+                                RawFacts<Identifier, CommandFunction<CommandSourceStack>> facts) {
+            this.owner = owner; this.view = view;
             var observed = new ArrayList<LoadedFunction>(facts.sources.size());
             for (var source : facts.sources) observed.add(new LoadedFunction(source));
             functions = List.copyOf(observed); sourceBytes = facts.sourceBytes; readBytes = facts.readBytes;
@@ -63,6 +67,25 @@ final class NativeLoadedCalibrationSources {
         List<LoadedFunction> functions() { return functions; }
         long sourceBytes() { return sourceBytes; }
         long readBytes() { return readBytes; }
+        /** No file read or reparse: checks the exact retained native owners and winners.
+         * A fresh observe is still required to compare current input bytes again. */
+        void checkCurrent(Checkpoint original) {
+            Objects.requireNonNull(original);
+            Checkpoint checkpoint = () -> {
+                original.check();
+                if (!owner.isSameThread()) throw failure("CALIBRATION_SOURCE_THREAD_REQUIRED");
+            };
+            checked(() -> {
+                var current = new ActualPort(owner);
+                assertView(view, current.view(checkpoint), checkpoint);
+                for (var function : functions) {
+                    checkpoint.check();
+                    assertSource(function.source, checked(() -> current.resolve(function.source.expected, checkpoint), checkpoint));
+                }
+                assertView(view, current.view(checkpoint), checkpoint);
+                return null;
+            }, checkpoint);
+        }
     }
 
     /** 원래 object를 보존하지만 호출 권한은 없다. 후속 runner는 새 원 요청으로 현재성을 재검사해야 한다. */
@@ -90,9 +113,10 @@ final class NativeLoadedCalibrationSources {
             if (!server.isSameThread()) throw failure("CALIBRATION_SOURCE_THREAD_REQUIRED");
         };
         checkpoint.check();
-        var facts = scan(new ActualPort(server), expected, checkpoint);
+        var port = new ActualPort(server);
+        var facts = scan(port, expected, checkpoint);
         checkpoint.check();
-        var observed = new ObservedSources(facts);
+        var observed = new ObservedSources(server, port.initial, facts);
         checkpoint.check();
         return observed;
     }

@@ -324,7 +324,26 @@ fn validate_manifest(value: &Value, validator: &ContractValidator) -> Result<(),
     }
     let mut ids = BTreeSet::new();
     let mut raw_total = 0usize;
-    for (step, program) in array(plan, "steps")?.iter().zip(array(value, "programs")?) {
+    let suite = CalibrationDispatchPlan::normative47().map_err(|_| invalid())?;
+    if value["suiteDigest"] != suite.suite_digest().as_str()
+        || value["recipeSha256"] != suite.suite_digest().as_str()
+    {
+        return Err(invalid());
+    }
+    let recipe = mmmm_contracts::parse_json_with_limits(
+        suite.canonical_recipe_bytes(),
+        mmmm_contracts::JsonLimits {
+            max_bytes: CalibrationDispatchPlan::MAX_RECIPE_BYTES,
+            max_depth: 64,
+            max_nodes: 100_000,
+        },
+    )
+    .map_err(|_| invalid())?;
+    for (index, (step, program)) in array(plan, "steps")?
+        .iter()
+        .zip(array(value, "programs")?)
+        .enumerate()
+    {
         exact(
             step,
             &[
@@ -379,6 +398,11 @@ fn validate_manifest(value: &Value, validator: &ContractValidator) -> Result<(),
                 "sourceSha256",
                 "sourceBytesHex",
                 "readbackAddresses",
+                "commands",
+                "preseedEndIndex",
+                "selectedCommandStageIndex",
+                "initializationCommands",
+                "cleanupCommands",
             ],
         )?;
         for key in ["programDigest", "sourceSha256"] {
@@ -405,6 +429,17 @@ fn validate_manifest(value: &Value, validator: &ContractValidator) -> Result<(),
         if raw_digest(&bytes).as_str() != field(program, "sourceSha256")?
             || !program["readbackAddresses"].is_object()
         {
+            return Err(invalid());
+        }
+        // Compare only source recipe data. This creates no native observation,
+        // loaded-function receipt, initialization ownership or execution grant.
+        let sealed = program_manifest(
+            &step["stepId"],
+            &suite.programs()[index],
+            &recipe["probes"][index]["readbackAddresses"],
+        )
+        .map_err(|_| invalid())?;
+        if program != &sealed {
             return Err(invalid());
         }
     }
@@ -1382,12 +1417,18 @@ fn build_manifest(
     )
     .map_err(|e| StorageError::Contract(e.to_string()))?;
     let steps = plan["steps"].as_array().ok_or_else(denied)?;
-    let programs=steps.iter().zip(suite.programs()).enumerate().map(|(index,(step,program))| {
-        let hex=program.source_bytes().iter().map(|byte|format!("{byte:02x}")).collect::<String>();
-        json!({"stepId":step["stepId"],"caseId":program.case().case_id(),"functionId":program.invocation_command().strip_prefix("function "),
-            "command":program.invocation_command(),"programDigest":program.source_digest(),"sourceSha256":program.source_digest(),
-            "sourceBytesHex":hex,"readbackAddresses":recipe["probes"][index]["readbackAddresses"]})
-    }).collect::<Vec<_>>();
+    let programs = steps
+        .iter()
+        .zip(suite.programs())
+        .enumerate()
+        .map(|(index, (step, program))| {
+            program_manifest(
+                &step["stepId"],
+                program,
+                &recipe["probes"][index]["readbackAddresses"],
+            )
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
     let steps = steps
         .iter()
         .map(|step| {
@@ -1407,6 +1448,40 @@ fn build_manifest(
             "projectId":plan["projectId"],"planId":plan["planId"],"planHash":plan["planHash"],"policyRevision":plan["policyRevision"],
             "contextPins":plan["contextPins"],"expiresAt":plan["expiresAt"],"steps":steps,"nativeExecutions":[]}}),
     )
+}
+
+fn program_manifest(
+    step: &Value,
+    program: &mmmm_compiler::calibration::CalibrationProgram,
+    readback_addresses: &Value,
+) -> StorageResult<Value> {
+    let function = program
+        .invocation_command()
+        .strip_prefix("function ")
+        .ok_or_else(denied)?;
+    // sourceBytesHex keeps the exact original comments and LF bytes. commands
+    // is the sealed non-comment native execution sequence, not a replacement
+    // body reconstructed by Java or permission to execute the function inline.
+    let hex = program
+        .source_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(json!({
+        "stepId":step,"caseId":program.case().case_id(),"functionId":function,
+        "command":program.invocation_command(),"programDigest":program.source_digest(),
+        "sourceSha256":program.source_digest(),"sourceBytesHex":hex,"readbackAddresses":readback_addresses,
+        "commands":program.commands(),
+        // [0, preseedEndIndex) is the prefix after which independent preseed
+        // capture occurs; the selected stage is a zero-based native body site,
+        // not the whole function's final command return.
+        "preseedEndIndex":program.preseed_end_index(),
+        "selectedCommandStageIndex":program.command_stage_index(),
+        // These are comparison inputs from the same sealed program. They do
+        // not grant a separate initialization/cleanup operation or lifetime.
+        "initializationCommands":program.initialization_commands(),
+        "cleanupCommands":program.cleanup_commands()
+    }))
 }
 
 #[cfg(test)]
@@ -1465,6 +1540,148 @@ mod tests {
         changed["steps"][23]["stepId"] = json!("calibration-22");
         changed["steps"][24]["dependsOn"] = json!(["calibration-22"]);
         assert!(verify_normative_plan(&changed).is_err());
+    }
+
+    // Reuses the existing ContextPin example and sealed compiler recipe. The
+    // private grammar previously lacked native body-site/init/cleanup inputs;
+    // this fixture exercises that new producer/consumer boundary, not a game run.
+    fn normative_manifest_input() -> Value {
+        let suite = CalibrationDispatchPlan::normative47().unwrap();
+        let recipe = mmmm_contracts::parse_json_with_limits(
+            suite.canonical_recipe_bytes(),
+            mmmm_contracts::JsonLimits {
+                max_bytes: CalibrationDispatchPlan::MAX_RECIPE_BYTES,
+                max_depth: 64,
+                max_nodes: 100_000,
+            },
+        )
+        .unwrap();
+        let example =
+            mmmm_contracts::parse_json(include_bytes!("../../../examples/execution-plan.json"))
+                .unwrap();
+        let steps = suite.programs().iter().enumerate().map(|(index, program)| {
+            let addresses = &suite.owned_addresses()[index];
+            // Match project_steps' two sealed-address footprint locators. This
+            // checks the production frame shape, not target ownership or grants.
+            let owned = [
+                format!("calibration-objective-{}", addresses.objective()),
+                format!("calibration-storage-{}", raw_digest(addresses.storage().as_str().as_bytes())),
+            ];
+            json!({
+                "stepId":format!("calibration-{index}"),"bindingId":"calibration-binding",
+                "actionId":"mmmm:command_execute","actionDigest":"1".repeat(64),"implementationDigest":"2".repeat(64),
+                "argumentsDigest":canonical_digest(&json!({"command":program.invocation_command()})).unwrap(),
+                "contextId":example["contextPins"][0]["contextId"],"contextDigest":example["contextPins"][0]["contextDigest"],
+                "resourcesRead":owned,"resourcesWritten":owned,"preconditions":[]
+            })
+        }).collect::<Vec<_>>();
+        let programs = suite
+            .programs()
+            .iter()
+            .enumerate()
+            .map(|(index, program)| {
+                program_manifest(
+                    &steps[index]["stepId"],
+                    program,
+                    &recipe["probes"][index]["readbackAddresses"],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "kind":"native_calibration_approval","purpose":PURPOSE,"selectionDigest":"3".repeat(64),
+            "hostEpoch":"epoch-fixture-01","registryGeneration":"1","runtimeSourceFactsDigest":"4".repeat(64),
+            "suiteDigest":suite.suite_digest(),"recipeSha256":suite.suite_digest(),"programs":programs,
+            "plan":{"kind":"native_plan_approval","protocolVersion":"0.2.0","principalId":"principal-fixture",
+                "projectId":"project-fixture","planId":"plan-fixture","planHash":"5".repeat(64),
+                "policyRevision":example["policyRevision"],"contextPins":example["contextPins"],
+                "expiresAt":"2099-01-01T00:00:00Z","steps":steps,"nativeExecutions":[]}
+        })
+    }
+
+    #[test]
+    fn private_program_manifest_requires_exact_sealed_body_sites_and_lifecycle_inputs() {
+        let validator = ContractValidator::shared().unwrap();
+        let original = normative_manifest_input();
+        validate_manifest(&original, validator).unwrap();
+        for key in [
+            "commands",
+            "preseedEndIndex",
+            "selectedCommandStageIndex",
+            "initializationCommands",
+            "cleanupCommands",
+        ] {
+            let mut changed = original.clone();
+            changed["programs"][0].as_object_mut().unwrap().remove(key);
+            assert!(validate_manifest(&changed, validator).is_err());
+        }
+        for (key, changed_value) in [
+            ("commands", json!(["say caller_supplied"])),
+            (
+                "preseedEndIndex",
+                json!(original["programs"][0]["preseedEndIndex"].as_u64().unwrap() + 1),
+            ),
+            (
+                "selectedCommandStageIndex",
+                json!(
+                    original["programs"][0]["selectedCommandStageIndex"]
+                        .as_u64()
+                        .unwrap()
+                        + 1
+                ),
+            ),
+            (
+                "initializationCommands",
+                json!(["scoreboard objectives add caller_owned dummy"]),
+            ),
+            ("cleanupCommands", json!([])),
+        ] {
+            let mut changed = original.clone();
+            changed["programs"][0][key] = changed_value;
+            assert!(validate_manifest(&changed, validator).is_err());
+        }
+        let mut changed = original.clone();
+        changed["programs"][0]["commands"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        assert!(validate_manifest(&changed, validator).is_err());
+        let mut changed = original.clone();
+        changed["programs"][0]["sourceBytesHex"] = json!("00");
+        changed["programs"][0]["sourceSha256"] = json!(raw_digest(&[0]));
+        changed["programs"][0]["programDigest"] = json!(raw_digest(&[0]));
+        assert!(validate_manifest(&changed, validator).is_err());
+        let mut changed = original.clone();
+        changed["programs"].as_array_mut().unwrap().swap(0, 1);
+        changed["plan"]["steps"].as_array_mut().unwrap().swap(0, 1);
+        assert!(validate_manifest(&changed, validator).is_err());
+
+        // Keep the actual authority frame's existing 1MiB/node bounds honest
+        // after adding the sealed command lists; do not relax them silently.
+        let context =
+            mmmm_contracts::parse_json(include_bytes!("../../../examples/execution-context.json"))
+                .unwrap();
+        let authority = json!({"kind":"host_apply_approval_authority","protocolVersion":"0.2.0","nonce":"calibration-manifest",
+            "purpose":PURPOSE,"contexts":[context],"approvedSources":{"mmmm_host":"0".repeat(64)},
+            "approvedActions":["1".repeat(64)],"permissions":READ_PERMISSIONS,"manifest":original});
+        let bytes = serde_json::to_vec(&authority).unwrap().len();
+        let mut pending = vec![&authority];
+        let mut nodes = 0usize;
+        while let Some(value) = pending.pop() {
+            nodes += 1;
+            match value {
+                Value::Array(children) => pending.extend(children),
+                Value::Object(children) => pending.extend(children.values()),
+                _ => (),
+            }
+        }
+        PublicFrame::from_value(authority).unwrap_or_else(|cause| {
+            panic!("Normative authority frame failed its existing bounds: bytes={bytes}, nodes={nodes}, cause={cause}")
+        });
+        println!(
+            "normative_calibration_authority bytes={bytes} nodes={nodes} limit_bytes={} limit_nodes=4096",
+            crate::peer_management::MAX_PUBLIC_BYTES
+        );
     }
 
     fn retained_stop(cause: &StorageError) -> &CalibrationCleanupStop {

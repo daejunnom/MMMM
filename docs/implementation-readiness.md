@@ -1539,6 +1539,79 @@ all-target strict Clippy는 exit 0·27,506 ms, Job commit peak 857,006,080 bytes
 process 7개·최대 표본 간격 120 ms였다. 자연 종료·drain/output/export/scratch/lease가
 정상 완료됐다. 현재 source의 전체 CI는 이 로컬 검사와 별도로 확인한다.
 
+## 실제 게임 API와 부분 관측 producer
+
+private program manifest에는 Rust sealed getter의 `commands`, `preseedEndIndex`,
+`selectedCommandStageIndex`, `initializationCommands`, `cleanupCommands`를 추가했다.
+원 comments/LF를 포함한 source bytes는 그대로 유지하고 Java에서 body를 다시 해석하지
+않는다. Rust는 47개 원 순서와 source·명령·단계·주소·init/cleanup 전체를 정본과 대조하며
+Java는 닫힌 field·정수·명령 수/UTF-8 byte 범위와 immutable 입력을 검사한다. 기존
+4096-node/1 MiB frame 한도는 바꾸지 않았다. 독립 source review finding은 0개다.
+Windows 관리 실행 `428` format·`429`의 해당 Rust 검사 3개가 통과했다. `429`는 exit 0·
+55,539 ms, Job commit peak 1,420,500,992 bytes·6 process·최대 표본 간격 145 ms였다.
+소유 잔여 빌드 자식 정리 뒤 drain/output/export/scratch/lease가 정상 완료됐다. 이후
+full-frame fixture의 read/write footprint를 실제 두 locator 형상으로 보완했으며 해당
+보완의 새 실행 결과와 Java 검사는 별도로 확인한다.
+
+Windows `427`·`430`은 초기 개발 서버 자료에서 실제 사용 경로가 확인된 공식 bundle만
+읽기 전용으로 조사했다. 원 `server.jar` 62,294,556 bytes·SHA-256
+`d052f14d7a173734fba553711e5b570162e2f2a313267ee31a21b975a679be64`와 complete owner·
+retained lease 부재를 전후 검사했다. 실제 nested game JAR는 26,652,008 bytes·SHA-256
+`a362163eec5d1612d520772bc16e5b39c09e3b234fdc045f56bf544284ee8ae6`, Brigadier 1.3.11은
+80,151 bytes·SHA-256 `9d09cf4819de83dfcd38bcb212d5f2227131791cef3abbfca3321d6fb2b9a64d`다.
+관리 scratch의 제한된 추출과 JDK 25 javap로 각각 29개/18개 실제 class API를 확인했다.
+원 게임 자료 변경·서버나 installer/game main 실행은 없었다. 경계는 협조적 path metadata와
+held Read stream이며 final path/file ID/hardlink 동등성을 증명했다고 확대하지 않는다.
+선행 `426`은 helper script scope 초기화 오류로 분석 전에 실패했으며 원 실패·정상 정리를
+보존했다. 별도 실행 준비 인용 오류도 관리 실행에 도달하지 않았고 JDK/SAC 실패가 아니다.
+
+실제 native 함수 parser는 `BuildContexts.Unbound(String, ContextChain)`를 생성한다.
+현재 constructor RETURN mixin과 `NativeCalibrationFunctions`는 정확한 vanilla entry와
+PlainTextFunction class, actual 등록 Identifier·entry 순서·원 constructor 입력 및 chain
+참조만 관측한다. manager/pack/winner/function 현재성과 원 파일 bytes 재관측을 구분하고
+원 callback은 보관하지 않는다. 이는 chain 내부 input·완전 소비·selected node·실제 실행
+증거가 아니다. actual runtime Mixin 적중도 아직 확인하지 않았다.
+
+선택 executable collector는 actual receiver/reflect Method를 D059 actual Class view와
+대조하며 ordinary virtual/상속/erased bridge와 native matcher가 지원하는 zero-capture
+static hidden forwarder만 다룬다. actual loader·issuer/class/generation·method descriptor/
+modifiers/code kind를 검사하고 256 selection·64 Class·8 MiB retained payload를 제한한다.
+이는 `current_vm_executable` 사실 역할이며 SourceAdmission이나 profile을 발급하지 않는다.
+captured/virtual hidden recipe의 미지원 경계와 실제 JNI 양성 미실행을 유지한다.
+
+fixed-address state reader는 실제 server/현재 level/owner/context/원 Control 아래 기존
+score와 cached storage의 고정 `inputs`·`invocation` 값만 읽는다. 전체 cached key를 4096개
+한도 안에서 확인한 뒤 get하며, 미관측 namespace를 load하거나 score를 생성하지 않는다.
+원 int·Float raw bits·부재/unknown 및 stale 원자료를 보존하고 success/seeded/command return을
+기대값에서 만들지 않는다. 추가 소스 리뷰의 현재 level identity와 초기 context 오류 보존
+지적을 보완했고 동일 reviewer의 재검토에서 모두 해소됐다. 실제 compilation·fixture
+실행·게임 관측은 별도 결과로 기록한다.
+
+실제 430 API에서 `BuildContexts`는 CustomModifierExecutor/CustomCommandExecutor 경로도
+갖는다. ExecuteCommand-only hook을 모든 명령의 실행으로 일반화하지 않는다. native queue는
+quota/overflow 때 정상 반환할 수 있어 drain 반환도 전체 entry 완료 증거가 아니다. 실제
+stage/preseed/selected return·v3 issuer·독립 readback consumer는 후속 연결 중이며 이 부분
+관측 producer만으로 dispatch를 활성화하지 않는다.
+
+## 현재 고정 SHA의 CI 실패 구분
+
+`54af8a8708d399b3e7044f036828bdd0e40219b1`의 JVM CI 59 (`38787591379`)는 세 OS와
+집계 성공을 관측했다. 원 ZIP 감사는 선행 고정 source의 CI 57과 구분하며 이번 원본은
+아직 감사하지 않았다. 같은 SHA의 Rust CI 68 (`38787591397`)은 Windows·Linux의 모든
+단계가 성공했지만 macOS bootstrap과 집계가 실패했다. macOS repo/fmt/test/lint는 skipped다.
+원 ZIP 3336 bytes·SHA-256 `dbe4ee90c5b1fc0c222c44084fbc38b8173e36aaafc24f476ec9b2934b3976fc`를
+외부에 보존하고 7 entries/확장 합계 5026 bytes를 감사했다. source/expected/PR head와
+별도 event SHA `141b799a42a843ccaee332ab5445994d541ad25e`를 대조했다.
+
+실제 오류는 Darwin observed-member의 TaskInfo result 0/ESRCH 후 BSD identity를 얻지
+못한 strict 실패다. before status 2/INEXIT true, after BSD 없음·memory identity match
+false, 해당 scan의 leader anchor 확인은 미도달이고 Rusage도 미도달이다. 값이 실제로
+바뀌었다거나 종료/reap을 관측한 것으로 바꾸지 않는다. complete sample 51개·최대 간격
+199 ms·peak RSS 452,493,312 bytes·footprint 213,872,064 bytes이며 상한 초과 근거는 없다.
+command exit는 null·supervisor_failure이고 drain/export는 완료했으며 slot/lease는 실패
+정책대로 보존했다. 원 Cargo stderr에는 compile 시작만 있어 compile/test 완료가 아니다.
+D060 Windows ancestry 또는 D062 Linux RSS 조건을 이 실패에 적용하지 않는다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.
