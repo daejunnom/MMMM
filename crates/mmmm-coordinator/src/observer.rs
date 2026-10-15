@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 
 #[path = "direct_block_observer.rs"]
 mod direct_block;
+pub(crate) use direct_block::finish as finish_native_observation;
 
 pub struct NativeObserver {
     bridge: HostBridge,

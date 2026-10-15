@@ -10,8 +10,9 @@ use crate::{
     },
     native_backend::{HostNativeBackend, OwnedNativeInventory, PreparedNativeBatch},
     native_targets::NativeTargetReader,
+    observer::{NativeObserver, finish_native_observation},
     planning_source::PlanningStore,
-    service::{RequestBudget, RequestContextSlot},
+    service::{RequestBudget, RequestContextSlot, RequestContextWitness},
 };
 use mmmm_adapters::{
     ActionDescriptor, ActionReadiness, Availability, CompatibilityEvidence, EnvironmentRef, Origin,
@@ -249,6 +250,15 @@ fn metadata_route(kind: NativeKind) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// This chooses a codec, never authority. Its consumers still require the
+/// exact same-Store saved plan/step and current original invocation admission.
+fn registered_direct_block(value: &Value) -> bool {
+    value["actionId"] == "mmmm:block_patch"
+        && value["arguments"]
+            .get("expectedRegistryGeneration")
+            .is_some()
+}
+
 pub struct CompositeComposition {
     pub hosts: HostBridge,
     pub authority: LocalAuthority,
@@ -327,6 +337,70 @@ impl CompositeProvider {
     }
 }
 impl Shared {
+    fn block_observer(&self) -> NativeObserver {
+        NativeObserver::authenticated(
+            self.hosts.clone(),
+            self.authority.clone(),
+            self.request.clone(),
+        )
+    }
+    fn direct_checkpoint<'a>(
+        &self,
+        call: &'a Call,
+        operation: &'a OperationRecord,
+        plan: &'a Value,
+        access: Access,
+    ) -> AppResult<DirectCallCheckpoint<'a>> {
+        let request = self.request.occupied_witness().map_err(service_cause)?;
+        if !request.authenticated().same_session(&call.authenticated)
+            || request.budget().deadline() != call.budget.deadline()
+            || !std::ptr::eq(request.budget().cancellation(), call.budget.cancellation())
+        {
+            return Err(forbidden());
+        }
+        call.check()?;
+        authorize_direct_retained(
+            &call.authority,
+            call.authenticated.principal(),
+            &call.context,
+            operation,
+            plan,
+            access,
+        )?;
+        let host = self.hosts.observe_context_witness(
+            call.authenticated.principal(),
+            &call.id,
+            request.budget().deadline(),
+        );
+        let host = finish_native_observation(
+            host,
+            (|| {
+                request.check_local().map_err(service_cause)?;
+                call.check()?;
+                authorize_direct_retained(
+                    &call.authority,
+                    call.authenticated.principal(),
+                    &call.context,
+                    operation,
+                    plan,
+                    access,
+                )
+            })(),
+        )?;
+        if host.context() != &call.context {
+            return Err(stale());
+        }
+        let checkpoint = DirectCallCheckpoint {
+            call,
+            operation,
+            plan,
+            access,
+            request,
+            host,
+        };
+        checkpoint.check()?;
+        Ok(checkpoint)
+    }
     fn call(&self, context: &Value) -> AppResult<Call> {
         let (authenticated, budget) = self
             .request
@@ -1055,8 +1129,9 @@ impl ProviderPort for CompositeProvider {
                 return Err(forbidden());
             }
             let mut backend = (*self.shared.backend).clone();
-            return mmmm_planner::PlanningEnvironmentPort::inventory(
+            return crate::planning_source::PlanningBackendPort::inventory_with_store(
                 &mut backend,
+                &PlanningStore::read(store),
                 call.authenticated.principal(),
                 context,
             )
@@ -1115,6 +1190,16 @@ impl ProviderPort for CompositeProvider {
         condition: &Value,
         context: &Value,
     ) -> AppResult<Sha256Digest> {
+        if registered_direct_block(step) {
+            let (call, scope) =
+                admit_plan_step(&self.shared, store, plan, step, condition, context)?;
+            NativeObserver::validate_direct_block_step(step, context, &scope)?;
+            if text(condition, "subject")?.starts_with("native:") {
+                return Err(store_required());
+            }
+            call.check()?;
+            return self.observe_precondition_with_store(store, condition, context);
+        }
         let admitted =
             admit_plan_precondition(&self.shared, store, plan, step, condition, context)?;
         let subject = text(condition, "subject")?;
@@ -1140,6 +1225,29 @@ impl ProviderPort for CompositeProvider {
         context: &Value,
     ) -> AppResult<Sha256Digest> {
         let subject = text(condition, "subject")?;
+        if registered_direct_block(step) && subject.starts_with("native:") {
+            let (call, scope) =
+                admit_plan_step(&self.shared, store, plan, step, condition, context)?;
+            NativeObserver::validate_direct_block_step(step, context, &scope)?;
+            let request = self
+                .shared
+                .request
+                .occupied_witness()
+                .map_err(|error| AppError::caused_by(error.code, error.message, error))?;
+            let result = self
+                .shared
+                .block_observer()
+                .observe_direct_plan_precondition(store, step, condition, context, &scope);
+            return finish_native_observation(
+                result,
+                (|| {
+                    request
+                        .check_local()
+                        .map_err(|error| AppError::caused_by(error.code, error.message, error))?;
+                    call.check()
+                })(),
+            );
+        }
         if !subject.starts_with("native:") && !subject.starts_with("owned-entity:") {
             return self
                 .observe_plan_precondition_with_store(store, plan, step, condition, context);
@@ -1204,13 +1312,35 @@ impl ProviderPort for CompositeProvider {
         invocation: &Value,
     ) -> AppResult<Value> {
         let (record, blob) = durable_original(&self.shared, store, invocation, Access::Apply)?;
-        let phase = self.shared.phase(invocation)?;
         let call = self.shared.call(&invocation["context"])?;
         let step = record
             .steps
             .iter()
             .find(|s| s.step_id.as_str() == invocation["stepId"].as_str().unwrap_or(""))
             .ok_or_else(invalid)?;
+        if registered_direct_block(invocation) {
+            let (_, plan, actual, _) = frozen_plan(&self.shared, store, invocation, Access::Apply)?;
+            NativeObserver::validate_direct_block_step(&actual, &call.context, &record.scope)?;
+            if record.state != OperationState::Running
+                || record.reconciliation_required
+                || record.cancellation_requested
+                || step.finished
+                || step.dispatch != DispatchEvidence::IntentDurable
+            {
+                return Err(error(
+                    "DISPATCH_ALREADY_ATTEMPTED",
+                    "The exact direct block durable intent is no longer dispatchable",
+                ));
+            }
+            let checkpoint = self
+                .shared
+                .direct_checkpoint(&call, &record, &plan, Access::Apply)?;
+            let result =
+                HttpProviderPort::with_deadline(self.shared.hosts.clone(), call.budget.deadline())
+                    .dispatch_with_store(store, invocation);
+            return finish_native_observation(result, checkpoint.check());
+        }
+        let phase = self.shared.phase(invocation)?;
         if record.state != OperationState::Running
             || record.reconciliation_required
             || record.cancellation_requested
@@ -1255,9 +1385,19 @@ impl ProviderPort for CompositeProvider {
         invocation: &Value,
         receipt: Option<&str>,
     ) -> AppResult<Option<Value>> {
-        let (_, plan, _, call) =
+        let (record, plan, step, call) =
             frozen_plan(&self.shared, store, invocation, Access::ObserveOperation)?;
         durable_original(&self.shared, store, invocation, Access::ObserveOperation)?;
+        if registered_direct_block(invocation) {
+            NativeObserver::validate_direct_block_step(&step, &call.context, &record.scope)?;
+            let checkpoint =
+                self.shared
+                    .direct_checkpoint(&call, &record, &plan, Access::ObserveOperation)?;
+            let result =
+                HttpProviderPort::with_deadline(self.shared.hosts.clone(), call.budget.deadline())
+                    .poll_with_store(store, invocation, receipt);
+            return finish_native_observation(result, checkpoint.check());
+        }
         let (change, _, _) = load_change(&self.shared, store, &call, &plan, invocation)?;
         if change.kind.world_effect() {
             let result =
@@ -1308,14 +1448,14 @@ struct AdmittedPrecondition {
     scope: WriteScope,
     prepared_subject: String,
 }
-fn admit_plan_precondition(
+fn admit_plan_step(
     shared: &Shared,
     store: &DurableStore,
     plan: &Value,
     step: &Value,
     condition: &Value,
     context: &Value,
-) -> AppResult<AdmittedPrecondition> {
+) -> AppResult<(Call, WriteScope)> {
     let call = shared.call(context)?;
     validate("ExecutionPlan", plan)?;
     validate("PlanStep", step)?;
@@ -1364,6 +1504,18 @@ fn admit_plan_precondition(
         &field_digest(context, "policyRevision")?,
         &plan["scope"],
     )?;
+    call.check()?;
+    Ok((call, scope))
+}
+fn admit_plan_precondition(
+    shared: &Shared,
+    store: &DurableStore,
+    plan: &Value,
+    step: &Value,
+    condition: &Value,
+    context: &Value,
+) -> AppResult<AdmittedPrecondition> {
+    let (call, scope) = admit_plan_step(shared, store, plan, step, condition, context)?;
     let reference = &step["arguments"]["preparedChange"];
     let prepared_subject = format!(
         "cas:{}:{}",
@@ -1616,6 +1768,12 @@ impl IndependentObserverPort for CompositeObserver {
         target: &str,
     ) -> AppResult<()> {
         self.shared.call(&invocation["context"])?;
+        if registered_direct_block(invocation) {
+            return self
+                .shared
+                .block_observer()
+                .validate_capture_target(invocation, scope, target);
+        }
         let phase = self.shared.phase(invocation)?;
         verify_change_scope(&phase.change, scope)?;
         if !phase.before.contains_key(target) {
@@ -1629,6 +1787,18 @@ impl IndependentObserverPort for CompositeObserver {
         invocation: &Value,
         scope: &WriteScope,
     ) -> AppResult<Option<BeforeCapture>> {
+        if registered_direct_block(invocation) {
+            let (record, _, step, call) =
+                frozen_plan(&self.shared, store, invocation, Access::Apply)?;
+            if &record.scope != scope {
+                return Err(forbidden());
+            }
+            NativeObserver::validate_direct_block_step(&step, &call.context, scope)?;
+            return self
+                .shared
+                .block_observer()
+                .capture_before_with_store(store, invocation, scope);
+        }
         let _ = (store, invocation, scope);
         Err(store_required())
     }
@@ -1638,6 +1808,18 @@ impl IndependentObserverPort for CompositeObserver {
         invocation: &Value,
         scope: &WriteScope,
     ) -> AppResult<Option<BeforeCapture>> {
+        if registered_direct_block(invocation) {
+            let (record, _, step, call) =
+                frozen_plan(&self.shared, store, invocation, Access::Apply)?;
+            if &record.scope != scope {
+                return Err(forbidden());
+            }
+            NativeObserver::validate_direct_block_step(&step, &call.context, scope)?;
+            return self
+                .shared
+                .block_observer()
+                .capture_before_retained_with_store(store, invocation, scope);
+        }
         let phase = self.shared.seal(store, invocation, scope)?;
         Ok(Some(BeforeCapture {
             invocation_id: decode(&invocation["invocationId"])?,
@@ -1668,6 +1850,19 @@ impl IndependentObserverPort for CompositeObserver {
         invocation: &Value,
         scope: &WriteScope,
     ) -> AppResult<ReadbackEvidence> {
+        if registered_direct_block(invocation) {
+            let (record, _, step, call) =
+                frozen_plan(&self.shared, store, invocation, Access::ObserveOperation)?;
+            if &record.scope != scope {
+                return Err(forbidden());
+            }
+            durable_original(&self.shared, store, invocation, Access::ObserveOperation)?;
+            NativeObserver::validate_direct_block_step(&step, &call.context, scope)?;
+            return self
+                .shared
+                .block_observer()
+                .readback_with_store(store, invocation, scope);
+        }
         let (record, _, _, call) =
             frozen_plan(&self.shared, store, invocation, Access::ObserveOperation)?;
         if &record.scope != scope {
@@ -1760,6 +1955,16 @@ impl IndependentObserverPort for CompositeObserver {
         invocation: &Value,
         target: &str,
     ) -> AppResult<Vec<u8>> {
+        if registered_direct_block(invocation) {
+            let (record, _, step, call) =
+                frozen_plan(&self.shared, store, invocation, Access::ObserveOperation)?;
+            durable_original(&self.shared, store, invocation, Access::ObserveOperation)?;
+            NativeObserver::validate_direct_block_step(&step, &call.context, &record.scope)?;
+            return self
+                .shared
+                .block_observer()
+                .read_target_with_store(store, invocation, target);
+        }
         durable_original(&self.shared, store, invocation, Access::ObserveOperation)?;
         let phase = self.shared.phase(invocation)?;
         if !phase.before.contains_key(target) {
@@ -1780,6 +1985,16 @@ impl IndependentObserverPort for CompositeObserver {
         invocation: &Value,
         target: &str,
     ) -> AppResult<Vec<u8>> {
+        if registered_direct_block(invocation) {
+            let (record, _, step, call) =
+                frozen_plan(&self.shared, store, invocation, Access::ObserveOperation)?;
+            durable_original(&self.shared, store, invocation, Access::ObserveOperation)?;
+            NativeObserver::validate_direct_block_step(&step, &call.context, &record.scope)?;
+            return self
+                .shared
+                .block_observer()
+                .read_target_retained_with_store(store, invocation, target);
+        }
         let (record, _) =
             durable_original(&self.shared, store, invocation, Access::ObserveOperation)?;
         let phase = self.shared.phase(invocation)?;
@@ -1866,6 +2081,69 @@ struct Call {
     allowed_resources: BTreeMap<ResourceId, Value>,
     local_witness: Option<HostContextWitness>,
     local_only: bool,
+}
+
+/// Held for exactly one direct SDK RPC. Postchecks use these original local
+/// witnesses and current ACL records, without another RPC or a new deadline.
+struct DirectCallCheckpoint<'a> {
+    call: &'a Call,
+    operation: &'a OperationRecord,
+    plan: &'a Value,
+    access: Access,
+    request: RequestContextWitness,
+    host: HostContextWitness,
+}
+impl DirectCallCheckpoint<'_> {
+    fn check(&self) -> AppResult<()> {
+        self.request.check_local().map_err(service_cause)?;
+        self.host.check_local()?;
+        self.call.check()?;
+        authorize_direct_retained(
+            &self.call.authority,
+            self.call.authenticated.principal(),
+            &self.call.context,
+            self.operation,
+            self.plan,
+            self.access,
+        )?;
+        self.host.check_local()?;
+        self.request.check_local().map_err(service_cause)
+    }
+}
+fn authorize_direct_retained(
+    authority: &LocalAuthority,
+    principal: &PrincipalId,
+    context: &Value,
+    operation: &OperationRecord,
+    plan: &Value,
+    access: Access,
+) -> AppResult<()> {
+    if !matches!(access, Access::Apply | Access::ObserveOperation)
+        || &operation.principal != principal
+        || context["principalRef"] != principal.as_str()
+        || context["projectId"] != operation.project_id.as_str()
+        || context["contextId"] != operation.context_id.as_str()
+        || plan["planId"] != operation.plan_id.as_str()
+        || plan["planHash"] != operation.plan_hash.as_str()
+        || !crate::authority::scope_contains(&context["scope"], &json!(operation.scope))
+    {
+        return Err(forbidden());
+    }
+    // Observe uses current full read authority, including after old Apply
+    // approval expiry. Dispatch additionally requires the exact live approval.
+    let mut current = authority.clone();
+    current.authorize_operation(principal, operation, Access::ObserveOperation)?;
+    current.authorize_retained_scope(
+        principal,
+        &operation.project_id,
+        &operation.context_id,
+        &field_digest(context, "policyRevision")?,
+        &json!(operation.scope),
+    )?;
+    if access == Access::Apply {
+        current.authorize_retained_apply(principal, context, plan)?;
+    }
+    Ok(())
 }
 impl Call {
     fn check(&self) -> AppResult<()> {
@@ -2250,6 +2528,9 @@ fn check_session(
 }
 fn error(code: &'static str, message: &'static str) -> AppError {
     AppError::new(code, message)
+}
+fn service_cause(error: crate::service::ServiceError) -> AppError {
+    AppError::caused_by(error.code, error.message, error)
 }
 fn invalid() -> AppError {
     error(

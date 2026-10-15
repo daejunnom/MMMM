@@ -179,14 +179,17 @@ jobs:
         timeout-minutes: 22
         run: |
           $ErrorActionPreference = 'Stop'
-          & $env:MMMM_XTASK run --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root (Join-Path $env:MMMM_EVIDENCE_ROOT 'test') --purpose ci-checks --timeout-seconds 1200 --owned-tail-policy terminate-build -- $env:MMMM_CARGO test --workspace --target $env:MMMM_RUST_TARGET --locked -- --test-threads=2
+          # Keep the existing Job budget: concurrent Windows rustc instances exceeded it locally.
+          $cargoJobs = if ($IsWindows) { 1 } else { 2 }
+          & $env:MMMM_XTASK run --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root (Join-Path $env:MMMM_EVIDENCE_ROOT 'test') --purpose ci-checks --timeout-seconds 1200 --owned-tail-policy terminate-build -- $env:MMMM_CARGO test --jobs $cargoJobs --workspace --target $env:MMMM_RUST_TARGET --locked -- --test-threads=2
           if ($LASTEXITCODE -ne 0) { throw 'Rust workspace tests failed.' }
 
       - name: Check Rust lints
         timeout-minutes: 22
         run: |
           $ErrorActionPreference = 'Stop'
-          & $env:MMMM_XTASK run --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root (Join-Path $env:MMMM_EVIDENCE_ROOT 'clippy') --purpose ci-checks --timeout-seconds 1200 --owned-tail-policy terminate-build -- $env:MMMM_CARGO clippy --workspace --all-targets --target $env:MMMM_RUST_TARGET --locked -- -D warnings
+          $cargoJobs = if ($IsWindows) { 1 } else { 2 }
+          & $env:MMMM_XTASK run --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root (Join-Path $env:MMMM_EVIDENCE_ROOT 'clippy') --purpose ci-checks --timeout-seconds 1200 --owned-tail-policy terminate-build -- $env:MMMM_CARGO clippy --jobs $cargoJobs --workspace --all-targets --target $env:MMMM_RUST_TARGET --locked -- -D warnings
           if ($LASTEXITCODE -ne 0) { throw 'Rust workspace lint check failed.' }
 
       - name: Export foundation evidence

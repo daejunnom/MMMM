@@ -77,8 +77,8 @@ impl DirectTarget {
                         .as_str()
                         .unwrap_or("")
                 && (0..3).all(|axis| {
-                    region.min[axis] <= i64::from(self.block.position[axis]) - 1
-                        && region.max_exclusive[axis] >= i64::from(self.block.position[axis]) + 2
+                    region.min[axis] < i64::from(self.block.position[axis])
+                        && region.max_exclusive[axis] > i64::from(self.block.position[axis]) + 1
                 })
         }) {
             return Err(forbidden());
@@ -128,6 +128,26 @@ pub(super) fn validate_target(
 }
 
 impl NativeObserver {
+    /// Structural selection only. Durable plan ownership and current authority
+    /// remain mandatory in the caller and in every actual observation.
+    pub(crate) fn validate_direct_block_step(
+        step: &Value,
+        context: &Value,
+        scope: &WriteScope,
+    ) -> AppResult<()> {
+        let direct = DirectTarget::from_step(step)?;
+        direct.validate_written(step)?;
+        if step["effect"] != "write"
+            || step["verificationRequirement"] != "independent_readback"
+            || step["resultBindings"]
+                .as_array()
+                .is_none_or(|bindings| !bindings.is_empty())
+        {
+            return Err(forbidden());
+        }
+        direct.validate_scope(&json!({"context":context}), scope)
+    }
+
     /// Called only after the composite's durable plan/step/grant admission. The
     /// requested hash can select only one of this codec's two exact locators;
     /// the actual current reader supplies the bytes and remains the authority.

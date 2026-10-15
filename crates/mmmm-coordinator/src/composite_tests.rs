@@ -310,3 +310,309 @@ fn a_committed_receipt_preserves_authored_effects_after_current_head_drift() {
         (EffectEvidence::SomeConfirmed, false)
     );
 }
+
+/// Reuse the existing canonical context for codec selection checks.
+/// These facts deliberately have no occupied request, paired route, approval,
+/// native reader or operation: passing them cannot authorize any actual I/O.
+fn direct_block_step() -> (Value, Value, WriteScope, Vec<String>) {
+    let mut context = descriptor_context();
+    context["scope"]["regions"] = json!([{"dimension":"minecraft:overworld","min":[-1,63,-1],"maxExclusive":[2,66,2],
+        "contextId":context["contextId"],"worldId":context["environment"]["worldId"]}]);
+    context["contextDigest"] = json!(projected_digest("ExecutionContext", &context).unwrap());
+    let scope: WriteScope = decode(&context["scope"]).unwrap();
+    let subjects: Vec<_> = ["block_state", "block_entity"]
+        .into_iter()
+        .map(|kind| {
+            let selector = crate::native_targets::NativeSelector::from_value(
+                &json!({"kind":kind,"dimension":"minecraft:overworld","position":[0,64,0]}),
+            )
+            .unwrap();
+            format!("native:{}", canonical_digest(selector.value()).unwrap())
+        })
+        .collect();
+    let step = json!({"stepId":"direct-block-fixture","bindingId":"binding-fixture-01","actionId":"mmmm:block_patch",
+        "actionContractVersion":"0.2.0","actionDigest":fixture_digest('a'),
+        "arguments":{"dimension":"minecraft:overworld","position":[0,64,0],
+            "expectedState":{"blockId":"minecraft:air","properties":{}},"desiredState":{"blockId":"minecraft:stone","properties":{}},
+            "expectedRegistryGeneration":"7"},"dependsOn":[],"effect":"write","completion":"synchronous","recovery":"none",
+        "resourcesRead":subjects,"resourcesWritten":subjects,"verificationRequirement":"independent_readback",
+        "contextId":context["contextId"],"implementationDigest":fixture_digest('b'),"resultBindings":[]});
+    validate("PlanStep", &step).unwrap();
+    validate("ExecutionContext", &context).unwrap();
+    (step, context, scope, subjects)
+}
+
+#[test]
+fn direct_block_codec_requires_both_exact_native_subjects_and_the_conservative_fence() {
+    let (step, context, scope, subjects) = direct_block_step();
+    assert!(registered_direct_block(&step));
+    NativeObserver::validate_direct_block_step(&step, &context, &scope).unwrap();
+    for targets in [
+        json!([subjects[0]]),
+        json!([subjects[0], subjects[0]]),
+        json!([subjects[0], subjects[1], "native:caller-added-target"]),
+    ] {
+        let mut changed = step.clone();
+        changed["resourcesWritten"] = targets;
+        assert_eq!(
+            NativeObserver::validate_direct_block_step(&changed, &context, &scope)
+                .unwrap_err()
+                .code,
+            "PERMISSION_REQUIRED"
+        );
+    }
+    let mut narrow = scope.clone();
+    narrow.regions[0].min = [0, 64, 0];
+    narrow.regions[0].max_exclusive = [1, 65, 1];
+    // A point is a valid legacy block region; the new codec requires its
+    // explicitly approved conservative box without expanding this old rule.
+    let invocation =
+        json!({"context":context,"actionId":step["actionId"],"arguments":step["arguments"]});
+    let point = crate::observer::BlockTarget::from_arguments(&step["arguments"]).unwrap();
+    crate::observer::validate_region(&invocation, &narrow, &point).unwrap();
+    assert_eq!(
+        NativeObserver::validate_direct_block_step(&step, &context, &narrow)
+            .unwrap_err()
+            .code,
+        "PERMISSION_REQUIRED"
+    );
+    let mut another_world = scope;
+    another_world.regions[0].world_id =
+        mmmm_contracts::WorldId::new("world-other-fixture").unwrap();
+    assert!(NativeObserver::validate_direct_block_step(&step, &context, &another_world).is_err());
+}
+
+#[test]
+fn direct_block_capture_never_confuses_legacy_snapshot_subjects_or_hashes_with_a_grant() {
+    let (step, context, scope, subjects) = direct_block_step();
+    let mut invocation = step.clone();
+    invocation["context"] = context;
+    let mut observer = NativeObserver::new(HostBridge::default());
+    for subject in &subjects {
+        observer
+            .validate_capture_target(&invocation, &scope, subject)
+            .unwrap();
+    }
+    let legacy = crate::observer::BlockTarget::from_arguments(&step["arguments"])
+        .unwrap()
+        .subject();
+    assert_eq!(
+        observer
+            .validate_capture_target(&invocation, &scope, &legacy)
+            .unwrap_err()
+            .code,
+        "PERMISSION_REQUIRED"
+    );
+    assert_eq!(
+        observer
+            .validate_capture_target(
+                &invocation,
+                &scope,
+                &format!("native:{}", fixture_digest('c'))
+            )
+            .unwrap_err()
+            .code,
+        "PERMISSION_REQUIRED"
+    );
+    assert_eq!(
+        observer
+            .capture_before(&invocation, &scope)
+            .err()
+            .unwrap()
+            .code,
+        "STORE_REQUIRED"
+    );
+    assert_eq!(
+        observer
+            .read_target(&invocation, &subjects[0])
+            .unwrap_err()
+            .code,
+        "STORE_REQUIRED"
+    );
+    let mut malformed = step.clone();
+    malformed["arguments"]["expectedRegistryGeneration"] = json!("007");
+    assert!(
+        NativeObserver::validate_direct_block_step(&malformed, &invocation["context"], &scope)
+            .is_err()
+    );
+    let mut forged = step;
+    forged["arguments"]["profileDigest"] = json!(fixture_digest('d'));
+    assert!(
+        NativeObserver::validate_direct_block_step(&forged, &invocation["context"], &scope)
+            .is_err()
+    );
+}
+
+#[test]
+fn original_native_observation_failure_and_current_revocation_both_survive() {
+    let result: AppResult<()> = finish_native_observation(
+        Err(AppError::new(
+            "NATIVE_OBSERVATION_FAILED",
+            "Original native response failed",
+        )),
+        Err(AppError::new(
+            "PERMISSION_REQUIRED",
+            "Current observation scope was revoked",
+        )),
+    );
+    let error = result.unwrap_err();
+    assert_eq!(error.code, "NATIVE_OBSERVATION_FAILED");
+    let cause = std::error::Error::source(&error).unwrap();
+    assert!(cause.to_string().contains("PERMISSION_REQUIRED"));
+    assert_eq!(
+        cause.source().unwrap().to_string(),
+        "NATIVE_OBSERVATION_FAILED: Original native response failed"
+    );
+}
+
+#[test]
+fn direct_postcheck_uses_the_current_real_grant_and_keeps_observe_separate_from_apply() {
+    let (step, mut context, scope, _) = direct_block_step();
+    let authority = LocalAuthority::new(HostBridge::default());
+    let principal: PrincipalId = decode(&context["principalRef"]).unwrap();
+    let project: ProjectId = decode(&context["projectId"]).unwrap();
+    let id: ContextId = decode(&context["contextId"]).unwrap();
+    let policy = authority
+        .install_project_access(
+            principal.clone(),
+            project.clone(),
+            json!(scope),
+            BTreeSet::from([id.clone()]),
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+    context["policyRevision"] = json!(policy);
+    context["contextDigest"] = json!(projected_digest("ExecutionContext", &context).unwrap());
+    let mut plan = parse_json(include_bytes!("../../../examples/execution-plan.json")).unwrap();
+    plan["projectId"] = json!(project);
+    plan["contextId"] = json!(id);
+    plan["policyRevision"] = json!(policy);
+    plan["scope"] = json!(scope);
+    plan["steps"] = json!([step]);
+    plan["contextPins"] = json!([{"contextId":id,"contextDigest":context["contextDigest"],"environment":context["environment"]}]);
+    plan["approvalRequirement"] = json!("explicit_approval");
+    plan["planHash"] = json!(projected_digest("ExecutionPlan", &plan).unwrap());
+    let operation = OperationRecord {
+        operation_id: OperationId::new("operation-direct-postcheck-fixture").unwrap(),
+        principal: principal.clone(),
+        project_id: project.clone(),
+        idempotency_key: "direct-postcheck-once".into(),
+        plan_id: decode(&plan["planId"]).unwrap(),
+        plan_hash: decode(&plan["planHash"]).unwrap(),
+        context_id: id.clone(),
+        state: OperationState::OutcomeUnknown,
+        cancellation_requested: false,
+        reconciliation_required: true,
+        scope: scope.clone(),
+        whole_project_fence: false,
+        steps: vec![],
+    };
+    authorize_direct_retained(
+        &authority,
+        &principal,
+        &context,
+        &operation,
+        &plan,
+        Access::ObserveOperation,
+    )
+    .unwrap();
+    // There is a real Project read grant, but no host or plan approval. The
+    // production checkpoint must never treat the read grant as Apply authority.
+    assert_eq!(
+        authorize_direct_retained(
+            &authority,
+            &principal,
+            &context,
+            &operation,
+            &plan,
+            Access::Apply
+        )
+        .unwrap_err()
+        .code,
+        "PERMISSION_REQUIRED"
+    );
+    authority.revoke_project(&principal, &project).unwrap();
+    let after_success = authorize_direct_retained(
+        &authority,
+        &principal,
+        &context,
+        &operation,
+        &plan,
+        Access::ObserveOperation,
+    );
+    assert_eq!(
+        finish_native_observation(Ok("received provider success"), after_success)
+            .unwrap_err()
+            .code,
+        "PERMISSION_REQUIRED"
+    );
+    let after_failure = authorize_direct_retained(
+        &authority,
+        &principal,
+        &context,
+        &operation,
+        &plan,
+        Access::ObserveOperation,
+    );
+    let error = finish_native_observation::<()>(
+        Err(AppError::new(
+            "HOST_RESULT_UNKNOWN",
+            "Original native failure",
+        )),
+        after_failure,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "HOST_RESULT_UNKNOWN");
+    let cause = std::error::Error::source(&error).unwrap();
+    assert!(cause.to_string().contains("PERMISSION_REQUIRED"));
+    assert_eq!(
+        cause.source().unwrap().to_string(),
+        "HOST_RESULT_UNKNOWN: Original native failure"
+    );
+
+    let successor = authority
+        .install_project_access(
+            principal.clone(),
+            project.clone(),
+            json!(scope),
+            BTreeSet::from([id]),
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+    assert_ne!(policy, successor);
+    assert!(
+        authorize_direct_retained(
+            &authority,
+            &principal,
+            &context,
+            &operation,
+            &plan,
+            Access::ObserveOperation
+        )
+        .is_err()
+    );
+    context["policyRevision"] = json!(successor);
+    context["contextDigest"] = json!(projected_digest("ExecutionContext", &context).unwrap());
+    // A current reader may still observe this original operation under the
+    // successor read grant. Its obsolete Apply policy/approval stays unusable.
+    authorize_direct_retained(
+        &authority,
+        &principal,
+        &context,
+        &operation,
+        &plan,
+        Access::ObserveOperation,
+    )
+    .unwrap();
+    assert!(
+        authorize_direct_retained(
+            &authority,
+            &principal,
+            &context,
+            &operation,
+            &plan,
+            Access::Apply
+        )
+        .is_err()
+    );
+}

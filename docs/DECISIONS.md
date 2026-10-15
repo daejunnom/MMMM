@@ -85,6 +85,8 @@
 
 | MMMM-D054 | Native pose의 sealed 저작 projection, 직접 블록 codec과 Compatibility의 보호된 승인 사실을 각각 독립 경계로 연결한다. | Display pose의 UUID·type·tag·matrix는 같은 SceneDraft와 AnimationDraft 및 exact target·clip revision·TPS에서만 도출하며 caller 입력이나 실제 실행 승인으로 바꾸지 않는다. 직접 블록의 known은 관측한 block-state subject에 한정한다. 27셀 guard와 보수적 region은 조명·POI·neighbor 등 간접 효과의 완전 범위가 아니며 간접복구·정확 undo 보장 제외를 warning/dropped/명시 승인 loss로 고정한다. 기존 실제 plan·profile·관리자 권한은 유지한다. Compatibility는 같은 보호 SQLite의 실제 native owner·Project·원본 ResourceRef·별도 profile/artifact/interface·현재 Policy 및 local-use scope를 묶은 불변 record에서 출발한다. CAS/import·공개 설정·관측된 profile만으로 승인을 만들지 않는다. private bootstrap은 원 기한·취소·peer stop과 1 MiB frame을 유지하며 최대 128 profile·개별 64 KiB·합계 256 KiB의 전체 map만 전달한다. 선택적 source 실패는 기본 native 읽기 pairing과 분리하고 생성한 Pending·Active 및 완료된 Rejected의 수명에 원 typed cause를 보존한다. Pending 생성 전 fatal 취소·기한과 Complete 전 rollback에서 해당 선택적 읽기 오류의 영구 보존은 발급하지 않는다. 실제 Java interface resolver·실행 권한·게임 tick 재생·클라이언트 시각 및 릴리스 인수는 해당 구현과 실제 증거가 확보될 때까지 미완료다. |
 
+| MMMM-D055 | Windows의 Rust 검사 빌드 동시 작업은 1개로 고정하고 기존 자원 상한을 유지한다. | 직접 블록 consumer 통합의 로컬 실행 354는 rustc 병렬 컴파일 중 실제 Job commit 2,149,158,912 bytes와 LLVM OOM으로 종료됐다. 원 실패와 drain·export·정리 결과를 보존한 뒤 Cargo `--jobs 1`만 명시한 355가 같은 2 GiB/32 process 상한에서 통과했다. Windows foundation test·Clippy에도 이 빌드 동시 작업 수를 적용한다. 테스트 thread 2개와 독립 OS matrix 병렬화, Linux/macOS Cargo 작업 2개, 기한·출력 및 슬롯 예산은 유지한다. 성공한 단일 실행이 모든 미래 빌드의 메모리 여유를 보장하지 않으므로 원시 자원 관측과 실패를 계속 보존한다. |
+
 ## 구현 전에 확인할 항목
 
 - 원본 계약과 예제 패키지의 내용, 버전 및 digest.

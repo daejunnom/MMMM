@@ -1029,7 +1029,13 @@ UUID를 받지 않으며, 기존 display의 세 interpolation/teleport 필드를
 조명·POI·entity·neighbor 효과는 `not_observed`이며 정확 undo를 보장하지 않는다.
 `INDIRECT_ENGINE_EFFECTS_EXCLUDED` loss는 명시 승인을 요구한다. 이 관측을 모든
 engine 효과의 완전 footprint나 새로운 native profile/관리자 승인으로 사용하지 않는다.
-실제 precondition·dispatch·before-capture·readback·reconcile의 연결 검증이 남아 있다.
+Composite의 precondition·dispatch·before-capture·readback·reconcile을 실제 소비
+경로에 연결했다. 현재 저장 invocation·plan·step과 같은 Store·원 scope를 확인하고
+dispatch에는 현재 Apply 승인, poll에는 현재 Observe 권한을 적용한다. actual host
+witness 취득은 원 기한으로 execution-context RPC를 한 번 수행한다. 이후 main RPC
+전후의 witness·grant·scope 검사는 로컬에서 수행하며 새 기한을 만들지 않는다.
+독립 리뷰에서 발견한 응답 후 grant·lease 재검사 누락을 수정했고, 원 native 오류와
+동시 권한 상실을 함께 보존한다. 실제 게임 write·readback 인수는 여전히 미실행이다.
 
 Compatibility 승인 저장은 기존 보호 Store에 actual native owner·Project·원본
 ResourceRef raw SHA와 별도의 profile/artifact/interface pin·현재 Policy/local-use scope를
@@ -1092,6 +1098,16 @@ PR head 및 별도 event SHA `8286282aff6a7f2fb026d58411a627337872273c`, raw dig
 확인했다. Clippy의 실제 세 오류는 direct observer 메서드 미사용, 같은 모듈의
 `int_plus_one`, peer codec의 `unused_unit`이며 후속 consumer 연결·표현식 수정을
 진행한다. Windows 로컬 SAC 차단과 원격 Windows 검사 성공은 별도 결과다.
+
+후속 direct consumer의 Windows `354`는 병렬 rustc 컴파일 중 LLVM OOM과 실제
+Job commit 2,149,158,912 bytes를 관측해 자원 상한으로 종료됐고 테스트는 시작하지
+못했다. 원 로그와 typed resource 오류를 보존했으며 drain·export·scratch 정리와
+lease 해제를 확인했다. D055에 따라 상한은 그대로 두고 Cargo 빌드 작업만 1개로
+명시한 `355`는 Coordinator unit 347개 통과/1개 ignored 및 별도 native stdio 검증을
+통과했다. command 0·114,236 ms, Job commit peak 1,397,723,136 bytes·peak process
+7개·최대 표본 간격 147 ms였고 출력·drain·export·scratch·lease를 정상 완료했다.
+`356`의 같은 package/all-target strict Clippy도 exit 0과 정상 정리를 확인했다.
+두 실행은 아직 실제 게임이나 후속 Compatibility resolver 검증의 근거가 아니다.
 
 고정 `b854b617846036bcb09058ca7da3eed303a1e680`의 Rust CI 50
 (`38698720838`)과 JVM CI 41 (`38698720798`)은 세 OS 및 집계가 모두 성공했다.
