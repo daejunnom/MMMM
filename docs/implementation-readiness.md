@@ -1668,16 +1668,16 @@ AppError cause도 서비스 경계에 보존한다.
 수정한 7파일은 `445`에서 format을 통과했고 `446`의 planner unit 38개가 통과했다.
 command exit 0·42,423 ms, Job commit peak 597,176,320 bytes·6 process·최대 sample gap
 145 ms이며 owned-tail 정리 뒤 drain·완전한 출력·export·scratch 정리·lease 해제를
-확인했다. 원 FN24 native 통합 회귀의 수정 후 로컬 재실행은 아직 하지 않았으며 현재
-작성 중인 calibration Rust source와 함께 동결한 뒤 별도 검증한다. 이전 `442` 실패를
+확인했다. 당시 원 FN24 native 통합 회귀의 수정 후 로컬 재실행은 미실행이었고 이후
+calibration Rust source와 함께 동결해 `463`에서 통과했다. 이전 `442` 실패를
 소급해 성공으로 표시하지 않는다.
 
 최종 비교 교정은 기존 FN24 통합 fixture의 실제 stored 정수 `0` 한 곳을 selection에서
 `0.0`으로 표현하고 전체 JCS digest·원 revision의 동일성을 확인한다. `455`의 세 파일
 format과 `456`의 planner 38개 unit이 통과했다. 후자는 command 0·33,702 ms·Job commit
 peak 597,020,672 bytes·6 process·최대 gap 150 ms이며 owned-tail 정리 뒤 drain·완전한
-출력·export·scratch 정리·lease 해제를 확인했다. 새 FN24 통합 회귀 자체의 수정 후
-재실행은 아직 미실행이며 planner unit 통과와 구분한다.
+출력·export·scratch 정리·lease 해제를 확인했다. 당시 새 FN24 통합 회귀 자체의 수정 후
+재실행은 미실행이었으며 후속 `463`의 실제 통합 통과와 planner unit 통과를 구분한다.
 
 ## 공통 Invocation reservation 집중 검증
 
@@ -1719,6 +1719,131 @@ commit peak 491,098,112 bytes·10 process·최대 sample gap 150 ms, `451`은 4,
 358,440,960 bytes·7 process다. 전자는 owned-tail 정리 뒤, 후자는 자연 종료 뒤 drain·
 완전한 출력·export·scratch 정리·lease 해제를 확인했다. 실제 macOS 전이·회복은 미관측이며
 새 supervisor를 로컬 관리 parent로 교체한 검사도 아니다. 후속 고정 source CI와 구분한다.
+
+## Linux JVM owned member의 정확한 Z4 Pending
+
+D071은 실제 CI62에서 거절된 stable Zombie·threads 4 owned member를 기존 유한 Pending
+조건에 포함한다. 원 full identity·같은 전후 count·RSS open ESRCH·실제 validated pidfd의
+NotReady/errno 없음·held original leader와 최종 leader 검사를 유지한다. member 2 또는 4,
+leader 기존 2 또는 3만 허용하며 다른 count·상태·오류는 거절한다. 새 query·retry·sleep·
+한도 변경 없이 원 prior Complete·100ms·1000ms·부분 사용량·late Complete·reap fence를
+그대로 사용한다. 미관측 RSS는 None이며 종료·0·Complete·empty·drain 성공으로 바꾸지 않는다.
+
+독립 source 리뷰, `462/466` format 후 `468` Windows 도구 lib 235개·bin 4개가 통과했고
+기존 isolated 1개는 ignored다. 기존 pure matrix에 stable Z4와 거절 조건을 확장했으며 실제
+Linux native 회복 검사가 아니다. command 0·39,954 ms·Job commit peak 455,847,936 bytes·
+10 process·최대 gap 150 ms이며 owned-tail 정리 후 drain·완전한 출력·export·scratch 정리·
+lease 해제를 확인했다. 실제 CI62의 793 samples·과거 maximum gap 167ms는 실패 순간 age나
+새 조건의 Pending 진입/회복을 증명하지 않는다. 수정 후 actual Linux 관측은 별도다.
+
+## Full-target 이미지와 실제 native calibration 생산·소비 경계
+
+D072의 Java 생산 경로는 actual function constructor 입력·stored chain·선택 node와 현재
+VM executable을 읽고 실제 원 function invocation을 같은 native queue로 실행한다.
+standard/custom handler·frame callback·command callback·queue 완료를 구분하며 scope 종료,
+quota/overflow·두 queue·source 재관측·whole before/after 검사를 모두 통과한 private
+CompletedRun만 immutable Source3를 만든다. 일반 command의 single-callback 계약은
+유지하고 전용 action은 실제 callback 수와 nullable return을 보존한다. 호스트에 caller의
+Rust CAS ref 또는 readback digest를 완료 사실로 돌려주는 경로는 없다.
+
+전체 objective/owned-storage 이미지는 기존 native read 알고리즘을 재사용하고 Float/Double
+원 비트 sidecar를 함께 보존한다. uncached namespace는 unknown이며 read/ready에서
+load·초기화하지 않는다. Rust는 typed target binding, 원 NBT와 raw-bit 관계·native UTF-16,
+실제 List writer/loader의 한 겹 wrapper를 검사한다. NBT 64 KiB·image 256 KiB·pair 512 KiB와
+RPC 1 MiB/depth 64/4096 nodes는 그대로다. List의 물리 wrapper 비용만 별도 derived
+128-depth/32768-node 상한으로 읽고 해제 후 actual tree의 원 64/16384를 다시 검사한다.
+
+private manifest는 `/2`와 exact 두 targetBindings를 사용하고 원 47-step metadata 및
+94개 full-target precondition을 유지한다. 각 step은 자기 두 조건만 투영한다. 같은 Runtime
+intent/claim 전에 실제 fresh prepare와 retained before를 대조하고, dispatch 후 원 durable
+claim에 결합한 Source3를 확인한 뒤 별도 fresh native state를 읽는다. 실제 HostResponse를
+기존 operation evidence에 보존하고 DirectChange는 원 RecoverySnapshot 흐름에 전달한다.
+원 Invocation blob의 raw SHA와 Source3의 canonical Invocation digest를 구분한다.
+
+Java 25파일과 Rust 12파일은 독립 source 리뷰 후 동결했다. Method join·event role 및 단일
+outcome·성공 case의 실제 selected return 존재에 관한 세 P2를 수정하고 재리뷰했다. `458`의
+Rust format은 통과했으나 `459`는 누락 import 두 곳으로 compile 실패하여 unit은 미도달이다.
+두 import만 추가해 `462` format을 통과한 뒤 통합 재검사한다. 고정 Java `2e13846`의
+Windows `461` full JVM은 선택 입력 193개 전후 pin 일치·manifest SHA-256
+`1bd68ec848ee427d0d409fa78fcd741240dc1ef94963206e624bc16719039c83`를 보존했다.
+Gradle 31 task가 실행됐으나 InterruptedTrace의 nonserializable 필드 경고 네 개가 Werror로
+거절돼 Fabric unit은 미도달이다. command 1·58,919 ms·Job commit peak 1,376,202,752 bytes·
+6 process·최대 gap 150 ms이며 drain·완전한 출력·export·scratch 정리·lease 해제를 확인했다.
+
+`463`은 CLI 16개·Coordinator 368개·Runtime 131개, 합계 515개 unit을 통과했고 기존 isolated
+1개는 ignored다. FN24 native 통합 회귀도 CONTEXT_UNKNOWN 기대값을 유지해 통과했다.
+새 manifest full-frame fixture의 기존 1 MiB/4096-node 검사도 통과했으며 수치 출력은
+캡처되어 이 기록에 새 bytes/nodes 값을 추정하지 않는다. command 0·232,433 ms·Job
+commit peak 1,557,188,608 bytes·7 process·최대 gap 150 ms이며 owned-tail 정리 후 drain·
+완전한 출력·export·scratch 정리·lease 해제를 확인했다. 이후 unused method 1개 제거와
+test-only helper의 cfg(test) 격리를 수행했다. `469` strict는 중첩 if 두 곳으로 거절돼
+조건·오류를 유지한 let-chain으로 정리하고 `470` format을 통과했다.
+
+`471`은 base `148b2af`와 실제 수정 Rust 15개를 구분한 집중 검사다. 입력 전후 pin이 같고
+manifest SHA-256은 `8635c51bf99a59377b7bad9203e8124286feec3c48fdd93b386fd36454b34512`다.
+native backend 12개와 원 authority frame 1개가 통과했다. 후자는 실제 **467,199 bytes/
+3400 nodes**로 기존 1 MiB/4096 안임을 출력했다. 기존 437의 466,350/3939 값과 다른 source
+이며 어느 쪽도 게임 실행 자료가 아니다. 뒤 all-target strict는 test의 clone 두 곳에서
+거절돼 해당 두 줄만 from_ref로 정리했다. test 0/0과 Clippy 101을 한 성공으로 합치지 않는다.
+관리 command 101·107,088 ms·Job commit peak 1,548,099,584 bytes·9 process·최대 gap 149 ms,
+owned-tail 정리 후 drain·완전한 출력·export·scratch 정리·lease 해제를 확인했다. 기존
+집중 test는 이 동등 교정 뒤 반복하지 않으며 format 후 strict만 별도 재검사한다.
+
+`472` format 후 `473`은 Runtime·Coordinator·CLI·Planner·도구 5 package의 all-targets
+strict Clippy를 통과했다. 입력 base와 수정 15개를 구분하고 개별 목록을 원 stdout에
+보존했으며 전후 manifest SHA-256은
+`ca9cc1867484e45b8f2e9a58bd2e4224f34a6cb07b7da82d9b250d6ce7d3e84c`로 같았다. command 0·
+31,402 ms·Job commit peak 957,550,592 bytes·8 process·최대 gap 142 ms이며 자연 종료 뒤
+drain·완전한 출력·export·scratch 정리·lease 해제를 확인했다. 이는 이전 test의 재실행이나
+전체 clean checkout CI 성공을 뜻하지 않는다.
+
+Java `ff83cca`는 앞선 InterruptedTrace 네 필드만 transient로 바꿔 원 JVM 안의 진단과
+불변 사실을 유지한다. `464`는 그 경고 해소 후 미참조 try resource 경고 한 곳으로
+Fabric compile이 다시 거절됐다. 입력 193개 전후 pin은 같았고 manifest SHA-256은
+`5f2ce3b12d43b31af348fa543531fed8298609b771c9a1a42930b7f47b9566cd`다. command 1·
+56,454 ms·Job commit peak 1,377,497,088 bytes·6 process·최대 gap 148 ms이며 drain·완전한
+출력·export·scratch 정리·lease 해제를 확인했다. `148b2af`는 Runner 한 곳과 같은 형태의
+test 네 곳의 resource 선언만 옮겨 원 try-with-resources close·primary/suppressed 순서를
+유지했다. 독립 재검토 뒤 full JVM을 재검사하며 이전 실패를 소급해 성공으로 표시하지
+않는다. 실제 Java serialization 지원도 주장하지 않는다.
+
+고정 `148b2afdf9f3175aee894e6863735bf17df084ab`의 `467`은 전체 JVM 7모듈 411개를
+통과했다. SDK 108·host-core 96·public adapter 29·Fabric 125·observer 24·legacy 18·provider
+11개이며 실패·오류·skip은 0이다. 필수 11 task가 모두 실제 실행됐고 JUnit XML 36개를
+별도로 CreateNew/flush/hash 대조해 보존했다. 입력 193개 전후 pin 일치·manifest SHA-256은
+`e52e768135790e74e9b9df03c6e8bc82b50022b5f188a3e8dc953dacb75bb95b`다. command 0·
+63,541 ms·Job commit peak 1,454,309,376 bytes·6 process·최대 gap 146 ms이며 자연 종료 뒤
+drain·완전한 출력·export·scratch 정리·lease 해제를 확인했다. 요약 12,594 bytes·SHA-256은
+`987226e45661205c0d9d49c941996f8af00522a4e287e94d648fd11d4c190d26`다. 실제 Mixin 적중·
+native observer/JNI positive·게임 실행을 이 단위 및 컴파일 검사에 포함하지 않는다.
+
+Windows API `465`는 같은 중지 서버의 원 JAR에서 13개 실제 class를 javap로 관측했다.
+실제 저장 타입은 SavedDataStorage이고 후보 DimensionDataStorage는 ZIP에 없어 읽지
+않았다. helper 준비의 문자열 치환 오류는 관리 실행 전 preflight_failure로 보존하고
+Parser 0-error 확인 후 한 번 실행했다. 원 JAR·owner의 전후 pin이 같고 command 0·
+22,319 ms·Job commit peak 184,864,768 bytes·4 process·최대 gap 125 ms, stdout 312,816
+bytes·SHA-256 `6e7a22e32704d76a9d68e3b81d1fec50efd874f0913d2f5066d343977ed0ab3b`·stderr 0이다.
+정확한 개발 output-root에서 drain·완전한 출력·export·scratch 정리·lease 해제를 확인했다.
+이는 API 본문 관측이며 실제 SavedData load/save·팩 설치·reload 또는 게임 실행은 아니다.
+SavedDataStorage의 기존 disk read는 unlimitedHeap·DFU·partial/null 오류 소비를 포함하고,
+쓰기 전에 dirty를 해제하며 IO 실패를 로그로 소비할 수 있다. 일반 get/null/save future를
+유한 취득·확정 부재·영속 쓰기 증거로 사용하지 않는다. FolderRepositorySource 재검색도
+디렉터리 생성과 오류 소비를 포함한다. 실제 producer는 원 파일·현재 권한·bounded input·
+독립 후행 사실을 보존해야 하며 단순 API 호출로 이 경계를 완화하지 않는다.
+
+실제 Mixin callsite·47개 게임 실행·실제 Source3 용량 적합성·새 profile admission은
+아직 미검증이다. Pack 설치·owned storage 초기화·reload·새 pairing은 별도 실제 operation이
+필요하며 이 구현의 read/ready가 대신하지 않는다. 실제 animation evidence와 Clip→Pack
+생산 연결, client 시각 인수와 공개 배포도 미완료다.
+
+Static Owned Pack의 생산 경로는 실제 SceneDraft가 cover한 object ID 대신 빈 집합을 넘기는
+오류를 별도 두 파일에서 교정했다. sealed `covered_owned_sources()`의 실제 ID만 같은
+PackBuildInputs에 전달하며 Project catalog 전체를 성공 flag로 복사하지 않는다. 원
+SceneRegistryVerifier·Clip/Physics 거절과 downstream exact kind/object/revision·Project·
+target/compiler pin을 유지한다. 기존 block_scene fixture를 재사용한 정적 성공과 missing·
+extra·stale 거절 회귀를 작성하고 독립 리뷰/`466` format 뒤 `471`의 focused 12개에서
+통과했다. 이는 정적 소비자 연결 검증이며 actual scene/animation evidence 발급 또는
+게임 인수로 확대하지 않는다.
 
 ## 공유 고정 SHA의 CI 실패 구분
 

@@ -303,8 +303,11 @@ fn entity_tombstone(
 }
 
 fn objective_present(payload: &Value) -> Result<()> {
+    objective_present_using(payload, &|value| nbt(value, NAMED_NBT))
+}
+fn objective_present_using(payload: &Value, native: &dyn Fn(&Value) -> Result<()>) -> Result<()> {
     fields(payload, &["nativeObjectiveNbt", "scores", "displaySlots"])?;
-    nbt(&payload["nativeObjectiveNbt"], NAMED_NBT)?;
+    native(&payload["nativeObjectiveNbt"])?;
     let mut previous: Option<&str> = None;
     let mut holder_bytes = 0usize;
     for entry in array(&payload["scores"], MAX_SCORE_HOLDERS)? {
@@ -321,7 +324,7 @@ fn objective_present(payload: &Value) -> Result<()> {
         previous = Some(holder);
         integer32(&entry["value"])?;
         boolean(entry, "locked")?;
-        nbt(&entry["nativeScoreNbt"], NAMED_NBT)?;
+        native(&entry["nativeScoreNbt"])?;
     }
     // Exhaustiveness comes from the admitted Java enum traversal, not an
     // invented Rust list. Reject ambiguous entries before preserving that list.
@@ -340,6 +343,107 @@ fn objective_present(payload: &Value) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Calibration factual images share the exact full-objective serializer and
+/// bounds. This port accepts only the extra raw-bit sidecar in its own codec;
+/// ordinary NativeTargets payload grammar and authority stay unchanged.
+pub(crate) fn validate_calibration_image(raw: &Value, selector: &Value) -> Result<()> {
+    bounded_json(raw, MAX_RAW_BYTES)?;
+    fields(
+        raw,
+        &[
+            "format",
+            "selector",
+            "status",
+            "presence",
+            "membershipScope",
+            "captureScope",
+            "coverage",
+            "reason",
+            "payload",
+        ],
+    )?;
+    require(raw["format"] == "mmmm.native.calibration-target/1" && raw["selector"] == *selector)?;
+    match text(selector, "kind")? {
+        "objective" => {
+            fields(selector, &["targetId", "kind", "objective"])?;
+            atom(text(selector, "objective")?, true)?;
+            if raw["status"] == "unknown" || raw["status"] == "unsupported" {
+                return validate_unknown(raw, "objective");
+            }
+            require(raw["status"] == "known")?;
+            full(
+                raw,
+                "current_native_scoreboard",
+                "native_objective_and_all_scores",
+            )?;
+            match text(raw, "presence")? {
+                "absent" => fields(&raw["payload"], &[]).map(|_| ()),
+                "present" => objective_present_using(&raw["payload"], &|value| {
+                    calibration_nbt(value, NAMED_NBT)
+                }),
+                _ => Err(NativePayloadError),
+            }
+        }
+        "owned_storage" => {
+            fields(selector, &["targetId", "kind", "storage", "ownedSubtrees"])?;
+            location(text(selector, "storage")?)?;
+            require(selector["ownedSubtrees"] == serde_json::json!(["inputs", "invocation"]))?;
+            if raw["status"] == "unknown" || raw["status"] == "unsupported" {
+                require(
+                    raw["presence"] == "unknown"
+                        && raw["membershipScope"] == "unknown"
+                        && raw["coverage"] == "best_effort"
+                        && raw["payload"].is_null(),
+                )?;
+                require(text(raw, "reason")?.len() <= 256 && !text(raw, "reason")?.is_empty())?;
+                return Ok(());
+            }
+            require(raw["status"] == "known")?;
+            full(
+                raw,
+                "current_cached_command_storage",
+                "native_owned_storage_subtrees",
+            )?;
+            let payload = &raw["payload"];
+            fields(payload, &["storagePresent", "inputs", "invocation"])?;
+            require(boolean(payload, "storagePresent")?)?;
+            for key in ["inputs", "invocation"] {
+                let subtree = &payload[key];
+                fields(subtree, &["presence", "nativeValueNbt"])?;
+                match text(subtree, "presence")? {
+                    "absent" => require(subtree["nativeValueNbt"].is_null())?,
+                    "present" => calibration_nbt(&subtree["nativeValueNbt"], ANY_NBT)?,
+                    _ => return Err(NativePayloadError),
+                }
+            }
+            require(
+                raw["presence"]
+                    == if payload["inputs"]["presence"] == "absent"
+                        && payload["invocation"]["presence"] == "absent"
+                    {
+                        "absent"
+                    } else {
+                        "present"
+                    },
+            )?;
+            Ok(())
+        }
+        _ => Err(NativePayloadError),
+    }
+}
+fn calibration_nbt(value: &Value, format: &str) -> Result<()> {
+    fields(value, &["format", "bytesHex", "sha256", "rawFloatingBits"])?;
+    let mut core = value.clone();
+    core.as_object_mut()
+        .ok_or(NativePayloadError)?
+        .remove("rawFloatingBits");
+    nbt(&core, format)?;
+    bounded_json(&value["rawFloatingBits"], MAX_NATIVE_BYTES)?;
+    // The factual consumer additionally decodes exact NBT paths/types and
+    // verifies complete Float/Double coverage against this bounded sidecar.
+    array(&value["rawFloatingBits"], MAX_NODES).map(|_| ())
 }
 
 fn block_state(value: &Value) -> Result<()> {

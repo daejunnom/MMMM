@@ -15,7 +15,7 @@ use crate::{
     planning_source::{
         LocalPlanningAccess, PlanningStore, SharedPlanningContexts, VerifiedPlanningTarget,
     },
-    service::RequestBudget,
+    service::{RequestBudget, RequestContextSlot},
 };
 use mmmm_application::{Access, AppError, AppResult};
 use mmmm_compiler::{
@@ -98,12 +98,6 @@ impl RuntimeCaseProgram {
             Self::DataPack(program) => program.command_stage_index(),
         }
     }
-    fn preseed_end_index(&self) -> u32 {
-        match self {
-            Self::Numeric(program) => program.preseed_end_index(),
-            Self::DataPack(_) => 0,
-        }
-    }
     fn commands(&self) -> &[String] {
         match self {
             Self::Numeric(program) => program.commands(),
@@ -160,6 +154,10 @@ pub struct RegisteredTargetProfiles {
     hosts: HostBridge,
     contexts: SharedPlanningContexts,
     sources: RegisteredCatalogSources,
+    calibration: Option<(
+        RequestContextSlot,
+        crate::calibration_execution::CalibrationRegistry,
+    )>,
 }
 impl RegisteredTargetProfiles {
     pub fn new(
@@ -174,7 +172,16 @@ impl RegisteredTargetProfiles {
             hosts,
             contexts,
             sources,
+            calibration: None,
         }
+    }
+    pub(crate) fn with_calibration(
+        mut self,
+        request: RequestContextSlot,
+        registry: crate::calibration_execution::CalibrationRegistry,
+    ) -> Self {
+        self.calibration = Some((request, registry));
+        self
     }
 
     pub fn register(
@@ -744,135 +751,48 @@ impl RegisteredTargetProfiles {
         expected: &RuntimeCaseSource,
         durable: &DurableCaseWitness,
         suite: &RuntimeSuite,
-        definitions: &BTreeMap<String, LoadedDefinitionSource>,
-        cache: &mut BTreeMap<SourceId, RegisteredCatalogSourceIdentity>,
-        bytes_left: &mut u64,
+        _definitions: &BTreeMap<String, LoadedDefinitionSource>,
+        _cache: &mut BTreeMap<SourceId, RegisteredCatalogSourceIdentity>,
+        _bytes_left: &mut u64,
     ) -> AppResult<CalibrationRunSource> {
-        rpc.fresh()?;
-        let commands = expected.program.commands();
-        let commands_digest = digest(&json!(commands))?;
-        let selector = json!({"kind":"calibration_run_source","invocationId":case.invocation_id,
-            "invocationDigest":durable.invocation_digest,"programDigest":expected.program.program_digest(),
-            "sourceResource":expected.source.resource,"commandsDigest":commands_digest,
-            "readbackSourceDigest":durable.readback_source_digest,
-            "expectedRuntimeSourceFactsDigest":suite.runtime_source_facts_digest,
-            "expectedRegistryGeneration":suite.registry_generation});
-        let response = self.hosts.inspect_response_with_deadline(
-            rpc.authenticated.principal(),
-            &rpc.context_id,
-            selector,
-            rpc.budget.deadline(),
-        )?;
-        retain_host_response(store, rpc, "calibration_run_source", &response)?;
-        if response["status"] != "ok" {
+        let RuntimeCaseProgram::Numeric(program) = &expected.program else {
             return Err(error(
                 "CALIBRATION_RUN_ISSUER_UNAVAILABLE",
-                "Actual immutable calibration dispatch source receipt is unavailable; the original host response is retained",
+                "Actual pack lifecycle issuer is not implemented by numeric Source3",
             ));
-        }
-        let payload = response.get("payload").ok_or_else(unverified)?;
-        exact_fields(
-            payload,
-            &[
-                "format",
-                "protocolVersion",
-                "environment",
-                "contextId",
-                "contextDigest",
-                "runtimeSourceFactsDigest",
-                "hostArtifactDigest",
-                "registryGeneration",
-                "invocationId",
-                "invocationDigest",
-                "programDigest",
-                "sourceResource",
-                "commandsDigest",
-                "readbackSourceDigest",
-                "preseedEndIndex",
-                "commandStageIndex",
-                "commands",
-                "observedFromTick",
-                "observedToTick",
-                "observedAt",
-            ],
-        )?;
-        if payload["format"] != "mmmm.native.calibration-run-source/2"
-            || payload["protocolVersion"] != "0.2.0"
-            || payload["environment"] != rpc.context["environment"]
-            || payload["contextId"] != rpc.context["contextId"]
-            || payload["contextDigest"] != rpc.context["contextDigest"]
-            || payload["runtimeSourceFactsDigest"] != suite.runtime_source_facts_digest.as_str()
-            || payload["hostArtifactDigest"] != suite.host_artifact_digest.as_str()
-            || payload["registryGeneration"] != suite.registry_generation
-            || payload["invocationId"] != case.invocation_id.as_str()
-            || payload["invocationDigest"] != durable.invocation_digest.as_str()
-            || payload["programDigest"] != expected.program.program_digest().as_str()
-            || payload["sourceResource"] != expected.source.resource
-            || payload["commandsDigest"] != commands_digest.as_str()
-            || payload["readbackSourceDigest"] != durable.readback_source_digest.as_str()
-            || integer(&payload["preseedEndIndex"])? != expected.program.preseed_end_index() as i32
-            || integer(&payload["commandStageIndex"])?
-                != expected.program.command_stage_index() as i32
+        };
+        let (slot, registry) = self.calibration.as_ref().ok_or_else(unverified)?;
+        let request = slot
+            .occupied_witness()
+            .map_err(|e| AppError::caused_by(e.code, e.message, e))?;
+        if !request.authenticated().same_session(&rpc.authenticated)
+            || request.budget().deadline() != rpc.budget.deadline()
+            || !std::ptr::eq(request.budget().cancellation(), rpc.budget.cancellation())
         {
-            return Err(unverified());
+            return Err(forbidden());
         }
-        validate_observed_window(payload)?;
-        let observed = payload["commands"].as_array().ok_or_else(unverified)?;
-        if observed.len() != commands.len() {
-            return Err(unverified());
-        }
-        verify_issued_command_return(
-            observed,
-            expected.program.command_stage_index(),
-            durable.selected_native_return,
+        let payload=store.with_write(|store| {
+            let entered=registry.enter(store,&request,&self.authority,&case.operation_id,&durable.original,crate::calibration_execution::CalibrationAccess::Observe)?.ok_or_else(unverified)?;
+            entered.verify_claim(store,&durable.original)?;
+            entered.route().inspect_original_with_store(store,&request,&durable.original,json!({"kind":"calibration_run_source","invocationId":case.invocation_id,"invocationDigest":durable.invocation_digest,"expectedRuntimeSourceFactsDigest":suite.runtime_source_facts_digest,"expectedRegistryGeneration":suite.registry_generation}),&|store|entered.verify_claim(store,&durable.original))
+        })?;
+        crate::observer::finish_native_observation(
+            crate::calibration_observer::verify_run_source(
+                &payload,
+                &durable.original,
+                program,
+                &suite.runtime_source_facts_digest,
+                &suite.registry_generation,
+                &suite.host_artifact_digest,
+                &|| rpc.local_current(),
+            ),
+            rpc.fresh(),
         )?;
-        let mut count = 0usize;
-        for (receipt, source) in observed.iter().zip(commands) {
-            budget_check(&rpc.budget)?;
-            exact_fields(
-                receipt,
-                &[
-                    "commandDigest",
-                    "consumedUtf16",
-                    "nativeReturn",
-                    "parserSources",
-                    "handlerSources",
-                ],
-            )?;
-            if receipt["commandDigest"] != digest(&json!(source))?.as_str()
-                || integer(&receipt["consumedUtf16"])? as usize != source.encode_utf16().count()
-            {
-                return Err(unverified());
-            }
-            required_nullable_integer(receipt.get("nativeReturn"))?;
-            for category in ["parserSources", "handlerSources"] {
-                let sources = receipt[category].as_array().ok_or_else(unverified)?;
-                if sources.is_empty() || sources.len() > 64 {
-                    return Err(unverified());
-                }
-                for source in sources {
-                    count = count
-                        .checked_add(1)
-                        .filter(|value| *value <= 1024)
-                        .ok_or_else(unverified)?;
-                    self.verify_current_definition_source(
-                        store,
-                        rpc,
-                        definitions,
-                        &suite.registry_generation,
-                        source,
-                        cache,
-                        bytes_left,
-                    )?;
-                }
-            }
-        }
-        rpc.fresh()?;
         Ok(CalibrationRunSource {
             case_id: case.case_id.clone(),
             invocation_id: case.invocation_id.clone(),
             program_digest: expected.program.program_digest().clone(),
-            receipt_digest: digest(payload)?,
+            receipt_digest: digest(&payload)?,
         })
     }
 
@@ -1132,8 +1052,7 @@ struct RuntimeCaseRecord {
 
 struct DurableCaseWitness {
     invocation_digest: Sha256Digest,
-    readback_source_digest: Sha256Digest,
-    selected_native_return: Option<i32>,
+    original: Value,
 }
 
 /// No JSON/public constructor. Only a response from the actual privately
@@ -1146,7 +1065,12 @@ struct CalibrationRunSource {
     receipt_digest: Sha256Digest,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
+#[allow(
+    dead_code,
+    reason = "Legacy v2 DTO is retained only for pure codec rejection regressions; production requires actual Source3 and fresh full images"
+)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct NumericReadback {
     format: String,
@@ -1163,12 +1087,14 @@ struct NumericReadback {
     scratch_present: bool,
     stale_output_seeded: bool,
 }
+#[cfg(test)]
 fn deserialize_required_nullable_int32<'de, D>(deserializer: D) -> Result<Option<Int32>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     Option::<Int32>::deserialize(deserializer)
 }
+#[cfg(test)]
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum TypedScalar {
@@ -1363,7 +1289,7 @@ fn verify_durable_case(
     bytes_left: &mut u64,
 ) -> AppResult<DurableCaseWitness> {
     rpc.fresh()?;
-    let (observation, invocation_digest, readback_source_digest) = store.with_read(|store| {
+    let (observation, invocation_digest, original) = store.with_read(|store| {
         let operation = store.operation(&case.operation_id).map_err(storage_app)?;
         if operation.principal != *rpc.authenticated.principal()
             || operation.project_id != rpc.project
@@ -1415,13 +1341,18 @@ fn verify_durable_case(
                 Ok(()) => storage_app(failure),
             })?;
         if invocation["invocationId"] != case.invocation_id.as_str()
-            || invocation["actionId"] != "mmmm:command_execute"
+            || invocation["actionId"]
+                != if matches!(&expected.program, RuntimeCaseProgram::Numeric(_)) {
+                    "mmmm:calibration_command_execute"
+                } else {
+                    "mmmm:command_execute"
+                }
             || invocation["actionContractVersion"] != "0.2.0"
             || invocation["context"] != rpc.context
             || invocation["context"]["principalRef"] != rpc.authenticated.principal().as_str()
             || invocation["implementationDigest"] != suite.host_artifact_digest.as_str()
             || invocation["arguments"]["command"] != expected.program.invocation_command()
-            || step.invocation_digest.as_ref() != Some(&digest(&invocation)?)
+            || step.invocation_digest.as_ref() != Some(&invocation_blob.digest)
         {
             return Err(unverified());
         }
@@ -1457,7 +1388,7 @@ fn verify_durable_case(
             &read_operation_blob(store, rpc, &source, bytes_left)?,
             &rpc.budget,
         )?;
-        Ok((observation, digest(&invocation)?, source.digest))
+        Ok((observation, digest(&invocation)?, invocation))
     })?;
     if case.case_id == PACK_CASE {
         verify_pack_readback(
@@ -1472,30 +1403,77 @@ fn verify_durable_case(
         rpc.fresh()?;
         return Ok(DurableCaseWitness {
             invocation_digest,
-            readback_source_digest,
-            selected_native_return: Some(1),
+            original,
         });
     }
-    let readback: NumericReadback =
-        serde_json::from_value(observation).map_err(|_| unverified())?;
-    if readback.format != "mmmm.target-case-readback/2"
-        || readback.case_id != case.case_id
-        || readback.source_resource != expected.source.resource
-        || readback.command_stage_index != expected.program.command_stage_index()
-        || readback.invocation_id != case.invocation_id
-        || readback.runtime_source_facts_digest != suite.runtime_source_facts_digest
-    {
-        return Err(unverified());
+    if observation["format"] == "mmmm.target-case-readback/3" {
+        let verified = (|| {
+            let RuntimeCaseProgram::Numeric(program) = &expected.program else {
+                return Err(unverified());
+            };
+            crate::calibration_observer::exact(
+                &observation,
+                &[
+                    "format",
+                    "caseId",
+                    "invocationId",
+                    "invocationDigest",
+                    "programDigest",
+                    "runtimeSourceFactsDigest",
+                    "targetImages",
+                    "state",
+                    "runSource",
+                ],
+            )?;
+            if observation["caseId"] != case.case_id
+                || observation["invocationId"] != case.invocation_id.as_str()
+                || observation["invocationDigest"] != invocation_digest.as_str()
+                || observation["programDigest"] != program.source_digest().as_str()
+                || observation["runtimeSourceFactsDigest"]
+                    != suite.runtime_source_facts_digest.as_str()
+            {
+                return Err(unverified());
+            }
+            let images = crate::calibration_observer::decode_images(
+                &observation["targetImages"],
+                &rpc.context,
+                program,
+                Some((
+                    &suite.runtime_source_facts_digest,
+                    &suite.registry_generation,
+                )),
+                &|| rpc.local_current(),
+            )?;
+            let state =
+                crate::calibration_observer::state(&images, program, &|| rpc.local_current())?;
+            let expected_state = json!({"okScore":program.expectation().ok_score,"output":program.expected_readback()["output"],"scratchPresent":program.expectation().scratch_present});
+            if state != observation["state"]
+                || state != expected_state
+                || observation["targetImages"]["hostArtifactDigest"]
+                    != suite.host_artifact_digest.as_str()
+            {
+                return Err(unverified());
+            }
+            crate::calibration_observer::verify_run_source(
+                &observation["runSource"],
+                &original,
+                program,
+                &suite.runtime_source_facts_digest,
+                &suite.registry_generation,
+                &suite.host_artifact_digest,
+                &|| rpc.local_current(),
+            )?;
+            Ok(DurableCaseWitness {
+                invocation_digest,
+                original,
+            })
+        })();
+        return crate::observer::finish_native_observation(verified, rpc.fresh());
     }
-    validate_numeric_readback(&readback)?;
-    rpc.fresh()?;
-    Ok(DurableCaseWitness {
-        invocation_digest,
-        readback_source_digest,
-        selected_native_return: readback.command_return.map(Int32::get),
-    })
+    Err(unverified())
 }
 
+#[cfg(test)]
 fn validate_numeric_readback(readback: &NumericReadback) -> AppResult<()> {
     let case = CalibrationCase::from_case_id(&readback.case_id).ok_or_else(unverified)?;
     let program = CalibrationProgram::for_case(case).map_err(domain_app)?;
@@ -1520,6 +1498,7 @@ fn validate_numeric_readback(readback: &NumericReadback) -> AppResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn verify_issued_command_return(
     observed: &[Value],
     stage: u32,
@@ -1729,6 +1708,21 @@ struct TargetRpc {
     context: Value,
 }
 impl TargetRpc {
+    fn local_current(&self) -> AppResult<()> {
+        budget_check(&self.budget)?;
+        if !self.authenticated.is_current()
+            || !self.authenticated.permits_context(self.context_id.as_str())
+        {
+            return Err(forbidden());
+        }
+        self.authority.authorize_retained_scope(
+            self.authenticated.principal(),
+            &self.project,
+            &self.context_id,
+            &field_digest(&self.context, "policyRevision")?,
+            &self.context["scope"],
+        )
+    }
     fn fresh(&self) -> AppResult<()> {
         budget_check(&self.budget)?;
         self.access.authorize_project(
@@ -2001,6 +1995,7 @@ fn integer(value: &Value) -> AppResult<i32> {
         .map(Int32::get)
         .map_err(|_| unverified())
 }
+#[cfg(test)]
 fn required_nullable_integer(value: Option<&Value>) -> AppResult<Option<i32>> {
     match value {
         Some(Value::Null) => Ok(None),
@@ -2064,6 +2059,7 @@ fn busy() -> AppError {
 fn storage_app(error_value: StorageError) -> AppError {
     AppError::storage("TARGET_SOURCE_UNAVAILABLE", error_value)
 }
+#[cfg(test)]
 fn domain_app(error_value: DomainError) -> AppError {
     AppError::storage(
         error_value.code,

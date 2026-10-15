@@ -196,7 +196,7 @@ impl Creator<'_> {
                     && provider["actions"].as_array().is_some_and(|actions| {
                         actions
                             .iter()
-                            .any(|action| action["actionId"] == "mmmm:command_execute")
+                            .any(|action| action["actionId"] == "mmmm:calibration_command_execute")
                     })
             });
         let provider = candidates.next().ok_or_else(unavailable)?;
@@ -204,7 +204,7 @@ impl Creator<'_> {
             return Err(unavailable());
         }
         let binding: BindingId = decode(&provider["bindingId"])?;
-        let stub = json!({"bindingId":binding,"actionId":"mmmm:command_execute"});
+        let stub = json!({"bindingId":binding,"actionId":"mmmm:calibration_command_execute"});
         let descriptor = finish_native_observation(
             HttpProviderPort::with_deadline(self.hosts.clone(), self.request.budget().deadline())
                 .action_descriptor(&stub, context),
@@ -318,12 +318,35 @@ impl SetupPlanningPort for Creator<'_> {
         // bytes. This creator adds no unused body pin or raw-source read grant.
         let (scope, steps) =
             project_steps(&self.sealed, selection, context, &binding, &descriptor)?;
+        let mut preconditions = Vec::with_capacity(94);
+        for program in self.sealed.programs() {
+            let images = crate::calibration_observer::plan_images(
+                store,
+                self.hosts,
+                self.request,
+                context,
+                program,
+                &|store| self.check_store(store),
+            )?;
+            if images.value["runtimeSourceFactsDigest"]
+                != crate::catalog_source::source_facts_pin(&facts)?.as_str()
+                || images.value["registryGeneration"] != facts["registryGeneration"]
+                || images.value["hostArtifactDigest"] != descriptor["implementationDigest"]
+            {
+                return Err(unavailable());
+            }
+            for image in images.images {
+                let blob = store.put_blob(&image.bytes).map_err(storage)?;
+                preconditions.push(json!({"kind":"resource_hash","subject":image.target,"expected":blob.digest,"coverage":"full_target"}));
+            }
+            self.check_store(store)?;
+        }
         self.check_store(store)?;
         self.prepared = true;
         Ok(PreparedPlan {
             contexts: vec![context.clone()],
             scope,
-            preconditions: vec![],
+            preconditions,
             steps,
             atomicity: "none".into(),
             losses: vec![],
@@ -417,7 +440,7 @@ fn validate_descriptor(descriptor: &Value) -> AppResult<()> {
         .map_err(|_| invalid())?
         .validate("ActionDescriptor", descriptor)
         .map_err(|_| invalid())?;
-    if descriptor["actionId"] != "mmmm:command_execute"
+    if descriptor["actionId"] != "mmmm:calibration_command_execute"
         || !matches!(descriptor["effect"].as_str(), Some("write" | "unknown"))
         || descriptor["completion"] != "synchronous"
         || descriptor["recovery"] != "none"
@@ -482,7 +505,7 @@ mod tests {
             serde_json::from_slice(include_bytes!("../../../examples/provider-supported.json"))
                 .unwrap();
         let mut descriptor = provider["actions"][0].clone();
-        descriptor["actionId"] = json!("mmmm:command_execute");
+        descriptor["actionId"] = json!("mmmm:calibration_command_execute");
         descriptor["semanticKind"] = json!("mmmm:raw_command");
         descriptor["effect"] = json!("unknown");
         descriptor["verificationRequirement"] = json!("independent_readback");

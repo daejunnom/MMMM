@@ -193,6 +193,27 @@ pub(crate) fn validate_frame(
                 return Err(invalid());
             }
             validate_manifest(&value["manifest"], validator)?;
+            let context = &contexts[0];
+            let manifest = &value["manifest"];
+            let plan = &manifest["plan"];
+            if context["principalRef"] != plan["principalId"]
+                || context["projectId"] != plan["projectId"]
+                || context["contextId"] != plan["contextPins"][0]["contextId"]
+                || context["contextDigest"] != plan["contextPins"][0]["contextDigest"]
+                || context["environment"] != plan["contextPins"][0]["environment"]
+            {
+                return Err(invalid());
+            }
+            for program in array(manifest, "programs")? {
+                for binding in array(program, "targetBindings")? {
+                    if !context["scope"]["externalTargetIds"]
+                        .as_array()
+                        .is_some_and(|targets| targets.contains(&binding["targetId"]))
+                    {
+                        return Err(invalid());
+                    }
+                }
+            }
             Ok(ManagementKind::Authority)
         }
         "host_apply_approval_installed" => {
@@ -271,7 +292,7 @@ fn validate_manifest(value: &Value, validator: &ContractValidator) -> Result<(),
             "programs",
         ],
     )?;
-    if value["kind"] != "native_calibration_approval" || value["purpose"] != PURPOSE {
+    if value["kind"] != "native_calibration_approval/2" || value["purpose"] != PURPOSE {
         return Err(invalid());
     }
     for key in [
@@ -330,15 +351,6 @@ fn validate_manifest(value: &Value, validator: &ContractValidator) -> Result<(),
     {
         return Err(invalid());
     }
-    let recipe = mmmm_contracts::parse_json_with_limits(
-        suite.canonical_recipe_bytes(),
-        mmmm_contracts::JsonLimits {
-            max_bytes: CalibrationDispatchPlan::MAX_RECIPE_BYTES,
-            max_depth: 64,
-            max_nodes: 100_000,
-        },
-    )
-    .map_err(|_| invalid())?;
     for (index, (step, program)) in array(plan, "steps")?
         .iter()
         .zip(array(value, "programs")?)
@@ -360,8 +372,10 @@ fn validate_manifest(value: &Value, validator: &ContractValidator) -> Result<(),
                 "preconditions",
             ],
         )?;
-        if step["actionId"] != "mmmm:command_execute"
+        if step["actionId"] != "mmmm:calibration_command_execute"
             || step["stepId"] != program["stepId"]
+            || step["contextId"] != plan["contextPins"][0]["contextId"]
+            || step["contextDigest"] != plan["contextPins"][0]["contextDigest"]
             || !ids.insert(field(step, "stepId")?)
         {
             return Err(invalid());
@@ -379,7 +393,8 @@ fn validate_manifest(value: &Value, validator: &ContractValidator) -> Result<(),
         }
         for key in ["resourcesRead", "resourcesWritten"] {
             for id in array(step, key)? {
-                ResourceId::new(id.as_str().ok_or_else(invalid)?).map_err(|_| invalid())?;
+                mmmm_contracts::TargetId::new(id.as_str().ok_or_else(invalid)?)
+                    .map_err(|_| invalid())?;
             }
         }
         for condition in array(step, "preconditions")? {
@@ -397,7 +412,7 @@ fn validate_manifest(value: &Value, validator: &ContractValidator) -> Result<(),
                 "programDigest",
                 "sourceSha256",
                 "sourceBytesHex",
-                "readbackAddresses",
+                "targetBindings",
                 "commands",
                 "preseedEndIndex",
                 "selectedCommandStageIndex",
@@ -426,21 +441,38 @@ fn validate_manifest(value: &Value, validator: &ContractValidator) -> Result<(),
             .step_by(2)
             .map(|i| u8::from_str_radix(&raw[i..i + 2], 16).map_err(|_| invalid()))
             .collect::<Result<Vec<_>, _>>()?;
-        if raw_digest(&bytes).as_str() != field(program, "sourceSha256")?
-            || !program["readbackAddresses"].is_object()
-        {
+        if raw_digest(&bytes).as_str() != field(program, "sourceSha256")? {
             return Err(invalid());
         }
         // Compare only source recipe data. This creates no native observation,
         // loaded-function receipt, initialization ownership or execution grant.
-        let sealed = program_manifest(
-            &step["stepId"],
-            &suite.programs()[index],
-            &recipe["probes"][index]["readbackAddresses"],
-        )
-        .map_err(|_| invalid())?;
+        let sealed =
+            program_manifest(&step["stepId"], &suite.programs()[index]).map_err(|_| invalid())?;
         if program != &sealed {
             return Err(invalid());
+        }
+        let bindings = crate::calibration_observer::target_bindings(&suite.programs()[index]);
+        let targets = bindings
+            .as_array()
+            .ok_or_else(invalid)?
+            .iter()
+            .map(|binding| binding["targetId"].clone())
+            .collect::<Vec<_>>();
+        if step["resourcesRead"] != json!(targets)
+            || step["resourcesWritten"] != json!(targets)
+            || array(step, "preconditions")?.len() != 2
+        {
+            return Err(invalid());
+        }
+        for (condition, target) in array(step, "preconditions")?.iter().zip(&targets) {
+            if condition["kind"] != "resource_hash"
+                || condition["coverage"] != "full_target"
+                || condition["subject"] != *target
+            {
+                return Err(invalid());
+            }
+            Sha256Digest::new(condition["expected"].as_str().ok_or_else(invalid)?)
+                .map_err(|_| invalid())?;
         }
     }
     Ok(())
@@ -698,6 +730,11 @@ pub(crate) fn verify_normative_plan(plan: &Value) -> StorageResult<CalibrationDi
         return Err(denied());
     }
     let mut seen_steps = BTreeSet::new();
+    let conditions = plan["preconditions"]
+        .as_array()
+        .filter(|v| v.len() == 94)
+        .ok_or_else(denied)?;
+    let mut targets = Vec::with_capacity(94);
     for (index, (step, program)) in steps.iter().zip(suite.programs()).enumerate() {
         let step_id = step["stepId"].as_str().ok_or_else(denied)?;
         let dependencies = step["dependsOn"].as_array().ok_or_else(denied)?;
@@ -706,9 +743,12 @@ pub(crate) fn verify_normative_plan(plan: &Value) -> StorageResult<CalibrationDi
         } else {
             dependencies.len() == 1 && dependencies[0] == steps[index - 1]["stepId"]
         };
-        if step["actionId"] != "mmmm:command_execute"
+        if step["actionId"] != "mmmm:calibration_command_execute"
             || step["arguments"] != json!({"command":program.invocation_command()})
-            || step["effect"] == "read"
+            || step["actionContractVersion"] != "0.2.0"
+            || !matches!(step["effect"].as_str(), Some("write" | "unknown"))
+            || step["completion"] != "synchronous"
+            || step["recovery"] != "none"
             || !step["resultBindings"].as_array().is_some_and(Vec::is_empty)
             || step["contextId"] != plan["contextId"]
             || step["verificationRequirement"] != "independent_readback"
@@ -717,6 +757,35 @@ pub(crate) fn verify_normative_plan(plan: &Value) -> StorageResult<CalibrationDi
         {
             return Err(denied());
         }
+        let bindings = crate::calibration_observer::target_bindings(program);
+        let owned = bindings
+            .as_array()
+            .ok_or_else(denied)?
+            .iter()
+            .map(|binding| binding["targetId"].clone())
+            .collect::<Vec<_>>();
+        if step["resourcesRead"] != json!(owned) || step["resourcesWritten"] != json!(owned) {
+            return Err(denied());
+        }
+        for (condition, target) in conditions[index * 2..index * 2 + 2].iter().zip(&owned) {
+            if condition["kind"] != "resource_hash"
+                || condition["coverage"] != "full_target"
+                || condition["subject"] != *target
+                || condition.as_object().is_none_or(|v| v.len() != 4)
+            {
+                return Err(denied());
+            }
+            Sha256Digest::new(condition["expected"].as_str().ok_or_else(denied)?)
+                .map_err(|_| denied())?;
+        }
+        targets.extend(owned);
+    }
+    if plan["scope"]["externalTargetIds"] != json!(targets)
+        || plan["scope"]["resourceIds"]
+            .as_array()
+            .is_none_or(|v| !v.is_empty())
+    {
+        return Err(denied());
     }
     Ok(suite)
 }
@@ -1407,40 +1476,24 @@ fn build_manifest(
     selection: &CalibrationSelectionRecord,
 ) -> StorageResult<Value> {
     let suite = verify_normative_plan(plan)?;
-    let recipe = mmmm_contracts::parse_json_with_limits(
-        suite.canonical_recipe_bytes(),
-        mmmm_contracts::JsonLimits {
-            max_bytes: CalibrationDispatchPlan::MAX_RECIPE_BYTES,
-            max_depth: 64,
-            max_nodes: 100_000,
-        },
-    )
-    .map_err(|e| StorageError::Contract(e.to_string()))?;
     let steps = plan["steps"].as_array().ok_or_else(denied)?;
     let programs = steps
         .iter()
         .zip(suite.programs())
-        .enumerate()
-        .map(|(index, (step, program))| {
-            program_manifest(
-                &step["stepId"],
-                program,
-                &recipe["probes"][index]["readbackAddresses"],
-            )
-        })
+        .map(|(step, program)| program_manifest(&step["stepId"], program))
         .collect::<StorageResult<Vec<_>>>()?;
     let steps = steps
         .iter()
-        .map(|step| {
+        .enumerate().map(|(index,step)| {
             let arguments_digest = canonical_digest(&step["arguments"])
                 .map_err(|cause| StorageError::Contract(cause.to_string()))?;
             Ok(json!({"stepId":step["stepId"],"bindingId":step["bindingId"],"actionId":step["actionId"],"actionDigest":step["actionDigest"],
                 "implementationDigest":step["implementationDigest"],"argumentsDigest":arguments_digest,"contextId":step["contextId"],"contextDigest":plan["contextPins"][0]["contextDigest"],
-                "resourcesRead":step["resourcesRead"],"resourcesWritten":step["resourcesWritten"],"preconditions":plan["preconditions"]}))
+                "resourcesRead":step["resourcesRead"],"resourcesWritten":step["resourcesWritten"],"preconditions":&plan["preconditions"].as_array().ok_or_else(denied)?[index*2..index*2+2]}))
         })
         .collect::<StorageResult<Vec<_>>>()?;
     Ok(
-        json!({"kind":"native_calibration_approval","purpose":PURPOSE,"selectionDigest":selection.selection_digest(),
+        json!({"kind":"native_calibration_approval/2","purpose":PURPOSE,"selectionDigest":selection.selection_digest(),
         "hostEpoch":context["environment"]["sessionEpoch"],"registryGeneration":offer["runtimeSourceFacts"]["registryGeneration"],
         "runtimeSourceFactsDigest":crate::catalog_source::source_facts_pin(&offer["runtimeSourceFacts"]).map_err(app_failure)?,
         "suiteDigest":suite.suite_digest(),"recipeSha256":suite.suite_digest(),"programs":programs,
@@ -1453,7 +1506,6 @@ fn build_manifest(
 fn program_manifest(
     step: &Value,
     program: &mmmm_compiler::calibration::CalibrationProgram,
-    readback_addresses: &Value,
 ) -> StorageResult<Value> {
     let function = program
         .invocation_command()
@@ -1470,7 +1522,7 @@ fn program_manifest(
     Ok(json!({
         "stepId":step,"caseId":program.case().case_id(),"functionId":function,
         "command":program.invocation_command(),"programDigest":program.source_digest(),
-        "sourceSha256":program.source_digest(),"sourceBytesHex":hex,"readbackAddresses":readback_addresses,
+        "sourceSha256":program.source_digest(),"sourceBytesHex":hex,"targetBindings":crate::calibration_observer::target_bindings(program),
         "commands":program.commands(),
         // [0, preseedEndIndex) is the prefix after which independent preseed
         // capture occurs; the selected stage is a zero-based native body site,
@@ -1498,19 +1550,28 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, program)| {
+                let bindings=crate::calibration_observer::target_bindings(program);
+                let owned=bindings.as_array().unwrap().iter().map(|value|value["targetId"].clone()).collect::<Vec<_>>();
                 json!({
                     "stepId": format!("calibration-{index}"),
-                    "actionId": "mmmm:command_execute",
+                    "actionId": "mmmm:calibration_command_execute",
                     "arguments": {"command": program.invocation_command()},
                     "effect": "write",
+                    "actionContractVersion":"0.2.0","completion":"synchronous","recovery":"none",
                     "resultBindings": [],
                     "contextId": "calibration-context",
                     "verificationRequirement": "independent_readback",
+                    "resourcesRead":owned,"resourcesWritten":owned,
                     "dependsOn": if index == 0 { vec![] } else { vec![format!("calibration-{}", index - 1)] }
                 })
             })
             .collect::<Vec<_>>();
-        json!({"contextId":"calibration-context", "contextPins":[{}], "steps":steps})
+        let targets = steps
+            .iter()
+            .flat_map(|step| step["resourcesWritten"].as_array().unwrap().clone())
+            .collect::<Vec<_>>();
+        let conditions=targets.iter().map(|target|json!({"kind":"resource_hash","subject":target,"expected":"6".repeat(64),"coverage":"full_target"})).collect::<Vec<_>>();
+        json!({"contextId":"calibration-context", "contextPins":[{}], "steps":steps,"scope":{"resourceIds":[],"externalTargetIds":targets},"preconditions":conditions})
     }
 
     #[test]
@@ -1547,15 +1608,6 @@ mod tests {
     // this fixture exercises that new producer/consumer boundary, not a game run.
     fn normative_manifest_input() -> Value {
         let suite = CalibrationDispatchPlan::normative47().unwrap();
-        let recipe = mmmm_contracts::parse_json_with_limits(
-            suite.canonical_recipe_bytes(),
-            mmmm_contracts::JsonLimits {
-                max_bytes: CalibrationDispatchPlan::MAX_RECIPE_BYTES,
-                max_depth: 64,
-                max_nodes: 100_000,
-            },
-        )
-        .unwrap();
         let example =
             mmmm_contracts::parse_json(include_bytes!("../../../examples/execution-plan.json"))
                 .unwrap();
@@ -1569,27 +1621,20 @@ mod tests {
             ];
             json!({
                 "stepId":format!("calibration-{index}"),"bindingId":"calibration-binding",
-                "actionId":"mmmm:command_execute","actionDigest":"1".repeat(64),"implementationDigest":"2".repeat(64),
+                "actionId":"mmmm:calibration_command_execute","actionDigest":"1".repeat(64),"implementationDigest":"2".repeat(64),
                 "argumentsDigest":canonical_digest(&json!({"command":program.invocation_command()})).unwrap(),
                 "contextId":example["contextPins"][0]["contextId"],"contextDigest":example["contextPins"][0]["contextDigest"],
-                "resourcesRead":owned,"resourcesWritten":owned,"preconditions":[]
+                "resourcesRead":owned,"resourcesWritten":owned,"preconditions":owned.iter().map(|target|json!({"kind":"resource_hash","subject":target,"expected":"6".repeat(64),"coverage":"full_target"})).collect::<Vec<_>>()
             })
         }).collect::<Vec<_>>();
         let programs = suite
             .programs()
             .iter()
             .enumerate()
-            .map(|(index, program)| {
-                program_manifest(
-                    &steps[index]["stepId"],
-                    program,
-                    &recipe["probes"][index]["readbackAddresses"],
-                )
-                .unwrap()
-            })
+            .map(|(index, program)| program_manifest(&steps[index]["stepId"], program).unwrap())
             .collect::<Vec<_>>();
         json!({
-            "kind":"native_calibration_approval","purpose":PURPOSE,"selectionDigest":"3".repeat(64),
+            "kind":"native_calibration_approval/2","purpose":PURPOSE,"selectionDigest":"3".repeat(64),
             "hostEpoch":"epoch-fixture-01","registryGeneration":"1","runtimeSourceFactsDigest":"4".repeat(64),
             "suiteDigest":suite.suite_digest(),"recipeSha256":suite.suite_digest(),"programs":programs,
             "plan":{"kind":"native_plan_approval","protocolVersion":"0.2.0","principalId":"principal-fixture",
@@ -1604,7 +1649,21 @@ mod tests {
         let validator = ContractValidator::shared().unwrap();
         let original = normative_manifest_input();
         validate_manifest(&original, validator).unwrap();
+        let mut old = original.clone();
+        old["kind"] = json!("native_calibration_approval");
+        assert!(validate_manifest(&old, validator).is_err());
+        let mut old = original.clone();
+        old["programs"][0]["readbackAddresses"] = json!({});
+        assert!(validate_manifest(&old, validator).is_err());
+        let mut changed = original.clone();
+        changed["plan"]["steps"][0]["actionId"] = json!("mmmm:command_execute");
+        assert!(validate_manifest(&changed, validator).is_err());
+        let mut changed = original.clone();
+        changed["plan"]["steps"][0]["preconditions"][1] =
+            changed["plan"]["steps"][0]["preconditions"][0].clone();
+        assert!(validate_manifest(&changed, validator).is_err());
         for key in [
+            "targetBindings",
             "commands",
             "preseedEndIndex",
             "selectedCommandStageIndex",
@@ -1658,9 +1717,25 @@ mod tests {
 
         // Keep the actual authority frame's existing 1MiB/node bounds honest
         // after adding the sealed command lists; do not relax them silently.
-        let context =
+        let mut context =
             mmmm_contracts::parse_json(include_bytes!("../../../examples/execution-context.json"))
                 .unwrap();
+        context["scope"]["resourceIds"] = json!([]);
+        context["scope"]["externalTargetIds"] = json!(
+            original["plan"]["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|step| step["resourcesWritten"].as_array().unwrap().clone())
+                .collect::<Vec<_>>()
+        );
+        context["contextDigest"] =
+            json!(mmmm_contracts::projected_digest("ExecutionContext", &context).unwrap());
+        let mut original = original;
+        original["plan"]["contextPins"][0]["contextDigest"] = context["contextDigest"].clone();
+        for step in original["plan"]["steps"].as_array_mut().unwrap() {
+            step["contextDigest"] = context["contextDigest"].clone();
+        }
         let authority = json!({"kind":"host_apply_approval_authority","protocolVersion":"0.2.0","nonce":"calibration-manifest",
             "purpose":PURPOSE,"contexts":[context],"approvedSources":{"mmmm_host":"0".repeat(64)},
             "approvedActions":["1".repeat(64)],"permissions":READ_PERMISSIONS,"manifest":original});

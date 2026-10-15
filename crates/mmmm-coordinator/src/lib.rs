@@ -5,6 +5,7 @@ pub mod auth;
 pub mod authority;
 pub mod bootstrap;
 pub mod calibration_execution;
+mod calibration_observer;
 mod calibration_planning;
 pub mod catalog_source;
 pub mod catalog_source_use;

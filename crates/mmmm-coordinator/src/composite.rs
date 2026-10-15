@@ -5,6 +5,7 @@
 use crate::{
     auth::AuthenticatedPrincipal,
     authority::LocalAuthority,
+    bootstrap::NativeWorkspacePermit,
     calibration_execution::{CalibrationAccess, CalibrationRegistry, EnteredCalibration},
     host::{
         DependencyProvenance, HostBridge, HostContextWitness, HttpProviderPort, VerifiedDependency,
@@ -1230,12 +1231,7 @@ impl ProviderPort for CompositeProvider {
         context: &Value,
     ) -> AppResult<Sha256Digest> {
         if self.shared.calibration.matches_plan(plan)? {
-            // No original Invocation exists at this phase. A locator cannot
-            // authorize prepare or substitute an independent factual read.
-            return Err(error(
-                "CALIBRATION_PRECONDITION_UNAVAILABLE",
-                "Independent calibration plan precondition producer is unavailable",
-            ));
+            return Err(store_required());
         }
         if registered_direct_block(step) {
             let (call, scope) =
@@ -1272,10 +1268,7 @@ impl ProviderPort for CompositeProvider {
         context: &Value,
     ) -> AppResult<Sha256Digest> {
         if self.shared.calibration.matches_plan(plan)? {
-            return Err(error(
-                "CALIBRATION_PRECONDITION_UNAVAILABLE",
-                "Independent calibration plan precondition producer is unavailable",
-            ));
+            return calibration_precondition(&self.shared, store, plan, step, condition, context);
         }
         let subject = text(condition, "subject")?;
         if registered_direct_block(step) && subject.starts_with("native:") {
@@ -1381,7 +1374,8 @@ impl ProviderPort for CompositeProvider {
                 invocation,
                 resolution,
                 &mut |route, request, original, store| {
-                    route.prepare(request, original, &|| entered.check_local(store))
+                    let _ = (route, request, original);
+                    crate::calibration_observer::check_prepared_capture(&entered, store)
                 },
             );
         }
@@ -1910,7 +1904,8 @@ impl IndependentObserverPort for CompositeObserver {
             self.shared
                 .enter_calibration(store, &request, invocation, CalibrationAccess::Apply)?
         {
-            return calibration_before(&entered, store, scope);
+            let _ = (entered, scope);
+            return Err(store_required());
         }
         if registered_direct_block(invocation) {
             let (record, _, step, call) =
@@ -1938,7 +1933,11 @@ impl IndependentObserverPort for CompositeObserver {
             self.shared
                 .enter_calibration(store, &request, invocation, CalibrationAccess::Apply)?
         {
-            return calibration_before(&entered, store, scope);
+            if &entered.operation().scope != scope {
+                return Err(forbidden());
+            }
+            let result = crate::calibration_observer::capture(&entered, store);
+            return finish_native_observation(result, entered.check_local(store));
         }
         if registered_direct_block(invocation) {
             let (record, _, step, call) =
@@ -1993,12 +1992,7 @@ impl IndependentObserverPort for CompositeObserver {
             let result = if &entered.operation().scope != scope {
                 Err(forbidden())
             } else {
-                // calibration_run_source requires an actual independent source
-                // receipt/digest. Do not synthesize these from invocation args.
-                Err(error(
-                    "CALIBRATION_READBACK_UNAVAILABLE",
-                    "Independent calibration readback source producer is unavailable",
-                ))
+                crate::calibration_observer::readback(&entered, store)
             };
             return finish_native_observation(result, entered.check_local(store));
         }
@@ -2463,28 +2457,75 @@ impl ProjectResourceAuthority for SourceAuthority {
     }
 }
 
-fn calibration_before(
-    entered: &EnteredCalibration<'_>,
-    store: &DurableStore,
-    scope: &WriteScope,
-) -> AppResult<Option<BeforeCapture>> {
-    let result = (|| {
-        if &entered.operation().scope != scope || entered.plan()["scope"] != json!(scope) {
-            return Err(forbidden());
+fn calibration_precondition(
+    shared: &Shared,
+    store: &mut DurableStore,
+    plan: &Value,
+    step: &Value,
+    condition: &Value,
+    context: &Value,
+) -> AppResult<Sha256Digest> {
+    let request = shared.calibration_request()?;
+    let call = shared.call(context)?;
+    let owner =
+        crate::workspace_bootstrap::NativeOwnerWitness::capture(store, request.budget().deadline())
+            .map_err(storage)?;
+    let suite =
+        crate::bootstrap::calibration_approval::verify_normative_plan(plan).map_err(storage)?;
+    let project: ProjectId = decode(&plan["projectId"])?;
+    let plan_id = decode(&plan["planId"])?;
+    let plan_hash = field_digest(plan, "planHash")?;
+    if request.method() != "plan.apply"
+        || !plan["steps"]
+            .as_array()
+            .is_some_and(|steps| steps.contains(step))
+        || !plan["preconditions"]
+            .as_array()
+            .is_some_and(|conditions| conditions.contains(condition))
+    {
+        return Err(forbidden());
+    }
+    let current = |store: &DurableStore| {
+        request.check_local().map_err(service_cause)?;
+        call.check()?;
+        owner.check_project(store, &project).map_err(storage)?;
+        if store.plan(&plan_id, &plan_hash).map_err(storage)? != *plan
+            || call.context != *context
+            || plan["contextPins"][0]["contextDigest"] != context["contextDigest"]
+        {
+            return Err(stale());
         }
-        // An actual null runner rejects here, before any durable intent.
-        // Readiness alone cannot manufacture an independent before-image.
-        entered
-            .route()
-            .prepare(entered.request(), entered.original(), &|| {
-                entered.check_local(store)
-            })?;
-        Err(error(
-            "CALIBRATION_CAPTURE_UNAVAILABLE",
-            "Independent calibration before-capture producer is unavailable",
-        ))
-    })();
-    finish_native_observation(result, entered.check_local(store))
+        shared
+            .authority
+            .authorize_retained_apply(call.authenticated.principal(), context, plan)
+    };
+    current(store)?;
+    let subject = text(condition, "subject")?;
+    let program = suite
+        .programs()
+        .iter()
+        .find(|program| {
+            crate::calibration_observer::target_bindings(program)
+                .as_array()
+                .is_some_and(|targets| targets.iter().any(|target| target["targetId"] == subject))
+        })
+        .ok_or_else(forbidden)?;
+    let images = crate::calibration_observer::plan_images(
+        store,
+        &shared.hosts,
+        &request,
+        context,
+        program,
+        &current,
+    )?;
+    let digest = images
+        .images
+        .iter()
+        .find(|image| image.target == subject)
+        .map(|image| raw_digest(&image.bytes))
+        .ok_or_else(forbidden)?;
+    current(store)?;
+    Ok(digest)
 }
 
 fn frozen_plan(

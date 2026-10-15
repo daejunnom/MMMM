@@ -252,7 +252,8 @@ impl DaemonSourceFactory for ProductionFactory {
             handles.hosts.clone(),
             contexts.clone(),
             catalog.clone(),
-        );
+        )
+        .with_calibration(handles.request.clone(), handles.calibration.clone());
         let compatibility = RegisteredCompatibilityProfiles::new(
             handles.request.clone(),
             handles.authority.clone(),

@@ -220,7 +220,7 @@ pub(crate) enum CalibrationAccess {
     Cancel,
 }
 
-type FreshCalibrationPrepare<'a> = dyn FnMut(&CalibrationHostRoute, &RequestContextWitness, &Value, &DurableStore) -> AppResult<()>
+type FreshCalibrationPrepare<'a> = dyn FnMut(&CalibrationHostRoute, &RequestContextWitness, &Value, &mut DurableStore) -> AppResult<()>
     + 'a;
 
 /// The reference prevents this authority from outliving its actual entered
@@ -246,9 +246,6 @@ impl EnteredCalibration<'_> {
     }
     pub(crate) fn original(&self) -> &Value {
         &self.original
-    }
-    pub(crate) fn plan(&self) -> &Value {
-        &self.plan
     }
     pub(crate) fn operation(&self) -> &OperationRecord {
         &self.operation

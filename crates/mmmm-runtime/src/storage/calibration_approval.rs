@@ -333,7 +333,7 @@ fn verify_selection(
         .ok_or_else(|| conflict("Calibration requires exactly 47 original steps"))?;
     for step in steps {
         rpc.check()?;
-        if step["actionId"] != "mmmm:command_execute"
+        if step["actionId"] != "mmmm:calibration_command_execute"
             || step["effect"] == "read"
             || step["recovery"] != "none"
             || step["contextId"] != plan["contextId"]

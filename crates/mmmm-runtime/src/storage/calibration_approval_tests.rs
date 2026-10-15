@@ -149,7 +149,7 @@ impl CalibrationApprovalAuthority for Authority {
             self.permit.0.cancelled.set(true);
             return Err(StorageError::Conflict("Fixture runtime source revoked"));
         }
-        if invocation["actionId"] != "mmmm:command_execute" {
+        if invocation["actionId"] != "mmmm:calibration_command_execute" {
             return Err(StorageError::Conflict("Fixture original command route"));
         }
         Ok(())
@@ -183,7 +183,7 @@ fn seed() -> (TestRoot, DurableStore, Rpc, Authority, Value, Value) {
         .map(|index| {
             let mut step = original.clone();
             step["stepId"] = json!(format!("calibration-step-{index:02}"));
-            step["actionId"] = json!("mmmm:command_execute");
+            step["actionId"] = json!("mmmm:calibration_command_execute");
             step["arguments"] =
                 json!({"command":format!("function mmmm:storage_fixture/case_{index:02}")});
             step["effect"] = json!("write");

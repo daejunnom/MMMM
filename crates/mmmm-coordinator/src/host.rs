@@ -13,7 +13,8 @@ use crate::{
 use mmmm_application::{AppError, AppResult, ProviderPort};
 use mmmm_contracts::{
     ActionId, BindingId, ContextId, ContractValidator, InvocationId, OperationId, PrincipalId,
-    ProjectId, Sha256Digest, StepId, encode_json, raw_digest, verify_projected_digest,
+    ProjectId, Sha256Digest, StepId, canonical_digest, encode_json, raw_digest,
+    verify_projected_digest,
 };
 use mmmm_runtime::storage::DurableStore;
 use serde_json::{Value, json};
@@ -267,22 +268,58 @@ impl CalibrationHostRoute {
             Ok(())
         })
     }
-    /// Non-consuming private prepare. The actual Java purpose route must check
-    /// ADMIN/source/current runner readiness; an absent runner is an error.
-    pub(crate) fn prepare(
+    /// Factual pre-intent acquisition. The common Application has reserved the
+    /// operation, but has not inserted an Invocation/claim yet. Retention binds
+    /// the exact frozen step without pretending that an Accepted run exists.
+    pub(crate) fn prepare_observed(
         &self,
+        store: &mut DurableStore,
         request: &RequestContextWitness,
         original: &Value,
-        current: &dyn Fn() -> AppResult<()>,
-    ) -> AppResult<()> {
+        current: &dyn Fn(&DurableStore) -> AppResult<()>,
+    ) -> AppResult<Value> {
         self.validate_original(original)?;
-        self.request_identity(request, current)?;
-        let prepared = (|| {
-            current()?;
+        current(store)?;
+        let result = (|| {
+            let operation: OperationId = serde_json::from_value(original["operationId"].clone())
+                .map_err(|_| error("STALE_CONTEXT", "Prepared operation identity is invalid"))?;
+            let record = store
+                .operation(&operation)
+                .map_err(|e| AppError::storage("STALE_CONTEXT", e))?;
+            let plan = store
+                .plan(&record.plan_id, &record.plan_hash)
+                .map_err(|e| AppError::storage("STALE_CONTEXT", e))?;
+            let step = plan["steps"]
+                .as_array()
+                .and_then(|steps| {
+                    steps
+                        .iter()
+                        .find(|step| step["stepId"] == original["stepId"])
+                })
+                .ok_or_else(|| error("STALE_CONTEXT", "Prepared frozen step is absent"))?;
+            if record.principal != *request.authenticated().principal()
+                || record.context_id.as_str()
+                    != original["context"]["contextId"].as_str().unwrap_or("")
+                || [
+                    "bindingId",
+                    "actionId",
+                    "actionContractVersion",
+                    "actionDigest",
+                    "implementationDigest",
+                    "arguments",
+                ]
+                .iter()
+                .any(|key| step[*key] != original[*key])
+            {
+                return Err(error(
+                    "STALE_CONTEXT",
+                    "Prepared invocation differs from its frozen operation",
+                ));
+            }
+            self.request_identity(request, &|| current(store))?;
             let host = self.current_request_host(request)?;
             let expires = self.invocation_deadline(request, original, true)?;
-            current()?;
-            self.check_current(request)?;
+            current(store)?;
             let acquired = exchange_acquired(
                 &host,
                 "prepare",
@@ -291,16 +328,71 @@ impl CalibrationHostRoute {
                 &expires,
                 request.budget().deadline(),
             )?;
-            let ready = response_payload(acquired.into_response()?)?;
-            if !ready.is_object() {
+            let acquired = retain_prepared_calibration_truth(store, &operation, acquired)?;
+            response_payload(acquired.into_response()?)
+        })();
+        calibration_route_finish(result, self.request_identity(request, &|| current(store)))
+    }
+    /// Only actual Accepted original-run queries use this private route. The
+    /// trusted consumer checks the protected Runtime claim before/after I/O.
+    pub(crate) fn inspect_original_with_store(
+        &self,
+        store: &mut DurableStore,
+        request: &RequestContextWitness,
+        original: &Value,
+        selector: Value,
+        current: &dyn Fn(&DurableStore) -> AppResult<()>,
+    ) -> AppResult<Value> {
+        self.validate_original(original)?;
+        let fields: &[&str] = match selector["kind"].as_str() {
+            Some("calibration_state") => &["kind", "invocationId", "invocationDigest"],
+            Some("calibration_run_source") => &[
+                "kind",
+                "invocationId",
+                "invocationDigest",
+                "expectedRuntimeSourceFactsDigest",
+                "expectedRegistryGeneration",
+            ],
+            _ => {
                 return Err(error(
-                    "HOST_RESPONSE_INVALID",
-                    "Private calibration readiness is invalid",
+                    "INVALID_INPUT",
+                    "Private calibration query is unsupported",
                 ));
             }
-            Ok(())
+        };
+        if selector.as_object().is_none_or(|value| {
+            value.len() != fields.len() || fields.iter().any(|key| !value.contains_key(*key))
+        }) || selector["invocationId"] != original["invocationId"]
+            || selector["invocationDigest"]
+                != canonical_digest(original)
+                    .map_err(|_| error("INVALID_INPUT", "Original invocation digest is invalid"))?
+                    .as_str()
+        {
+            return Err(error(
+                "INVALID_INPUT",
+                "Private query differs from the original invocation",
+            ));
+        }
+        current(store)?;
+        let result = (|| {
+            let key = durable_invocation_key(store, original, request.budget().deadline())?;
+            self.retain_attempt(&key, false)?;
+            self.request_identity(request, &|| current(store))?;
+            let host = self.current_request_host(request)?;
+            let expires = self.invocation_deadline(request, original, false)?;
+            current(store)?;
+            let acquired = exchange_acquired(
+                &host,
+                "inspect",
+                Some(&self.read_owner.context_id),
+                selector,
+                &expires,
+                request.budget().deadline(),
+            )?;
+            let acquired = retain_acquired_operation_truth(store, &key, acquired)?;
+            response_payload(acquired.into_response()?)
         })();
-        calibration_route_finish(prepared, self.request_identity(request, current))
+        calibration_route_finish(result, self.request_identity(request, &|| current(store)))
     }
     pub(crate) fn dispatch_with_store(
         &self,
@@ -2241,6 +2333,34 @@ fn retain_first_dispatch(
 /// narrow operation pin creates no ResourceRef, grant, result acceptance or
 /// effect-state transition. Its authority is the actual first-dispatch route
 /// and immutable intent already checked before the consuming request.
+fn retain_prepared_calibration_truth(
+    store: &mut DurableStore,
+    operation: &OperationId,
+    acquired: HostReplyAcquisition,
+) -> AppResult<HostReplyAcquisition> {
+    let Some(response) = acquired.validated_response() else {
+        return Ok(acquired);
+    };
+    let retained = (|| {
+        let bytes = encode_json(response)
+            .map_err(|e| mmmm_runtime::storage::StorageError::Contract(e.to_string()))?;
+        if bytes.len() > crate::rpc::MAX_CONTROL_BYTES {
+            return Err(mmmm_runtime::storage::StorageError::InvalidInput(
+                "Prepared factual reply exceeds the finite byte limit".into(),
+            ));
+        }
+        let blob = store.put_blob(&bytes)?;
+        store.append_operation_evidence(operation, &blob)
+    })();
+    match retained {
+        Ok(()) => Ok(acquired),
+        Err(cause) => Err(AppError::caused_by(
+            "EVIDENCE_RETENTION_FAILED",
+            "Actual prepared host reply could not be retained",
+            HostTruthRetentionFailure { acquired, cause },
+        )),
+    }
+}
 fn retain_acquired_operation_truth(
     store: &mut DurableStore,
     key: &OriginalInvocationKey,
@@ -3481,7 +3601,7 @@ mod tests {
                 assert_eq!(store.data_root(), root);
                 // This cancellation is deliberately after durable truth exists,
                 // without a sleep or a race with the loopback response writer.
-                if !store.operation_evidence(&operation).unwrap().is_empty() {
+                if !self.prepare && !store.operation_evidence(&operation).unwrap().is_empty() {
                     self.cancel_after_retention
                         .store(true, std::sync::atomic::Ordering::Release);
                 }
@@ -3501,8 +3621,7 @@ mod tests {
             };
             let result = if self.prepare {
                 self.route
-                    .prepare(&request, &self.original, &|| current(context.store))
-                    .map(|()| json!({}))
+                    .prepare_observed(context.store, &request, &self.original, &current)
             } else {
                 self.route
                     .dispatch_with_store(context.store, &request, &self.original, &current)
@@ -3744,12 +3863,15 @@ mod tests {
             service.management_store().operation(&operation).unwrap(),
             before
         );
-        assert!(
-            service
-                .management_store()
-                .operation_evidence(&operation)
-                .unwrap()
-                .is_empty()
-        );
+        let evidence = service
+            .management_store()
+            .operation_evidence(&operation)
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        let retained = mmmm_contracts::parse_json(
+            &service.management_store().read_blob(&evidence[0]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(retained, native.response);
     }
 }
