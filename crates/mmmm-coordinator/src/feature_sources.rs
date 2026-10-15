@@ -3,6 +3,7 @@
 use crate::{
     auth::AuthenticatedPrincipal,
     authority::LocalAuthority,
+    bootstrap::NativeWorkspacePermit,
     catalog_source::RegisteredCatalogSources,
     features::{
         CaptureInputs, FeatureAccess, FeatureResourcePort, FeatureSources, ManualSceneInputs,
@@ -16,7 +17,7 @@ use crate::{
         SharedPlanningContexts, SharedPlanningData, SharedPlanningDependencies,
     },
     production_factory::RegisteredCompatibilityProfiles,
-    service::{RequestBudget, RequestContextSlot, ServiceError},
+    service::{RequestBudget, RequestContextSlot, ServiceError, ServiceExtensionContext},
 };
 use mmmm_adapters::{InventorySnapshot, ProviderDescriptor};
 use mmmm_application::{Access, AppError, AppResult};
@@ -37,9 +38,12 @@ use mmmm_planner::{
     ObjectPin, OwnedKind, PlanningEnvironmentPort, ProjectCatalog, ProjectSourcePort, SceneSource,
 };
 use mmmm_reference::{AccessControl, ReadPrincipal};
+#[cfg(test)]
+use mmmm_runtime::artifact::register_resource;
 use mmmm_runtime::{
     artifact::{
-        ArtifactError, ArtifactResult, ResourceAuthority, ResourceOwner, register_resource,
+        ArtifactError, ArtifactResult, ResourceAuthority, ResourceOwner,
+        register_resource_with_diagnostics,
     },
     storage::{
         DurableStore, StorageError, StorageResult,
@@ -350,24 +354,49 @@ struct ManualRecord {
 #[derive(Default)]
 pub struct ManualSceneRegistry {
     records: BTreeMap<(PrincipalId, String), ManualRecord>,
+    authored: BTreeMap<(PrincipalId, ResourceId), AuthoredManualRecord>,
     bytes: usize,
+}
+#[derive(Clone)]
+struct AuthoredManualRecord {
+    binding: SourceBinding,
+    selection: Value,
+    source_map: Value,
+    selection_pin: ResourceRef,
+    source_map_pin: ResourceRef,
+    edit_payload_pin: ResourceRef,
+    patch: Value,
+    policy: DeltaPolicy,
+    weight: usize,
 }
 pub type SharedManualScenes = Rc<RefCell<ManualSceneRegistry>>;
 
 /// The planner and features consume the same native-installed manual record.
 /// The delegate retains independent state/bake codecs; a public patch cannot
 /// populate this registry or turn a manual scene into a sealed baked clip.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Forward the installed request/authority and exact shared source registries without constructing replacement grants"
+)]
 pub fn manual_data_adapter(
     delegate: SharedPlanningData,
     request: RequestContextSlot,
     authority: LocalAuthority,
     manual: SharedManualScenes,
+    hosts: HostBridge,
+    contexts: SharedPlanningContexts,
+    rights: SharedResourceRights,
+    products: SharedFeatureProducts,
 ) -> SharedPlanningData {
     Rc::new(RefCell::new(Box::new(ManualSceneData {
         delegate,
         request,
         authority,
         manual,
+        hosts,
+        contexts,
+        rights,
+        products,
     })))
 }
 struct ManualSceneData {
@@ -375,8 +404,48 @@ struct ManualSceneData {
     request: RequestContextSlot,
     authority: LocalAuthority,
     manual: SharedManualScenes,
+    hosts: HostBridge,
+    contexts: SharedPlanningContexts,
+    rights: SharedResourceRights,
+    products: SharedFeatureProducts,
 }
 impl ManualSceneData {
+    fn resources<'a>(
+        &self,
+        store: PlanningStore<'a>,
+        project: &ProjectCatalog,
+        context: &Value,
+        budget: &RequestBudget,
+    ) -> AppResult<LocalFeatureResources<'a>> {
+        let (principal, actual) = self
+            .request
+            .current()
+            .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
+        if actual.deadline() != budget.deadline()
+            || !std::ptr::eq(actual.cancellation(), budget.cancellation())
+        {
+            return Err(forbidden());
+        }
+        let access = LocalPlanningAccess::new(
+            principal.clone(),
+            self.authority.clone(),
+            self.hosts.clone(),
+            budget.clone(),
+            self.contexts.clone(),
+        )?;
+        Ok(LocalFeatureResources {
+            source: BorrowedProjectSource::new(store.clone(), access, self.delegate.clone()),
+            store,
+            principal,
+            project: project.clone(),
+            context: context.clone(),
+            authority: self.authority.clone(),
+            rights: self.rights.clone(),
+            products: self.products.clone(),
+            budget: budget.clone(),
+            origin: FeatureOrigin::default(),
+        })
+    }
     fn record(
         &self,
         principal: &PrincipalId,
@@ -407,6 +476,36 @@ impl ManualSceneData {
     }
 }
 impl PlanningDataPort for ManualSceneData {
+    fn admit_scene_source_resources_with_store(
+        &mut self,
+        store: &PlanningStore<'_>,
+        principal: &PrincipalId,
+        project: &ProjectCatalog,
+        patch: &Value,
+        context: &Value,
+        budget: &RequestBudget,
+    ) -> AppResult<()> {
+        if let Some(record) = authored_manual_for_patch(
+            &self.manual,
+            &self.request,
+            &self.authority,
+            principal,
+            project,
+            patch,
+            context,
+            budget,
+        )? {
+            let mut resources = self.resources(store.clone(), project, context, budget)?;
+            let admission = recheck_authored_manual(&mut resources, &self.request, &record)?;
+            return store.record_manual_scene_sources(&admission);
+        }
+        self.delegate
+            .try_borrow_mut()
+            .map_err(|_| busy())?
+            .admit_scene_source_resources_with_store(
+                store, principal, project, patch, context, budget,
+            )
+    }
     #[allow(
         clippy::too_many_arguments,
         reason = "Forward the actual Store and unchanged authenticated state-source inputs to the delegate"
@@ -437,6 +536,20 @@ impl PlanningDataPort for ManualSceneData {
         context: &Value,
         budget: &RequestBudget,
     ) -> AppResult<SceneSource> {
+        if let Some(record) = authored_manual_for_patch(
+            &self.manual,
+            &self.request,
+            &self.authority,
+            principal,
+            project,
+            patch,
+            context,
+            budget,
+        )? {
+            let mut resources = self.resources(store.clone(), project, context, budget)?;
+            recheck_authored_manual(&mut resources, &self.request, &record)?;
+            return authored_scene_source(&record);
+        }
         if self
             .record(principal, project, patch, context, budget)?
             .is_some()
@@ -462,6 +575,28 @@ impl PlanningDataPort for ManualSceneData {
         context: &Value,
         budget: &RequestBudget,
     ) -> AppResult<()> {
+        if let Some(record) = authored_manual_for_patch(
+            &self.manual,
+            &self.request,
+            &self.authority,
+            principal,
+            project,
+            patch,
+            context,
+            budget,
+        )? {
+            let mut resources = self.resources(store.clone(), project, context, budget)?;
+            recheck_authored_manual(&mut resources, &self.request, &record)?;
+            let expected = authored_scene_source(&record)?;
+            if source.selection.value() != expected.selection.value()
+                || source.artifact != expected.artifact
+                || source.source_map != expected.source_map
+                || source.ingested_bake.is_some()
+            {
+                return Err(conflict());
+            }
+            return budget_check(budget);
+        }
         if self
             .record(principal, project, patch, context, budget)?
             .is_some()
@@ -559,7 +694,14 @@ struct ProductRecord {
     producer: Sha256Digest,
     origin: FeatureOrigin,
     shape: Option<shape_source::ShapeGeometryReceipt>,
+    kind: ProductKind,
     weight: usize,
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProductKind {
+    Generated,
+    ExchangeSelection,
+    NativeManualInput,
 }
 #[derive(Default)]
 pub struct FeatureProductRegistry {
@@ -739,6 +881,30 @@ impl LocalFeatureSources {
             native,
         ))
     }
+    fn resources_for_store<'a>(
+        &self,
+        access: &FeatureAccess,
+        store: PlanningStore<'a>,
+        budget: &RequestBudget,
+    ) -> Result<LocalFeatureResources<'a>, ServiceError> {
+        let (principal, source, project) = self.source(access, store.clone(), budget)?;
+        let context = access
+            .context
+            .clone()
+            .ok_or_else(|| manual_service(unavailable()))?;
+        Ok(LocalFeatureResources {
+            source,
+            store,
+            principal,
+            project,
+            context,
+            authority: self.composition.authority.clone(),
+            rights: self.composition.rights.clone(),
+            products: self.composition.products.clone(),
+            budget: budget.clone(),
+            origin: self.origin.clone(),
+        })
+    }
     /// Called by trusted native/file ingress only after bytes were placed in
     /// registered Project CAS. This does not fabricate a completed BakeArtifact.
     pub fn register_manual(
@@ -887,7 +1053,13 @@ impl LocalFeatureSources {
             .manual
             .try_borrow_mut()
             .map_err(|_| busy())?;
-        if registry.records.len() >= 128 && !registry.records.contains_key(&key) {
+        if registry
+            .records
+            .len()
+            .checked_add(registry.authored.len())
+            .is_none_or(|size| size >= 128)
+            && !registry.records.contains_key(&key)
+        {
             return Err(limit());
         }
         if let Some(old) = registry.records.get(&key)
@@ -934,6 +1106,307 @@ impl LocalFeatureSources {
 }
 
 impl FeatureSources for LocalFeatureSources {
+    fn import_manual_scene(
+        &mut self,
+        selection: &crate::native_manual_exchange::NativeManualSelection,
+        owner: &crate::workspace_bootstrap::NativeOwnerWitness,
+        call: &mut ServiceExtensionContext<'_>,
+    ) -> Result<crate::native_manual_exchange::ManualSceneReceipt, ServiceError> {
+        use crate::native_manual_exchange::{
+            ManualSceneCommittedFailure, ManualSceneReceipt, ManualSceneStagingFailure, checked,
+        };
+        let request = self.composition.request.current_witness("scene.diff")?;
+        let local_check = |store: &DurableStore| -> Result<(), ServiceError> {
+            request.check_local()?;
+            owner
+                .check_project(store, &selection.project_id)
+                .map_err(|cause| manual_service(storage_app(cause)))?;
+            if owner.principal() != call.principal.principal()
+                || !request.authenticated().same_session(call.principal)
+            {
+                return Err(manual_service(forbidden()));
+            }
+            let project = store
+                .project(&selection.project_id)
+                .map_err(|cause| manual_service(storage_app(cause)))?;
+            if project["revision"] != selection.expected_revision.as_str() {
+                return Err(manual_service(conflict()));
+            }
+            request.check_local()
+        };
+        local_check(call.store)?;
+        let access_result = self.access(
+            call.principal,
+            "scene.diff",
+            &json!({"contextId":selection.context_id}),
+            call.store,
+            call.budget,
+        );
+        let access = checked(access_result, local_check(call.store))?;
+        let prepared = (|| {
+            let mut resources =
+                self.resources_for_store(&access, PlanningStore::read(call.store), call.budget)?;
+            let principal = resources.principal.clone();
+            let project = resources.project.clone();
+            if project.project_id() != &selection.project_id
+                || project.revision() != &selection.expected_revision
+            {
+                return Err(manual_service(conflict()));
+            }
+            if [
+                &selection.source_map_resource,
+                &selection.edit_payload_resource,
+            ]
+            .iter()
+            .any(|id| project.resource_ids().contains(*id))
+            {
+                return Err(manual_service(forbidden()));
+            }
+            let context = access
+                .context
+                .as_ref()
+                .ok_or_else(|| manual_service(unavailable()))?;
+            let selection_pin = resources
+                .products
+                .try_borrow()
+                .map_err(|_| manual_service(busy()))?
+                .records
+                .get(&(
+                    selection.project_id.clone(),
+                    selection.selection_resource.clone(),
+                ))
+                .filter(|record| record.kind == ProductKind::ExchangeSelection)
+                .map(|record| record.resource.clone())
+                .ok_or_else(|| manual_service(forbidden()))?;
+            let issued = resources
+                .product(&selection_pin)
+                .map_err(manual_service)?
+                .ok_or_else(|| manual_service(forbidden()))?;
+            let original_bytes = resources
+                .read_source(
+                    selection.context_id.as_str(),
+                    &json!(selection_pin),
+                    ResourcePurpose::Read,
+                    MAX_CODEC_BYTES,
+                )
+                .map_err(manual_service)?;
+            let original = parse_feature_document(
+                &original_bytes.bytes,
+                "SceneSelectionSnapshot",
+                call.budget,
+            )
+            .map_err(manual_service)?;
+            verify_selection(
+                &mut resources.source,
+                &principal,
+                &project,
+                context,
+                &original,
+            )
+            .map_err(manual_service)?;
+            let mut totals =
+                crate::native_import_files::ImportReadBudget::new(0).map_err(|cause| {
+                    ServiceError::caused_by(
+                        "MANUAL_SOURCE_INVALID",
+                        "Manual file budget is invalid",
+                        cause,
+                    )
+                })?;
+            let mut inputs = Vec::new();
+            for (path, id, definition) in [
+                (
+                    &selection.source_map_file,
+                    &selection.source_map_resource,
+                    "SourceMap",
+                ),
+                (
+                    &selection.edit_payload_file,
+                    &selection.edit_payload_resource,
+                    "ScenePatch",
+                ),
+            ] {
+                request.check_local()?;
+                local_check(call.store)?;
+                let read = crate::native_import_files::read_selected(
+                    path,
+                    crate::native_import_files::InputRole::Document,
+                    owner,
+                    call.budget,
+                    &mut totals,
+                )
+                .map_err(|cause| {
+                    ServiceError::caused_by(
+                        "MANUAL_SOURCE_INVALID",
+                        "Selected manual file could not be read",
+                        cause,
+                    )
+                });
+                let bytes = checked(read, local_check(call.store))?;
+                let value = parse_feature_document(&bytes, definition, call.budget)
+                    .map_err(manual_service)?;
+                let mut pin =
+                    crate::features::content_resource("manual-input", "application/json", &bytes);
+                pin["resourceId"] = json!(id);
+                let pin: ResourceRef =
+                    serde_json::from_value(pin).map_err(|_| manual_service(invalid()))?;
+                inputs.push((pin, bytes, value));
+            }
+            let pins = [selection_pin, inputs[0].0.clone(), inputs[1].0.clone()];
+            let map = inputs[0].2.clone();
+            let payload = inputs[1].2.clone();
+            let policy = selection.policy()?;
+            let decoded = decode_static_manual(
+                &original,
+                &original,
+                &StaticManualCodec {
+                    source_artifact: &pins[0],
+                    source_map: &pins[1],
+                    edit_payload: &pins[2],
+                    policy: &policy,
+                },
+                &map,
+                &payload,
+                call.budget,
+            )
+            .map_err(manual_service)?;
+            let patch = diff_scene_edits(
+                &decoded.selection,
+                &decoded.edits,
+                &decoded.source_artifact,
+                &decoded.source_map,
+                &decoded.losses,
+                "manual-draft",
+                &policy,
+            )
+            .map_err(exchange_app)
+            .map_err(manual_service)?;
+            let patch = crate::features::stable_patch(
+                patch,
+                &access,
+                &decoded.selection,
+                &policy,
+                call.budget,
+            )?;
+            merge_origin(&mut self.origin, &issued.origin, call.budget).map_err(manual_service)?;
+            origin_selection(&mut self.origin, &project, &original, call.budget)
+                .map_err(manual_service)?;
+            let weight = record_cost(
+                context,
+                &json!({"selection":original,"map":map,"patch":patch}),
+                &[&pins[0], &pins[1], &pins[2]],
+            )
+            .map_err(manual_service)?;
+            let record = AuthoredManualRecord {
+                binding: SourceBinding::capture(
+                    &principal,
+                    &project,
+                    context,
+                    &self.composition.authority,
+                )
+                .map_err(manual_service)?,
+                selection: original,
+                source_map: map,
+                selection_pin: pins[0].clone(),
+                source_map_pin: pins[1].clone(),
+                edit_payload_pin: pins[2].clone(),
+                patch,
+                policy,
+                weight,
+            };
+            Ok((record, inputs))
+        })();
+        let checkpoint = self
+            .current(&access, call.budget)
+            .map(|_| ())
+            .and_then(|()| local_check(call.store));
+        let (record, inputs) = checked(prepared, checkpoint)?;
+        let bytes = encode_json(&record.patch).map_err(|_| manual_service(limit()))?;
+        let resource_value = crate::features::content_resource(
+            "manual-scene",
+            "application/vnd.mmmm.scene-patch+json",
+            &bytes,
+        );
+        let resource: ResourceRef = serde_json::from_value(resource_value.clone())
+            .map_err(|_| manual_service(invalid()))?;
+        let receipt = ManualSceneReceipt {
+            project_id: selection.project_id.clone(),
+            patch_id: text(&record.patch, "patchId")
+                .map_err(manual_service)?
+                .to_owned(),
+            resource,
+        };
+        let key = (
+            call.principal.principal().clone(),
+            receipt.resource.resource_id.clone(),
+        );
+        {
+            let registry = self
+                .composition
+                .manual
+                .try_borrow()
+                .map_err(|_| manual_service(busy()))?;
+            admit_authored_manual(&registry, &key, &record).map_err(manual_service)?;
+        }
+        let staged = {
+            let mut resources =
+                self.resources_for_store(&access, PlanningStore::write(call.store), call.budget)?;
+            let result = (|| {
+                for (pin, source_bytes, _) in &inputs {
+                    resources.stage_product(
+                        &json!(pin),
+                        source_bytes,
+                        ProductKind::NativeManualInput,
+                    )?;
+                }
+                resources.stage_product(&resource_value, &bytes, ProductKind::Generated)
+            })();
+            result.map_err(manual_service)
+        };
+        let checkpoint = self
+            .current(&access, call.budget)
+            .map(|_| ())
+            .and_then(|()| local_check(call.store));
+        if let Err(cause) = staged {
+            let cause = checked::<()>(Err(cause), checkpoint).unwrap_err();
+            return Err(ServiceError::caused_by(
+                "MANUAL_STAGING_UNCERTAIN",
+                "Manual ScenePatch staging effects require diagnosis; automatic retry is forbidden",
+                ManualSceneStagingFailure {
+                    candidate: receipt,
+                    sources: [
+                        record.selection_pin.clone(),
+                        record.source_map_pin.clone(),
+                        record.edit_payload_pin.clone(),
+                    ],
+                    cause,
+                },
+            ));
+        }
+        let publish = checkpoint.and_then(|()| {
+            let mut registry = self
+                .composition
+                .manual
+                .try_borrow_mut()
+                .map_err(|_| manual_service(busy()))?;
+            let total = admit_authored_manual(&registry, &key, &record).map_err(manual_service)?;
+            registry.authored.insert(key, record);
+            registry.bytes = total;
+            Ok(())
+        });
+        let final_checkpoint = self
+            .current(&access, call.budget)
+            .map(|_| ())
+            .and_then(|()| local_check(call.store));
+        let publish = checked(publish, final_checkpoint);
+        if let Err(cause) = publish {
+            return Err(ServiceError::caused_by(
+                "MANUAL_SCENE_COMMITTED",
+                "Manual ScenePatch was staged but its final source checkpoint failed",
+                ManualSceneCommittedFailure { receipt, cause },
+            ));
+        }
+        Ok(receipt)
+    }
     fn compatibility_bind(
         &mut self,
         access: &FeatureAccess,
@@ -1074,24 +1547,11 @@ impl FeatureSources for LocalFeatureSources {
         store: &'a mut DurableStore,
         budget: &'a RequestBudget,
     ) -> Result<Box<dyn FeatureResourcePort + 'a>, ServiceError> {
-        let shared = PlanningStore::write(store);
-        let (principal, source, project) = self.source(access, shared.clone(), budget)?;
-        let context = access
-            .context
-            .clone()
-            .ok_or_else(|| service(unavailable()))?;
-        Ok(Box::new(LocalFeatureResources {
-            source,
-            store: shared,
-            principal,
-            project,
-            context,
-            authority: self.composition.authority.clone(),
-            rights: self.composition.rights.clone(),
-            products: self.composition.products.clone(),
-            budget: budget.clone(),
-            origin: self.origin.clone(),
-        }))
+        Ok(Box::new(self.resources_for_store(
+            access,
+            PlanningStore::write(store),
+            budget,
+        )?))
     }
     fn inventory(
         &mut self,
@@ -1218,6 +1678,7 @@ impl FeatureSources for LocalFeatureSources {
                     producer: raw_digest(include_bytes!("features.rs")),
                     origin: FeatureOrigin::default(),
                     shape: Some(receipt),
+                    kind: ProductKind::Generated,
                     weight,
                 },
             );
@@ -1513,6 +1974,26 @@ impl FeatureSources for LocalFeatureSources {
             .context
             .as_ref()
             .ok_or_else(|| service(unavailable()))?;
+        if let Some(record) = authored_manual_for_patch(
+            &self.composition.manual,
+            &self.composition.request,
+            &self.composition.authority,
+            principal.principal(),
+            &project,
+            &input["patch"],
+            context,
+            budget,
+        )
+        .map_err(manual_service)?
+        {
+            let mut resources =
+                self.resources_for_store(access, PlanningStore::read(store), budget)?;
+            recheck_authored_manual(&mut resources, &self.composition.request, &record)
+                .map_err(manual_service)?;
+            return Selection::from_value(&record.selection)
+                .map_err(exchange_app)
+                .map_err(manual_service);
+        }
         if let Some(record) = manual_record_for_patch(
             &self.composition.manual,
             &principal,
@@ -1558,6 +2039,24 @@ impl FeatureSources for LocalFeatureSources {
             .context
             .as_ref()
             .ok_or_else(|| service(unavailable()))?;
+        if let Some(record) = authored_manual_for_patch(
+            &self.composition.manual,
+            &self.composition.request,
+            &self.composition.authority,
+            principal.principal(),
+            &project,
+            &input["patch"],
+            context,
+            budget,
+        )
+        .map_err(manual_service)?
+        {
+            let mut resources =
+                self.resources_for_store(access, PlanningStore::read(store), budget)?;
+            recheck_authored_manual(&mut resources, &self.composition.request, &record)
+                .map_err(manual_service)?;
+            return Ok(record.policy);
+        }
         source
             .scene_source(principal.principal(), &project, &input["patch"], context)
             .map(|scene| scene.delta_policy)
@@ -1684,6 +2183,88 @@ impl LocalFeatureResources<'_> {
         )
     }
 }
+impl LocalFeatureResources<'_> {
+    fn read_source(
+        &mut self,
+        context: &str,
+        resource: &Value,
+        purpose: ResourcePurpose,
+        max_bytes: u64,
+    ) -> AppResult<AuthorizedBytes> {
+        self.fresh(context)?;
+        let pin: ResourceRef = serde_json::from_value(resource.clone()).map_err(|_| invalid())?;
+        if pin.media_type.len() > 1024 {
+            return Err(limit());
+        }
+        if max_bytes == 0 || pin.size_bytes > max_bytes || max_bytes > MAX_SOURCE_BYTES {
+            return Err(limit());
+        }
+        let redistribution = self.rights(&pin)?;
+        if purpose == ResourcePurpose::Redistribute && redistribution != Redistribution::Allowed {
+            return Err(forbidden());
+        }
+        let product = self.product(&pin)?;
+        let is_product = product.is_some();
+        let bytes = if let Some(product) = product {
+            let rpc = ProductRpc {
+                access: self.source.access().clone(),
+                context: context_id(&self.context)?,
+            };
+            let mut reader = ProjectResourceReader::new(
+                Box::new(ProductAuthority {
+                    access: self.source.access().clone(),
+                    principal: self.principal.clone(),
+                    project: self.project.clone(),
+                    context: self.context.clone(),
+                    authority: self.authority.clone(),
+                    product,
+                }),
+                MAX_SOURCE_BYTES,
+            )
+            .map_err(storage_app)?;
+            let query = ProjectResourceQuery::RegisteredImmutable {
+                resource_id: pin.resource_id.clone(),
+            };
+            self.store.with_read(|store| {
+                reader
+                    .read(
+                        store,
+                        &rpc,
+                        &ProjectResourceRequest {
+                            project: self.project.project_id(),
+                            current_project_revision: self.project.revision(),
+                            query: &query,
+                            expected: Some(resource),
+                        },
+                        max_bytes,
+                    )
+                    .map(|read| read.bytes)
+                    .map_err(storage_app)
+            })?
+        } else {
+            self.source
+                .resource_bytes(
+                    self.principal.principal(),
+                    &self.project,
+                    &pin,
+                    Some(&self.context),
+                    max_bytes,
+                )?
+                .bytes
+        };
+        self.fresh(context)?;
+        if is_product {
+            let current = self.product(&pin)?.ok_or_else(forbidden)?;
+            merge_origin(&mut self.origin, &current.origin, &self.budget)?;
+        } else {
+            merge_resource(&mut self.origin.resources, &pin, &self.budget)?;
+        }
+        Ok(AuthorizedBytes {
+            bytes,
+            redistribution,
+        })
+    }
+}
 impl ResourcePort for LocalFeatureResources<'_> {
     fn authorize_selection(&mut self, context: &str, selection: &Value) -> ExchangeResult<()> {
         self.fresh(context).map_err(app_exchange)?;
@@ -1727,85 +2308,8 @@ impl ResourcePort for LocalFeatureResources<'_> {
         purpose: ResourcePurpose,
         max_bytes: u64,
     ) -> ExchangeResult<AuthorizedBytes> {
-        self.fresh(context).map_err(app_exchange)?;
-        let pin: ResourceRef =
-            serde_json::from_value(resource.clone()).map_err(|_| app_exchange(invalid()))?;
-        if pin.media_type.len() > 1024 {
-            return Err(app_exchange(limit()));
-        }
-        if max_bytes == 0 || pin.size_bytes > max_bytes || max_bytes > MAX_SOURCE_BYTES {
-            return Err(app_exchange(limit()));
-        }
-        let redistribution = self.rights(&pin).map_err(app_exchange)?;
-        if purpose == ResourcePurpose::Redistribute && redistribution != Redistribution::Allowed {
-            return Err(app_exchange(forbidden()));
-        }
-        let product = self.product(&pin).map_err(app_exchange)?;
-        let is_product = product.is_some();
-        let bytes = if let Some(product) = product {
-            let rpc = ProductRpc {
-                access: self.source.access().clone(),
-                context: context_id(&self.context).map_err(app_exchange)?,
-            };
-            let mut reader = ProjectResourceReader::new(
-                Box::new(ProductAuthority {
-                    access: self.source.access().clone(),
-                    principal: self.principal.clone(),
-                    project: self.project.clone(),
-                    context: self.context.clone(),
-                    authority: self.authority.clone(),
-                    product,
-                }),
-                MAX_SOURCE_BYTES,
-            )
-            .map_err(storage_exchange)?;
-            let query = ProjectResourceQuery::RegisteredImmutable {
-                resource_id: pin.resource_id.clone(),
-            };
-            self.store
-                .with_read(|store| {
-                    reader
-                        .read(
-                            store,
-                            &rpc,
-                            &ProjectResourceRequest {
-                                project: self.project.project_id(),
-                                current_project_revision: self.project.revision(),
-                                query: &query,
-                                expected: Some(resource),
-                            },
-                            max_bytes,
-                        )
-                        .map(|read| read.bytes)
-                        .map_err(storage_app)
-                })
-                .map_err(app_exchange)?
-        } else {
-            self.source
-                .resource_bytes(
-                    self.principal.principal(),
-                    &self.project,
-                    &pin,
-                    Some(&self.context),
-                    max_bytes,
-                )
-                .map_err(app_exchange)?
-                .bytes
-        };
-        self.fresh(context).map_err(app_exchange)?;
-        if is_product {
-            let current = self
-                .product(&pin)
-                .map_err(app_exchange)?
-                .ok_or_else(|| app_exchange(forbidden()))?;
-            merge_origin(&mut self.origin, &current.origin, &self.budget).map_err(app_exchange)?;
-        } else {
-            merge_resource(&mut self.origin.resources, &pin, &self.budget).map_err(app_exchange)?;
-        }
-        Ok(AuthorizedBytes {
-            bytes,
-            redistribution,
-        })
+        self.read_source(context, resource, purpose, max_bytes)
+            .map_err(app_exchange)
     }
     fn embedded_rights(
         &mut self,
@@ -1819,81 +2323,81 @@ impl ResourcePort for LocalFeatureResources<'_> {
         Ok(rights)
     }
 }
-impl FeatureResourcePort for LocalFeatureResources<'_> {
-    fn stage(&mut self, resource: &Value, bytes: &[u8]) -> ExchangeResult<()> {
-        let context = text(&self.context, "contextId")
-            .map_err(app_exchange)?
-            .to_owned();
-        self.fresh(&context).map_err(app_exchange)?;
-        verify_resource(resource, bytes, MAX_SOURCE_BYTES)?;
-        let pin: ResourceRef =
-            serde_json::from_value(resource.clone()).map_err(|_| app_exchange(invalid()))?;
+impl LocalFeatureResources<'_> {
+    fn stage_product(
+        &mut self,
+        resource: &Value,
+        bytes: &[u8],
+        kind: ProductKind,
+    ) -> AppResult<()> {
+        let context = text(&self.context, "contextId")?.to_owned();
+        self.fresh(&context)?;
+        verify_resource(resource, bytes, MAX_SOURCE_BYTES).map_err(exchange_app)?;
+        let pin: ResourceRef = serde_json::from_value(resource.clone()).map_err(|_| invalid())?;
         if pin.media_type.len() > 1024 {
-            return Err(app_exchange(limit()));
+            return Err(limit());
         }
-        // Existing authored/source assets keep their actual rights. Only a new
-        // Rust-produced output obtains a producer witness through this port.
+        // Existing sources keep their actual rights. Generated output and
+        // selected native input have distinct private provenance; neither
+        // classification supplies redistribution permission.
         let current_scope = self
             .authority
-            .project_scope(self.principal.principal(), self.project.project_id())
-            .map_err(app_exchange)?;
+            .project_scope(self.principal.principal(), self.project.project_id())?;
         let already_source = self
             .rights
             .try_borrow()
-            .map_err(|_| app_exchange(busy()))?
+            .map_err(|_| busy())?
             .records
             .contains_key(&(self.project.project_id().clone(), pin.resource_id.clone()))
             || self.origin.resources.contains_key(&pin.resource_id)
             || current_scope["resourceIds"]
                 .as_array()
                 .is_some_and(|ids| ids.contains(&resource["resourceId"]));
-        self.store
-            .with_write(|store| {
-                self.source.access().check()?;
-                let blob = store.put_blob(bytes).map_err(storage_app)?;
-                if blob.digest != pin.sha256 || blob.byte_length != pin.size_bytes {
-                    return Err(invalid());
-                }
-                register_resource(
-                    store,
-                    resource,
-                    ResourceOwner::Project(self.project.project_id().clone()),
-                )
-                .map_err(|e| AppError::new(e.code, e.message))?;
-                self.source.access().check()
-            })
-            .map_err(app_exchange)?;
-        self.fresh(&context).map_err(app_exchange)?;
+        self.store.with_write(|store| {
+            self.source.access().check()?;
+            let blob = store.put_blob(bytes).map_err(storage_app)?;
+            if blob.digest != pin.sha256 || blob.byte_length != pin.size_bytes {
+                return Err(invalid());
+            }
+            register_resource_with_diagnostics(
+                store,
+                resource,
+                ResourceOwner::Project(self.project.project_id().clone()),
+            )
+            .map_err(|cause| {
+                let error = cause.public_error();
+                AppError::caused_by(error.code, error.message, cause)
+            })?;
+            self.source.access().check()
+        })?;
+        self.fresh(&context)?;
         if !already_source {
-            let mut products = self
-                .products
-                .try_borrow_mut()
-                .map_err(|_| app_exchange(busy()))?;
+            let mut products = self.products.try_borrow_mut().map_err(|_| busy())?;
             let key = (self.project.project_id().clone(), pin.resource_id.clone());
             if products.records.len() >= 128 && !products.records.contains_key(&key) {
-                return Err(app_exchange(limit()));
+                return Err(limit());
             }
             if products
                 .records
                 .get(&key)
-                .is_some_and(|old| !same_resource(&old.resource, &pin))
+                .is_some_and(|old| !same_resource(&old.resource, &pin) || old.kind != kind)
             {
-                return Err(app_exchange(conflict()));
+                return Err(conflict());
             }
             if self.origin.resources.len() > 256 || self.origin.objects.len() > 4096 {
-                return Err(app_exchange(limit()));
+                return Err(limit());
             }
             let provenance =
                 json!({"objects":self.origin.objects,"resources":self.origin.resources});
-            let weight = record_cost(&self.context, &provenance, &[&pin]).map_err(app_exchange)?;
+            let weight = record_cost(&self.context, &provenance, &[&pin])?;
             let previous = products.records.get(&key).map_or(0, |old| old.weight);
             let total = products
                 .bytes
                 .checked_sub(previous)
                 .and_then(|bytes| bytes.checked_add(weight))
-                .ok_or_else(|| app_exchange(limit()))?;
+                .ok_or_else(limit)?;
             if total > MAX_REGISTRY_BYTES {
-                return Err(app_exchange(limit()));
+                return Err(limit());
             }
             let record = ProductRecord {
                 binding: SourceBinding::capture(
@@ -1901,23 +2405,39 @@ impl FeatureResourcePort for LocalFeatureResources<'_> {
                     &self.project,
                     &self.context,
                     &self.authority,
-                )
-                .map_err(app_exchange)?,
+                )?,
                 resource: pin,
                 producer: raw_digest(include_bytes!("features.rs")),
                 origin: self.origin.clone(),
                 shape: None,
+                kind,
                 weight,
             };
             self.budget
                 .check()
-                .map_err(|e| ExchangeError::new(e.code, e.message))?;
+                .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
             products.records.insert(key, record);
             products.bytes = total;
         }
         self.budget
             .check()
-            .map_err(|e| ExchangeError::new(e.code, e.message))
+            .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))
+    }
+}
+impl FeatureResourcePort for LocalFeatureResources<'_> {
+    fn stage(&mut self, resource: &Value, bytes: &[u8]) -> ExchangeResult<()> {
+        self.stage_product(resource, bytes, ProductKind::Generated)
+            .map_err(app_exchange)
+    }
+    fn stage_exchange_selection(&mut self, resource: &Value, bytes: &[u8]) -> ExchangeResult<()> {
+        let selection = parse_feature_document(bytes, "SceneSelectionSnapshot", &self.budget)
+            .map_err(app_exchange)?;
+        let context = text(&self.context, "contextId")
+            .map_err(app_exchange)?
+            .to_owned();
+        self.authorize_selection(&context, &selection)?;
+        self.stage_product(resource, bytes, ProductKind::ExchangeSelection)
+            .map_err(app_exchange)
     }
 }
 struct ProductRpc {
@@ -2244,6 +2764,229 @@ impl ResourceAuthority for FeatureArtifactAuthority {
     }
 }
 
+fn admit_authored_manual(
+    registry: &ManualSceneRegistry,
+    key: &(PrincipalId, ResourceId),
+    record: &AuthoredManualRecord,
+) -> AppResult<usize> {
+    if registry
+        .records
+        .len()
+        .checked_add(registry.authored.len())
+        .is_none_or(|size| size >= 128)
+        && !registry.authored.contains_key(key)
+    {
+        return Err(limit());
+    }
+    if let Some(old) = registry.authored.get(key)
+        && (old.patch != record.patch
+            || old.selection != record.selection
+            || old.source_map != record.source_map
+            || !same_resource(&old.selection_pin, &record.selection_pin)
+            || !same_resource(&old.source_map_pin, &record.source_map_pin)
+            || !same_resource(&old.edit_payload_pin, &record.edit_payload_pin))
+    {
+        return Err(conflict());
+    }
+    let previous = registry.authored.get(key).map_or(0, |old| old.weight);
+    let total = registry
+        .bytes
+        .checked_sub(previous)
+        .and_then(|bytes| bytes.checked_add(record.weight))
+        .ok_or_else(limit)?;
+    if total > MAX_REGISTRY_BYTES {
+        return Err(limit());
+    }
+    Ok(total)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The installed shared registry/request/authority and unchanged qualified source inputs are independently checked"
+)]
+fn authored_manual_for_patch(
+    manual: &SharedManualScenes,
+    request: &RequestContextSlot,
+    authority: &LocalAuthority,
+    principal: &PrincipalId,
+    project: &ProjectCatalog,
+    patch: &Value,
+    context: &Value,
+    budget: &RequestBudget,
+) -> AppResult<Option<AuthoredManualRecord>> {
+    budget_check(budget)?;
+    validate("ScenePatch", patch)?;
+    let witness = request
+        .occupied_witness()
+        .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
+    let authenticated = witness.authenticated();
+    if authenticated.principal() != principal
+        || witness.budget().deadline() != budget.deadline()
+        || !std::ptr::eq(witness.budget().cancellation(), budget.cancellation())
+        || !authenticated.permits_context(context_id(context)?.as_str())
+        || patch["projectId"] != project.project_id().as_str()
+        || patch["baseRevision"] != project.revision().as_str()
+    {
+        return Err(forbidden());
+    }
+    let registry = manual.try_borrow().map_err(|_| busy())?;
+    for ((owner, _), record) in &registry.authored {
+        budget_check(budget)?;
+        if owner != principal || record.patch != *patch {
+            continue;
+        }
+        if !record
+            .binding
+            .matches(authenticated, project, context, authority)?
+        {
+            return Err(stale());
+        }
+        let policy =
+            serde_json::from_value(context["policyRevision"].clone()).map_err(|_| invalid())?;
+        authority.authorize_retained_scope(
+            principal,
+            project.project_id(),
+            &context_id(context)?,
+            &policy,
+            &context["scope"],
+        )?;
+        witness
+            .check_local()
+            .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
+        return Ok(Some(record.clone()));
+    }
+    Ok(None)
+}
+
+fn authored_scene_source(record: &AuthoredManualRecord) -> AppResult<SceneSource> {
+    let selection = Selection::from_value(&record.selection).map_err(exchange_app)?;
+    mmmm_exchange::patch::validate_scene_patch(&record.patch, &selection, &record.policy)
+        .map_err(exchange_app)?;
+    Ok(SceneSource {
+        selection,
+        delta_policy: record.policy.clone(),
+        artifact: record.selection.clone(),
+        source_map: record.source_map.clone(),
+        ingested_bake: None,
+    })
+}
+/// Created only after all three protected producer/input records and their
+/// exact CAS bytes were read under this original occupied service request.
+pub(crate) struct ManualSceneReadAdmission {
+    request: crate::service::RequestContextWitness,
+    owner: crate::workspace_bootstrap::NativeOwnerWitness,
+    access: LocalPlanningAccess,
+    store_identity: usize,
+    project: ProjectId,
+    revision: Sha256Digest,
+    context: Value,
+    pins: [ResourceRef; 3],
+}
+impl ManualSceneReadAdmission {
+    pub(crate) fn check(&self, store: &PlanningStore<'_>) -> AppResult<()> {
+        self.request
+            .check_local()
+            .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
+        self.access.authorize_project(
+            self.request.authenticated().principal(),
+            &self.project,
+            Some(&self.context),
+            Access::ReadProject,
+        )?;
+        store.with_read(|store| {
+            if std::ptr::from_ref(store) as usize != self.store_identity {
+                return Err(forbidden());
+            }
+            self.owner
+                .check_project(store, &self.project)
+                .map_err(storage_app)?;
+            if store.project(&self.project).map_err(storage_app)?["revision"]
+                != self.revision.as_str()
+            {
+                return Err(conflict());
+            }
+            Ok(())
+        })
+    }
+    pub(crate) fn pins(&self) -> (&PrincipalId, &ProjectId, &Value, &[ResourceRef; 3]) {
+        (
+            self.request.authenticated().principal(),
+            &self.project,
+            &self.context,
+            &self.pins,
+        )
+    }
+}
+fn recheck_authored_manual(
+    resources: &mut LocalFeatureResources<'_>,
+    request: &RequestContextSlot,
+    record: &AuthoredManualRecord,
+) -> AppResult<ManualSceneReadAdmission> {
+    let witness = request
+        .occupied_witness()
+        .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
+    let (owner, store_identity) = resources.store.with_read(|store| {
+        let owner = crate::workspace_bootstrap::NativeOwnerWitness::capture(
+            store,
+            resources.budget.deadline(),
+        )
+        .map_err(storage_app)?;
+        owner
+            .check_project(store, resources.project.project_id())
+            .map_err(storage_app)?;
+        if owner.principal() != resources.principal.principal()
+            || !witness.authenticated().same_session(&resources.principal)
+        {
+            return Err(forbidden());
+        }
+        Ok((owner, std::ptr::from_ref(store) as usize))
+    })?;
+    let context = text(&resources.context, "contextId")?.to_owned();
+    let pins = [
+        record.selection_pin.clone(),
+        record.source_map_pin.clone(),
+        record.edit_payload_pin.clone(),
+    ];
+    for (index, pin) in pins.iter().enumerate() {
+        let kind = if index == 0 {
+            ProductKind::ExchangeSelection
+        } else {
+            ProductKind::NativeManualInput
+        };
+        let read = (|| {
+            let product = resources.product(pin)?.ok_or_else(forbidden)?;
+            if product.kind != kind {
+                return Err(forbidden());
+            }
+            resources.read_source(
+                &context,
+                &json!(pin),
+                ResourcePurpose::Read,
+                MAX_CODEC_BYTES,
+            )
+        })()
+        .map_err(manual_service);
+        let checkpoint = resources
+            .fresh(&context)
+            .map_err(manual_service)
+            .and_then(|()| witness.check_local());
+        crate::native_manual_exchange::checked(read, checkpoint)
+            .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
+    }
+    let admission = ManualSceneReadAdmission {
+        request: witness,
+        owner,
+        access: resources.source.access().clone(),
+        store_identity,
+        project: resources.project.project_id().clone(),
+        revision: resources.project.revision().clone(),
+        context: resources.context.clone(),
+        pins,
+    };
+    admission.check(&resources.store)?;
+    Ok(admission)
+}
+
 fn manual_record_for_patch(
     manual: &SharedManualScenes,
     principal: &AuthenticatedPrincipal,
@@ -2522,12 +3265,18 @@ fn read_json(
         Some(context),
         MAX_CODEC_BYTES,
     )?;
-    let budget = source.access().budget();
-    for _ in read.bytes.chunks(16 * 1024) {
+    parse_feature_document(&read.bytes, definition, source.access().budget())
+}
+fn parse_feature_document(
+    bytes: &[u8],
+    definition: &str,
+    budget: &RequestBudget,
+) -> AppResult<Value> {
+    for _ in bytes.chunks(16 * 1024) {
         budget_check(budget)?;
     }
     let value = parse_json_with_control(
-        &read.bytes,
+        bytes,
         JsonLimits {
             max_bytes: MAX_CODEC_BYTES as usize,
             max_depth: 64,
@@ -2605,19 +3354,47 @@ fn decode_manual(
     payload: &Value,
     budget: &RequestBudget,
 ) -> AppResult<ManualSceneInputs> {
-    budget_check(budget)?;
     match &registration.codec {
         ManualSceneCodec::CanonicalScenePatch => {}
     }
     validate("BakeArtifact", artifact)?;
+    decode_static_manual(
+        selection,
+        artifact,
+        &StaticManualCodec {
+            source_artifact: &registration.source_artifact,
+            source_map: &registration.source_map,
+            edit_payload: &registration.edit_payload,
+            policy: &registration.policy,
+        },
+        map,
+        payload,
+        budget,
+    )
+}
+struct StaticManualCodec<'a> {
+    source_artifact: &'a ResourceRef,
+    source_map: &'a ResourceRef,
+    edit_payload: &'a ResourceRef,
+    policy: &'a DeltaPolicy,
+}
+fn decode_static_manual(
+    selection: &Value,
+    artifact: &Value,
+    codec: &StaticManualCodec<'_>,
+    map: &Value,
+    payload: &Value,
+    budget: &RequestBudget,
+) -> AppResult<ManualSceneInputs> {
+    budget_check(budget)?;
     validate("ScenePatch", payload)?;
     validate("SourceMap", map)?;
-    let source_artifact =
-        serde_json::to_value(&registration.source_artifact).map_err(|_| invalid())?;
-    let source_map = serde_json::to_value(&registration.source_map).map_err(|_| invalid())?;
+    let source_artifact = serde_json::to_value(codec.source_artifact).map_err(|_| invalid())?;
+    let source_map = serde_json::to_value(codec.source_map).map_err(|_| invalid())?;
     if payload["projectId"] != selection["projectId"]
         || payload["baseRevision"] != selection["projectRevision"]
-        || artifact["sourceProjectRevision"] != selection["projectRevision"]
+        || (artifact.get("sourceProjectRevision").is_some()
+            && artifact["sourceProjectRevision"] != selection["projectRevision"])
         || map["inputRevision"] != selection["projectRevision"]
         || payload["sourceArtifact"] != source_artifact
         || payload["sourceMap"] != source_map
@@ -2632,7 +3409,7 @@ fn decode_manual(
     let mut confirmed = BTreeSet::new();
     for mapping in mappings {
         budget_check(budget)?;
-        if mapping["outputResourceId"] != registration.edit_payload.resource_id.as_str() {
+        if mapping["outputResourceId"] != codec.edit_payload.resource_id.as_str() {
             return Err(mapping_error());
         }
         let locator = text(mapping, "locator")?;
@@ -2703,7 +3480,7 @@ fn decode_manual(
         source_artifact,
         source_map,
         losses,
-        policy: registration.policy.clone(),
+        policy: codec.policy.clone(),
     })
 }
 fn same_resource(left: &ResourceRef, right: &ResourceRef) -> bool {
@@ -2725,6 +3502,13 @@ fn context_id(value: &Value) -> AppResult<ContextId> {
 }
 fn budget_check(budget: &RequestBudget) -> AppResult<()> {
     budget.check().map_err(|e| AppError::new(e.code, e.message))
+}
+fn manual_service(error: AppError) -> ServiceError {
+    ServiceError::caused_by(
+        error.code,
+        "The actual manual source rejected the request",
+        error,
+    )
 }
 fn service(error: AppError) -> ServiceError {
     ServiceError::new(
@@ -2771,9 +3555,6 @@ fn storage_app(error: StorageError) -> AppError {
         _ => "SOURCE_UNAVAILABLE",
     };
     AppError::storage(code, error)
-}
-fn storage_exchange(error: StorageError) -> ExchangeError {
-    app_exchange(storage_app(error))
 }
 fn storage_from_app(error: AppError) -> StorageError {
     StorageError::InvalidTransition(format!("{}: {}", error.code, error.message))

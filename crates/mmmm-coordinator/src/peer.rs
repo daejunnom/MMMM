@@ -160,6 +160,7 @@ pub(crate) struct PeerNativeTestState {
 /// capability를 만들지 않으며 실제 서버의 same-account 검증 핸들을 계속 소유한다.
 pub struct PeerHostAttach {
     inner: platform::HostClient,
+    manual_scene: bool,
 }
 /// Complete 수신 후에도 검증한 연결과 native guard를 계속 소유한다.
 /// 외부 relay의 실제 flush/EOF/helper drain 이후에만 완료를 요청해야 한다.
@@ -199,11 +200,25 @@ impl PeerHostAttach {
     /// One-phase owner selection already committed in the same Store. This
     /// only proves result delivery; an ACK failure cannot revoke that fact.
     pub(crate) fn complete_owner_selection(self) -> Result<(), PeerError> {
+        if self.manual_scene {
+            return Err(PeerError::Protocol);
+        }
         self.inner.complete_delivery()
     }
     /// The one-phase plan result is already durable. ACK/EOF confirms delivery
     /// only and cannot undo or retry the saved plan.
     pub(crate) fn complete_calibration_plan(self) -> Result<(), PeerError> {
+        if self.manual_scene {
+            return Err(PeerError::Protocol);
+        }
+        self.inner.complete_delivery()
+    }
+    /// The saved manual patch survives delivery failure. Only the native
+    /// manual exchange can acknowledge this one-phase result.
+    pub(crate) fn complete_manual_scene(self) -> Result<(), PeerError> {
+        if !self.manual_scene {
+            return Err(PeerError::Protocol);
+        }
         self.inner.complete_delivery()
     }
     pub fn offer(
@@ -228,13 +243,23 @@ impl PeerHostAttach {
         budget
             .check()
             .map_err(|error| PeerError::from(ExchangeError::from(error)))?;
+        let manual_scene = offer.public().is_manual_scene();
         let (inner, authority) = platform::offer_host(runtime, reference, offer, budget)?;
-        Ok((Self { inner }, authority))
+        Ok((
+            Self {
+                inner,
+                manual_scene,
+            },
+            authority,
+        ))
     }
     pub fn installed_staged(
         self,
         public: PublicFrame,
     ) -> Result<(PendingHostCompletion, PublicFrame), PeerError> {
+        if self.manual_scene {
+            return Err(PeerError::Protocol);
+        }
         let (inner, complete) = self.inner.installed_staged(public)?;
         Ok((PendingHostCompletion { inner }, complete))
     }

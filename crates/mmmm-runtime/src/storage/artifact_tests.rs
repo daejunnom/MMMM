@@ -417,6 +417,68 @@ fn returned_slice_is_captured_in_the_same_pass_that_hashes_it() {
 }
 
 #[test]
+fn diagnostic_registration_keeps_actual_artifact_cas_and_sql_causes_without_changing_public_errors()
+{
+    let root = TestRoot::new();
+    let mut store = root.open();
+    let owner = ResourceOwner::Principal(PrincipalId::new("principal-artifact").unwrap());
+    let invalid = json!({"resourceId":"resource-invalid"});
+    let error =
+        register_resource_with_diagnostics(&mut store, &invalid, owner.clone()).unwrap_err();
+    assert!(matches!(error, ResourceRegistrationError::Artifact(_)));
+    assert!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .is::<ArtifactError>()
+    );
+    assert_eq!(
+        error.public_error(),
+        register_resource(&mut store, &invalid, owner.clone()).unwrap_err()
+    );
+
+    let absent = json!({"resourceId":"resource-absent","sha256":raw_digest(b"not retained in this CAS"),"sizeBytes":24,"mediaType":"application/octet-stream"});
+    let error = register_resource_with_diagnostics(&mut store, &absent, owner.clone()).unwrap_err();
+    assert!(matches!(error, ResourceRegistrationError::Storage(_)));
+    assert!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .is::<StorageError>()
+    );
+    assert_eq!(
+        error.public_error(),
+        register_resource(&mut store, &absent, owner.clone()).unwrap_err()
+    );
+
+    let (resource, _) = register(&mut store, "resource-diagnostic-existing", b"kept bytes");
+    let mut selected = resource;
+    selected["resourceId"] = json!("resource-diagnostic-readonly");
+    store
+        .connection
+        .execute_batch("PRAGMA query_only=ON")
+        .unwrap();
+    let error =
+        register_resource_with_diagnostics(&mut store, &selected, owner.clone()).unwrap_err();
+    assert!(matches!(
+        error,
+        ResourceRegistrationError::Storage(StorageError::Sqlite(_))
+    ));
+    assert!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .is::<StorageError>()
+    );
+    assert_eq!(
+        error.public_error(),
+        register_resource(&mut store, &selected, owner).unwrap_err()
+    );
+    store
+        .connection
+        .execute_batch("PRAGMA query_only=OFF")
+        .unwrap();
+    let count: i64 = store.connection.query_row("SELECT count(*) FROM artifact_resources WHERE resource_id='resource-diagnostic-readonly'", [], |row| row.get(0)).unwrap();
+    assert_eq!(count, 0);
+}
+#[test]
 fn immutable_registration_survives_restart_and_gc_and_rejects_rebinding() {
     let root = TestRoot::new();
     let mut store = root.open();

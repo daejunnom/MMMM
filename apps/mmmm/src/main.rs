@@ -21,6 +21,8 @@ const USAGE: &str = "Usage:\n\
     Prefab, Clip and new raw resources can share one atomic batch; raw resource pairs can also be imported alone. The data root must contain an initialized Project and have no active daemon owner.\n\
     Select regular files directly. Links, hardlinks, special files and known secret paths are refused; source files are read without replacement or deletion.\n\
   mmmm call <function.name> --data-root <absolute root> [--json|--summary] < request.json\n\
+  mmmm manual-import --data-root <absolute root> --project <projectId> --expected-revision <sha256> --context <contextId> --selection-resource <FN24 resourceId> --source-map-file <absolute JSON path> --source-map-resource <resourceId> --edit-payload-file <absolute JSON path> --edit-payload-resource <resourceId> --allow-delta <kind,instanceId,nodeId> ...\n\
+    Use the active daemon and its original exported selection. Static delta choices create a proposal only; source rights remain unknown and automatic bake stays unavailable without an actual provider. Selected files are bounded reads, while Project head and user originals are preserved.\n\
   mmmm calibration-plan --data-root <absolute root> --project <projectId> --expected-revision <sha256> --context <contextId>\n\
   mmmm calibration-approve --data-root <absolute root> --project <projectId> --plan-id <planId> --plan-hash <sha256>\n\
     Select one existing frozen normative47 plan through the active daemon's same-user native peer. The daemon checks its original Project revision against the same protected Store; this command does not reopen or replace the daemon owner.\n\

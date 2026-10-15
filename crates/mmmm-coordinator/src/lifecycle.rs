@@ -81,23 +81,28 @@ struct HostManagement {
     session: SessionHandle,
     installed_policy: SessionPolicy,
     calibration_plans: BTreeMap<RequestId, CalibrationPlanAttempt>,
+    manual_scenes: BTreeMap<
+        RequestId,
+        NativePreparationAttempt<crate::native_manual_exchange::ManualSceneReceipt>,
+    >,
 }
 const MAX_RETAINED_CALIBRATION_PLANS: usize = 32;
 /// These process-local diagnostics retain the original typed service failure
 /// and native delivery outcome. The immutable saved plan lives in the Store;
 /// this record is neither a second ledger nor a recoverable execution grant.
-struct CalibrationPlanAttempt {
+type CalibrationPlanAttempt = NativePreparationAttempt<(PlanId, Sha256Digest)>;
+struct NativePreparationAttempt<R> {
     witness: BootstrapWitness,
     original_witness: BootstrapWitness,
     owner: Option<crate::auth::AuthenticatedPrincipal>,
-    committed: Option<(PlanId, Sha256Digest)>,
+    committed: Option<R>,
     failure: Option<ServiceError>,
     delivery_failure: Option<ManagementError>,
     native_failure: Option<crate::peer::PeerError>,
     original_completion: Option<(bool, Instant)>,
     delivery_completed: bool,
 }
-impl CalibrationPlanAttempt {
+impl<R> NativePreparationAttempt<R> {
     fn allow_receipt_redelivery(&self) -> Result<(), ManagementError> {
         if self.delivery_completed {
             Ok(())
@@ -163,6 +168,97 @@ fn committed_calibration_plan(error: &ServiceError) -> Option<(PlanId, Sha256Dig
     None
 }
 impl HostManagement {
+    fn prepare_manual_scene(
+        &mut self,
+        service: &mut ApplicationService,
+        authority: &SessionAuthority,
+        offer: crate::peer_management::HostOffer,
+        budget: &BootstrapBudget,
+    ) -> Result<PublicFrame, ManagementError> {
+        use crate::native_manual_exchange::{ManualSceneCommittedFailure, NativeManualSelection};
+        let witness = offer.witness().clone();
+        let frame = offer.public().value();
+        let selection =
+            NativeManualSelection::from_frame(frame).map_err(|_| ManagementError::InvalidFrame)?;
+        if frame["dataRoot"].as_str().map(std::path::Path::new) != Some(service.data_root()) {
+            return Err(ManagementError::InvalidFrame);
+        }
+        // A failed or uncertain original attempt remains diagnostic. A repeated
+        // path/ID selection cannot silently replay a possibly completed write
+        // or reinterpret newly changed file bytes as the old result.
+        if self.manual_scenes.values().any(|attempt| {
+            attempt.original_witness.nonce() == witness.nonce()
+                && attempt.original_witness.offer_digest() == witness.offer_digest()
+        }) {
+            return Err(ManagementError::Busy);
+        }
+        if self
+            .manual_scenes
+            .len()
+            .checked_add(self.calibration_plans.len())
+            .is_none_or(|count| count >= MAX_RETAINED_CALIBRATION_PLANS)
+        {
+            return Err(ManagementError::Busy);
+        }
+        let principal = authority.installed_principal(&self.session);
+        let owner = principal.as_ref().ok().cloned();
+        let result = (|| {
+            let request = RequestBudget::from_bootstrap(budget)?;
+            let principal = principal.map_err(|cause| {
+                ServiceError::caused_by(
+                    "AUTHENTICATION_REQUIRED",
+                    "Current installed native owner session is unavailable",
+                    cause,
+                )
+            })?;
+            service.import_manual_scene(&principal, &selection, &request)
+        })();
+        let (committed, failure) = match result {
+            Ok(receipt) => (Some(receipt), None),
+            Err(error) => {
+                let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+                let mut committed = None;
+                for _ in 0..8 {
+                    let Some(cause) = current else {
+                        break;
+                    };
+                    if let Some(saved) = cause.downcast_ref::<ManualSceneCommittedFailure>() {
+                        committed = Some(saved.receipt.clone());
+                        break;
+                    }
+                    current = cause.source();
+                }
+                (committed, Some(error))
+            }
+        };
+        let reply = committed.as_ref().ok_or(ManagementError::WrongReply).and_then(|receipt| PublicFrame::from_value(serde_json::json!({
+            "kind":"native_manual_scene_prepared", "protocolVersion":mmmm_contracts::CONTRACT_VERSION,"nonce":witness.nonce(),
+            "projectId":receipt.project_id,"patchId":receipt.patch_id,"resource":receipt.resource,
+            "outcome":if failure.is_some() { "committed_checkpoint_failed" } else { "prepared" },
+        })));
+        self.manual_scenes.insert(
+            witness.id().clone(),
+            NativePreparationAttempt {
+                witness: witness.clone(),
+                original_witness: witness,
+                owner,
+                committed,
+                failure,
+                delivery_failure: reply.as_ref().err().copied(),
+                native_failure: None,
+                original_completion: None,
+                delivery_completed: false,
+            },
+        );
+        reply
+    }
+    fn finish_manual_scene(&mut self, finished: &CompletedBootstrap, budget: &BootstrapBudget) {
+        if let Some(attempt) = self.manual_scenes.get_mut(finished.witness().id())
+            && attempt.observe_completion(finished, budget)
+        {
+            self.manual_scenes.remove(finished.witness().id());
+        }
+    }
     fn prepare_calibration_plan(
         &mut self,
         service: &mut ApplicationService,
@@ -245,7 +341,12 @@ impl HostManagement {
             return reply;
         }
         // Reserve retention capacity before the helper can freeze anything.
-        if self.calibration_plans.len() >= MAX_RETAINED_CALIBRATION_PLANS {
+        if self
+            .calibration_plans
+            .len()
+            .checked_add(self.manual_scenes.len())
+            .is_none_or(|count| count >= MAX_RETAINED_CALIBRATION_PLANS)
+        {
             return Err(ManagementError::Busy);
         }
         let principal = authority.installed_principal(&self.session);
@@ -389,6 +490,7 @@ impl Coordinator {
                         session,
                         installed_policy,
                         calibration_plans: BTreeMap::new(),
+                        manual_scenes: BTreeMap::new(),
                     }),
                 )
             }
@@ -590,6 +692,22 @@ impl Coordinator {
                     .unwrap_or(budget.deadline());
                 let witness_id = request.witness().id().clone();
                 let reply = match request {
+                    ManagementRequest::Offer(offer) if offer.public().is_manual_scene() => {
+                        management
+                            .prepare_manual_scene(
+                                &mut self.service,
+                                &self.authority,
+                                offer,
+                                &budget,
+                            )
+                            .map(Some)
+                    }
+                    ManagementRequest::Finished(finished)
+                        if finished.witness().is_manual_scene() =>
+                    {
+                        management.finish_manual_scene(&finished, &budget);
+                        Ok(None)
+                    }
                     ManagementRequest::Offer(offer) if offer.public().is_calibration_plan() => {
                         management
                             .prepare_calibration_plan(
@@ -620,10 +738,13 @@ impl Coordinator {
                     let wire_reply = reply.and_then(|frame| {
                         frame.ok_or(crate::peer_management::ManagementError::WrongReply)
                     });
-                    if let Err(error) = responder.respond(wire_reply)
-                        && let Some(attempt) = management.calibration_plans.get_mut(&witness_id)
-                    {
-                        attempt.delivery_failure.get_or_insert(error);
+                    if let Err(error) = responder.respond(wire_reply) {
+                        if let Some(attempt) = management.calibration_plans.get_mut(&witness_id) {
+                            attempt.delivery_failure.get_or_insert(error);
+                        }
+                        if let Some(attempt) = management.manual_scenes.get_mut(&witness_id) {
+                            attempt.delivery_failure.get_or_insert(error);
+                        }
                     }
                 } else {
                     reply.map_err(|_| CoordinatorError::Cleanup)?;

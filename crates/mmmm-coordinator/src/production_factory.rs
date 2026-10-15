@@ -237,6 +237,10 @@ impl DaemonSourceFactory for ProductionFactory {
             handles.request.clone(),
             handles.authority.clone(),
             manual.clone(),
+            handles.hosts.clone(),
+            contexts.clone(),
+            rights.clone(),
+            products.clone(),
         );
         let catalog = RegisteredCatalogSources::new(
             handles.authority.clone(),

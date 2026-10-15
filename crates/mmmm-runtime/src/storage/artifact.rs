@@ -56,22 +56,64 @@ impl std::fmt::Display for ArtifactError {
 impl std::error::Error for ArtifactError {}
 impl From<StorageError> for ArtifactError {
     fn from(error: StorageError) -> Self {
-        // No path, SQLite statement or untrusted diagnostic is exposed over RPC.
-        match error {
-            StorageError::Corrupt(_) | StorageError::UnsafePath => Self::new(
-                "RESOURCE_INTEGRITY_FAILED",
-                "Registered artifact failed integrity verification",
-            ),
-            StorageError::Conflict(_) => Self::new(
-                "RESOURCE_REGISTRATION_CONFLICT",
-                "Resource identity is already registered with different metadata",
-            ),
-            StorageError::NotFound(_) => Self::forbidden(),
-            _ => Self::new("RESOURCE_UNAVAILABLE", "Registered artifact cannot be read"),
-        }
+        artifact_storage_error(&error)
+    }
+}
+fn artifact_storage_error(error: &StorageError) -> ArtifactError {
+    // No path, SQLite statement or untrusted diagnostic is exposed over RPC.
+    match error {
+        StorageError::Corrupt(_) | StorageError::UnsafePath => ArtifactError::new(
+            "RESOURCE_INTEGRITY_FAILED",
+            "Registered artifact failed integrity verification",
+        ),
+        StorageError::Conflict(_) => ArtifactError::new(
+            "RESOURCE_REGISTRATION_CONFLICT",
+            "Resource identity is already registered with different metadata",
+        ),
+        StorageError::NotFound(_) => ArtifactError::forbidden(),
+        _ => ArtifactError::new("RESOURCE_UNAVAILABLE", "Registered artifact cannot be read"),
     }
 }
 pub type ArtifactResult<T> = Result<T, ArtifactError>;
+
+/// Trusted local diagnostics retain the original source. Public artifact APIs
+/// continue to expose only the same closed ArtifactError code and message.
+#[derive(Debug)]
+pub enum ResourceRegistrationError {
+    Artifact(ArtifactError),
+    Storage(StorageError),
+}
+impl ResourceRegistrationError {
+    pub fn public_error(&self) -> ArtifactError {
+        match self {
+            Self::Artifact(error) => *error,
+            Self::Storage(error) => artifact_storage_error(error),
+        }
+    }
+}
+impl From<ArtifactError> for ResourceRegistrationError {
+    fn from(error: ArtifactError) -> Self {
+        Self::Artifact(error)
+    }
+}
+impl From<StorageError> for ResourceRegistrationError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+impl std::fmt::Display for ResourceRegistrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.public_error().fmt(f)
+    }
+}
+impl std::error::Error for ResourceRegistrationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Artifact(error) => Some(error),
+            Self::Storage(error) => Some(error),
+        }
+    }
+}
 
 /// Internal ownership is persisted separately from the public ResourceRef. It
 /// is not an authority claim accepted from JSON-RPC callers.
@@ -124,16 +166,29 @@ pub fn register_resource(
     resource: &Value,
     owner: ResourceOwner,
 ) -> ArtifactResult<()> {
-    register_resource_inner(store, resource, owner, true)
+    register_resource_inner::<ArtifactError>(store, resource, owner, true)
 }
 
-fn register_resource_inner(
+/// The same registration algorithm, ordering and immutable CAS/owner checks as
+/// register_resource, with original local failure diagnostics kept intact.
+pub fn register_resource_with_diagnostics(
+    store: &mut DurableStore,
+    resource: &Value,
+    owner: ResourceOwner,
+) -> Result<(), ResourceRegistrationError> {
+    register_resource_inner::<ResourceRegistrationError>(store, resource, owner, true)
+}
+
+fn register_resource_inner<E>(
     store: &mut DurableStore,
     resource: &Value,
     owner: ResourceOwner,
     verify_bytes: bool,
-) -> ArtifactResult<()> {
-    let prepared = prepare_resource_registration(store, resource, &owner)?;
+) -> Result<(), E>
+where
+    E: From<ArtifactError> + From<StorageError>,
+{
+    let prepared = prepare_resource_registration::<E>(store, resource, &owner)?;
     if verify_bytes {
         store.cas.verify(&prepared.blob)?;
     }
@@ -147,7 +202,7 @@ fn register_resource_inner(
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(StorageError::from)?;
-    register_prepared_resource_in(&transaction, &prepared, &mut || Ok(()))?;
+    register_prepared_resource_in::<_, E>(&transaction, &prepared, &mut || Ok(()))?;
     transaction.commit().map_err(StorageError::from)?;
     Ok(())
 }
@@ -161,15 +216,18 @@ struct PreparedResourceRegistration {
     blob: BlobRef,
 }
 
-fn prepare_resource_registration(
+fn prepare_resource_registration<E>(
     store: &DurableStore,
     resource: &Value,
     owner: &ResourceOwner,
-) -> ArtifactResult<PreparedResourceRegistration> {
+) -> Result<PreparedResourceRegistration, E>
+where
+    E: From<ArtifactError> + From<StorageError>,
+{
     let (resource_id, blob) = validate_resource(&store.validator, resource)?;
     let resource_bytes = encode_json(resource).map_err(|_| ArtifactError::invalid())?;
     if resource_bytes.len() > MAX_RESOURCE_METADATA_BYTES {
-        return Err(ArtifactError::invalid());
+        return Err(ArtifactError::invalid().into());
     }
     let owner_value = serde_json::to_value(owner).map_err(|_| ArtifactError::invalid())?;
     let owner_bytes = encode_json(&owner_value).map_err(|_| ArtifactError::invalid())?;
@@ -213,7 +271,7 @@ where
     if !std::ptr::eq(&**transaction, &store.connection) {
         return Err(StorageError::Conflict("Artifact transaction Store").into());
     }
-    let prepared = prepare_resource_registration(store, resource, owner)?;
+    let prepared = prepare_resource_registration::<ArtifactError>(store, resource, owner)?;
     if &prepared.blob != blob {
         return Err(StorageError::Conflict("Artifact ResourceRef/blob pin").into());
     }
@@ -224,18 +282,19 @@ where
         .cas
         .read_verified_slice::<StorageError, _>(blob, blob.byte_length, 1, &mut *check)?;
     check()?;
-    register_prepared_resource_in(transaction, &prepared, check)?;
+    register_prepared_resource_in::<_, ArtifactError>(transaction, &prepared, check)?;
     check()?;
     Ok(())
 }
 
-fn register_prepared_resource_in<F>(
+fn register_prepared_resource_in<F, E>(
     transaction: &Transaction<'_>,
     prepared: &PreparedResourceRegistration,
     check: &mut F,
-) -> ArtifactResult<()>
+) -> Result<(), E>
 where
     F: FnMut() -> Result<(), StorageError>,
+    E: From<ArtifactError> + From<StorageError>,
 {
     check()?;
     transaction
@@ -269,7 +328,8 @@ where
         return Err(ArtifactError::new(
             "RESOURCE_LIMIT",
             "Resource registry capacity is exhausted",
-        ));
+        )
+        .into());
     }
     check()?;
     pin_blob(transaction, "artifact", resource_id.as_str(), blob)?;
@@ -310,7 +370,7 @@ pub fn issue_operation_resource(
         "resourceId":format!("artifact-{}", identity.as_str()),
         "sha256":blob.digest,"sizeBytes":blob.byte_length,"mediaType":media_type,
     });
-    register_resource_inner(store, &resource, owner, false)?;
+    register_resource_inner::<ArtifactError>(store, &resource, owner, false)?;
     Ok(resource)
 }
 

@@ -794,6 +794,131 @@ fn diff(decoded: &ManualSceneInputs) -> ExchangeResult<Value> {
 }
 
 #[test]
+fn authored_static_codec_keeps_original_selection_cas_pin_and_rejects_clip_or_mapping_claims() {
+    // Decoder coverage reuses the existing owned selection/CAS fixture only.
+    // The native owner, FN24 product issuance and common service path are
+    // exercised separately in production_factory_tests.
+    let root = TestRoot::new();
+    let mut store = root.open();
+    let (project, selection) = project_and_selection(
+        &mut store,
+        &[
+            "resource-static-selection",
+            "resource-static-map",
+            "resource-static-payload",
+        ],
+    );
+    let auth = AccessFixture::new(&project);
+    let selection_pin = registered(
+        &mut store,
+        &project,
+        "resource-static-selection",
+        &encode_json(&selection).unwrap(),
+    );
+    let map = json!({"contractVersion":"0.2.0","generatorVersion":"authored-static-decoder",
+        "inputRevision":project.revision(),"entries":[{"sourceObjectId":"instance-shop-a",
+            "sourceNodeId":"door","outputResourceId":"resource-static-payload","locator":"/entries/0"}]});
+    let map_pin = registered(
+        &mut store,
+        &project,
+        "resource-static-map",
+        &encode_json(&map).unwrap(),
+    );
+    let mut transform = selection["prefabs"][0]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["nodeId"] == "door")
+        .unwrap()["transform"]
+        .clone();
+    transform["translation"] = json!([3, 2, 0]);
+    let payload = json!({"contractVersion":"0.2.0","patchId":"patch-authored-static-input",
+        "projectId":project.project_id(),"baseRevision":project.revision(),"sourceArtifact":selection_pin,
+        "sourceMap":map_pin,"entries":[{"kind":"update_transform","instanceId":"instance-shop-a",
+            "nodeId":"door","transform":transform}],"losses":[],"absenceMeansDeletion":false});
+    let payload_pin = registered(
+        &mut store,
+        &project,
+        "resource-static-payload",
+        &encode_json(&payload).unwrap(),
+    );
+    let mut policy = DeltaPolicy::default();
+    policy
+        .allow(
+            ObjectNode {
+                instance_id: "instance-shop-a".into(),
+                node_id: "door".into(),
+            },
+            DeltaKind::UpdateTransform,
+        )
+        .unwrap();
+    let codec = StaticManualCodec {
+        source_artifact: &selection_pin,
+        source_map: &map_pin,
+        edit_payload: &payload_pin,
+        policy: &policy,
+    };
+    let decoded =
+        decode_static_manual(&selection, &selection, &codec, &map, &payload, &auth.budget).unwrap();
+    let patch = diff(&decoded).unwrap();
+    assert_eq!(patch["sourceArtifact"], json!(selection_pin));
+    assert_eq!(decoded.artifact, selection);
+    assert!(decoded.artifact.get("artifactId").is_none());
+    assert!(decoded.artifact.get("initialFinalVerified").is_none());
+    assert_eq!(patch["entries"], payload["entries"]);
+    assert_eq!(patch["losses"], json!([]));
+    assert_eq!(patch["absenceMeansDeletion"], false);
+    assert_eq!(
+        store
+            .read_blob(&BlobRef {
+                digest: selection_pin.sha256.clone(),
+                byte_length: selection_pin.size_bytes
+            })
+            .unwrap(),
+        encode_json(&selection).unwrap()
+    );
+
+    let mut clip = payload.clone();
+    clip["entries"][0] = json!({"kind":"attach_clip","instanceId":"instance-shop-a","nodeId":"door","clipId":"clip-door"});
+    assert_eq!(
+        app_failure(decode_static_manual(
+            &selection,
+            &selection,
+            &codec,
+            &map,
+            &clip,
+            &auth.budget
+        )),
+        "UNSUPPORTED_FORMAT"
+    );
+    let mut ambiguous = map;
+    ambiguous["entries"][0]["sourceNodeId"] = json!("sign");
+    assert_eq!(
+        app_failure(decode_static_manual(
+            &selection,
+            &selection,
+            &codec,
+            &ambiguous,
+            &payload,
+            &auth.budget
+        )),
+        "OBJECT_MAPPING_AMBIGUOUS"
+    );
+    assert_eq!(
+        failure(diff_scene_edits(
+            &decoded.selection,
+            &decoded.edits,
+            &decoded.source_artifact,
+            &decoded.source_map,
+            &decoded.losses,
+            "patch-static-denied",
+            &DeltaPolicy::default()
+        )),
+        "PERMISSION_REQUIRED"
+    );
+}
+
+#[test]
 fn exact_cas_manual_codec_proposes_explicit_create_update_delete_without_bake_completion() {
     let root = TestRoot::new();
     let mut store = root.open();

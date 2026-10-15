@@ -1612,7 +1612,73 @@ local 변수에만 근거를 적은 removal 경고 예외를 뒀다. 원 bits와
 유지하며 실제 getter의 관측 계약을 검사한다. production reader는 변경하지 않았다.
 소스 리뷰와 이후 새 JVM 실행 결과는 구분한다.
 
+후속 Windows 관리 JVM `435`는 고정 source
+`47a11eaef7f718bf84e360104763e2b64fd690fd`의 7개 모듈 404 tests/34 reports와 필수
+11개 Gradle task 실제 실행을 모두 통과했다. 원 source 181개를 실행 전후 대조했고
+source-input manifest SHA-256은
+`b7e058c9fc8b9c5b16f06b2c53987fc7b0463b8e748df4fcbf92b644138f6948`다.
+새 approval 6개·executable 5개·state reader 4개 테스트가 포함되며 실제 Mixin 주입·JNI
+positive 실행·게임 stage runner나 관리자 승인을 검증한 것으로 확대하지 않는다.
+명령 exit 0·43,635 ms, Job commit peak 1,404,518,400 bytes·6 process·최대 sample gap
+147 ms이며 자연 종료·drain·완전한 출력·export·scratch 정리·lease 해제를 확인했다.
+원 JUnit XML 34개를 외부 evidence에 CreateNew/flush/hash 대조하여 보존했고,
+요약 12,109 bytes·SHA-256
+`4a11453d72529f98a3c3af756451525a1d85c6d6dca52fa9841bfcfd4d4a1057`를 기록했다.
+실패한 `433` 원 근거를 대체하거나 현재 개발 자료를 최종 출시 증거로 승격하지 않는다.
+
+## 수동 교환 native ingress와 현재 회귀
+
+D068의 `manual-import`는 원 FN24 selection을 가진 현재 native owner, 실제 선택 파일과
+명시적 static delta를 같은 Coordinator/Store의 기존 diff·stable patch·scene planner에
+연결한다. SourceMap과 편집 payload의 원 bytes 및 정본 patch를 private CAS에 보존하며
+Project head와 권리 상태를 변경하지 않는다. 불투명한 생산 admission만 원 protected
+product와 현재 CAS를 재검사한 뒤 call-local source map에 연결한다. 일반 resource 읽기
+순서와 권한, 실제 sealed bake 없는 clip 부착 거절을 유지한다. 같은 offer의 Busy,
+ACK/EOF/stdout 및 후행 checkpoint 실패에는 원 locator와 원인을 보존한다.
+
+Windows 관리 `436`은 소유 Rust 17파일 format을 통과했다. `437`은 컴파일·CLI 16개와
+Coordinator 362개 통과/새 회귀 2개 실패/기존 1 ignored다. 당시 full normative manifest
+fixture는 실제 466,350 bytes/3939 nodes로 기존 1 MiB/4096 한도 안임을 관측했다.
+실패한 parser fixture는 managed scratch의 verbatim 경로 표현과 충돌했고, catalog fixture는
+필수 mod/pack source 집합을 unknown으로 제공했다. production 거절 조건은 유지하고 두
+fixture만 교정하여 `440`에서 format을 통과했다. `441`의 Runtime 131개 unit은 모두 통과했다.
+새 단일 registration diagnostic 알고리즘의 실제 schema/CAS/SQLite 실패 원인과 기존 공개
+오류 동일성 검사가 포함된다.
+
+`442`의 수동 교환 집중 검사 6개는 5개 통과/1개 실패다. parser·tokenless transport·기존
+manual codec/bundle 회귀는 통과했고 실제 FN24→파일 import→CAS 보존→Project/head 불변을
+확인한 새 회귀는 후속 scene.plan에서 예상한 CONTEXT_UNKNOWN 대신 REVISION_CONFLICT를
+반환했다. 충돌 원인을 추적 중이며 expected code를 낮춰 통과시키거나 실제 게임 또는
+EX14 전체 인수 성공으로 표시하지 않는다. 마지막 두 실행은 각각 command 0/101·
+47,996/76,552 ms, Job commit peak 708,636,672/1,473,343,488 bytes·6 process다.
+원 로그·실패를 보존했고 owned-tail 정리 뒤 drain·완전한 출력·export·scratch 정리·
+lease 해제를 확인했다. 이 source의 strict Clippy와 새 고정 SHA CI는 아직 미실행이다.
+
 ## 공유 고정 SHA의 CI 실패 구분
+
+추가 Windows API 관측 `438`은 Brigadier/native custom 실행 interface 10개,
+`439`는 DoubleTag 1개를 각각 원 JAR과 고정 JDK의 javap로 확인했다. 두 실행은 command
+0·stderr 0, 각각 7,951/3,977 ms와 Job commit peak 177,094,656/171,249,664 bytes·
+4 process이며 drain·완전한 출력·export·scratch 정리·lease 해제가 정상이다. 원 stdout은
+65,443 bytes·SHA-256 `291ced3084b2b97d556fe2891929ca74336959361dfe2f3c3e93622cdf6f4163`,
+9,335 bytes·SHA-256 `472b0bd09ee9a7a132b2a82da110f881df810ed5928400acf204acb257d658c7`다.
+실제 getter·SAM descriptor·custom 경로와 queue overflow의 한계를 확인한 근거이며
+게임 실행·완료 stage나 복원 성공의 증거가 아니다.
+
+이 조사에서 `430/434/438/439`의 outer 명령이 output-root를 누락해 제품 기본 루트 아래
+별도의 `build/managed-v1` catalog를 사용한 오류를 확인했다. 고정 개발 catalog와 동일한
+크기 관측 또는 지정 개발 루트 준수로 보고하지 않는다. 정확한 checks/jvm owner 두 개는
+원 checkout·purpose와 일치하고 complete이며 lease·scratch가 없는 상태를 확인했다.
+원 evidence와 완료 cache는 보존했고 다른 자료를 삭제하거나 이동하지 않았다. 후속 실행은
+지정 개발 output-root를 명시한다. 이 실수는 제품 SQLite/CAS의 수명 또는 중단 lease를
+자동으로 회수하는 예외를 만들지 않는다.
+
+후속 고정 source `47a11eaef7f718bf84e360104763e2b64fd690fd`의 JVM CI 61
+(`38792722101`)과 Rust CI 70 (`38792722276`)는 각각 Windows x64/Linux x64/macOS
+ARM64 세 job 및 집계 성공을 관측했다. Rust 70의 macOS bootstrap 성공은 이 실행의
+실제 결과이며 선행 68의 ESRCH가 재현됐거나 그 실패 정책이 이미 보완됐다는 증거는 아니다.
+두 실행의 새 원 ZIP 감사는 수행하지 않았다. 이후 미커밋 구현과 게임 및 공개 배포를
+이 고정 SHA의 검사 성공에 포함하지 않는다.
 
 `54af8a8708d399b3e7044f036828bdd0e40219b1`의 JVM CI 59 (`38787591379`)는 세 OS와
 집계 성공을 관측했다. 원 ZIP 감사는 선행 고정 source의 CI 57과 구분하며 이번 원본은

@@ -6,9 +6,9 @@
 
 use crate::credential::SecretToken;
 use mmmm_contracts::{
-    ContextId, ContractValidator, JsonLimits, PlanId, PrincipalId, ProjectId, RequestId,
-    ResourceLocation, SessionEpoch, Sha256Digest, SourceId, canonical_digest,
-    parse_json_with_limits, verify_projected_digest,
+    ContextId, ContractValidator, InstanceId, JsonLimits, NodeId, PatchId, PlanId, PrincipalId,
+    ProjectId, RequestId, ResourceId, ResourceLocation, SessionEpoch, Sha256Digest, SourceId,
+    canonical_digest, parse_json_with_limits, verify_projected_digest,
 };
 use serde_json::{Map, Value};
 use std::{
@@ -33,6 +33,7 @@ pub const BOOTSTRAP_LIMIT: Duration = Duration::from_secs(30);
 pub const NATIVE_IO_LIMIT: Duration = Duration::from_secs(5);
 pub const APPLICATION_REPLY_LIMIT: Duration = Duration::from_secs(10);
 pub(crate) const CALIBRATION_PLAN_PURPOSE: &str = "numeric_calibration_plan_normative47/1";
+pub(crate) const MANUAL_SCENE_PURPOSE: &str = "manual_static_scene_import/1";
 const POLL_SLICE: Duration = Duration::from_millis(20);
 const MAX_COMPATIBILITY_APPROVALS: usize = 128;
 const MAX_COMPATIBILITY_PROFILE_BYTES: usize = 65_536;
@@ -138,8 +139,15 @@ impl PublicFrame {
         self.value["kind"] == "native_calibration_plan_offer"
             || self.value["kind"] == "native_calibration_plan_prepared"
     }
+    pub(crate) fn is_manual_scene(&self) -> bool {
+        self.value["kind"] == "native_manual_scene_offer"
+            || self.value["kind"] == "native_manual_scene_prepared"
+    }
+    pub(crate) fn is_native_preparation(&self) -> bool {
+        self.is_calibration_plan() || self.is_manual_scene()
+    }
     pub(crate) fn is_native_owner_command(&self) -> bool {
-        self.is_calibration_owner_selection() || self.is_calibration_plan()
+        self.is_calibration_owner_selection() || self.is_native_preparation()
     }
     pub fn nonce(&self) -> &str {
         // validate_public proves this required nonempty stable identity.
@@ -222,6 +230,104 @@ fn validate_public(value: &Value) -> Result<ManagementKind, ManagementError> {
     RequestId::new(text(value, "nonce")?).map_err(|_| ManagementError::InvalidFrame)?;
     let validator = ContractValidator::shared().map_err(|_| ManagementError::InvalidFrame)?;
     match text(value, "kind")? {
+        "native_manual_scene_offer" => {
+            exact(
+                object,
+                &[
+                    "kind",
+                    "protocolVersion",
+                    "nonce",
+                    "purpose",
+                    "dataRoot",
+                    "projectId",
+                    "expectedRevision",
+                    "contextId",
+                    "selectionResourceId",
+                    "sourceMapResourceId",
+                    "editPayloadResourceId",
+                    "sourceMapFile",
+                    "editPayloadFile",
+                    "allowedDeltas",
+                ],
+            )?;
+            if text(value, "purpose")? != MANUAL_SCENE_PURPOSE {
+                return Err(ManagementError::InvalidFrame);
+            }
+            // These local selectors are syntax only. The protected importer
+            // owns bounded reads and all file/link/secret admission checks.
+            for field in ["dataRoot", "sourceMapFile", "editPayloadFile"] {
+                let path = text(value, field)?;
+                if path.len() > 4096
+                    || path.chars().any(char::is_control)
+                    || !Path::new(path).is_absolute()
+                {
+                    return Err(ManagementError::InvalidFrame);
+                }
+            }
+            ProjectId::new(text(value, "projectId")?).map_err(|_| ManagementError::InvalidFrame)?;
+            ContextId::new(text(value, "contextId")?).map_err(|_| ManagementError::InvalidFrame)?;
+            digest(text(value, "expectedRevision")?)?;
+            let mut resources = BTreeSet::new();
+            for field in [
+                "selectionResourceId",
+                "sourceMapResourceId",
+                "editPayloadResourceId",
+            ] {
+                let resource = ResourceId::new(text(value, field)?)
+                    .map_err(|_| ManagementError::InvalidFrame)?;
+                if !resources.insert(resource) {
+                    return Err(ManagementError::InvalidFrame);
+                }
+            }
+            let deltas = array(value, "allowedDeltas")?;
+            if deltas.len() > 256 {
+                return Err(ManagementError::InvalidFrame);
+            }
+            let mut targets = BTreeSet::new();
+            for delta in deltas {
+                exact(
+                    delta.as_object().ok_or(ManagementError::InvalidFrame)?,
+                    &["instanceId", "nodeId", "kind"],
+                )?;
+                let instance = InstanceId::new(text(delta, "instanceId")?)
+                    .map_err(|_| ManagementError::InvalidFrame)?;
+                let node = NodeId::new(text(delta, "nodeId")?)
+                    .map_err(|_| ManagementError::InvalidFrame)?;
+                let kind = text(delta, "kind")?;
+                if !matches!(
+                    kind,
+                    "create_node" | "update_transform" | "update_display" | "delete_node"
+                ) || !targets.insert((instance, node, kind))
+                {
+                    return Err(ManagementError::InvalidFrame);
+                }
+            }
+            Ok(ManagementKind::Offer)
+        }
+        "native_manual_scene_prepared" => {
+            exact(
+                object,
+                &[
+                    "kind",
+                    "protocolVersion",
+                    "nonce",
+                    "projectId",
+                    "patchId",
+                    "resource",
+                    "outcome",
+                ],
+            )?;
+            if !matches!(
+                text(value, "outcome")?,
+                "prepared" | "committed_checkpoint_failed"
+            ) {
+                return Err(ManagementError::InvalidFrame);
+            }
+            ProjectId::new(text(value, "projectId")?).map_err(|_| ManagementError::InvalidFrame)?;
+            PatchId::new(text(value, "patchId")?).map_err(|_| ManagementError::InvalidFrame)?;
+            definition(validator, "ResourceRef", &value["resource"])?;
+            Ok(ManagementKind::Authority)
+        }
         "native_calibration_plan_offer" => {
             exact(
                 object,
@@ -649,6 +755,7 @@ pub struct BootstrapWitness {
     nonce: RequestId,
     offer_digest: Sha256Digest,
     calibration_plan: bool,
+    manual_scene: bool,
 }
 impl BootstrapWitness {
     pub fn id(&self) -> &RequestId {
@@ -662,6 +769,9 @@ impl BootstrapWitness {
     }
     pub(crate) fn is_calibration_plan(&self) -> bool {
         self.calibration_plan
+    }
+    pub(crate) fn is_manual_scene(&self) -> bool {
+        self.manual_scene
     }
 }
 
@@ -689,6 +799,12 @@ impl HostOffer {
         }
         Self::with_token(public, None)
     }
+    pub(crate) fn manual_scene(public: PublicFrame) -> Result<Self, ManagementError> {
+        if public.kind() != ManagementKind::Offer || !public.is_manual_scene() {
+            return Err(ManagementError::InvalidFrame);
+        }
+        Self::with_token(public, None)
+    }
     fn with_token(
         public: PublicFrame,
         token: Option<SecretToken>,
@@ -699,6 +815,7 @@ impl HostOffer {
             offer_digest: canonical_digest(public.value())
                 .map_err(|_| ManagementError::InvalidFrame)?,
             calibration_plan: public.is_calibration_plan(),
+            manual_scene: public.is_manual_scene(),
         };
         Ok(Self {
             public,
@@ -774,7 +891,10 @@ impl ManagementRequest {
         public: PublicFrame,
         witness: BootstrapWitness,
     ) -> Result<Self, ManagementError> {
-        if public.kind() != ManagementKind::Installed || public.nonce() != witness.nonce() {
+        if public.kind() != ManagementKind::Installed
+            || public.nonce() != witness.nonce()
+            || witness.is_manual_scene()
+        {
             return Err(ManagementError::WrongReply);
         }
         Ok(Self::Installed { public, witness })
@@ -798,7 +918,8 @@ impl ManagementRequest {
             Self::Offer(offer) if offer.public().kind() == ManagementKind::Offer => Ok(()),
             Self::Installed { public, witness }
                 if public.kind() == ManagementKind::Installed
-                    && public.nonce() == witness.nonce() =>
+                    && public.nonce() == witness.nonce()
+                    && !witness.is_manual_scene() =>
             {
                 Ok(())
             }

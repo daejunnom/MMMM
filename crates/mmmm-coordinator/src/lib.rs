@@ -26,6 +26,7 @@ pub mod native_backend;
 mod native_catalog;
 pub mod native_entry;
 mod native_import_files;
+pub mod native_manual_exchange;
 pub mod native_payload;
 pub mod native_project;
 pub mod native_read_targets;

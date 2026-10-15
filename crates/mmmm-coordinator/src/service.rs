@@ -375,6 +375,17 @@ impl ServiceExtensionContext<'_> {
 }
 
 pub trait ServiceExtension {
+    fn import_manual_scene(
+        &mut self,
+        _selection: &crate::native_manual_exchange::NativeManualSelection,
+        _owner: &crate::workspace_bootstrap::NativeOwnerWitness,
+        _context: &mut ServiceExtensionContext<'_>,
+    ) -> Result<crate::native_manual_exchange::ManualSceneReceipt, ServiceError> {
+        Err(ServiceError::new(
+            "SOURCE_UNAVAILABLE",
+            "Native static manual source is unavailable",
+        ))
+    }
     fn call(
         &mut self,
         method: &str,
@@ -391,6 +402,25 @@ pub struct ExtensionRouter {
     methods: BTreeSet<String>,
 }
 impl ExtensionRouter {
+    fn import_manual_scene(
+        &mut self,
+        selection: &crate::native_manual_exchange::NativeManualSelection,
+        owner: &crate::workspace_bootstrap::NativeOwnerWitness,
+        context: &mut ServiceExtensionContext<'_>,
+    ) -> Result<crate::native_manual_exchange::ManualSceneReceipt, ServiceError> {
+        context.check("scene.diff")?;
+        let (_, handler) = self
+            .groups
+            .iter_mut()
+            .find(|(methods, _)| methods.contains("scene.diff"))
+            .ok_or_else(|| {
+                ServiceError::new(
+                    "SOURCE_UNAVAILABLE",
+                    "Native static manual source is unavailable",
+                )
+            })?;
+        handler.import_manual_scene(selection, owner, context)
+    }
     pub fn register<I, S>(
         &mut self,
         methods: I,
@@ -522,6 +552,57 @@ impl ApplicationService {
     }
     pub fn bind_request_context(&mut self, context: RequestContextSlot) {
         self.request_context = Some(context);
+    }
+    pub(crate) fn import_manual_scene(
+        &mut self,
+        principal: &AuthenticatedPrincipal,
+        selection: &crate::native_manual_exchange::NativeManualSelection,
+        budget: &RequestBudget,
+    ) -> Result<crate::native_manual_exchange::ManualSceneReceipt, ServiceError> {
+        budget.check()?;
+        if !principal.permits("scene.diff")
+            || !principal.permits_context(selection.context_id.as_str())
+            || crate::peer::fatal_stop_requested()
+        {
+            return Err(ServiceError::new(
+                "PERMISSION_REQUIRED",
+                "Current native manual scene authority is required",
+            ));
+        }
+        let slot = self.request_context.as_ref().ok_or_else(|| {
+            ServiceError::new(
+                "INVALID_COMPOSITION",
+                "Native manual import requires the actual service request slot",
+            )
+        })?;
+        let _scope = slot.enter(principal, budget, "scene.diff")?;
+        let request = slot.current_witness("scene.diff")?;
+        let owner =
+            crate::workspace_bootstrap::NativeOwnerWitness::capture(&self.store, budget.deadline())
+                .map_err(|cause| {
+                    ServiceError::caused_by(
+                        "PERMISSION_REQUIRED",
+                        "Actual native Store owner is required",
+                        cause,
+                    )
+                })?;
+        if owner.principal() != principal.principal() {
+            return Err(ServiceError::new(
+                "PERMISSION_REQUIRED",
+                "Manual import requires the current native owner session",
+            ));
+        }
+        request.check_local()?;
+        let mut context = ServiceExtensionContext {
+            principal,
+            budget,
+            store: &mut self.store,
+            ports: &mut self.ports,
+        };
+        // The one scene.diff owner retains the same FeatureSources and shared
+        // manual registry as later scene.plan calls. No alternate ledger opens.
+        self.extensions
+            .import_manual_scene(selection, &owner, &mut context)
     }
     /// Install trusted lazy ports over this service's occupied request and
     /// unique Store. Binding performs no native observation or SQL operation.

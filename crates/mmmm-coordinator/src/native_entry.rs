@@ -71,6 +71,7 @@ pub enum EntryError {
     Arguments,
     HostReadPolicyArguments,
     SourceArguments,
+    ManualArguments,
     CatalogSourceArguments,
     CatalogSourceRequest(mmmm_application::AppError),
     CompatibilityProfileArguments,
@@ -126,6 +127,11 @@ pub enum EntryError {
         checkpoint_failed: bool,
         delivery: Option<Box<EntryError>>,
     },
+    ManualSceneCommitted {
+        receipt: Box<crate::native_manual_exchange::ManualSceneReceipt>,
+        checkpoint_failed: bool,
+        delivery: Option<Box<EntryError>>,
+    },
     Shutdown {
         primary: Option<Box<EntryError>>,
         cleanup: CoordinatorError,
@@ -134,9 +140,16 @@ pub enum EntryError {
 impl std::fmt::Display for EntryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ManualSceneCommitted { receipt, checkpoint_failed, delivery } => {
+                write!(f, "Manual ScenePatch {} for Project {} was staged as {} ({}); its original resource is retained", receipt.patch_id, receipt.project_id, receipt.resource.resource_id, receipt.resource.sha256)?;
+                if *checkpoint_failed { f.write_str("; final source checkpoint failed (MANUAL_SCENE_COMMITTED); the Coordinator retains the original cause")?; }
+                if let Some(error) = delivery { write!(f, "; result delivery failed: {error}")?; }
+                Ok(())
+            }
             Self::Arguments => f.write_str("Native command arguments are invalid"),
             Self::HostReadPolicyArguments => f.write_str("Host setup read policy requires unique --shape-mode survival|creative|adventure|spectator selections and optional --native-observation user_local_only; absent selections grant no corresponding source access"),
             Self::SourceArguments => f.write_str("Native source import requires at least one document or raw resource pair and at most 256 combined document/resource inputs: --document <kind>:<JSON>, --document-file <kind>:<absolute JSON path>, and adjacent --resource-descriptor-file/--resource-bytes-file paths; kinds are prefab|instance|clip and OS argv limits may be smaller"),
+            Self::ManualArguments => f.write_str("Manual import requires an existing Coordinator, exact Project/head/context, an original exchange selection resource, selected absolute SourceMap/ScenePatch JSON files with unique resource IDs, and repeated --allow-delta kind,instanceId,nodeId static choices; no source rights or game-write grant is created"),
             Self::CatalogSourceArguments => f.write_str("Catalog source use requires --mode inspect or replace; replace needs --expected-state-digest and a complete set selected by --game-artifact <resourceId>/repeated --mod <canonicalId>,<nativeId>,<resourceId>, or explicit --withdraw true with no selections; <=256 selections, <=64 KiB selector metadata, user_local_only only"),
             Self::CatalogSourceRequest(error) => write!(f, "{}: Cold native catalog source use could not continue", error.code),
             Self::CompatibilityProfileArguments => f.write_str("Compatibility profile approval requires one initialized Project revision and exact existing profile resource ID/raw SHA-256, a bounded approval reference, separate artifact and interface SHA-256 selections; no profile JSON or authority options are accepted"),
@@ -213,6 +226,10 @@ impl std::error::Error for EntryError {
 }
 
 enum Command {
+    ManualImport {
+        root: PathBuf,
+        selection: crate::native_manual_exchange::NativeManualSelection,
+    },
     Init {
         root: PathBuf,
         name: String,
@@ -305,6 +322,70 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
         return Ok(false);
     };
     match command {
+        Command::ManualImport { root, selection } => {
+            use crate::{
+                credential::CredentialRef,
+                host_relay::CoordinatorLocator,
+                peer::PeerHostAttach,
+                peer_management::{HostOffer, PublicFrame},
+            };
+            let deadline = started + crate::peer_management::BOOTSTRAP_LIMIT;
+            let endpoint = host_relay::ExistingCoordinator
+                .ensure_endpoint(&root, &selection.project_id, deadline)
+                .map_err(EntryError::Relay)?;
+            let mut frame = selection.locators();
+            frame["kind"] = json!("native_manual_scene_offer");
+            frame["protocolVersion"] = json!(mmmm_contracts::CONTRACT_VERSION);
+            frame["purpose"] = json!(crate::peer_management::MANUAL_SCENE_PURPOSE);
+            frame["dataRoot"] = json!(root);
+            frame["nonce"] = json!(format!(
+                "manual-scene-{}",
+                mmmm_contracts::canonical_digest(&frame).map_err(|_| EntryError::Arguments)?
+            ));
+            let offer = HostOffer::manual_scene(
+                PublicFrame::from_value(frame).map_err(|_| EntryError::Arguments)?,
+            )
+            .map_err(|_| EntryError::OutputInvalid)?;
+            let reference = CredentialRef::new(&endpoint.credential_ref)
+                .map_err(|_| EntryError::OutputInvalid)?;
+            let (pending, prepared) = PeerHostAttach::offer_with_deadline(
+                &root.join("runtime"),
+                &reference,
+                offer,
+                deadline,
+            )
+            .map_err(EntryError::Peer)?;
+            if !prepared.is_manual_scene()
+                || prepared.value()["projectId"] != selection.project_id.as_str()
+            {
+                return Err(EntryError::OutputInvalid);
+            }
+            let value = prepared.value();
+            let receipt = crate::native_manual_exchange::ManualSceneReceipt {
+                project_id: selection.project_id,
+                patch_id: value["patchId"]
+                    .as_str()
+                    .ok_or(EntryError::OutputInvalid)?
+                    .to_owned(),
+                resource: serde_json::from_value(value["resource"].clone())
+                    .map_err(|_| EntryError::OutputInvalid)?,
+            };
+            let checkpoint_failed = value["outcome"] == "committed_checkpoint_failed";
+            let result = json!({"kind":"manual_scene_prepared","projectId":receipt.project_id,"patchId":receipt.patch_id,"resource":receipt.resource,"outcome":value["outcome"]});
+            let delivery = pending
+                .complete_manual_scene()
+                .map_err(EntryError::Peer)
+                .and_then(|()| output(&result, deadline.min(Instant::now() + OUTPUT)))
+                .err()
+                .map(Box::new);
+            if checkpoint_failed || delivery.is_some() {
+                return Err(EntryError::ManualSceneCommitted {
+                    receipt: Box::new(receipt),
+                    checkpoint_failed,
+                    delivery,
+                });
+            }
+        }
         Command::CalibrationPlan { root, selection } => {
             use crate::{
                 credential::CredentialRef,
@@ -711,10 +792,71 @@ fn finish(coordinator: Coordinator, primary: Result<(), EntryError>) -> Result<(
     }
 }
 
+fn parse_manual_import(args: &[String]) -> Result<Command, EntryError> {
+    if args.len() < 21
+        || args.len() > 531
+        || args.iter().any(|arg| arg.len() > 4096)
+        || args
+            .iter()
+            .try_fold(0usize, |size, arg| size.checked_add(arg.len()))
+            .is_none_or(|size| size > 65_536)
+    {
+        return Err(EntryError::ManualArguments);
+    }
+    let mut options = std::collections::BTreeMap::new();
+    let mut deltas = Vec::new();
+    for pair in args[1..].chunks(2) {
+        if pair.len() != 2 {
+            return Err(EntryError::ManualArguments);
+        }
+        if pair[0] == "--allow-delta" {
+            if deltas.len() >= 256 {
+                return Err(EntryError::ManualArguments);
+            }
+            let values = pair[1].split(',').collect::<Vec<_>>();
+            if values.len() != 3 {
+                return Err(EntryError::ManualArguments);
+            }
+            deltas.push(json!({"kind":values[0],"instanceId":values[1],"nodeId":values[2]}));
+        } else if !matches!(
+            pair[0].as_str(),
+            "--data-root"
+                | "--project"
+                | "--expected-revision"
+                | "--context"
+                | "--selection-resource"
+                | "--source-map-file"
+                | "--source-map-resource"
+                | "--edit-payload-file"
+                | "--edit-payload-resource"
+        ) || options.insert(pair[0].as_str(), pair[1].as_str()).is_some()
+        {
+            return Err(EntryError::ManualArguments);
+        }
+    }
+    let mut take = |key| options.remove(key).ok_or(EntryError::ManualArguments);
+    let root = PathBuf::from(take("--data-root")?);
+    if !root.is_absolute() {
+        return Err(EntryError::ManualArguments);
+    }
+    let map = selected_path(take("--source-map-file")?, InputRole::Document)
+        .map_err(|_| EntryError::ManualArguments)?;
+    let payload = selected_path(take("--edit-payload-file")?, InputRole::Document)
+        .map_err(|_| EntryError::ManualArguments)?;
+    let selection = crate::native_manual_exchange::NativeManualSelection::from_frame(&json!({
+        "projectId":take("--project")?,"expectedRevision":take("--expected-revision")?,"contextId":take("--context")?,
+        "selectionResourceId":take("--selection-resource")?,"sourceMapResourceId":take("--source-map-resource")?,"editPayloadResourceId":take("--edit-payload-resource")?,
+        "sourceMapFile":map,"editPayloadFile":payload,"allowedDeltas":deltas,
+    })).map_err(|_| EntryError::ManualArguments)?;
+    Ok(Command::ManualImport { root, selection })
+}
 fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
     let Some(command) = args.first().map(String::as_str) else {
         return Ok(None);
     };
+    if command == "manual-import" {
+        return parse_manual_import(args).map(Some);
+    }
     if command == daemon_launch::DAEMON_CHILD_COMMAND {
         return Ok(Some(Command::Owned(args[1..].to_vec())));
     }
@@ -1489,6 +1631,63 @@ mod tests {
         } else {
             "/mmmm-test-root"
         }
+    }
+    #[test]
+    fn manual_import_accepts_only_explicit_static_files_and_delta_selectors() {
+        // This parser-only check opens no files. Use the already selected plain
+        // absolute locator; a managed temp root may have a Windows verbatim
+        // prefix, which the real file-selection boundary intentionally rejects.
+        let map = Path::new(root()).join("mmmm-manual-map.json");
+        let payload = Path::new(root()).join("mmmm-manual-patch.json");
+        let hash = "a".repeat(64);
+        let input = args(&[
+            "manual-import",
+            "--data-root",
+            root(),
+            "--project",
+            "project-test",
+            "--expected-revision",
+            &hash,
+            "--context",
+            "context-test",
+            "--selection-resource",
+            "selection-input",
+            "--source-map-file",
+            map.to_str().unwrap(),
+            "--source-map-resource",
+            "manual-map",
+            "--edit-payload-file",
+            payload.to_str().unwrap(),
+            "--edit-payload-resource",
+            "manual-patch",
+            "--allow-delta",
+            "update_transform,instance-test,node-test",
+        ]);
+        assert!(matches!(
+            parse(&input),
+            Ok(Some(Command::ManualImport { .. }))
+        ));
+        for rejected in [
+            "attach_clip,instance-test,node-test",
+            "update_transform,instance-test",
+            "update_transform,instance-test,node-test,extra",
+        ] {
+            let mut changed = input.clone();
+            *changed.last_mut().unwrap() = rejected.to_owned();
+            assert!(matches!(parse(&changed), Err(EntryError::ManualArguments)));
+        }
+        let mut duplicate = input.clone();
+        duplicate.extend(args(&[
+            "--allow-delta",
+            "update_transform,instance-test,node-test",
+        ]));
+        assert!(matches!(
+            parse(&duplicate),
+            Err(EntryError::ManualArguments)
+        ));
+        let mut injected = input;
+        injected.extend(args(&["--rights", "owned"]));
+        assert!(matches!(parse(&injected), Err(EntryError::ManualArguments)));
     }
     #[test]
     fn locator_selection_never_accepts_authority_fields() {

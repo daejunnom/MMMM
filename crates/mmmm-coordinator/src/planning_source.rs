@@ -71,6 +71,19 @@ struct IssuedSource {
 }
 type SharedIssuedSources = Rc<RefCell<BTreeMap<ResourceId, IssuedSource>>>;
 impl<'a> PlanningStore<'a> {
+    /// Only the concrete native manual producer can construct this admission.
+    /// Raw DTO pins cannot populate the call-local issuance map.
+    pub(crate) fn record_manual_scene_sources(
+        &self,
+        admission: &crate::feature_sources::ManualSceneReadAdmission,
+    ) -> AppResult<()> {
+        admission.check(self)?;
+        let (principal, project, context, pins) = admission.pins();
+        for pin in pins {
+            self.record_issued(principal, project, context, pin)?;
+        }
+        admission.check(self)
+    }
     pub fn read(store: &'a DurableStore) -> Self {
         Self {
             store: Rc::new(RefCell::new(BorrowedStore::Read(store))),
@@ -484,6 +497,23 @@ pub struct ObservedStateSnapshot {
 /// state codecs. They cannot open a second store: all durable reads use the
 /// BorrowedProjectSource passed by the coordinator composition.
 pub trait PlanningDataPort {
+    /// Narrow admission of previously issued private scene inputs. The default
+    /// changes no authority or ordering of ordinary resource reads.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The actual Store and unchanged source/principal/context inputs are checked together"
+    )]
+    fn admit_scene_source_resources_with_store(
+        &mut self,
+        _store: &PlanningStore<'_>,
+        _principal: &PrincipalId,
+        _project: &ProjectCatalog,
+        _patch: &Value,
+        _context: &Value,
+        _budget: &RequestBudget,
+    ) -> AppResult<()> {
+        Ok(())
+    }
     fn state_snapshot(
         &mut self,
         principal: &PrincipalId,
@@ -1402,6 +1432,17 @@ impl ProjectSourcePort for BorrowedProjectSource<'_> {
     ) -> AppResult<SceneSource> {
         self.authorize(principal, project, Some(context))?;
         validate("ScenePatch", patch)?;
+        self.data
+            .try_borrow_mut()
+            .map_err(|_| source_busy())?
+            .admit_scene_source_resources_with_store(
+                &self.store,
+                principal,
+                project,
+                patch,
+                context,
+                self.access.budget(),
+            )?;
         let artifact = decode_resource(&patch["sourceArtifact"])?;
         let map = decode_resource(&patch["sourceMap"])?;
         let artifact_bytes = self.resource_bytes(

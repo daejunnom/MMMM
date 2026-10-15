@@ -187,7 +187,9 @@ pub(crate) fn serve_host_exchange<I: ManagementIo>(
     if public.kind() != ManagementKind::Offer {
         return Err(ManagementError::InvalidFrame.into());
     }
-    let offer = if public.is_calibration_plan() {
+    let offer = if public.is_manual_scene() {
+        HostOffer::manual_scene(public)?
+    } else if public.is_calibration_plan() {
         HostOffer::calibration_plan(public)?
     } else if public.is_calibration_owner_selection() {
         HostOffer::owner_selection(public)?
@@ -197,12 +199,13 @@ pub(crate) fn serve_host_exchange<I: ManagementIo>(
         HostOffer::from_raw(public, raw_token)?
     };
     let owner_selection = offer.public().is_calibration_owner_selection();
-    let calibration_plan = offer.public().is_calibration_plan();
+    let native_preparation = offer.public().is_native_preparation();
+    let manual_scene = offer.public().is_manual_scene();
     let witness = offer.witness().clone();
-    if calibration_plan {
-        // A frozen plan remains saved if any subsequent delivery fails. Its
-        // Finished receipt is consumed only by the private plan entry, never by
-        // pairing or approval rollback.
+    if native_preparation {
+        // A saved preparation remains durable after delivery failure. Its
+        // original subtype remains on the witness so Finished reaches only
+        // that private entry, never pairing or approval rollback.
         let finish = NativeFinish {
             sender,
             witness: witness.clone(),
@@ -213,7 +216,7 @@ pub(crate) fn serve_host_exchange<I: ManagementIo>(
             let prepared = sender
                 .submit(ManagementRequest::Offer(offer), budget)?
                 .wait()?;
-            if !prepared.is_calibration_plan() {
+            if !prepared.is_native_preparation() || prepared.is_manual_scene() != manual_scene {
                 return Err(ManagementError::WrongReply.into());
             }
             write_public(io, &prepared, budget)?;
@@ -308,6 +311,7 @@ impl<I: ManagementIo> HostAttachClient<I> {
         let (public, token, _) = offer.into_parts();
         let owner_selection = public.is_native_owner_command();
         let calibration_plan = public.is_calibration_plan();
+        let manual_scene = public.is_manual_scene();
         let approval = public.value()["kind"] == "host_apply_approval_offer";
         let mut pending = Self {
             io,
@@ -331,6 +335,7 @@ impl<I: ManagementIo> HostAttachClient<I> {
         }
         if authority.is_native_owner_command() != owner_selection
             || authority.is_calibration_plan() != calibration_plan
+            || authority.is_manual_scene() != manual_scene
         {
             return Err(ManagementError::WrongReply.into());
         }
@@ -416,7 +421,7 @@ impl<I: ManagementIo> Drop for HostAttachClient<I> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::{
         collections::VecDeque,
         sync::{Arc, Mutex},
@@ -461,7 +466,7 @@ mod tests {
             Ok(())
         }
         fn disconnect(&mut self, _: &BootstrapBudget) -> Result<(), PeerError> {
-            panic!("client fixture never invokes server disconnect")
+            Ok(())
         }
         fn wait_disconnect(
             &mut self,
@@ -626,6 +631,186 @@ mod tests {
             Err(ExchangeError::Native(PeerError::Protocol))
         ));
         assert!(budget.check().is_ok());
+    }
+
+    #[test]
+    fn manual_scene_preparation_keeps_its_closed_tokenless_finished_identity() {
+        let manual = json!({"kind":"native_manual_scene_offer","protocolVersion":"0.2.0","nonce":"manual-staged",
+            "purpose":crate::peer_management::MANUAL_SCENE_PURPOSE,"dataRoot":std::env::temp_dir(),"projectId":"project-fixture",
+            "expectedRevision":"a".repeat(64),"contextId":"context-fixture","selectionResourceId":"selection-fixture",
+            "sourceMapResourceId":"source-map-fixture","editPayloadResourceId":"edit-payload-fixture",
+            "sourceMapFile":std::env::temp_dir().join("manual-source-map.json"),
+            "editPayloadFile":std::env::temp_dir().join("manual-edit-payload.json"),
+            "allowedDeltas":[{"instanceId":"instance-fixture","nodeId":"node-fixture","kind":"update_transform"},
+                {"instanceId":"instance-fixture","nodeId":"node-fixture","kind":"update_display"}]});
+        let offer =
+            HostOffer::manual_scene(PublicFrame::from_value(manual.clone()).unwrap()).unwrap();
+        assert!(offer.witness().is_manual_scene());
+        assert!(!offer.witness().is_calibration_plan());
+        let installed_frame = PublicFrame::from_value(json!({"kind":"host_pairing_installed","protocolVersion":"0.2.0",
+            "nonce":"manual-staged","hostEndpoint":{"address":"127.0.0.1:32123","path":"/rpc","hostEpoch":"host-staged"}})).unwrap();
+        assert!(ManagementRequest::installed(installed_frame, offer.witness().clone()).is_err());
+        assert!(offer.into_parts().1.is_none());
+        assert!(
+            HostOffer::calibration_plan(PublicFrame::from_value(manual.clone()).unwrap()).is_err()
+        );
+        assert!(
+            HostOffer::owner_selection(PublicFrame::from_value(manual.clone()).unwrap()).is_err()
+        );
+        for field in [
+            "sourceRef",
+            "rights",
+            "sourceBytes",
+            "principalId",
+            "capability",
+        ] {
+            let mut forged = manual.clone();
+            forged[field] = json!(true);
+            assert!(PublicFrame::from_value(forged).is_err());
+        }
+        for (field, value) in [
+            (
+                "purpose",
+                json!(crate::peer_management::CALIBRATION_PLAN_PURPOSE),
+            ),
+            ("selectionResourceId", manual["sourceMapResourceId"].clone()),
+            (
+                "editPayloadResourceId",
+                manual["sourceMapResourceId"].clone(),
+            ),
+            ("sourceMapResourceId", manual["selectionResourceId"].clone()),
+            ("dataRoot", json!("relative")),
+            ("sourceMapFile", json!("relative-map.json")),
+            ("editPayloadFile", json!("relative-edit.json")),
+            ("contextId", json!("")),
+            ("expectedRevision", json!("A".repeat(64))),
+        ] {
+            let mut forged = manual.clone();
+            forged[field] = value;
+            assert!(PublicFrame::from_value(forged).is_err());
+        }
+        for field in ["sourceMapFile", "editPayloadFile"] {
+            let mut missing = manual.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(PublicFrame::from_value(missing).is_err());
+            let mut oversized = manual.clone();
+            oversized[field] = json!(std::env::temp_dir().join("x".repeat(4097)));
+            assert!(PublicFrame::from_value(oversized).is_err());
+            let mut control = manual.clone();
+            control[field] = json!(format!("{}\n", std::env::temp_dir().display()));
+            assert!(PublicFrame::from_value(control).is_err());
+        }
+        let mut forged = manual.clone();
+        forged["allowedDeltas"][1] = forged["allowedDeltas"][0].clone();
+        assert!(PublicFrame::from_value(forged).is_err());
+        let mut forged = manual.clone();
+        forged["allowedDeltas"][0]["kind"] = json!("set_animation");
+        assert!(PublicFrame::from_value(forged).is_err());
+        let mut forged = manual.clone();
+        forged["allowedDeltas"][0]["sourceRef"] = json!(true);
+        assert!(PublicFrame::from_value(forged).is_err());
+        let mut forged = manual.clone();
+        forged["allowedDeltas"] = Value::Array((0..257).map(|index| {
+            json!({"instanceId":"instance-fixture","nodeId":format!("node-{index}"),"kind":"update_transform"})
+        }).collect());
+        assert!(PublicFrame::from_value(forged).is_err());
+
+        // The existing byte fixture now exercises the actual server path too:
+        // no 32-byte host capability follows this strictly validated offer.
+        for (outcome, acknowledgement, delivered) in [
+            ("prepared", MANAGEMENT_ACK, true),
+            ("committed_checkpoint_failed", 0_u8, false),
+        ] {
+            let prepared = json!({"kind":"native_manual_scene_prepared","protocolVersion":"0.2.0","nonce":"manual-staged",
+                "projectId":"project-fixture","patchId":"patch-fixture","resource":{"resourceId":"patch-resource-fixture",
+                    "sha256":"b".repeat(64),"mediaType":"application/json","sizeBytes":12},"outcome":outcome});
+            let frame = PublicFrame::from_value(manual.clone())
+                .unwrap()
+                .encode()
+                .unwrap();
+            let input = frame
+                .length_prefix()
+                .into_iter()
+                .chain(frame.payload().iter().copied())
+                .chain([acknowledgement])
+                .collect();
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let mut io = ObservedIo {
+                input,
+                writes: writes.clone(),
+                eof_error: None,
+            };
+            let budget = BootstrapBudget::with_deadline(Instant::now() + Duration::from_secs(2));
+            let (sender, receiver) = crate::peer_management::management_channel();
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| serve_host_exchange(&mut io, &sender, &budget));
+                let receive = || {
+                    let deadline = Instant::now() + Duration::from_secs(1);
+                    loop {
+                        if let Some(envelope) = receiver.try_receive().unwrap() {
+                            break envelope;
+                        }
+                        assert!(Instant::now() < deadline);
+                        std::thread::yield_now();
+                    }
+                };
+                let (request, responder) = receive().into_parts().unwrap();
+                let ManagementRequest::Offer(offer) = request else {
+                    panic!("manual offer expected")
+                };
+                assert!(offer.public().is_manual_scene());
+                assert!(offer.witness().is_manual_scene());
+                assert!(!offer.witness().is_calibration_plan());
+                assert!(offer.into_parts().1.is_none());
+                responder
+                    .unwrap()
+                    .respond(Ok(PublicFrame::from_value(prepared.clone()).unwrap()))
+                    .unwrap();
+                let (request, responder) = receive().into_parts().unwrap();
+                assert!(responder.is_none());
+                let ManagementRequest::Finished(finished) = request else {
+                    panic!("native finish expected")
+                };
+                assert!(finished.witness().is_manual_scene());
+                assert!(!finished.witness().is_calibration_plan());
+                assert_eq!(finished.delivered(), delivered);
+                assert_eq!(
+                    finished.failure(),
+                    (!delivered).then_some(PeerError::Protocol)
+                );
+                assert_eq!(worker.join().unwrap().is_ok(), delivered);
+            });
+            assert!(io.input.is_empty());
+            let bytes = writes.lock().unwrap().concat();
+            let reply = PublicFrame::decode(&bytes[4..]).unwrap();
+            assert!(reply.is_manual_scene());
+            assert_eq!(reply.value(), &prepared);
+
+            let encoded = reply.encode().unwrap();
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let io = ObservedIo {
+                input: encoded
+                    .length_prefix()
+                    .into_iter()
+                    .chain(encoded.payload().iter().copied())
+                    .collect(),
+                writes: writes.clone(),
+                eof_error: None,
+            };
+            let offer =
+                HostOffer::manual_scene(PublicFrame::from_value(manual.clone()).unwrap()).unwrap();
+            let length = offer.public().encode().unwrap().payload().len();
+            let (mut pending, reply) =
+                HostAttachClient::offer(io, offer, BootstrapBudget::new()).unwrap();
+            assert!(reply.is_manual_scene());
+            assert_eq!(
+                writes.lock().unwrap().iter().map(Vec::len).sum::<usize>(),
+                HOST_MAGIC.len() + 4 + length
+            );
+            assert!(pending.installed_staged(installed()).is_err());
+            pending.complete_delivery().unwrap();
+            assert_eq!(ack_count(&writes), 1);
+        }
     }
 
     #[test]

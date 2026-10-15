@@ -85,6 +85,11 @@ pub struct FeatureAccess {
 /// must retain immutable ResourceRef metadata and exact-source rights evidence.
 pub trait FeatureResourcePort: ResourcePort {
     fn stage(&mut self, resource: &Value, bytes: &[u8]) -> ExchangeResult<()>;
+    /// Only the owning FN24 call marks its original canonical selection.
+    /// This provenance grants neither asset rights nor game-write authority.
+    fn stage_exchange_selection(&mut self, resource: &Value, bytes: &[u8]) -> ExchangeResult<()> {
+        self.stage(resource, bytes)
+    }
 }
 
 pub struct MathInputs {
@@ -128,6 +133,19 @@ pub struct ManualSceneInputs {
 /// Optional missing backends return SOURCE_UNAVAILABLE/CAPABILITY_UNAVAILABLE;
 /// they must not infer readiness from provider declarations or fixture claims.
 pub trait FeatureSources {
+    /// Private same-owner selection only; ordinary FN28 DTOs cannot register a
+    /// manual codec or replace the current service request/Store authority.
+    fn import_manual_scene(
+        &mut self,
+        _selection: &crate::native_manual_exchange::NativeManualSelection,
+        _owner: &crate::workspace_bootstrap::NativeOwnerWitness,
+        _context: &mut ServiceExtensionContext<'_>,
+    ) -> Result<crate::native_manual_exchange::ManualSceneReceipt, ServiceError> {
+        Err(ServiceError::new(
+            "SOURCE_UNAVAILABLE",
+            "Native static manual source is unavailable",
+        ))
+    }
     fn access(
         &mut self,
         principal: &AuthenticatedPrincipal,
@@ -864,6 +882,15 @@ impl FeatureExtension {
 }
 
 impl ServiceExtension for FeatureExtension {
+    fn import_manual_scene(
+        &mut self,
+        selection: &crate::native_manual_exchange::NativeManualSelection,
+        owner: &crate::workspace_bootstrap::NativeOwnerWitness,
+        context: &mut ServiceExtensionContext<'_>,
+    ) -> Result<crate::native_manual_exchange::ManualSceneReceipt, ServiceError> {
+        context.check("scene.diff")?;
+        self.sources.import_manual_scene(selection, owner, context)
+    }
     fn call(
         &mut self,
         method: &str,
@@ -1026,9 +1053,26 @@ fn stage_bundle(
             }
             verify_resource(&payload["resource"], bytes, limits.max_member_bytes)
                 .map_err(exchange_error)?;
-            resources
-                .stage(&payload["resource"], bytes)
-                .map_err(exchange_error)?;
+            let canonical_selection = payload["kind"] == "opaque_source"
+                && payload["resource"]["mediaType"]
+                    == "application/vnd.mmmm.canonical-selection+json"
+                || payload["kind"] == "selection"
+                    && manifest["preservedFeatures"]
+                        .as_array()
+                        .is_none_or(|features| {
+                            features
+                                .iter()
+                                .all(|feature| feature != mmmm_exchange::normalization::PROFILE)
+                        });
+            if canonical_selection {
+                resources
+                    .stage_exchange_selection(&payload["resource"], bytes)
+                    .map_err(exchange_error)?;
+            } else {
+                resources
+                    .stage(&payload["resource"], bytes)
+                    .map_err(exchange_error)?;
+            }
         }
     }
     let manifest_bytes = mmmm_contracts::encode_json(manifest).map_err(|_| limit())?;
@@ -1095,7 +1139,7 @@ fn stable_bundle_manifest(
     Ok(manifest)
 }
 
-fn stable_patch(
+pub(crate) fn stable_patch(
     mut patch: Value,
     access: &FeatureAccess,
     selection: &Selection,
@@ -1232,6 +1276,12 @@ impl<'a> BudgetResources<'a> {
         self.account(bytes.len() as u64)?;
         verify_resource(reference, bytes, MAX_CALL_RESOURCE_BYTES)?;
         self.inner.stage(reference, bytes)?;
+        self.check()
+    }
+    fn stage_exchange_selection(&mut self, reference: &Value, bytes: &[u8]) -> ExchangeResult<()> {
+        self.account(bytes.len() as u64)?;
+        verify_resource(reference, bytes, MAX_CALL_RESOURCE_BYTES)?;
+        self.inner.stage_exchange_selection(reference, bytes)?;
         self.check()
     }
 }
@@ -1421,7 +1471,7 @@ pub(crate) fn wire_deadline(budget: &RequestBudget) -> Result<String, ServiceErr
         .format(&time::format_description::well_known::Rfc3339)
         .map_err(|_| invalid_source())
 }
-fn content_resource(prefix: &str, media_type: &str, bytes: &[u8]) -> Value {
+pub(crate) fn content_resource(prefix: &str, media_type: &str, bytes: &[u8]) -> Value {
     let hash = raw_digest(bytes);
     json!({"resourceId":format!("{prefix}-{}", &hash.as_str()[..24]), "sha256":hash, "mediaType":media_type, "sizeBytes":bytes.len()})
 }

@@ -285,6 +285,33 @@ fn source_fixture(
     budget: RequestBudget,
     read: impl FnMut(&mut DurableStore, RequestContextWitness) -> AppResult<Value> + 'static,
 ) -> FactorySourceFixture {
+    let mut extensions = ExtensionRouter::default();
+    extensions
+        .register(
+            ["scene.diff"],
+            Box::new(FactorySourceExtension {
+                request: handles.request.clone(),
+                read: Box::new(read),
+            }),
+        )
+        .unwrap();
+    authenticated_feature_fixture(
+        store,
+        handles,
+        parts,
+        budget,
+        Some(extensions),
+        &["scene.diff"],
+    )
+}
+fn authenticated_feature_fixture(
+    store: DurableStore,
+    handles: &DaemonHandles,
+    parts: DaemonSourceParts,
+    budget: RequestBudget,
+    extensions: Option<ExtensionRouter>,
+    methods: &[&str],
+) -> FactorySourceFixture {
     let workspace = handles.workspace.as_ref().unwrap();
     let context = ContextId::new(workspace.context["contextId"].as_str().unwrap()).unwrap();
     let planner = StoreAwarePlanner::new(PlanningComposition {
@@ -311,22 +338,22 @@ fn source_fixture(
         },
     );
     service.bind_request_context(handles.request.clone());
-    let mut extensions = ExtensionRouter::default();
-    extensions
-        .register(
-            ["scene.diff"],
-            Box::new(FactorySourceExtension {
-                request: handles.request.clone(),
-                read: Box::new(read),
-            }),
-        )
-        .unwrap();
+    let extensions = extensions.unwrap_or_else(|| {
+        let mut extensions = ExtensionRouter::default();
+        extensions
+            .register(
+                FEATURE_METHODS.iter().copied(),
+                Box::new(FeatureExtension::new(parts.features, handles.hosts.clone()).unwrap()),
+            )
+            .unwrap();
+        extensions
+    });
     service.set_extensions(extensions);
     let mut sessions = SessionAuthority::new(1).unwrap();
     let token = sessions
         .install(SessionPolicy {
             principal: workspace.witness.principal().clone(),
-            allowed_methods: ["scene.diff".to_owned()].into(),
+            allowed_methods: methods.iter().map(|method| (*method).to_owned()).collect(),
             allowed_contexts: [context].into(),
             lifetime: Duration::from_secs(30),
         })
@@ -595,6 +622,336 @@ fn raw_resource(id: ResourceId, bytes: &[u8]) -> ResourceRef {
         media_type: "application/json".into(),
         size_bytes: bytes.len() as u64,
     }
+}
+
+#[test]
+fn original_fn24_selection_and_explicit_manual_files_reach_common_scene_plan_without_game_claims() {
+    use crate::{
+        catalog_source::{
+            CatalogEnvironmentRegistration, CatalogSourceBacking, CatalogSourceRegistration,
+        },
+        native_manual_exchange::NativeManualSelection,
+    };
+    use mmmm_exchange::{patch::DeltaKind, selection::ObjectNode};
+    use mmmm_reference::{CatalogLayer, CatalogSourceCodec, CatalogSourceRole};
+    use mmmm_runtime::storage::{
+        BlobRef,
+        owned_documents::{OwnedDocumentKind, OwnedDocumentPin},
+    };
+
+    // Reuse the actual protected Store, native Project and authored source
+    // import fixture. No bake, game observation, source-rights verifier or
+    // alternative session/receipt issuer is introduced for this regression.
+    let root = TestRoot::new();
+    let mut store = root.open();
+    let mut handles = handles(&mut store);
+    let budget =
+        RequestBudget::new(Duration::from_secs(30), Arc::new(AtomicBool::new(false))).unwrap();
+    let inputs = native_owned_scene(&mut store, &mut handles, &budget);
+    let original_project = store.project(inputs.catalog.project_id()).unwrap();
+    let workspace = handles.workspace.as_ref().unwrap();
+    let context = workspace.context.clone();
+    let original_scope = context["scope"].clone();
+    let original_policy = context["policyRevision"].clone();
+    let context_id = ContextId::new(context["contextId"].as_str().unwrap()).unwrap();
+    let mut factory = ProductionFactory::offline_owned(binary_digest());
+    let parts = factory.compose(&handles, &store).unwrap();
+    let registries = factory.registries().unwrap().clone();
+    let mut fixture = authenticated_feature_fixture(
+        store,
+        &handles,
+        parts,
+        budget.clone(),
+        None,
+        &[
+            "catalog.capture",
+            "exchange.prepare",
+            "exchange.inspect",
+            "scene.diff",
+            "scene.plan",
+        ],
+    );
+
+    // This existing native owner selects its real retained authored document
+    // for local reference capture only. It grants no redistribution rights.
+    // The capture's explicit offline input consists of this one authored
+    // source, with no selected pack or mod inputs. These source metadata labels
+    // describe that extraction; they are not a connected-game observation.
+    registries.catalog.register(
+        &fixture.authenticated, &budget, fixture.service.management_store(),
+        CatalogEnvironmentRegistration {
+            context: context.clone(), game_version: Some("26.3".into()), locale: Some("en_us".into()),
+            artifact_source: None, server_pack_sources: Some(vec![]), client_pack_sources: Some(vec![]),
+            mod_sources: Some(BTreeMap::new()),
+            registry_generation: Some(format!("authored-source-{}", raw_digest(&encode_json(&inputs.prefab).unwrap()))),
+            native_mod_ids: BTreeMap::new(),
+            sources: vec![CatalogSourceRegistration {
+                source: json!({"sourceId":"source-manual-owned-prefab","kind":"project_declared",
+                    "locator":"mmmm-source://unresolved","sha256":null,"rights":"user_local_only",
+                    "verifiedAt":"2026-10-14T00:00:00Z"}),
+                layer: CatalogLayer::LocalArtifact, role: CatalogSourceRole::CatalogData,
+                codec: CatalogSourceCodec::JsonAsset {
+                    kind: mmmm_contracts::ResourceLocation::new("mmmm:prefab_source").unwrap(),
+                    resource_id: mmmm_contracts::ResourceLocation::new("example:shop").unwrap(),
+                    value_type: "raw_prefab_source".into(), unit: "unitless".into(),
+                },
+                backing: CatalogSourceBacking::OwnedDocument(OwnedDocumentPin {
+                    kind: OwnedDocumentKind::Prefab,
+                    object_id: serde_json::from_value(inputs.prefab["prefabId"].clone()).unwrap(),
+                    revision: serde_json::from_value(inputs.prefab["revision"].clone()).unwrap(),
+                }),
+            }],
+        },
+    ).unwrap();
+    let sources = registries
+        .catalog
+        .source_refs(&fixture.authenticated, &context_id, &budget)
+        .unwrap();
+    let snapshot = fixture
+        .service
+        .call(
+            &fixture.authenticated,
+            "catalog.capture",
+            &json!({
+                "contextId":context_id,"environment":context["environment"],"sources":sources,
+                "kind":"local_artifact","loadPolicy":"no_implicit_runtime_mutation",
+            }),
+            &budget,
+        )
+        .unwrap();
+    assert_eq!(snapshot["sources"][0]["rights"], "user_local_only");
+    let mut selection =
+        parse_json(include_bytes!("../../../examples/scene-selection.json")).unwrap();
+    selection["projectId"] = json!(inputs.catalog.project_id());
+    selection["projectRevision"] = json!(inputs.catalog.revision());
+    selection["prefabs"] = json!([inputs.prefab]);
+    selection["instances"] = json!([inputs.instance]);
+    selection["selectedNodeIds"] = json!(["door"]);
+    selection["sourceMap"] = inputs.patch["sourceMap"].clone();
+    let coordinates = parse_json(include_bytes!("../../../examples/exchange-manifest.json"))
+        .unwrap()["coordinates"]
+        .clone();
+    let manifest = fixture.service.call(&fixture.authenticated, "exchange.prepare", &json!({
+        "contextId":context_id,"selection":selection,"dataSnapshotId":snapshot["snapshotId"],"coordinates":coordinates,
+    }), &budget).unwrap();
+    let selection_pin = manifest["payloads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|payload| payload["kind"] == "selection")
+        .unwrap()["resource"]
+        .clone();
+    assert_eq!(
+        selection_pin["sha256"],
+        json!(raw_digest(&encode_json(&selection).unwrap()))
+    );
+    assert!(
+        !original_project["resourceIds"]
+            .as_array()
+            .unwrap()
+            .contains(&selection_pin["resourceId"])
+    );
+    assert_eq!(
+        manifest["payloads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|payload| payload["kind"] == "source_map")
+            .unwrap()["redistribution"],
+        "unknown"
+    );
+
+    let map_id = ResourceId::new("resource-native-manual-return-map").unwrap();
+    let payload_id = ResourceId::new("resource-native-manual-return-patch").unwrap();
+    let map = json!({"contractVersion":"0.2.0","generatorVersion":"manual-authored-static",
+        "inputRevision":inputs.catalog.revision(),"entries":[{"sourceObjectId":"instance-shop-a",
+            "sourceNodeId":"door","outputResourceId":payload_id,"locator":"/entries/0"}]});
+    // Preserve deliberately noncanonical file bytes: the source pins must bind
+    // the selected files, rather than a reserialized replacement document.
+    let map_bytes = [b" \n".as_slice(), &encode_json(&map).unwrap(), b"\n "].concat();
+    let map_pin = raw_resource(map_id.clone(), &map_bytes);
+    let mut transform = selection["prefabs"][0]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["nodeId"] == "door")
+        .unwrap()["transform"]
+        .clone();
+    transform["translation"] = json!([3, 2, 0]);
+    let payload = json!({"contractVersion":"0.2.0","patchId":"patch-native-manual-file-input",
+        "projectId":inputs.catalog.project_id(),"baseRevision":inputs.catalog.revision(),
+        "sourceArtifact":selection_pin,"sourceMap":map_pin,"entries":[{"kind":"update_transform",
+            "instanceId":"instance-shop-a","nodeId":"door","transform":transform}],
+        "losses":[],"absenceMeansDeletion":false});
+    let payload_bytes = [b"\n ".as_slice(), &encode_json(&payload).unwrap(), b" \n"].concat();
+    let payload_pin = raw_resource(payload_id.clone(), &payload_bytes);
+    let map_path = root.0.join("manual-return-map.json");
+    let payload_path = root.0.join("manual-return-patch.json");
+    fs::write(&map_path, &map_bytes).unwrap();
+    fs::write(&payload_path, &payload_bytes).unwrap();
+    // The production selector takes ordinary Windows paths. Keep the root's
+    // canonical spelling for the existing fixture's ownership and cleanup.
+    let ordinary = |path: &Path| {
+        #[cfg(windows)]
+        let selected = PathBuf::from(
+            path.to_str()
+                .unwrap()
+                .strip_prefix("\\\\?\\")
+                .unwrap_or(path.to_str().unwrap()),
+        );
+        #[cfg(not(windows))]
+        let selected = path.to_path_buf();
+        assert_eq!(fs::canonicalize(&selected).unwrap(), path);
+        selected
+    };
+    let native = NativeManualSelection {
+        project_id: inputs.catalog.project_id().clone(),
+        expected_revision: inputs.catalog.revision().clone(),
+        context_id: context_id.clone(),
+        selection_resource: serde_json::from_value(selection_pin["resourceId"].clone()).unwrap(),
+        source_map_resource: map_id,
+        edit_payload_resource: payload_id,
+        source_map_file: ordinary(&map_path),
+        edit_payload_file: ordinary(&payload_path),
+        allowed_deltas: vec![(
+            ObjectNode {
+                instance_id: "instance-shop-a".into(),
+                node_id: "door".into(),
+            },
+            DeltaKind::UpdateTransform,
+        )],
+    };
+    let mut stale = native.clone();
+    stale.expected_revision = raw_digest(b"A different native Project head");
+    assert_eq!(
+        fixture
+            .service
+            .import_manual_scene(&fixture.authenticated, &stale, &budget)
+            .unwrap_err()
+            .code,
+        "REVISION_CONFLICT"
+    );
+    assert_eq!(
+        fixture
+            .service
+            .management_store()
+            .project(inputs.catalog.project_id())
+            .unwrap(),
+        original_project
+    );
+    let receipt = fixture
+        .service
+        .import_manual_scene(&fixture.authenticated, &native, &budget)
+        .unwrap();
+    assert_eq!(receipt.project_id, *inputs.catalog.project_id());
+    let patch_bytes = fixture
+        .service
+        .management_store()
+        .read_blob(&BlobRef {
+            digest: receipt.resource.sha256.clone(),
+            byte_length: receipt.resource.size_bytes,
+        })
+        .unwrap();
+    let patch = parse_json(&patch_bytes).unwrap();
+    assert_eq!(patch["sourceArtifact"], selection_pin);
+    assert_eq!(patch["sourceMap"], json!(map_pin));
+    assert_eq!(patch["entries"], payload["entries"]);
+    assert_eq!(patch["baseRevision"], json!(inputs.catalog.revision()));
+    assert_eq!(patch["losses"], json!([]));
+    assert_eq!(patch["absenceMeansDeletion"], false);
+    assert!(patch.get("artifactId").is_none());
+    for (pin, original) in [(&map_pin, &map_bytes), (&payload_pin, &payload_bytes)] {
+        assert_eq!(
+            fixture
+                .service
+                .management_store()
+                .read_blob(&BlobRef {
+                    digest: pin.sha256.clone(),
+                    byte_length: pin.size_bytes,
+                })
+                .unwrap(),
+            *original
+        );
+    }
+    assert_eq!(
+        fixture
+            .service
+            .management_store()
+            .project(inputs.catalog.project_id())
+            .unwrap(),
+        original_project
+    );
+    assert_eq!(
+        handles
+            .authority
+            .project_scope(
+                fixture.authenticated.principal(),
+                inputs.catalog.project_id()
+            )
+            .unwrap(),
+        original_scope
+    );
+    assert_eq!(
+        json!(
+            handles
+                .authority
+                .policy_revision(
+                    fixture.authenticated.principal(),
+                    inputs.catalog.project_id()
+                )
+                .unwrap()
+        ),
+        original_policy
+    );
+    assert!(handles.request.current().is_err());
+
+    // Exercise the actual common planner. A successful static import is not a
+    // game target/source/Apply approval, so real target admission stays closed.
+    let planning = json!({"contextId":context_id,"patch":patch});
+    let unavailable = fixture
+        .service
+        .call(&fixture.authenticated, "scene.plan", &planning, &budget)
+        .unwrap_err();
+    assert_eq!(unavailable.code, "CONTEXT_UNKNOWN");
+    assert_eq!(
+        fixture
+            .service
+            .management_store()
+            .project(inputs.catalog.project_id())
+            .unwrap(),
+        original_project
+    );
+    assert!(handles.request.current().is_err());
+
+    // Reading unchanged files/CAS cannot revive the original session or grant.
+    fixture._sessions.revoke_all();
+    assert_eq!(
+        fixture
+            .service
+            .import_manual_scene(&fixture.authenticated, &native, &budget)
+            .unwrap_err()
+            .code,
+        "PERMISSION_REQUIRED"
+    );
+    assert_eq!(
+        fixture
+            .service
+            .call(&fixture.authenticated, "scene.plan", &planning, &budget)
+            .unwrap_err()
+            .code,
+        "PERMISSION_REQUIRED"
+    );
+    assert_eq!(
+        fixture
+            .service
+            .management_store()
+            .read_blob(&BlobRef {
+                digest: receipt.resource.sha256,
+                byte_length: receipt.resource.size_bytes,
+            })
+            .unwrap(),
+        patch_bytes
+    );
 }
 
 #[test]

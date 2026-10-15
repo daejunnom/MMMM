@@ -51,6 +51,14 @@ SHA-256 목록과 대조한 뒤 계약, 예제, 정책 및 인수 자료를 도�
 Project가 필요하며 계획 생성 자체가 게임 설치·ADMIN 승인·실행·target profile 인수를
 뜻하지 않는다. 최초 runner와 독립 readback의 실제 게임 연결은 아직 구현 중이다.
 
+`manual-import`는 기존 Coordinator에서 원 `exchange.prepare` selection과 명시적으로
+선택한 SourceMap·ScenePatch 파일을 같은 CAS의 공통 `scene.diff`/`scene.plan` 경로에
+연결한다. `--help`의 Project/head/context, 세 resource ID, 두 절대 파일 경로와
+`--allow-delta <kind,instanceId,nodeId>`를 선택한다. SourceMap은 편집 payload의 resource
+ID를 참조하고 편집 patch는 SourceMap의 정확한 Ref를 참조한다. 원 파일과 Project head,
+Unknown 권리는 유지한다. 실제 sealed bake 없이 clip 부착을 허용하지 않으며 정적 patch
+저장 성공을 게임 적용이나 EX14 전체 인수 완료로 표시하지 않는다.
+
 ## 출시 조건
 
 필수 인수 항목에는 실제 결과와 source, target, artifact 식별 근거를 연결한다.
