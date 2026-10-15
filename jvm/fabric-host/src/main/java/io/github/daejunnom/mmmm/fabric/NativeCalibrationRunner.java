@@ -146,7 +146,8 @@ final class NativeCalibrationRunner implements NativeCalibrationApproval.Runner,
             var parsed = server.getCommands().getDispatcher().parse(new StringReader(program.command()), source);
             trace = new Trace(original, program, admitted.function(), actualLevel, parsed.getContext().build(program.command()).getCommand());
             NativeCommandDispatch.Observation returned;
-            try (var scope = NativeCalibrationStageHooks.open(trace)) {
+            var scope = NativeCalibrationStageHooks.open(trace);
+            try (scope) {
                 current(original, control); trace.control = control;
                 try { returned = NativeCommandDispatch.executeObserved(server, parsed); }
                 finally { trace.control = null; }

@@ -21,7 +21,8 @@ final class NativeCalibrationStageHooksTest {
                 assertSame(primary, failure); assertNull(result); throw post;
             }
         };
-        try (var scope = NativeCalibrationStageHooks.open(listener)) {
+        var scope = NativeCalibrationStageHooks.open(listener);
+        try (scope) {
             assertSame(primary, assertThrows(RuntimeException.class,
                     () -> NativeCalibrationStageHooks.nativeHandler(context -> { throw primary; }, null)));
             assertArrayEquals(new Throwable[] {post}, primary.getSuppressed());
@@ -36,7 +37,8 @@ final class NativeCalibrationStageHooksTest {
                 assertSame(primary, failure); throw post;
             }
         };
-        try (var scope = NativeCalibrationStageHooks.open(listener)) {
+        var scope = NativeCalibrationStageHooks.open(listener);
+        try (scope) {
             assertSame(primary, assertThrows(RuntimeException.class, () -> NativeCalibrationStageHooks.nativeCustom(new Object(), new Object(), new Object(), true,
                     () -> { calls.incrementAndGet(); throw primary; })));
             assertEquals(1, calls.get()); assertArrayEquals(new Throwable[] {post}, primary.getSuppressed());
@@ -47,7 +49,8 @@ final class NativeCalibrationStageHooksTest {
         var listener = new Listener() {
             @Override public void afterResultCallback(CommandContext<?> context, Throwable failure) { assertSame(primary, failure); throw post; }
         };
-        try (var scope = NativeCalibrationStageHooks.open(listener)) {
+        var scope = NativeCalibrationStageHooks.open(listener);
+        try (scope) {
             assertSame(primary, assertThrows(RuntimeException.class, () -> NativeCalibrationStageHooks.nativeResultCallback((context, success, result) -> {
                 effects.incrementAndGet(); assertFalse(success); assertEquals(0, result); throw primary;
             }, null, false, 0)));
@@ -57,7 +60,8 @@ final class NativeCalibrationStageHooksTest {
     @Test void precheckFailurePreventsEffectAndNestedScopeCannotReplaceOwner() {
         AtomicInteger calls = new AtomicInteger(); ContractException denied = new ContractException("CANCELLATION_REQUESTED", "fixture");
         var listener = new Listener() { @Override public void beforeHandler(Object handler, CommandContext<?> context) { throw denied; } };
-        try (var scope = NativeCalibrationStageHooks.open(listener)) {
+        var scope = NativeCalibrationStageHooks.open(listener);
+        try (scope) {
             assertEquals("CALIBRATION_STAGE_REENTRANT", assertThrows(ContractException.class, () -> NativeCalibrationStageHooks.open(new Listener())).code());
             assertSame(denied, assertThrows(ContractException.class, () -> NativeCalibrationStageHooks.nativeHandler(context -> calls.incrementAndGet(), null)));
         }
