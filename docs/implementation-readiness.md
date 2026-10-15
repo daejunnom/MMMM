@@ -713,8 +713,8 @@ namespace `official`·게임 26.3·Loom 1.17.21·Gradle 9.6.0·loader 0.19.5를 
 또는 세 OS에서 배포할 동일 파일의 인수를 의미하지 않는다.
 
 관련 실행의 drain·출력·export·scratch 정리·lease 해제와 supervisor/cleanup 오류 0을
-확인했다. game root와 정상 stop 제어를 준비하는 동안에도 실제 게임은 미실행이며
-world/config 보존, 실제 관리자 연결과 최종 배포 인수는 별도 단계로 남긴다.
+확인했다. 이 준비 시점에는 실제 게임을 실행하지 않았으며 world/config 보존,
+실제 관리자 연결과 최종 배포 인수는 후속 단계로 남겼다.
 
 [공식 Fabric server launcher 페이지](https://fabricmc.net/use/?page=server)가 제시한
 26.3 / loader 0.19.5 / launcher 1.1.2의 고정 HTTPS 입력을 별도 관리 실행에서
@@ -764,7 +764,7 @@ online mode·RCON/query 비활성화·2명·view/simulation 2의 고정 properti
 command 0·932 ms·helper 524 ms·stderr 0·오류 0이며 원 파일을 덮거나 삭제하지 않았다.
 정상 drain·출력·export·scratch 정리와 root/build lease 해제 뒤 자료를 보존했다.
 이 준비는 실제 mod 로드·ordinary origin 검사·observer 설치나 관리자 pairing을
-대신하지 않는다. EULA와 게임은 계속 미실행이다.
+대신하지 않는다. 이 mod 배치 준비 시점에는 EULA 수락과 게임을 실행하지 않았다.
 
 실제 게임용 observer DLL을 Windows MSVC target으로 locked build했다. command
 0·4,251 ms·명시 owned-tail 종료이며 721,408 bytes·SHA
@@ -777,6 +777,143 @@ ASCII 상대 이름 186자·상한 259 안임을 관측했다. JDK archive·modu
 command 0·1,424 ms·helper 1,008 ms·stderr 0으로 copy와 자료를 보존하고 정상 drain·
 출력·export·scratch 및 root/build lease 해제를 확인했다. 이는 whole-JDK image·
 classpath·SourceAdmission·게임에서의 observer 설치 성공을 의미하지 않는다.
+
+### 같은 설치의 EULA 동의와 게임 및 baseline 실패
+
+사용자가 같은 Windows 개발 설치에 한정해 EULA 동의와 실행을 허용한 뒤, 관리 실행
+309에서 `eula=true` 10 bytes를 CreateNew·flush로 기록했다. SHA는
+`ee27072e4a23e088522f740ddaab0c7c4145c186969e90a86254faa3a5ec5ce6`다.
+이 동의와 기록의 범위는 해당 설치다. 앞의 launcher·mod·observer 준비 기록은 그보다
+이전 시점의 관측으로 보존한다.
+
+| 실제 Windows 실행 | Java 종료와 시간 | 게임 관측 |
+| --- | --- | --- |
+| 310: native agent와 Java agent 모두 사용 | exit 0·9,344 ms | Ready 미관측, 90초 stop 요청 전에 종료·입력 0 bytes, 게임 시작 실패 |
+| 312: 두 agent 인수만 제거한 같은 설치의 baseline | exit 0·3,901 ms | 같은 실패, Ready 미관측, stop 미요청·입력 0 bytes |
+
+첫 오류는 `MixinExtrasConfigPlugin`의 `knot` loader 객체를 `app` loader의
+`IMixinConfigPlugin`으로 cast하지 못한 ClassCastException이다. 이어
+`FabricLoaderImpl`의 target class loader 로드 거절과 Fabric API `LivingEntityMixin`의
+`MIXINEXTRAS:EXPRESSION` injection point 오류, `Failed to start the minecraft server`를
+관측했다. baseline은 같은 설치에서 두 agent 옵션 없이도 같은 실패가 재현됐다는
+근거다. observer의 일반적인 무관성이나 실제 게임 인수를 확정하지 않는다.
+
+두 실행은 17개 사전 input pin과 16개 불변 입력의 사후 pin이 일치했다. 185-byte
+properties는 사전 pin만 확인했고 게임 실행 후 내용은 읽지 않았다. 기존 180초 실행·
+90초 stop 정책, 메모리 2 GiB·process 32개·출력 64 MiB 상한을 유지했다. 위
+721,408-byte DLL의 source와 이후 CI 기준 `da95d0dc8ab88b40b9c4bf142d606f30179bd192`의
+observer crate 사이에는 source 차이가 없음을 대조했다. drain·완전한 출력·export·
+scratch 정리와 root/build lease 해제를 확인했으며 게임 자료를 보존했다. 외부 관리
+종료와 Java exit 0은 위 게임 실패를 성공으로 바꾸지 않는다.
+
+### Windows의 같은 게임 파일에 대한 경로 별칭 관측
+
+관리 실행 314는 baseline에 고정 class-load debug 로그만 추가했다. Java exit 0·
+79,202 ms이며 같은 최초 cast와 게임 시작 실패를 관측했다. stop은 미요청·0 bytes다.
+stdout 19,504 bytes·SHA
+`25e73cecae3e0e2b2a072cb862ef681553dc9bcc3fed911b221d24313ccf5fd2`, stderr
+4,863,762 bytes·SHA
+`a6b0191eab61d5e1322adf85586097380b91fb6c32888680b78f2df5bfcb3d16`를 외부에 보존했다.
+app과 Knot가 같은 Loader 및 Mixin 클래스의 길이·VM checksum을 보고했지만 app의
+원본 URI는 패키지 캐시의 물리 경로, Knot의 URI는 논리 Roaming 경로였다. URI와
+local path는 달랐다. 616-byte launcher의 고정 digest와 두 ZIP entry를 다시 대조해
+정확한 `fabric-server-launch.properties` marker의 존재도 확인했다.
+
+실행 315는 game directory·Sponge Mixin JAR·Fabric Loader JAR의 각 두 경로를
+`fsutil file queryfileid`로 조회했다. 같은 C: drive이고 조상 reparse/device가 없으며
+128-bit file ID 세 쌍이 모두 같았다. command 0·1,079 ms·stderr 0이고 파일 내용·
+owner·lease는 읽지 않았다. 이 순차 메타데이터 관측은 spawn까지 유지되는 handle
+증명이나 별도 volume serial 대조를 대신하지 않는다.
+
+공식 JDK의 app classpath는 Windows IO의 final-handle canonicalization을 사용하지만,
+Fabric의 NIO 경로 집합 비교에는 가상화된 논리 표현이 남을 수 있다. 이는 launcher가
+system library에서 제외되지 않고 manifest의 classpath를 Knot에 노출하는 가설과
+맞는다. 실제 분류 내부를 관측하거나 checksum을 원 class bytes의 SHA로 해석하지는
+않았다. [JDK IO 구현](https://github.com/openjdk/jdk25u/blob/jdk-25.0.4.1%2B1/src/java.base/windows/classes/java/io/WinNTFileSystem.java),
+[JDK NIO 구현](https://github.com/openjdk/jdk25u/blob/jdk-25.0.4.1%2B1/src/java.base/windows/classes/sun/nio/fs/WindowsLinkSupport.java),
+[Fabric 분류](https://github.com/FabricMC/fabric-loader/blob/0.19.5/src/main/java/net/fabricmc/loader/impl/game/LibClassifier.java).
+
+D053의 명시적인 launch directory는 기존 root·owner·lease를 유지하고 held game
+handle의 native volume/file identity와 대조한다. 같은 내용의 다른 디렉터리 거절,
+secret·parent 경로의 사전 거절, 취소와 owner 변경의 동시 원인 보존을 검증했다.
+실행 320은 library 229 PASS·1 ignored와 CLI 4 PASS, 321은 strict all-target Clippy
+0·2,637 ms, 322는 새 runner build 0·920 ms다. 새 runner는 3,073,024 bytes·SHA
+`1550b1921fd45ba67500a2f00e934111c78d57fa333209632146da4df9e83d2b`다.
+
+원 실패도 보존한다. 317은 컴파일 중 timeout 124이며 설정 240초와 달리 실제
+906,203 ms·최대 native 표본 공백 893,565 ms를 기록했고 테스트 결과는 없다.
+원인은 확정하지 않았다. 318은 컴파일 후 228 PASS·1 FAIL·1 ignored로 끝났다.
+새 검사의 `PathBuf::join("..")`가 Windows verbatim 경로를 먼저 정규화했으므로,
+원 parent component를 직접 구성하는 입력으로 고친 뒤 320에서 통과했다. 두 실패의
+drain·출력·export·scratch 정리와 lease 해제는 완료됐으며 실행 상한은 늘리지 않았다.
+이 로컬 도구 검사와 명시 경로의 실제 게임 실행·인수는 별도다.
+
+같은 설치의 실행 324는 두 agent를 다시 사용하고, 기존 논리 owner root를 유지한 채
+명시한 물리 game directory와 그 root에서 파생하는 `-jar`·native agent·입력 pin을
+일관되게 사용했다. 실제 CLI의 explicit alias requested/validated가 모두 true다.
+17개 사전 pin과 16개 불변 입력의 사후 pin이 일치했고 observer 상대 ASCII 이름은
+186 bytes로 기존 259-byte 제한 안이다. 원 EULA·owner·lease·world를 이동하거나
+복사하지 않았으며 properties는 실행 전 기존 185-byte pin만 읽고 닫았다.
+
+서버는 Minecraft 26.3·`mmmm_host 0.1.0`을 로드하고 `127.0.0.1:25565`에서
+`Done (2.147s)`를 기록했다. 앞선 Mixin cast·target-loader 실패는 나타나지 않았다.
+stop 요청은 원 요청 시계 92,069 ms에 관측됐고 실제 private LF 입력 5 bytes를 한 번
+전달했다. 서버의 `Stopping server`·players/worlds/chunks 저장 로그 뒤 Java exit 0·
+90,921 ms·자연 종료·완전한 출력과 drain을 확인했다. 감독 receipt의 game-save ACK는
+계속 `not_observed`이며 이 로그만으로 world 내용의 독립 readback을 발급하지 않는다.
+
+stdout는 16,881 bytes·SHA
+`c856c38289c17566bad4f9b82c2386082fe6352b977e5694f1054b023555d68c`, stderr는
+944 bytes·SHA `338f1df16b8905621c55d549c5a43115d379e65146b21b85078b81abf397de4f`다.
+Windows Job commit peak는 859,840,512 bytes, 896개 표본의 최대 간격은 148 ms이며
+원 2 GiB·32-process 정책을 유지했다. 6,675 ms의 별도 보존 단계에서 자료를 보존하고
+scratch·root/build lease를 정상 해제했다. 최종 합산 catalog는 9,271,900,198 bytes로
+기존 한도 안이다. 초기 게임 시작과 정상 중지의 양성이며 블록 apply/readback,
+clip·adapter·권한 pairing·클라이언트 및 3개 OS 게임 인수는 아직 아니다.
+
+같은 원 로그에는 Perflib 진단과 인증 서비스 연결 거절·`Services are unavailable`도
+있다. 전역 성능 counter나 online mode를 바꾸지 않았으며 실제 로그인·관리자 pairing의
+성공으로 보고하지 않는다. 실행 후 mutable properties·EULA·world 내용을 다시
+읽거나 hash하지 않았다.
+
+### 같은 현재 source의 Rust CI 49와 JVM CI 40
+
+source `da95d0dc8ab88b40b9c4bf142d606f30179bd192`의
+[Rust CI 49](https://github.com/daejunnom/MMMM/actions/runs/38644754912)와
+[JVM CI 40](https://github.com/daejunnom/MMMM/actions/runs/38644754976)은 각각 세 OS job과
+집계 성공을 확인했다. 실제 archive의 source·검사 집계·관리 종료 근거를 대조했으며
+앞의 로컬 게임 실패 및 후속 제품 인수와 구분한다.
+
+| Rust CI 49 | 표준 unit/bin PASS | ignored | native stderr 진행의 실제 bytes·시간 |
+| --- | ---: | ---: | --- |
+| Windows | 1,151 | 2 | 4,096 bytes·89 ms |
+| Linux | 1,164 | 4 | 65,536 bytes·90 ms |
+| macOS | 1,161 | 1 | 65,536 bytes·342 ms |
+
+각 OS의 doc test 1개와 custom `native_stdio` harness 1회는 위 unit/bin 합계와 별도다.
+native stderr 검사는 원 deadline과 drain을 유지했다. repository 검사는 466개·위반
+0이며 관련 finish의 정리·lease 해제를 확인했다. macOS는 실제 rusage exit와 부분 task
+lower bound 표본에서 member Pending 1회, BSD status 2·INEXIT true·같은 anchor를
+보존하고 최종 drain 0을 확인했다. bootstrap의 D051 진단 key와 D052 실행 branch
+counter는 해당 기록에 없어 그 경로의 실제 도달 여부를 소급 확정하지 않는다.
+
+JVM CI 40은 일곱 모듈의 333 tests·failures/errors/skipped 0, 필수 task 11개 모두
+실제 executed다. 테스트 수는 SDK 108·host-core 89·public adapter 17·Fabric host 68·
+definition observer 22·legacy fixture 18·provider fixture 11이다. observer의 세 단계
+record digest 9개와 이전 JVM digest 5개, 8개 header pin의 재검증 및 native build·
+header witness·startup의 관리 종료를 확인했다. Windows의 이전 JVM·startup은 자연
+종료, native build·header 관리 실행은 명시 owned-tail 종료이며 모두 drain/output/
+export·supervisor/cleanup 오류 0·scratch 정리·lease 해제를 보존했다.
+
+이번 observer source manifest는 이전 53개가 아닌 54개이며 JVM source 입력은 169개다.
+controlled startup은 12개 선택 pin의 획득·실행 전후 재검사와 13개 완료 phase,
+5,886-byte ABI2/stdout의 동일 digest를 확인했다. Windows raw SHA는
+`5eddf455a2379f51258d0fd54062d595ab26e1a444cc785d1b495a6ebc1e3b54`다. Linux는
+reserved leader의 RSS open/ESRCH에서 Pending 1회·pidfd not-ready·현재 identity 일치를
+관측했고 대응 macOS optional 진단은 null로 남았다. 이 기록들은
+`development_fixture`이며 game/release는 not-run, SourceAdmission·target policy·
+whole-JDK image 인수는 false다. 현재 실제 게임 실패의 해결이나 제품 배포를 의미하지
+않는다.
 
 실패한 실행의 원본 판정은 유지한다. native drain과 정확한 소유 기록을 확인하고
 로그를 별도로 내보내며 digest를 대조한 경우에만 해당 실행의 알려진 임시 파일을

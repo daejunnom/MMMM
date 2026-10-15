@@ -191,6 +191,7 @@ impl RetainedPreservation {
 
 struct RetainedRunOptions {
     root: PathBuf,
+    launch_directory: Option<PathBuf>,
     stop_after: Option<Duration>,
 }
 
@@ -201,6 +202,7 @@ fn retained_run_options(
     timeout: u64,
 ) -> Result<Option<RetainedRunOptions>, Box<dyn std::error::Error>> {
     let root = optional_path(flags, "--retained-game-root");
+    let launch_directory = optional_path(flags, "--retained-game-launch-directory");
     let stop_after = flags
         .remove("--minecraft-stop-after-seconds")
         .map(|value| value.parse::<u64>())
@@ -209,10 +211,19 @@ fn retained_run_options(
         if stop_after.is_some() {
             return Err("Minecraft stop requires --retained-game-root".into());
         }
+        if launch_directory.is_some() {
+            return Err("retained game launch directory requires --retained-game-root".into());
+        }
         return Ok(None);
     };
     if !root.is_absolute() {
         return Err("retained game root must be absolute".into());
+    }
+    if launch_directory
+        .as_ref()
+        .is_some_and(|directory| !directory.is_absolute())
+    {
+        return Err("retained game launch directory must be absolute".into());
     }
     if purpose != "jvm" {
         return Err("retained game mode requires purpose jvm".into());
@@ -227,6 +238,7 @@ fn retained_run_options(
     }
     Ok(Some(RetainedRunOptions {
         root,
+        launch_directory,
         stop_after: stop_after.map(Duration::from_secs),
     }))
 }
@@ -384,19 +396,34 @@ fn run_managed(
         }
         Ok(())
     };
-    let mut retained = if let Some(options) = &retained_options {
-        match storage::retained_game::RetainedGame::acquire(
+    let explicit_alias_requested = retained_options
+        .as_ref()
+        .is_some_and(|options| options.launch_directory.is_some());
+    let mut explicit_alias_validated = false;
+    let (mut retained, retained_launch_directory) = if let Some(options) = &retained_options {
+        let admission = storage::retained_game::RetainedGame::acquire(
             &build,
             &checkout,
             &options.root,
             &mut original_checkpoint,
-        ) {
-            Ok(retained) => Some(retained),
+        )
+        .and_then(|retained| {
+            let directory = retained.game_directory_for_launch(
+                options.launch_directory.as_deref(),
+                &mut original_checkpoint,
+            )?;
+            explicit_alias_validated = explicit_alias_requested;
+            Ok((retained, directory))
+        });
+        match admission {
+            Ok((retained, directory)) => (Some(retained), Some(directory)),
             Err(error) => {
                 let report = serde_json::json!({
                     "schema": "mmmm-retained-game-admission/1",
                     "status": "admission_failed",
                     "error": storage_error_report(&error),
+                    "explicit_alias_requested": explicit_alias_requested,
+                    "explicit_alias_validated": explicit_alias_validated,
                     "build_lease_release_attempted": false,
                 });
                 if let Err(export) =
@@ -408,7 +435,7 @@ fn run_managed(
             }
         }
     } else {
-        None
+        (None, None)
     };
     let mut stop_schedule = retained_options
         .as_ref()
@@ -420,8 +447,8 @@ fn run_managed(
         });
     let stdout = build.paths().scratch.join("command.stdout.log");
     let stderr = build.paths().scratch.join("command.stderr.log");
-    let cwd = match &retained {
-        Some(retained) => retained.game_directory()?.to_path_buf(),
+    let cwd = match retained_launch_directory {
+        Some(directory) => directory,
         None => fs::canonicalize(&checkout)?,
     };
     let mut spec = process::ProcessSpec::new(program, cwd, stdout.clone(), stderr.clone());
@@ -538,6 +565,8 @@ fn run_managed(
             "schema": "mmmm-retained-game-run/1",
             "working_directory": "validated_retained_game_directory",
             "working_directory_scope": "direct_child_only",
+            "explicit_alias_requested": explicit_alias_requested,
+            "explicit_alias_validated": explicit_alias_validated,
             "native_resource_policy_scope": "managed_jvm",
             "last_measurement": retained_measurement,
             "minecraft_stop_schedule": stop_schedule.as_ref().map(|schedule| schedule.report(spec.observation_interval)),
@@ -863,15 +892,64 @@ mod observation_evidence_tests {
             }
             assert!(retained_run_options(&mut flags, purpose, tail, timeout).is_err());
         }
+        for stop in [None, Some("1")] {
+            let mut flags = BTreeMap::from([("--retained-game-root".into(), root_text.into())]);
+            if let Some(stop) = stop {
+                flags.insert("--minecraft-stop-after-seconds".into(), stop.into());
+            }
+            let options = retained_run_options(&mut flags, "jvm", process::TailPolicy::Reject, 2)
+                .unwrap()
+                .unwrap();
+            assert_eq!(options.root, root);
+            assert!(options.launch_directory.is_none());
+            assert_eq!(options.stop_after, stop.map(|_| Duration::from_secs(1)));
+            assert!(flags.is_empty());
+        }
+        for (purpose, tail, root_value, launch_directory) in [
+            ("jvm", process::TailPolicy::Reject, None, root_text),
+            (
+                "jvm",
+                process::TailPolicy::Reject,
+                Some(root_text),
+                "relative-game-directory",
+            ),
+            (
+                "fixture",
+                process::TailPolicy::Reject,
+                Some(root_text),
+                root_text,
+            ),
+            (
+                "jvm",
+                process::TailPolicy::TerminateForBuild,
+                Some(root_text),
+                root_text,
+            ),
+        ] {
+            let mut flags = BTreeMap::from([(
+                "--retained-game-launch-directory".into(),
+                launch_directory.into(),
+            )]);
+            if let Some(root) = root_value {
+                flags.insert("--retained-game-root".into(), root.into());
+            }
+            assert!(retained_run_options(&mut flags, purpose, tail, 2).is_err());
+            assert!(flags.is_empty());
+        }
+        let launch_directory = root.join("game");
         let mut flags = BTreeMap::from([
             ("--retained-game-root".into(), root_text.into()),
-            ("--minecraft-stop-after-seconds".into(), "1".into()),
+            (
+                "--retained-game-launch-directory".into(),
+                launch_directory.to_str().unwrap().into(),
+            ),
         ]);
         let options = retained_run_options(&mut flags, "jvm", process::TailPolicy::Reject, 2)
             .unwrap()
             .unwrap();
         assert_eq!(options.root, root);
-        assert_eq!(options.stop_after, Some(Duration::from_secs(1)));
+        assert_eq!(options.launch_directory, Some(launch_directory));
+        assert!(options.stop_after.is_none());
         assert!(flags.is_empty());
     }
 

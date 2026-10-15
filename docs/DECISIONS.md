@@ -81,6 +81,8 @@
 
 | MMMM-D052 | Linux의 고정 proc directory FD에서 소유 판정 전 열거 후보의 최초 stat open이 실제 ESRCH인 경우에만 사라진 후보로 건너뛴다. | EnumeratedCandidate·Stat·Open·raw errno 3의 교집합을 원 directory FD 확보 뒤 한 호출에만 적용한다. 최초 identity·group·pidfd나 owned exit witness를 발급하지 않으며 None 자체를 RSS 0·Complete·empty·Pending 또는 signal 권한으로 사용하지 않는다. 남은 scan과 원 leader 재검증 및 기존 Complete/Pending·drain 조건을 그대로 따른다. reserved leader·owned member·다른 파일과 operation·ENOENT·다른 errno·raw errno 부재는 원 typed 오류를 유지한다. 기존 열린 stat read의 ESRCH 경계와 proc FD가 재사용 PID로 재결합하지 않는 공식 의미에 근거하며 실제 CI runner의 kernel stack을 관측했다고 주장하지 않는다. 추가 native query·retry·sleep·기한·cadence·자원 상한 변경은 없다. |
 
+| MMMM-D053 | 같은 retained game 디렉터리의 실행 경로 표현은 명시적으로 선택하고 held native identity로 검증한다. | Windows의 가상화된 AppData에서 Java IO와 NIO가 다른 경로 문자열을 보존하여 Fabric의 system library 제외가 깨질 수 있다. 별도 launch directory는 비밀·상대·상위 경로와 link/reparse를 거절한 뒤 현재 소유권 및 원 game handle의 volume/file identity와 대조한다. 기존 root digest·owner·lease를 유지하고 자동 별칭 검색·소유권 채택·자료 이동·복사를 하지 않는다. cwd와 Java 입력의 일관성은 실제 launcher가 고정하며 도구는 argv나 classpath 권한을 확대하지 않는다. 원 기한·자원·출력·drain 및 보존 규칙을 유지하고 실제 원인 및 게임 성공은 별도 관측으로 확인한다. |
+
 ## 구현 전에 확인할 항목
 
 - 원본 계약과 예제 패키지의 내용, 버전 및 digest.

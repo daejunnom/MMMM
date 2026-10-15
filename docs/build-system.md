@@ -228,6 +228,16 @@ timeout보다 작아야 한다. stop 시계는 retained 입장 전의 요청 시
 원래 5초 관측과 저장량 검사 뒤 Running에서 한 번 요청하므로 정확한 spawn 시각이나
 초 단위 전송 시각을 보장하지 않는다. 일반 run은 기존 null stdin과 cwd를 유지한다.
 
+`--retained-game-launch-directory <절대 경로>`는 같은 game 디렉터리의 실행 경로
+표현을 명시적으로 선택한다. 비밀·상대·상위 경로와 link/reparse 경계를 먼저
+거절하고, 현재 소유 기록 및 held game handle과 native volume/file identity가
+일치하는 경로만 허용한다. 원 retained root, owner digest와 lease는 바꾸지 않는다.
+자동 별칭 검색·중단 소유권 채택·자료 이동이나 복사는 포함하지 않는다. 명시하지
+않으면 기존 cwd를 사용한다. 실행자는 `-jar`와 게임에서 파생하는 입력도 같은 검증된
+표현으로 고정해야 하며, 이 옵션이 Java argv를 재작성하거나 classpath를 승인하지는
+않는다. 검사는 원 실행 기한의 협력 checkpoint를 따르며 hostile 동일 UID의 원자적
+namespace 고정을 보장하지 않는다. 실제 경로 분리와 실행 결과는 별도 증거로 남긴다.
+
 확인된 native drain 결과를 받은 뒤에는 실행과 별개인 단일 30초 보존 기한을 시작한다.
 retained 측정, 64 KiB 단위 원시 로그 복사와 sync, complete 및 완료 receipt 기록은
 같은 남은 기한을 소비한다. 원 timeout·취소와 native 결과는 유지하며 게임 실행을

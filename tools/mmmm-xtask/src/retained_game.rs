@@ -213,6 +213,42 @@ impl<'build> RetainedGame<'build> {
         Ok(&self.game)
     }
 
+    /// An explicit local alias is only a launch path to the already held game
+    /// directory. It does not adopt a root or change any owner, lease, or digest.
+    /// Namespace checks retain the existing cooperative filesystem boundary;
+    /// returning a path is not an atomic compare-and-spawn operation.
+    pub fn game_directory_for_launch(
+        &self,
+        candidate: Option<&Path>,
+        progress: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<PathBuf, StorageError> {
+        // Reject lexical secret/path selectors before any metadata, including
+        // the current owner's checks. Never canonicalize an explicit alias back
+        // to another representation or infer one from a package/path prefix.
+        if let Some(candidate) = candidate {
+            validate_root_path(candidate)?;
+            reject_secret_leaf_file(candidate)?;
+        }
+        observation_checkpoint(progress)?;
+        let result = (|| {
+            let Some(candidate) = candidate else {
+                return self.game_directory().map(Path::to_path_buf);
+            };
+            self.check_current_ownership()?;
+            let result = (|| {
+                observation_checkpoint(progress)?;
+                self.game_anchor.verify(candidate)?;
+                observation_checkpoint(progress)?;
+                Ok(candidate.to_path_buf())
+            })();
+            let postcheck = self
+                .check_current_ownership()
+                .and_then(|()| self.game_anchor.verify(candidate));
+            checked_result(result, postcheck)
+        })();
+        checked_result(result, observation_checkpoint(progress))
+    }
+
     pub fn check_current_ownership(&self) -> Result<(), StorageError> {
         self.build.verify_ownership()?;
         self.root_anchor.verify(&self.root)?;
@@ -705,7 +741,30 @@ mod tests {
         let fixture = Fixture::new();
         let build = fixture.build();
         let retained = fixture.acquire(&build);
-        let world = retained.game_directory().unwrap().join("world");
+        let game = retained.game_directory().unwrap().to_path_buf();
+        assert_eq!(
+            retained
+                .game_directory_for_launch(None, &mut || Ok(()))
+                .unwrap(),
+            game
+        );
+        assert_eq!(
+            retained
+                .game_directory_for_launch(Some(&game), &mut || Ok(()))
+                .unwrap(),
+            game
+        );
+        let mut explicit = game.as_os_str().to_os_string();
+        explicit.push(std::path::MAIN_SEPARATOR.to_string());
+        let explicit = PathBuf::from(explicit);
+        assert_eq!(
+            retained
+                .game_directory_for_launch(Some(&explicit), &mut || Ok(()))
+                .unwrap()
+                .as_os_str(),
+            explicit.as_os_str()
+        );
+        let world = game.join("world");
         fs::create_dir(&world).unwrap();
         fs::write(world.join("region.data"), b"retained world bytes").unwrap();
         let debug = format!("{retained:?}");
@@ -738,6 +797,94 @@ mod tests {
             fs::read(world.join("region.data")).unwrap(),
             b"retained world bytes"
         );
+    }
+
+    #[test]
+    fn launch_alias_rejects_an_unrelated_directory_with_equal_content_without_changing_ownership() {
+        let fixture = Fixture::new();
+        let build = fixture.build();
+        let retained = fixture.acquire(&build);
+        let game = retained.game_directory().unwrap().to_path_buf();
+        fs::write(game.join("world.data"), b"same authored bytes").unwrap();
+        let other = fixture.root.join("unrelated-game");
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join("world.data"), b"same authored bytes").unwrap();
+        let owner = fs::read(fixture.game_root().join("owner.json")).unwrap();
+        let lease = fs::read(fixture.game_root().join("lease.json")).unwrap();
+        assert_eq!(
+            kind(retained.game_directory_for_launch(Some(&other), &mut || Ok(()))),
+            "ownership"
+        );
+        retained.check_current_ownership().unwrap();
+        assert!(fs::read(fixture.game_root().join("owner.json")).unwrap() == owner);
+        assert!(fs::read(fixture.game_root().join("lease.json")).unwrap() == lease);
+        assert_eq!(
+            fs::read(game.join("world.data")).unwrap(),
+            b"same authored bytes"
+        );
+        assert_eq!(
+            fs::read(other.join("world.data")).unwrap(),
+            b"same authored bytes"
+        );
+    }
+
+    #[test]
+    fn launch_alias_lexical_guards_precede_metadata_and_stale_owner_checks() {
+        let fixture = Fixture::new();
+        let build = fixture.build();
+        let retained = fixture.acquire(&build);
+        let game = retained.game_directory().unwrap().to_path_buf();
+        let owner = b"changed owner must remain preserved";
+        let lease = fs::read(fixture.game_root().join("lease.json")).unwrap();
+        fs::write(fixture.game_root().join("owner.json"), owner).unwrap();
+        for selector in ["credentials", "api-key", "private-key"] {
+            // These paths do not exist. No secret-named fixture is created or
+            // inspected; lexical denial must win over both I/O and stale owner.
+            let candidate = fixture.root.join("not-created").join(selector);
+            assert_eq!(
+                kind(
+                    retained.game_directory_for_launch(Some(&candidate), &mut || {
+                        panic!("lexical denial must precede every checkpoint and metadata query")
+                    })
+                ),
+                "secret_path"
+            );
+        }
+        // PathBuf::join normalizes parent components on Windows verbatim paths.
+        // Preserve the raw selector so this exercises the API's lexical guard.
+        let mut raw_parent = game.as_os_str().to_os_string();
+        raw_parent.push(std::path::MAIN_SEPARATOR.to_string());
+        raw_parent.push("..");
+        let raw_parent = PathBuf::from(raw_parent);
+        assert!(
+            raw_parent
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+        );
+        for candidate in [PathBuf::from("relative-game"), raw_parent] {
+            assert_eq!(
+                kind(
+                    retained.game_directory_for_launch(Some(&candidate), &mut || {
+                        panic!("lexical denial must precede every checkpoint and metadata query")
+                    })
+                ),
+                "path"
+            );
+        }
+        assert_eq!(
+            kind(retained.game_directory_for_launch(None, &mut || Ok(()))),
+            "ownership"
+        );
+        assert_eq!(
+            kind(retained.game_directory_for_launch(Some(&game), &mut || Ok(()))),
+            "ownership"
+        );
+        assert_eq!(
+            fs::read(fixture.game_root().join("owner.json")).unwrap(),
+            owner
+        );
+        assert!(fs::read(fixture.game_root().join("lease.json")).unwrap() == lease);
+        assert!(game.is_dir());
     }
 
     #[test]
@@ -816,6 +963,14 @@ mod tests {
         let replaced = b"different current retained lease";
         fs::write(other.join("lease.json"), replaced).unwrap();
         assert_eq!(kind(retained.game_directory()), "ownership");
+        assert_eq!(
+            kind(retained.game_directory_for_launch(None, &mut || Ok(()))),
+            "ownership"
+        );
+        assert_eq!(
+            kind(retained.game_directory_for_launch(Some(&other.join("game")), &mut || Ok(()))),
+            "ownership"
+        );
         assert_eq!(
             kind(retained.complete(&outcome(0), &mut || Ok(()))),
             "ownership"
@@ -1147,6 +1302,44 @@ mod tests {
             .downcast_ref::<StorageError>()
             .unwrap();
         assert_eq!(postcheck.kind, "ownership");
+        // The launch port must preserve cancellation and a changed owner just
+        // like a retained measurement, without inventing another lease.
+        fs::write(
+            fixture.game_root().join("owner.json"),
+            &retained.owner_bytes,
+        )
+        .unwrap();
+        let mut launch_checkpoints = 0;
+        let error = retained
+            .game_directory_for_launch(Some(&retained.game), &mut || {
+                launch_checkpoints += 1;
+                if launch_checkpoints == 2 {
+                    fs::write(
+                        fixture.game_root().join("owner.json"),
+                        b"changed during launch validation",
+                    )
+                    .unwrap();
+                    return Err("cancel current launch validation".into());
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.kind, "observation_failed");
+        assert_eq!(error.message, "cancel current launch validation");
+        assert_eq!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<StorageError>()
+                .unwrap()
+                .kind,
+            "ownership"
+        );
+        assert_eq!(
+            kind(retained.game_directory_for_launch(None, &mut || {
+                Err("cancel default launch validation".into())
+            })),
+            "observation_failed"
+        );
         assert_eq!(
             fs::read(fixture.game_root().join("lease.json")).unwrap(),
             lease
