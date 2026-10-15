@@ -417,11 +417,11 @@ fn pending_exit_transition(
         }
         ProcessRole::EnumeratedCandidate => false,
     };
-    // Only the reserved leader has also been observed in a stable Z3
-    // transition. These exact counts admit an incomplete sample, not exit.
+    // The reserved leader has also been observed in stable Z3, and an owned
+    // member in stable Z4. These exact counts admit incompleteness, not exit.
     let threads_match_role = match conditions.role {
         ProcessRole::ReservedLeader => matches!(before.threads, 2 | 3),
-        ProcessRole::OwnedMember => before.threads == 2,
+        ProcessRole::OwnedMember => matches!(before.threads, 2 | 4),
         ProcessRole::EnumeratedCandidate => false,
     };
     conditions.owner.reservation_valid
@@ -1804,7 +1804,7 @@ pub(super) mod tests {
 
         // A member has no Child reservation of its own. Only the already
         // checked original leader anchor and its held Child may admit this
-        // incomplete sample; neither Z2 nor NotReady is an exit witness.
+        // incomplete sample; neither Z2/Z4 nor NotReady is an exit witness.
         let member = parse_stat(&render_stat("124", &stat_fields('Z', 2)), 124).unwrap();
         let member_conditions = PendingConditions {
             role: ProcessRole::OwnedMember,
@@ -1817,6 +1817,46 @@ pub(super) mod tests {
             &failure,
             member_conditions
         ));
+        let four_threads = Stat {
+            threads: 4,
+            ..member
+        };
+        assert!(pending_exit_transition(
+            four_threads.identity,
+            four_threads,
+            Some(four_threads),
+            &failure,
+            member_conditions
+        ));
+        assert!(!four_threads.definitely_exited());
+        // Z4 plus an actual NotReady check stays unknown RSS: the ordinary
+        // settlement must still fail, never omit the process or emit RSS 0.
+        assert!(
+            settle_member(
+                four_threads,
+                Some(four_threads),
+                Some(Err(
+                    pending_observation_for_role(PendingRole::OwnedMember).original_error()
+                )),
+                false
+            )
+            .is_err()
+        );
+        for (before_threads, after_threads) in [(2, 4), (4, 2), (3, 4), (4, 3), (4, 5), (5, 4)] {
+            assert!(!pending_exit_transition(
+                member.identity,
+                Stat {
+                    threads: before_threads,
+                    ..member
+                },
+                Some(Stat {
+                    threads: after_threads,
+                    ..member
+                }),
+                &failure,
+                member_conditions
+            ));
+        }
         assert!(
             settle_member(
                 member,
@@ -1889,7 +1929,17 @@ pub(super) mod tests {
                 member_conditions
             ));
         }
-        for (state, threads) in [(b'S', 2), (b'X', 2), (b'x', 2), (b'Z', 1), (b'Z', 3)] {
+        for (state, threads) in [
+            (b'S', 2),
+            (b'X', 2),
+            (b'x', 2),
+            (b'Z', 1),
+            (b'Z', 3),
+            (b'S', 4),
+            (b'X', 4),
+            (b'x', 4),
+            (b'Z', 5),
+        ] {
             let wrong = Stat {
                 state,
                 threads,
@@ -1941,16 +1991,18 @@ pub(super) mod tests {
                 ..conditions.owner
             },
         ] {
-            assert!(!pending_exit_transition(
-                member.identity,
-                member,
-                Some(member),
-                &failure,
-                PendingConditions {
-                    owner,
-                    ..member_conditions
-                }
-            ));
+            for candidate in [member, four_threads] {
+                assert!(!pending_exit_transition(
+                    candidate.identity,
+                    candidate,
+                    Some(candidate),
+                    &failure,
+                    PendingConditions {
+                        owner,
+                        ..member_conditions
+                    }
+                ));
+            }
         }
         for unknown in [
             PendingConditions {
@@ -2014,21 +2066,25 @@ pub(super) mod tests {
                 ..member_conditions
             },
         ] {
+            for candidate in [member, four_threads] {
+                assert!(!pending_exit_transition(
+                    candidate.identity,
+                    candidate,
+                    Some(candidate),
+                    &failure,
+                    unknown
+                ));
+            }
+        }
+        for candidate in [member, four_threads] {
             assert!(!pending_exit_transition(
-                member.identity,
-                member,
-                Some(member),
+                candidate.identity,
+                candidate,
+                None,
                 &failure,
-                unknown
+                member_conditions
             ));
         }
-        assert!(!pending_exit_transition(
-            member.identity,
-            member,
-            None,
-            &failure,
-            member_conditions
-        ));
         for wrong in [
             RssFailure::Open(std::io::Error::from_raw_os_error(2)),
             RssFailure::Read(std::io::Error::from_raw_os_error(3)),
@@ -2036,13 +2092,15 @@ pub(super) mod tests {
                 pending_observation_for_role(PendingRole::OwnedMember).original_error(),
             ),
         ] {
-            assert!(!pending_exit_transition(
-                member.identity,
-                member,
-                Some(member),
-                &wrong,
-                member_conditions
-            ));
+            for candidate in [member, four_threads] {
+                assert!(!pending_exit_transition(
+                    candidate.identity,
+                    candidate,
+                    Some(candidate),
+                    &wrong,
+                    member_conditions
+                ));
+            }
         }
     }
 

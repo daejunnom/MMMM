@@ -459,6 +459,15 @@ drain이 아니다. count-only empty만으로 미해결 Pending의 정상 reap�
 JVM에 전역 1초 gap 제한을 적용하지 않는다. 이는 새 조건부 관측 유예 정책이며 이전
 Linux 실행에 이미 존재한 보장으로 해석하지 않는다.
 
+D062와 D071은 이미 열거해 원 leader에 묶인 owned member의 정확한 전이에도 같은
+Pending 수명을 적용한다. member는 전후 stable Zombie·threads 2 또는 4, reserved leader는
+기존 2 또는 3만 허용한다. 원 full identity·실제 RSS open ESRCH·validated whole-group
+pidfd의 flags 0 및 실제 TerminalPoll/NotReady/errno 없음·held original leader와 순회 말미의
+leader 검사가 모두 필요하다. count 변화, member 3·leader 4와 다른 오류는 계속 실패한다.
+member의 Z4를 종료나 RSS 0으로 바꾸지 않으며 prior Complete·1000ms·부분 상한·late
+Complete와 reap fence를 그대로 적용한다. 새 조회·retry·sleep·상한 변경은 없다. 이 조건의
+소스·순수 검사와 실제 Linux Pending 진입/회복은 실행별 근거로 구분한다.
+
 RSS 합계는 각 process를 순서대로 읽은 관측이다. 공유 페이지를 process마다 포함하며
 그룹 전체의 동시 snapshot, 유일한 물리 메모리 사용량이나 kernel resident quota가
 아니다. `kernel_resident_quota=false`, `kernel_process_quota=false`,
