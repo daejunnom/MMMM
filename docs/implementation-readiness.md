@@ -1242,6 +1242,21 @@ bootstrap loader만 0으로 식별한다. fixture에서 nonbootstrap ID 0을 거
 lease 결과를 보존한다. before/after native status 숫자는 이 실패에서 관측되지 않았고
 만들어 채우지 않는다. 후속 실제 startup 성공은 별도 확인한다.
 
+D061의 새 `NativeLoadedCalibrationSources`는 실제 winner source와 등록 함수 object를
+읽기 전용으로 관측한다. 실제 원본 26.3 JAR을 held read·전후 digest로 고정한 static
+검사 `370`·`376`에서 manager/pack/reload API와 함수 loader의 winner-map 및 native
+FileToIdConverter 매핑을 확인했다. 새 producer는 exact getResource만 사용하고 전역
+함수 자료를 열거하지 않는다. 최대 47함수·함수별 64 KiB·합계 1 MiB와 두 pass의
+공유 stream read 한도, pack 목록 256개와 원 checkpoint를 적용한다. 실제 server
+thread, manager·선택 pack·winner·함수 object/ID와 source 원문을 전후 확인한다.
+원 취소와 open/read/close 및 후행 현재성 오류를 보존하며 raw test scan은 production
+view로 변환되지 않는다. 기존 fixture에 복수 manager/winner 교체와 두 source read
+경계가 없어 작은 순수 port fixture와 검사 8개를 별도 소스에 작성했다. 독립 소스
+리뷰의 blocking finding은 없으며 컴파일·실제 검사는 후속 관리 실행에서 확인한다.
+liveHost·paired/context/epoch/generation/reload 및 원 요청 기한 callback 설치, 실제
+load→parsed function 인과, staging·permit·runner·수치 readback·issuer는 미연결이다.
+현재 helper는 instantiate·parse·handler·reload·쓰기나 profile 승인을 수행하지 않는다.
+
 고정 `b854b617846036bcb09058ca7da3eed303a1e680`의 Rust CI 50
 (`38698720838`)과 JVM CI 41 (`38698720798`)은 세 OS 및 집계가 모두 성공했다.
 실제 ZIP 6개를 별도 보존하여 크기·SHA와 source/expected/PR head, 별도 event SHA
