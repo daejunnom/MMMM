@@ -99,13 +99,16 @@ fn dispatch_is_exactly_the_closed47_case_corpus_with_distinct_owned_scopes() {
 #[test]
 fn every_logical_function_preserves_original_program_bytes_digest_and_observation_site() {
     let dispatch = plan();
+    let loaded = dispatch.loaded_source_expectations().unwrap();
+    assert_eq!(loaded.len(), 47);
     assert_eq!(dispatch.source_entries().len(), 48);
     let pack = parse_json(&dispatch.source_entries()["pack.mcmeta"]).unwrap();
     assert_eq!(pack["pack"]["min_format"], json!([121, 0]));
     assert_eq!(pack["pack"]["max_format"], json!([121, 0]));
     assert!(pack["pack"].get("pack_format").is_none());
     let mut expected_paths = BTreeSet::from(["pack.mcmeta".to_owned()]);
-    for case in dispatch.cases() {
+    let mut resource_ids = BTreeSet::new();
+    for (case, expected) in dispatch.cases().iter().zip(&loaded) {
         let original = CalibrationProgram::for_case(*case).unwrap();
         let invocation = original
             .invocation_command()
@@ -121,11 +124,38 @@ fn every_logical_function_preserves_original_program_bytes_digest_and_observatio
             .expect("exact original entry");
         assert_eq!(bytes, original.source_bytes());
         assert_eq!(&raw_digest(bytes), original.source_digest());
+        assert_eq!(expected.function_id().as_str(), invocation);
+        assert_eq!(expected.logical_path(), logical_path);
+        // Native FileToIdConverter reads the ResourceManager ID, whose path
+        // still includes function/ and .mcfunction. Dispatch omits both.
+        let logical_resource = logical_path.strip_prefix("data/").unwrap();
+        let (resource_namespace, resource_path) = logical_resource.split_once('/').unwrap();
+        assert_eq!(
+            expected.resource_id().as_str(),
+            format!("{resource_namespace}:{resource_path}")
+        );
+        assert!(resource_ids.insert(expected.resource_id().as_str()));
+        assert_eq!(expected.source_bytes(), bytes.as_slice());
+        assert!(std::ptr::eq(expected.source_bytes(), bytes.as_slice()));
+        assert_eq!(expected.source_sha256(), original.source_digest());
         let matching = dispatch
             .programs()
             .iter()
             .find(|program| program.case() == *case)
             .unwrap();
+        assert!(std::ptr::eq(
+            expected.source_sha256(),
+            matching.source_digest()
+        ));
+        let addresses = dispatch
+            .owned_addresses()
+            .iter()
+            .find(|value| value.case() == *case)
+            .unwrap();
+        assert!(std::ptr::eq(
+            expected.function_id(),
+            addresses.function_id()
+        ));
         assert_eq!(matching.commands(), original.commands());
         assert_eq!(
             matching.command_stage_index(),
@@ -144,6 +174,19 @@ fn every_logical_function_preserves_original_program_bytes_digest_and_observatio
             .cloned()
             .collect::<BTreeSet<_>>(),
         expected_paths
+    );
+    assert_eq!(resource_ids.len(), 47);
+    assert!(
+        loaded
+            .iter()
+            .all(|entry| entry.source_bytes().len() <= 64 * 1024)
+    );
+    assert!(
+        loaded
+            .iter()
+            .map(|entry| entry.source_bytes().len())
+            .sum::<usize>()
+            <= 1024 * 1024
     );
 }
 
@@ -241,6 +284,33 @@ fn canonical_recipe_and_normative_entries_are_deterministic_and_immutable_to_exp
         repeated.canonical_recipe_bytes()
     );
     assert_eq!(dispatch.suite_digest(), repeated.suite_digest());
+
+    // The borrowed projection cannot silently follow a divergent private
+    // source map or duplicate a case if future compiler edits break the seal.
+    let mut changed_source = dispatch.clone();
+    changed_source
+        .source_entries
+        .get_mut(&logical_path)
+        .unwrap()
+        .extend_from_slice(b"# changed private source\n");
+    assert!(changed_source.loaded_source_expectations().is_err());
+    let mut wrong_directory = dispatch.clone();
+    let bytes = wrong_directory
+        .source_entries
+        .remove(&logical_path)
+        .unwrap();
+    wrong_directory
+        .source_entries
+        .insert(logical_path.replace("/function/", "/functions/"), bytes);
+    assert!(wrong_directory.loaded_source_expectations().is_err());
+    let mut duplicate = dispatch.clone();
+    duplicate.programs[1] = duplicate.programs[0].clone();
+    duplicate.owned_addresses[1] = duplicate.owned_addresses[0].clone();
+    assert!(duplicate.loaded_source_expectations().is_err());
+    assert_eq!(
+        dispatch.loaded_source_expectations().unwrap()[0].source_bytes(),
+        first.source_bytes()
+    );
 }
 
 #[test]

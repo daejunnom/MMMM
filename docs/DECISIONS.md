@@ -99,6 +99,13 @@
 
 | MMMM-D061 | Calibration의 현재 함수 source bytes와 실제 등록 함수 object를 읽기 전용 producer로 관측한다. | 실제 server thread·원 checkpoint 안에서 native FileToIdConverter의 왕복 매핑과 exact getResource winner lookup을 사용한다. 최대 47함수·함수별 64 KiB·원문 합계 1 MiB·pack별 목록 256개 및 두 pass의 공유 stream read 예산을 적용하고 manager·선택 pack·winner·실제 function identity와 원 bytes를 전후 대조한다. raw/test scan 자료는 production view로 변환하지 않는다. 관측 결과에 원 callback은 보관하지 않으며 후속 실행은 새 실제 요청의 현재성을 검사해야 한다. caller 비교 원문이나 이 동시 관측만으로 Rust provenance·실제 load에서 parsed function이 만들어진 인과·permit·profile·실행 권한을 만들지 않는다. live host·원 권한 및 calibration runner 연결과 실제 게임 검증은 별도 단계다. |
 
+D061의 Rust 비교 입력은 같은 sealed `CalibrationDispatchPlan`의
+`loaded_source_expectations()`에서만 투영한다. 원 function ID·logical entry bytes와
+program digest는 plan에서 빌리고, native resource lookup ID는 별도로 구분한다.
+정본 47개 순서·고유성·singular function 경로·원 bytes/digest와 Java 쪽 64 KiB/1 MiB
+한도를 대조하며 recipe와 suite identity를 바꾸지 않는다. 이 비교 자료는 loaded-source
+receipt·실제 load 인과·승인이나 실행 권한이 아니고 공개 저장/wire 계약을 추가하지 않는다.
+
 ## 구현 전에 확인할 항목
 
 - 원본 계약과 예제 패키지의 내용, 버전 및 digest.

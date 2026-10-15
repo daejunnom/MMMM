@@ -1180,8 +1180,9 @@ ACL 거절인지는 현 진단만으로 확정하지 않는다.
 
 후속 D059 구현은 실제 JNI Class 조회에서만 private `CurrentLoadedExecutable`을
 발급하고 collector와 현재 owner slot에 보존한다. Class·실제 loader 객체·원 native
-stamp와 전체 envelope를 재검사하며, ordinary frame의 loader 0과 실제 bootstrap
-loader를 구분한다. raw fixture에는 view가 없어 executable 조회를 만족시키지 못한다.
+stamp와 전체 envelope를 재검사하며, 현재 native loader ID 0은 실제 bootstrap을
+뜻하고 nonbootstrap은 실제 loader 객체와 해당 ID를 대조한다. raw fixture에는 view가
+없어 executable 조회를 만족시키지 못한다.
 기존 startup fixture의 실제 ordinary·hidden 세 Class는 새 발급 및 현재성 경로를
 사용하도록 연결했다. 기존 64 Class/8 MiB 안에 decoded byte payload까지 계상하고
 slot의 JNI와 원 checkpoint는 monitor 밖에서 실행한 뒤 현재 ticket·owner를 다시
@@ -1252,10 +1253,58 @@ thread, manager·선택 pack·winner·함수 object/ID와 source 원문을 전�
 원 취소와 open/read/close 및 후행 현재성 오류를 보존하며 raw test scan은 production
 view로 변환되지 않는다. 기존 fixture에 복수 manager/winner 교체와 두 source read
 경계가 없어 작은 순수 port fixture와 검사 8개를 별도 소스에 작성했다. 독립 소스
-리뷰의 blocking finding은 없으며 컴파일·실제 검사는 후속 관리 실행에서 확인한다.
+리뷰의 blocking finding은 없다. 정확한 `518013125f332a602b2c3936ce2eb8dcd9ea18b0`의
+Windows 관리 실행 `383`은 7모듈 386 tests/31 reports와 33 executed tasks를 통과했다.
+SDK 108, host-core 92, public-java-adapter 29, Fabric host 104, definition-observer
+24, legacy fixture 18, provider fixture 11이며 failure/error/skipped는 모두 0이다.
+외부 로컬 요약 SHA는
+`2b1d16247ee87f7a3a76a002886d45258f9d3e7cb7dbcaaa7fe85b01bb757390`다.
+command 0·28,934 ms, Job commit peak 1,375,506,432 bytes·peak process 6개·최대
+표본 간격 124 ms였고 원 2 GiB/32 process 상한과 drain·완전한 출력·export·scratch
+정리·lease 해제를 확인했다. JVM source 범위의 tracked 변경과 미등록 파일이 없음을
+실행 전후 검사하여 다른 소스를 해당 SHA의 성공에 섞지 않았다.
 liveHost·paired/context/epoch/generation/reload 및 원 요청 기한 callback 설치, 실제
 load→parsed function 인과, staging·permit·runner·수치 readback·issuer는 미연결이다.
 현재 helper는 instantiate·parse·handler·reload·쓰기나 profile 승인을 수행하지 않는다.
+
+교정한 `5d9c1df99b67cfab32d6b7a68a09c1d6ff10e10c`의 JVM CI 51
+(`38759797927`)은 세 OS와 집계가 성공했다. 원 ZIP 3개 감사에서 source/expected/PR
+head와 별도 event SHA `6d38d5a5cf9e9036968ece5a8909d5ae9f9c1a02`, 각 OS의 378
+tests/30 reports/필수 11 executed tasks 및 observer build·header·startup의 원 digest와
+receipt 연결을 대조했다. 실제 startup은 세 OS 모두 command 0·drained/output complete,
+5,886-byte ABI2 frame과 stdout의 digest가 일치했고 내부 native observed status 255,
+direct absence flag 1과 summary target class status 7을 확인했다. 고정 fixture는 실제
+ordinary·samless hidden·positive hidden view의 발급·현재성과 direct raw/view 부재를
+재검사한 뒤에만 frame을 출력한다. 개별 JNI query의 before/after status 숫자는
+export되지 않아 따로 추정하지 않는다. 각 OS properties는 264 bytes와 고정 Git blob
+SHA가 일치했으며 종료·drain·export·scratch·lease가 정상 완료됐다. 원 owner와 일부
+JDK/JAR 원문은 ZIP에 없으므로 전부를 재hash한 것으로 보고하지 않는다. 이 통제된
+startup 성공은 slot 양성·실제 게임·SourceAdmission·쓰기나 profile 승인 증거가 아니다.
+같은 SHA의 Rust CI 60 (`38759798078`)은 세 OS tests·strict Clippy 및 집계가 성공했고
+원 ZIP 3개를 보존해 감사한다. 실제 native 5 경합 회복 여부는 원 record로만 판정한다.
+
+후속 `5180131`의 JVM CI 52 (`38760866044`)는 세 OS JVM 단계와 Windows·macOS의
+native observer 단계가 성공했지만 Linux native observer 단계와 집계가 실패했다.
+원 ZIP 3개를 별도 보존했다. Linux는 build·header가 성공했고 startup 명령도 0으로
+끝났지만 reserved leader의 RSS Open/ESRCH 관측 오류로 `PROCESS_INCOMPLETE`였다.
+전후 Zombie·threads 3·원 identity 일치·BoundValidated pidfd TerminalPoll/NotReady를
+보존하며 기존 threads 2의 제한된 Pending 조건과 별도로 검토한다. ABI decode/hash
+단계는 미도달이므로 stdout을 검증된 ABI 성공으로 올리지 않는다. drain·출력·export·
+scratch 정리·lease 해제는 정상 완료했고 원 오류 및 상세 pin을 추가 감사한다. 앞선 CI 51
+성공이나 로컬 `383`의 성공으로 이 실패를 대신하지 않는다. 같은 SHA의 Rust CI 61
+(`38760866094`)은 등록과 진행 중 상태만 확인했으며 아직 성공으로 집계하지 않는다.
+
+D061의 Rust 연결은 sealed plan의 `loaded_source_expectations()`에서 원 function ID와
+logical entry bytes·digest를 빌려 주고 native resource lookup ID를 구분한다. 정본
+47개 순서·고유성·원 source/hash와 함수별 64 KiB·합계 1 MiB를 검증하며 recipe 및
+suite digest를 바꾸지 않는다. 독립 소스 리뷰 blocking finding은 0개이며 기존 검사
+두 곳을 확장해 원 데이터 borrow·native ID 매핑·source/path/중복 변조 거절을 확인한다.
+새 fixture는 없다. Windows `384`의 소유 두 파일 format과 `385`의 compiler unit
+89개·compile-fail doctest 1개가 통과했고 `386`의 package/all-target strict Clippy도
+exit 0이었다. `385`는 command 0·27,626 ms, Job commit peak 751,947,776 bytes·peak
+process 6개·최대 표본 간격 128 ms였고 소유 잔여 자식 정리 후 drain·출력·export·
+scratch·lease를 완료했다. 원 2 GiB/32 process 상한을 유지했다. 이는 비교 자료의
+생산 경로이며 아직 Java 전달·실제 pack load 관측이나 실행 승인을 발급하지 않는다.
 
 고정 `b854b617846036bcb09058ca7da3eed303a1e680`의 Rust CI 50
 (`38698720838`)과 JVM CI 41 (`38698720798`)은 세 OS 및 집계가 모두 성공했다.

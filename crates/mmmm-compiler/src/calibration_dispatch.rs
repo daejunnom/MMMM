@@ -92,6 +92,38 @@ pub struct CalibrationDispatchBudget {
     max_command_bytes: usize,
 }
 
+/// Exact native function-loading expectations borrowed from one sealed recipe.
+/// This is source comparison data, not a loaded-source receipt or permission.
+/// The original entry bytes and digest remain owned by the borrowed plan.
+#[derive(Debug)]
+pub struct CalibrationLoadedFunctionSource<'a> {
+    function_id: &'a ResourceLocation,
+    resource_id: ResourceLocation,
+    logical_path: &'a str,
+    source_bytes: &'a [u8],
+    source_sha256: &'a Sha256Digest,
+}
+
+impl CalibrationLoadedFunctionSource<'_> {
+    pub fn function_id(&self) -> &ResourceLocation {
+        self.function_id
+    }
+    /// ResourceManager lookup ID, including the singular native function
+    /// directory and .mcfunction suffix; not the dispatch function ID.
+    pub fn resource_id(&self) -> &ResourceLocation {
+        &self.resource_id
+    }
+    pub fn logical_path(&self) -> &str {
+        self.logical_path
+    }
+    pub fn source_bytes(&self) -> &[u8] {
+        self.source_bytes
+    }
+    pub fn source_sha256(&self) -> &Sha256Digest {
+        self.source_sha256
+    }
+}
+
 impl CalibrationDispatchBudget {
     pub const fn cases(&self) -> usize {
         self.cases
@@ -144,6 +176,7 @@ pub struct CalibrationDispatchPlan {
 impl CalibrationDispatchPlan {
     pub const MAX_CASES: usize = 47;
     pub const MAX_SOURCE_BYTES: usize = 1024 * 1024;
+    pub const MAX_LOADED_FUNCTION_BYTES: usize = 64 * 1024;
     pub const MAX_COMMANDS: usize = 4096;
     pub const MAX_COMMAND_BYTES: usize = 8192;
     pub const MAX_RECIPE_BYTES: usize = 4 * 1024 * 1024;
@@ -316,6 +349,96 @@ impl CalibrationDispatchPlan {
     /// Logical entries, never a ZIP digest or proof of installed pack contents.
     pub fn source_entries(&self) -> &BTreeMap<String, Vec<u8>> {
         &self.source_entries
+    }
+    /// ALL-order expectations for the native 26.3 function resource converter.
+    /// The mapping comes from the original logical pack entries and sealed
+    /// function invocations. No function body is rebuilt, flattened or copied.
+    pub fn loaded_source_expectations(
+        &self,
+    ) -> Result<Vec<CalibrationLoadedFunctionSource<'_>>, DomainError> {
+        if CalibrationCase::ALL.len() != Self::MAX_CASES
+            || self.programs.len() != Self::MAX_CASES
+            || self.owned_addresses.len() != Self::MAX_CASES
+            || self.source_entries.len() != Self::MAX_CASES + 1
+            || !self.source_entries.contains_key("pack.mcmeta")
+        {
+            return Err(invalid(
+                "Loaded function expectations require the exact 47-case recipe",
+            ));
+        }
+        let mut expectations = Vec::with_capacity(Self::MAX_CASES);
+        let mut functions = BTreeSet::new();
+        let mut paths = BTreeSet::new();
+        let mut source_bytes_total = 0usize;
+        for ((case, program), addresses) in CalibrationCase::ALL
+            .iter()
+            .zip(&self.programs)
+            .zip(&self.owned_addresses)
+        {
+            verify_program(program)?;
+            let function = program
+                .invocation_command()
+                .strip_prefix("function ")
+                .ok_or_else(|| invalid("A calibration entry must use native function dispatch"))?;
+            if program.case() != *case
+                || addresses.case != *case
+                || addresses.function_id.as_str() != function
+                || !functions.insert(function)
+            {
+                return Err(invalid(
+                    "Duplicate or mismatched loaded calibration function",
+                ));
+            }
+            let (namespace, path) = function
+                .split_once(':')
+                .ok_or_else(|| invalid("A calibration function needs a namespace"))?;
+            if namespace != "mmmm_calibration" {
+                return Err(invalid("Unexpected loaded calibration function namespace"));
+            }
+            let logical = format!("data/{namespace}/function/{path}.mcfunction");
+            let (logical_path, source_bytes) = self
+                .source_entries
+                .get_key_value(&logical)
+                .ok_or_else(|| invalid("The original calibration function entry is missing"))?;
+            if !paths.insert(logical_path.as_str())
+                || source_bytes.is_empty()
+                || source_bytes.len() > Self::MAX_LOADED_FUNCTION_BYTES
+            {
+                return Err(invalid(
+                    "Loaded function source is duplicated, empty or larger than 64KiB",
+                ));
+            }
+            if source_bytes.as_slice() != program.source_bytes()
+                || raw_digest(source_bytes) != *program.source_digest()
+            {
+                return Err(invalid(
+                    "Loaded function source differs from its original program bytes or digest",
+                ));
+            }
+            source_bytes_total = checked_add(
+                source_bytes_total,
+                source_bytes.len(),
+                "Loaded function source byte count overflow",
+            )?;
+            if source_bytes_total > Self::MAX_SOURCE_BYTES {
+                return Err(invalid(
+                    "Loaded function sources exceed the 1MiB native input budget",
+                ));
+            }
+            // FileToIdConverter(function, ".mcfunction") maps this exact pack
+            // resource ID to the distinct original native dispatch function ID.
+            let resource_id =
+                ResourceLocation::new(format!("{namespace}:function/{path}.mcfunction"))
+                    .map_err(|error| invalid(error.to_string()))?;
+            expectations.push(CalibrationLoadedFunctionSource {
+                function_id: &addresses.function_id,
+                resource_id,
+                logical_path,
+                source_bytes,
+                source_sha256: program.source_digest(),
+            });
+        }
+        Ok(expectations)
     }
     /// Pins source bytes, ownership inventory, dispatch order and probe sites.
     /// Expected values remain in CalibrationProgram; observations are host data.
