@@ -1190,6 +1190,14 @@ source factory의 수집과 admission 양성은 아직 연결하지 않았다. �
 최종 classfile, 일반 쓰기·profile·calibration 승인을 발급한 것으로 보고하지 않으며
 수정한 소스의 실제 JVM·native startup 검증은 후속 실행에서 확인한다.
 
+공유한 `45789e938307cef6362c30fbc06aba9947333332`의 Windows JVM `373`은 제품
+Java와 observer 검사를 컴파일했지만 Fabric test compile에서 새 관측 타입을 찾지
+못해 exit 1이었다. observer는 생산 경계에서 의도한 compile-only 의존성이며 agent가
+별도로 제공한다. 테스트가 새 API를 직접 참조하므로 같은 내부 observer 프로젝트를
+testImplementation에도 추가한다. 외부 의존성이나 생산 JAR의 포함 범위는 바꾸지 않는다.
+Gradle 32 executed tasks와 원 진단·출력을 보존하고 drain·export·scratch 정리·lease
+해제를 확인했다. Fabric의 오래된 XML 결과를 이 실패 실행의 성공으로 집계하지 않는다.
+
 고정 `b854b617846036bcb09058ca7da3eed303a1e680`의 Rust CI 50
 (`38698720838`)과 JVM CI 41 (`38698720798`)은 세 OS 및 집계가 모두 성공했다.
 실제 ZIP 6개를 별도 보존하여 크기·SHA와 source/expected/PR head, 별도 event SHA

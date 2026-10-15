@@ -7,6 +7,7 @@ dependencies {
     implementation project(':host-core')
     implementation project(':public-java-adapter')
     compileOnly project(':definition-observer')
+    testImplementation project(':definition-observer')
     include project(':host-core')
     include project(':provider-sdk')
     include project(':public-java-adapter')
