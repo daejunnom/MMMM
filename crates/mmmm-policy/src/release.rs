@@ -216,6 +216,10 @@ fn validate_binding(binding: &ReleaseBinding) -> Result<(), PolicyError> {
 }
 
 fn validate_claim(claim: &ReleaseProofClaim) -> Result<(), PolicyError> {
+    // A retained not-run result does not claim that any artifact was tested.
+    // Its frozen binding, result bytes and producer authentication still apply.
+    let untested_not_run =
+        matches!(&claim.result, EvidenceResult::NotRun) && claim.tested_artifact_sha256.is_empty();
     if claim.runner.trim().is_empty()
         || claim.runner.len() > 256
         || !timestamp_utc(&claim.timestamp)
@@ -224,7 +228,7 @@ fn validate_claim(claim: &ReleaseProofClaim) -> Result<(), PolicyError> {
             .limitations
             .iter()
             .any(|item| item.is_empty() || item.len() > 4096)
-        || claim.tested_artifact_sha256.is_empty()
+        || (!untested_not_run && claim.tested_artifact_sha256.is_empty())
         || claim.tested_artifact_sha256.len() > 128
         || claim.result_artifact_sha256.is_empty()
         || claim.result_artifact_sha256.len() > 128
@@ -233,9 +237,10 @@ fn validate_claim(claim: &ReleaseProofClaim) -> Result<(), PolicyError> {
             .iter()
             .chain(&claim.result_artifact_sha256)
             .all(|digest| sha256(digest))
-        || !claim
-            .tested_artifact_sha256
-            .contains(&claim.binding.bundle_sha256)
+        || (!untested_not_run
+            && !claim
+                .tested_artifact_sha256
+                .contains(&claim.binding.bundle_sha256))
         || claim.inventory.len() > 4096
         || claim.components.len() > 4096
         || claim.unresolved_operations.len() > 1024

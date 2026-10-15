@@ -1996,6 +1996,33 @@ lease 해제다. 순수 해석 3개와 실제 Store/public reader의 no-entered-
 가짜 NativeRead·ADMIN·양성 snapshot fixture로 실제 발급을 대신하지 않았다. 실제 게임
 display·geometry·시각 관측은 별도 미실행이다.
 
+## 정직한 NotRun 릴리스 자료의 소비
+
+내부 ReleaseProofClaim의 `NotRun`만 tested-artifact 집합을 비워 표현할 수 있도록
+정책을 좁게 수정했다. Passed/Failed 및 nonempty NotRun의 기존 tested-bundle 조건,
+실제 binding·source/profile·bundle/inventory·result artifact·원 verifier와 전체 canonical
+claim digest 인증은 유지한다. NotRun은 여전히 필수 인수를 통과하지 못하며 생산
+`release_evidence=None`의 거절도 바꾸지 않았다. 실제 미실행을 위해 가짜 tested SHA나
+릴리스 bundle을 만들지 않는다.
+
+기존 fixture 검사 하나를 확장했고 독립 source 리뷰 뒤 `484` format을 수행했다. `485`의
+Windows policy 30개와 kernel 순수 3개가 통과했으며 policy의 기존 failed/notRun 구분
+회귀도 실제 통과했다. base `57d7717`과 수정 입력 14개를 구분해 전후 SHA-256
+`605e439707ea18025fab036fdef827266a02b1c896d2ad7df324fb6eb717ebf8` 일치를 확인했다.
+별도 supplemental source 기록 2,523 bytes·SHA-256
+`43b6850cd23d97e5820e79d504a0863a2c5191c3b6fbc5812aae7137332ae361`을 외부에 보존했고
+원 managed receipt는 수정하지 않았다. `485`는 command 0·11,676 ms·Job commit peak
+435,798,016 bytes·6 process·최대 gap 116 ms이며 owned-tail 정리 후 drain·완전한 출력·
+export·scratch 정리·lease 해제다. 실제 filesystem/JNI/game 인수는 이 순수 검사에 없다.
+후속 `488`에서 observer/kernel/policy 세 package의 all-target strict Clippy도 통과했으며
+이는 별도 미공유 구현을 포함한 로컬 검사다. 생산 릴리스 증거 발급·collector 또는 출시
+완료를 뜻하지 않는다.
+
+고정 `57d7717dbdff23c89de8000c6c7db3da4431fd57`의 JVM CI 73 (`38811299947`)는
+성공 metadata를 관측했고, Rust CI 82 (`38811299924`)는 세 OS의 모든 test/lint 단계와
+집계 성공을 확인했다. 이 두 새 원 ZIP 감사는 수행하지 않았다. 이후 미공유 bootstrap·
+파일 kernel·정책 변경의 성공 근거로 사용하지 않는다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

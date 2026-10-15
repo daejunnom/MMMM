@@ -588,16 +588,61 @@ fn caller_cannot_remove_failed_or_not_run_required_acceptance() {
 
 #[test]
 fn actual_failed_and_not_run_results_remain_distinct() {
-    let (evidence, binding, mut claims) = release_fixture();
-    claims[0].result = EvidenceResult::Failed {
-        reason: "fixture failure".into(),
-    };
-    claims[1].result = EvidenceResult::NotRun;
-    let index = index(binding, claims, EvidenceOrigin::Actual).unwrap();
-    let report = evaluate(&evidence, Some(&index));
-    assert!(has(&report, "ACCEPTANCE_FAILED"));
-    assert!(has(&report, "ACCEPTANCE_NOT_RUN"));
-    assert_eq!(report.missing_test_ids.len(), 2);
+    // The existing verifier simulates authenticated policy inputs only. These
+    // fixtures do not issue actual game observations or production authority.
+    for untested in [false, true] {
+        let (evidence, binding, mut claims) = release_fixture();
+        claims[0].result = EvidenceResult::Failed {
+            reason: "fixture failure".into(),
+        };
+        claims[1].result = EvidenceResult::NotRun;
+        if untested {
+            claims[1].tested_artifact_sha256.clear();
+        }
+        let index = index(binding, claims, EvidenceOrigin::Actual).unwrap();
+        let report = evaluate(&evidence, Some(&index));
+        assert!(!report.eligible);
+        assert!(has(&report, "ACCEPTANCE_FAILED"));
+        assert!(has(&report, "ACCEPTANCE_NOT_RUN"));
+        assert_eq!(report.missing_test_ids.len(), 2);
+    }
+    for result in [
+        EvidenceResult::Passed,
+        EvidenceResult::Failed {
+            reason: "fixture failure".into(),
+        },
+    ] {
+        let (_, binding, mut claims) = release_fixture();
+        claims[0].result = result;
+        claims[0].tested_artifact_sha256.clear();
+        assert!(index(binding, claims, EvidenceOrigin::Actual).is_err());
+    }
+    for invalid in 0..3 {
+        let (_, binding, mut claims) = release_fixture();
+        claims[0].result = EvidenceResult::NotRun;
+        claims[0].tested_artifact_sha256.clear();
+        match invalid {
+            0 => claims[0].result_artifact_sha256.clear(),
+            1 => claims[0].binding.frozen_source_sha = "8".repeat(40),
+            _ => {
+                claims[0].tested_artifact_sha256.insert("8".repeat(64));
+            }
+        }
+        assert!(index(binding, claims, EvidenceOrigin::Actual).is_err());
+    }
+    let (_, binding, mut claims) = release_fixture();
+    let mut claim = claims.remove(0);
+    let original = material("fixture-original-claim", &claim);
+    claim.result = EvidenceResult::NotRun;
+    claim.tested_artifact_sha256.clear();
+    assert!(
+        VerifiedEvidenceIndex::verify(
+            binding,
+            vec![(claim, original)],
+            &FixtureVerifier(EvidenceOrigin::Actual),
+        )
+        .is_err()
+    );
 }
 
 #[test]
