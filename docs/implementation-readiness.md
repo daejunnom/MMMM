@@ -1281,7 +1281,14 @@ SHA가 일치했으며 종료·drain·export·scratch·lease가 정상 완료됐
 JDK/JAR 원문은 ZIP에 없으므로 전부를 재hash한 것으로 보고하지 않는다. 이 통제된
 startup 성공은 slot 양성·실제 게임·SourceAdmission·쓰기나 profile 승인 증거가 아니다.
 같은 SHA의 Rust CI 60 (`38759798078`)은 세 OS tests·strict Clippy 및 집계가 성공했고
-원 ZIP 3개를 보존해 감사한다. 실제 native 5 경합 회복 여부는 원 record로만 판정한다.
+원 ZIP 3개 감사를 마쳤다. source/expected/PR head·별도 event SHA와 실제 raw digest 및
+format/repository/test/Clippy 12개 managed process의 exit 0·drain·출력·export·scratch·
+lease가 일치했다. 원 stdout의 각 30개 harness summary 합계는 Windows 1,193 PASS/
+2 ignored, Linux 1,206 PASS/4 ignored, macOS 1,203 PASS/1 ignored이며 doctest를
+포함한다. 별도 native stdio binary도 각 원 stderr에서 실제 호출을 확인했다. D060의
+새 세 검사와 기존 owner/link/cancel/budget 검사는 실제 통과했고 각 CI bootstrap은
+해당 source의 xtask 컴파일·정상 실행을 기록한다. 다만 모든 phase의 observation retry
+records는 0개이므로 실제 native 5 경합의 발현·회복 양성으로 보고하지 않는다.
 
 후속 `5180131`의 JVM CI 52 (`38760866044`)는 세 OS JVM 단계와 Windows·macOS의
 native observer 단계가 성공했지만 Linux native observer 단계와 집계가 실패했다.
@@ -1290,9 +1297,35 @@ native observer 단계가 성공했지만 Linux native observer 단계와 집계
 전후 Zombie·threads 3·원 identity 일치·BoundValidated pidfd TerminalPoll/NotReady를
 보존하며 기존 threads 2의 제한된 Pending 조건과 별도로 검토한다. ABI decode/hash
 단계는 미도달이므로 stdout을 검증된 ABI 성공으로 올리지 않는다. drain·출력·export·
-scratch 정리·lease 해제는 정상 완료했고 원 오류 및 상세 pin을 추가 감사한다. 앞선 CI 51
+scratch 정리·lease 해제는 정상 완료했고 원 오류와 상세 pin 연결을 보존했다. 앞선 CI 51
 성공이나 로컬 `383`의 성공으로 이 실패를 대신하지 않는다. 같은 SHA의 Rust CI 61
-(`38760866094`)은 등록과 진행 중 상태만 확인했으며 아직 성공으로 집계하지 않는다.
+(`38760866094`)은 이후 세 OS tests·Clippy와 집계의 성공을 관측했다. 이 job 관측과
+앞선 CI 60의 실제 ZIP 감사는 구분한다.
+
+CI 52 원 ZIP 감사도 완료했다. source/expected/PR head와 별도 event SHA
+`ed8ff30f8d265e9d55eead841e97c6483016d121`, OS별 386 tests/31 reports/11 executed
+tasks, 새 source helper 검사 8개와 실제 pin/receipt가 일치했다. Linux는 원 오류 뒤
+별도 post-check 12개를 완료했고 post-check error는 없지만 raw candidate·summary와
+ABI2 artifact가 없어 startup 성공으로 승격하지 않는다. Windows·macOS는 5,886-byte
+ABI2와 stdout digest가 같고 실제 current-view fixture까지 완료했다. 세 OS의 properties
+264 bytes·source inventory 177개 및 중요 source 13개의 고정 Git blob 대조가 일치했다.
+원 owner·일부 JDK/JAR 원문은 미포함이며 실제 게임 calibration 실행은 여전히 미실행이다.
+
+`826e8b7b0c7bc416de408ed6b0fb365e6e4f07a8`의 JVM CI 53 (`38763086193`)도 세 OS와
+집계가 성공했고 원 ZIP 3개를 별도 보존했다. 이 실행은 D062 source 정정 이전이므로
+앞선 Linux threads 3 실패의 회복 양성으로 기록하지 않는다. source·실제 pin·종료와
+정리 및 재사용할 입력의 동일성은 해당 artifact로 따로 대조한다.
+
+D062는 `linux_resources.rs`의 reserved leader에만 stable threads 3 조건을 추가한다.
+기존 동일 threads 2와 모든 anchor·identity·typed errno·pidfd 조건을 유지하고 일반
+member·불일치·다른 수를 거절한다. 기존 순수 검사 한 곳을 확장했으며 새 fixture는
+없다. 독립 소스 리뷰 blocking finding은 0개이고 Windows `388`의 해당 파일 format과
+`389`의 xtask lib 232 PASS/1 ignored 및 `390`의 package/all-target strict Clippy가
+통과했다. 이 Windows 검사는 Linux 전용 모듈을 실행한 근거가 아니며 실제 Linux
+검사·native 전이 회복은 후속 CI가 필요하다. WSL/Ubuntu는 사용하지 않았다. `389`는
+command 0·28,216 ms, Job commit peak 453,840,896 bytes·peak process 10개·최대
+표본 간격 146 ms, 소유 잔여 자식 정리 이후 drain·출력·export·scratch·lease 정상
+완료이며 원 2 GiB/32 process 상한을 유지했다.
 
 D061의 Rust 연결은 sealed plan의 `loaded_source_expectations()`에서 원 function ID와
 logical entry bytes·digest를 빌려 주고 native resource lookup ID를 구분한다. 정본

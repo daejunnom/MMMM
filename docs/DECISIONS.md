@@ -99,6 +99,8 @@
 
 | MMMM-D061 | Calibration의 현재 함수 source bytes와 실제 등록 함수 object를 읽기 전용 producer로 관측한다. | 실제 server thread·원 checkpoint 안에서 native FileToIdConverter의 왕복 매핑과 exact getResource winner lookup을 사용한다. 최대 47함수·함수별 64 KiB·원문 합계 1 MiB·pack별 목록 256개 및 두 pass의 공유 stream read 예산을 적용하고 manager·선택 pack·winner·실제 function identity와 원 bytes를 전후 대조한다. raw/test scan 자료는 production view로 변환하지 않는다. 관측 결과에 원 callback은 보관하지 않으며 후속 실행은 새 실제 요청의 현재성을 검사해야 한다. caller 비교 원문이나 이 동시 관측만으로 Rust provenance·실제 load에서 parsed function이 만들어진 인과·permit·profile·실행 권한을 만들지 않는다. live host·원 권한 및 calibration runner 연결과 실제 게임 검증은 별도 단계다. |
 
+| MMMM-D062 | 실제 CI 52에서 확인한 Linux reserved leader의 전후 동일 threads 3도 원 오류를 보존한 Pending으로만 처리한다. | 원 leader anchor·미회수 Child 예약·전후 identity·양쪽 Zombie·RSS Open/ESRCH 3·실제 BoundValidated pidfd TerminalPoll/NotReady와 errno 없음 조건을 유지한다. reserved leader만 동일 (2,2) 또는 (3,3)을 허용하고 OwnedMember는 기존 (2,2), candidate·비대칭·다른 수는 계속 거절한다. 마지막 실제 Complete부터 1,000 ms·이전 Complete 필수·100 ms cadence·부분 자원 하한 검사·오류와 history 보존 및 원 drain/reap 규칙은 바꾸지 않는다. Pending을 RSS 0·완전 표본·종료·ABI 성공으로 올리지 않으며 native 조회·재시도·sleep·기한 확대도 없다. 원 CI 실패, source 검증과 후속 실제 Linux 관측을 구분한다. |
+
 D061의 Rust 비교 입력은 같은 sealed `CalibrationDispatchPlan`의
 `loaded_source_expectations()`에서만 투영한다. 원 function ID·logical entry bytes와
 program digest는 plan에서 빌리고, native resource lookup ID는 별도로 구분한다.

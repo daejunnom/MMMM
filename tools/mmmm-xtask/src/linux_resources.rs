@@ -417,6 +417,13 @@ fn pending_exit_transition(
         }
         ProcessRole::EnumeratedCandidate => false,
     };
+    // Only the reserved leader has also been observed in a stable Z3
+    // transition. These exact counts admit an incomplete sample, not exit.
+    let threads_match_role = match conditions.role {
+        ProcessRole::ReservedLeader => matches!(before.threads, 2 | 3),
+        ProcessRole::OwnedMember => before.threads == 2,
+        ProcessRole::EnumeratedCandidate => false,
+    };
     conditions.owner.reservation_valid
         && leader.pid > 0
         && leader.group == leader.pid
@@ -428,9 +435,9 @@ fn pending_exit_transition(
             .is_some_and(PidfdDiagnostic::terminal_not_ready)
         && before.identity == original
         && before.state == b'Z'
-        && before.threads == 2
+        && threads_match_role
         && after.is_some_and(|after| {
-            after.identity == original && after.state == b'Z' && after.threads == 2
+            after.identity == original && after.state == b'Z' && after.threads == before.threads
         })
         && failure.open_esrch()
 }
@@ -1561,11 +1568,49 @@ pub(super) mod tests {
             &failure,
             conditions
         ));
+        let three_threads = Stat {
+            threads: 3,
+            ..before
+        };
+        assert!(pending_exit_transition(
+            original,
+            three_threads,
+            Some(three_threads),
+            &failure,
+            conditions
+        ));
+        assert!(!three_threads.definitely_exited());
+        for (before_threads, after_threads) in
+            [(0, 0), (1, 1), (4, 4), (u64::MAX, u64::MAX), (2, 3), (3, 2)]
+        {
+            assert!(!pending_exit_transition(
+                original,
+                Stat {
+                    threads: before_threads,
+                    ..before
+                },
+                Some(Stat {
+                    threads: after_threads,
+                    ..before
+                }),
+                &failure,
+                conditions
+            ));
+        }
         // The old settlement remains fatal without the new incomplete policy.
         assert!(
             settle_member(
                 before,
                 Some(before),
+                Some(Err(pending_observation().original_error())),
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            settle_member(
+                three_threads,
+                Some(three_threads),
                 Some(Err(pending_observation().original_error())),
                 true
             )
@@ -1737,6 +1782,25 @@ pub(super) mod tests {
         let closed = serde_json::to_string(&actual).unwrap();
         assert!(!closed.contains("start_ticks\":456"));
         assert!(!closed.contains("native ) comm"));
+        let mut three_thread_fact = actual.clone();
+        three_thread_fact.stat_observation.record_stats(
+            original,
+            Some(three_threads),
+            Some(three_threads),
+        );
+        assert_eq!(
+            three_thread_fact.original_error_kind,
+            actual.original_error_kind
+        );
+        assert_eq!(three_thread_fact.original_error, actual.original_error);
+        let rendered = three_thread_fact.original_error().to_string();
+        assert!(rendered.contains("before_threads=Some(3)"));
+        assert!(rendered.contains("after_threads=Some(3)"));
+        assert!(rendered.contains("os_error=Some(3)"));
+        assert!(rendered.contains(
+            "pidfd_observation(phase=terminal_poll; category=not_ready; native_errno=None)"
+        ));
+        assert!(rendered.len() < 1280);
 
         // A member has no Child reservation of its own. Only the already
         // checked original leader anchor and its held Child may admit this
@@ -1841,6 +1905,13 @@ pub(super) mod tests {
             assert!(!pending_exit_transition(
                 member.identity,
                 member,
+                Some(wrong),
+                &failure,
+                member_conditions
+            ));
+            assert!(!pending_exit_transition(
+                member.identity,
+                wrong,
                 Some(wrong),
                 &failure,
                 member_conditions
