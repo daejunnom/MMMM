@@ -442,7 +442,7 @@ fn forty_seven_original_claims_survive_restart_and_never_change_operation() {
     let selection =
         register_calibration_selection(&mut store, &rpc, &mut authority, &request).unwrap();
     rpc.completed.set(true);
-    confirm(&mut store, &rpc, &mut authority, &selection).unwrap();
+    let approval = confirm(&mut store, &rpc, &mut authority, &selection).unwrap();
     reserve(&mut store, &plan, "calibration-op", "calibration-key");
     let observation = store
         .put_blob(b"independent storage-only readback fixture")
@@ -457,6 +457,15 @@ fn forty_seven_original_claims_survive_restart_and_never_change_operation() {
         );
         let step = dispatch(&mut store, &rpc, &mut authority, &original).unwrap();
         assert_eq!(step.dispatch, DispatchEvidence::IntentDurable);
+        verify_calibration_intent_claim(
+            &store,
+            &approval,
+            &OperationId::new("calibration-op").unwrap(),
+            &step.step_id,
+            &original,
+            &|| rpc.check(),
+        )
+        .unwrap();
         assert!(dispatch(&mut store, &rpc, &mut authority, &original).is_err());
         store
             .record_observation(
@@ -512,7 +521,97 @@ fn forty_seven_original_claims_survive_restart_and_never_change_operation() {
             digest,
             raw_digest(&mmmm_contracts::encode_json(&expected).unwrap()).as_str()
         );
+        verify_calibration_intent_claim(
+            &store,
+            &approval,
+            &OperationId::new("calibration-op").unwrap(),
+            &StepId::new(format!("calibration-step-{index:02}")).unwrap(),
+            &expected,
+            &|| rpc.check(),
+        )
+        .unwrap();
     }
+}
+
+#[test]
+fn original_claim_query_is_factual_and_rejects_unclaimed_or_rewritten_intent() {
+    let (_root, mut store, rpc, mut authority, plan, context) = seed();
+    let request = authority.expected.clone();
+    let selection =
+        register_calibration_selection(&mut store, &rpc, &mut authority, &request).unwrap();
+    rpc.completed.set(true);
+    let approval = confirm(&mut store, &rpc, &mut authority, &selection).unwrap();
+    reserve(&mut store, &plan, "calibration-op", "calibration-key");
+    let operation = OperationId::new("calibration-op").unwrap();
+    let step = StepId::new("calibration-step-00").unwrap();
+    let original = invocation(&plan, &context, operation.as_str(), 0, "invocation-query");
+    assert!(matches!(
+        verify_calibration_intent_claim(&store, &approval, &operation, &step, &original, &|| rpc
+            .check()),
+        Err(StorageError::NotFound(_))
+    ));
+    assert_eq!(count(&store, "calibration_step_claims"), 0);
+    dispatch(&mut store, &rpc, &mut authority, &original).unwrap();
+    verify_calibration_intent_claim(&store, &approval, &operation, &step, &original, &|| {
+        rpc.check()
+    })
+    .unwrap();
+    let (_other_root, other_store, other_rpc, _other_authority, _other_plan, _other_context) =
+        seed();
+    assert!(matches!(
+        verify_calibration_intent_claim(
+            &other_store,
+            &approval,
+            &operation,
+            &step,
+            &original,
+            &|| other_rpc.check()
+        ),
+        Err(StorageError::Conflict(_))
+    ));
+    assert_eq!(count(&other_store, "invocations"), 0);
+    let mut rewritten = original.clone();
+    rewritten["arguments"]["command"] = json!("function mmmm:storage_fixture/other");
+    rewritten["argumentsDigest"] = json!(canonical_digest(&rewritten["arguments"]).unwrap());
+    assert!(matches!(
+        verify_calibration_intent_claim(&store, &approval, &operation, &step, &rewritten, &|| rpc
+            .check()),
+        Err(StorageError::Conflict(_))
+    ));
+    // A claim-row/index mismatch cannot borrow an otherwise valid durable
+    // Invocation. This uses the existing SQLite fixture, not another ledger.
+    store.connection.execute("UPDATE calibration_step_claims SET invocation_digest=?1 WHERE approval_ref=?2 AND step_id=?3",
+        params!["a".repeat(64),selection.approval_ref(),step.as_str()]).unwrap();
+    assert!(matches!(
+        verify_calibration_intent_claim(&store, &approval, &operation, &step, &original, &|| rpc
+            .check()),
+        Err(StorageError::Conflict(_))
+    ));
+    assert_eq!(count(&store, "calibration_step_claims"), 1);
+    assert_eq!(count(&store, "invocations"), 1);
+    // Preserve a primary wrong-original failure together with the original
+    // checkpoint's concurrent cancellation; neither becomes a safe retry.
+    let mut wrong = original.clone();
+    wrong["operationId"] = json!("another-operation");
+    let calls = Cell::new(0);
+    let failure =
+        verify_calibration_intent_claim(&store, &approval, &operation, &step, &wrong, &|| {
+            calls.set(calls.get() + 1);
+            if calls.get() > 1 {
+                Err(StorageError::Conflict("Fixture original request cancelled"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+    assert!(matches!(
+        failure.primary_failure(),
+        StorageError::Conflict("Calibration original claim operation identity")
+    ));
+    assert!(matches!(
+        failure.checkpoint_failure(),
+        Some(StorageError::Conflict("Fixture original request cancelled"))
+    ));
 }
 
 #[test]

@@ -704,6 +704,75 @@ pub fn dispatch_calibration_intent(
     finish_request(outcome, rpc)
 }
 
+/// Local-only historical claim verification, not an Apply or observation grant.
+/// The trusted consumer separately checks its actual entered request, current
+/// authority and exact retained private route. This reads only the existing
+/// approval/claim/journal/CAS facts and never creates schema or a new claim.
+pub fn verify_calibration_intent_claim(
+    store: &DurableStore,
+    approval: &CalibrationApprovalRecord,
+    original_operation: &OperationId,
+    original_step: &StepId,
+    original_invocation: &Value,
+    original_checkpoint: &dyn Fn() -> StorageResult<()>,
+) -> StorageResult<()> {
+    let outcome = (|| {
+        original_checkpoint()?;
+        let selection = approval.selection();
+        let pins = selection.pins();
+        if registered_native_project_owner(store, &pins.project_id)? != *selection.native_owner()
+            || approval_inner(store, selection.approval_ref())?.as_ref() != Some(approval)
+        {
+            return Err(conflict("Calibration original claim approval/owner"));
+        }
+        let operation = store.operation(original_operation)?;
+        if operation.principal != approval.confirmation().principal_id
+            || operation.project_id != pins.project_id
+            || operation.plan_id != pins.plan_id
+            || operation.plan_hash != pins.plan_hash
+            || original_invocation["operationId"] != original_operation.as_str()
+            || original_invocation["stepId"] != original_step.as_str()
+        {
+            return Err(conflict("Calibration original claim operation identity"));
+        }
+        // No current-expiry or remote capability is inferred from these rows.
+        // The original same-transaction claim remains factual after interruption.
+        let claimed: Option<(String, String, String, String)> = store.connection.query_row(
+            "SELECT o.operation_id,s.operation_id,s.invocation_id,s.invocation_digest FROM calibration_operation_claims o JOIN calibration_step_claims s ON s.approval_ref=o.approval_ref WHERE o.approval_ref=?1 AND s.step_id=?2",
+            params![selection.approval_ref(),original_step.as_str()],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        ).optional()?;
+        let (claimed_operation, step_operation, invocation_id, invocation_digest) =
+            claimed.ok_or(StorageError::NotFound("Original calibration intent claim"))?;
+        let actual = store.stored_invocation_checked(
+            original_operation,
+            original_step,
+            8 * 1024 * 1024,
+            original_checkpoint,
+        )?;
+        let blob = store.stored_invocation_blob(original_operation, original_step)?;
+        let bytes = mmmm_contracts::encode_json(original_invocation).map_err(contract)?;
+        if bytes.len() > 8 * 1024 * 1024
+            || claimed_operation != original_operation.as_str()
+            || step_operation != original_operation.as_str()
+            || original_invocation["invocationId"] != invocation_id
+            || invocation_digest != blob.digest.as_str()
+            || raw_digest(&bytes) != blob.digest
+            || bytes.len() as u64 != blob.byte_length
+            || actual != *original_invocation
+        {
+            return Err(conflict("Calibration original claim Invocation/CAS digest"));
+        }
+        if registered_native_project_owner(store, &pins.project_id)? != *selection.native_owner()
+            || approval_inner(store, selection.approval_ref())?.as_ref() != Some(approval)
+        {
+            return Err(conflict("Calibration original claim approval/owner"));
+        }
+        original_checkpoint()
+    })();
+    checked_after(outcome, original_checkpoint())
+}
+
 pub(crate) fn reject_unclaimed_plan(
     transaction: &Transaction<'_>,
     operation: &OperationRecord,

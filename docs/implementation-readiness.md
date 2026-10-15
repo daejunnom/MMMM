@@ -1434,9 +1434,42 @@ Java host에는 고정 normative47 plan만 받는 별도 calibration purpose 승
 활성화한다. 일반 read route와 `verifiedWriteProfile=false`는 유지한다. prepare는 plan을
 소비하지 않으며 실제 runner가 없으면 `CALIBRATION_RUNNER_UNAVAILABLE`로 거절한다.
 runner failure와 후행 현재성 오류 및 bridge output close 오류의 원인 보존 두 건은
-독립 소스 리뷰로 보완을 확인했다. 이 checkpoint의 Java compile·JUnit·실제 ADMIN과
-게임 실행은 아직 미검증이다. Coordinator publisher와 실제 execution consumer는 별도
-미커밋 작업이며, Java source만으로 plan 생성·로드·실행·readback 성공을 주장하지 않는다.
+독립 소스 리뷰로 보완을 확인했다. Coordinator publisher와 실제 execution consumer는
+별도 미커밋 작업이며, Java source만으로 plan 생성·로드·실행·readback 성공을 주장하지 않는다.
+
+공유 `b350fea`의 Windows 관리 실행 `410`은 실제 JDK/Gradle launcher digest와 원
+source 174개의 전후 일치를 확인하고 필수 11개 task를 모두 실제 실행했다. Fabric
+compile 및 JUnit은 32개 XML 보고서의 394개 test가 통과했고 실패·오류·skip은 0이다.
+새 purpose 승인 검사는 5개이며 실패 전용 runner와 기존 47행 Harness를 재사용한 검사다.
+원 XML 32개 74,325 bytes와 보고서별 digest를 증거 루트에 보존했다. 명령은 exit 0·
+66,354 ms, Job commit peak 1,398,284,288 bytes·6 process·최대 표본 간격 140 ms였고
+자연 종료·Job drain·완전한 출력·export·scratch 정리·lease 반환을 확인했다. 요약 digest는
+`87c724ccc67981fbf4044b8190a15dfeb6c2d1c10c0d5532a8877f37a77f907e`다. 외부 실행
+준비용 shell 인용 오류는 관리 실행에 도달하지 않았으며 검사 성공으로 세지 않았다.
+
+같은 `b350fea`의 JVM CI 57 (`38781127673`)은 실제 세 OS compile/test/native 관측 및
+집계 성공을 조회했고 원 ZIP 3개를 외부에 보존했다. 독립 원 ZIP 감사에서 source·expected·
+PR head는 모두 같은 `b350fea`, 별도 event SHA는 `e869de78c3d8f9bd98e73aada01d1d40502c6a58`,
+attempt 1이며 세 OS 각각 32 reports·394 tests·실패/오류/skip 0·필수 11 tasks executed를
+대조했다. native 3단계의 process/finish/finalization 9개와 prior JVM 5개 raw hash 연결,
+54개 build-source 입력 manifest·실제 native library·8개 header pin·startup 13단계와
+원 source pin 12개의 전후 일치 및 정상 정리도 대조했다. ZIP에 원 XML·owner·JAR·JDK
+archive가 없어 해당 원본을 독립 재hash했다고 기록하지 않는다. Linux의 ESRCH Pending은
+기존 zombie threads 2 한 번이며 threads 3 양성은 없고, Windows ancestry 5 race 및
+macOS memory/rusage 종료 Pending의 native 양성도 없다. Rust CI 66 (`38781127682`)은
+마지막 조회에서 in_progress였으며 성공을 확인하지 않았다. 실제 player ADMIN·게임 실행·
+클라이언트 검증과 공개 배포는 미완료다.
+
+Runtime에는 `verify_calibration_intent_claim`을 추가했다. existing approval과 operation/
+step claim을 명시적으로 JOIN한 뒤 원 operation·step·Invocation ID, 저장된 실제 CAS
+bytes의 raw digest·길이 및 파싱한 Invocation을 대조한다. 새 schema·claim·원장이나
+현재 Apply grant를 만들지 않는 사실 조회다. 기존 47-step/restart fixture와 좁은 검사로
+unclaimed·다른 Store·원 Invocation 변경·claim digest 변조·원 오류와 후행 취소 병존을
+확인했다. Windows 관리 실행 `412`의 Runtime 130개 unit test가 전부 통과했고 실패·
+ignored는 0이다. 명령 exit 0·57,337 ms, Job commit peak 711,147,520 bytes·6 process·
+최대 표본 간격 144 ms 및 소유 자식 정리 후 drain/output/export/scratch/lease 완료를
+확인했다. `413`은 이 두 소유 파일만 format했고 `414` Runtime/all-target strict Clippy도
+exit 0·정상 정리였다. 같은 source의 전체 Coordinator 연결 검증과 구분한다.
 
 ## 첫 공개 배포 인수
 
