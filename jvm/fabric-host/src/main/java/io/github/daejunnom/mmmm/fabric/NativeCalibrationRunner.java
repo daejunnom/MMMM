@@ -68,10 +68,11 @@ final class NativeCalibrationRunner implements NativeCalibrationApproval.Runner,
     /** Failure evidence only. It cannot be decoded/converted to a completed run or a ready grant. */
     static final class InterruptedTrace extends RuntimeException {
         private static final long serialVersionUID = 1L;
-        private final List<NativeCalibrationRunFacts.CommandFact> observed;
-        private final NativeCalibrationTargetImages.ImagePair preseed;
-        private final NativeCalibrationExecutables.Witness executables;
-        private final List<Throwable> nativeFailures;
+        // Process-local native identities and observations are not Java serialization data.
+        private final transient List<NativeCalibrationRunFacts.CommandFact> observed;
+        private final transient NativeCalibrationTargetImages.ImagePair preseed;
+        private final transient NativeCalibrationExecutables.Witness executables;
+        private final transient List<Throwable> nativeFailures;
         private InterruptedTrace(Trace trace) {
             super("Native calibration stopped with partial observations"); observed = trace.snapshot();
             preseed = trace.preseed; executables = trace.function.executables(); nativeFailures = List.copyOf(trace.nativeFailures);
