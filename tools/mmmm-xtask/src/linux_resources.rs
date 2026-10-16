@@ -18,6 +18,79 @@ const ROLLUP_BYTES: usize = 32 * 1024;
 const DIRECTORY_ENTRIES: usize = 100_000;
 pub(super) const LIVE_LIMIT: usize = 32;
 
+/// Borrowed from this observation's original command or fixed drain phase.
+/// Neither this callback nor its cancellation/deadline may enter retained facts.
+#[cfg(target_os = "linux")]
+pub(super) struct ObservationControl<'a> {
+    checkpoint: &'a mut dyn FnMut(&'static str) -> Result<(), ProcessError>,
+    allow_new_bindings: bool,
+    scope_phase: &'static str,
+}
+
+#[cfg(target_os = "linux")]
+impl<'a> ObservationControl<'a> {
+    pub(super) fn new(
+        checkpoint: &'a mut dyn FnMut(&'static str) -> Result<(), ProcessError>,
+        allow_new_bindings: bool,
+    ) -> Self {
+        Self {
+            checkpoint,
+            allow_new_bindings,
+            scope_phase: "native_binding",
+        }
+    }
+
+    pub(super) fn in_scope(mut self, phase: &'static str) -> Self {
+        self.scope_phase = phase;
+        self
+    }
+
+    pub(super) fn check(&mut self, phase: &'static str) -> Result<(), ProcessError> {
+        (self.checkpoint)(phase)
+    }
+
+    pub(super) fn allow_new_bindings(&self) -> bool {
+        self.allow_new_bindings
+    }
+
+    fn io<T>(
+        &mut self,
+        phase: &'static str,
+        operation: impl FnOnce() -> std::io::Result<T>,
+    ) -> Result<std::io::Result<T>, ProcessError> {
+        self.check(phase)?;
+        let result = operation();
+        match (result, self.check(phase)) {
+            (result, Ok(())) => Ok(result),
+            (Ok(_), Err(post)) => Err(post),
+            (Err(original), Err(post)) => Err(ProcessError::new(
+                "resource_observation",
+                format!(
+                    "linux_native_query(phase={phase}; native_errno={:?}); post={post}",
+                    original.raw_os_error()
+                ),
+            )),
+        }
+    }
+
+    pub(super) fn finish<T>(
+        &mut self,
+        result: Result<T, ProcessError>,
+        phase: &'static str,
+    ) -> Result<T, ProcessError> {
+        match (result, self.check(phase)) {
+            (result, Ok(())) => result,
+            (Ok(_), Err(post)) => Err(post),
+            (Err(mut original), Err(post)) => {
+                original
+                    .message
+                    .push_str(&format!("; linux_observation_post({phase})={post}"));
+                Err(original)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Identity {
     pid: i32,
@@ -212,6 +285,43 @@ impl fmt::Display for StatDiagnostic {
         }
         write!(f, ")")
     }
+}
+
+/// Bounded historical diagnostics, never an input to identity or drain checks.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct LifetimeEvidence {
+    pub retirement_count: u64,
+    pub binding_attempt_count: u64,
+    pub max_retained_members: usize,
+    pub max_retained_fds: usize,
+    pub close_stage_failure_count: u64,
+    pub first: Option<Box<LifetimeRetirementObservation>>,
+    pub last: Option<Box<LifetimeRetirementObservation>>,
+    pub query_failure_count: u64,
+    pub first_query_failure: Option<Box<LifetimeQueryFailure>>,
+    pub last_query_failure: Option<Box<LifetimeQueryFailure>>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Serialize)]
+pub struct LifetimeQueryFailure {
+    phase: &'static str,
+    kind: &'static str,
+    message: String,
+    message_truncated: bool,
+    stat_observation: Option<StatDiagnostic>,
+    pidfd_observation: Option<PidfdDiagnostic>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Serialize)]
+pub struct LifetimeRetirementObservation {
+    phase: &'static str,
+    scan_sequence: u64,
+    lifetime_sequence: u64,
+    original_failure_kind: &'static str,
+    stat_observation: StatDiagnostic,
 }
 
 /// A count-only observation has no RSS value. A memory observation also leaves
@@ -868,13 +978,53 @@ fn verify_identity(before: Stat, after: Stat) -> Result<(), ProcessError> {
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn original_retirement_transition(original: Identity, before: Stat, after: Stat) -> bool {
+    before.identity == original
+        && before.state == b'Z'
+        && before.threads == 2
+        && after.state == b'X'
+        && after.threads == 0
+        && after.identity.pid == original.pid
+        && after.identity.start_ticks == original.start_ticks
+        && after.identity.group == -1
+        && after.identity.session == -1
+}
+
+#[cfg(target_os = "linux")]
+fn retired_stat(original: Identity, observed: Stat) -> bool {
+    observed.identity.pid == original.pid
+        && observed.identity.start_ticks == original.start_ticks
+        && observed.identity.group == -1
+        && observed.identity.session == -1
+        && observed.state == b'X'
+        && observed.threads == 0
+}
+
+#[cfg(target_os = "linux")]
+fn finish_observation<T>(
+    result: Result<T, ProcessError>,
+    after: Result<(), ProcessError>,
+) -> Result<T, ProcessError> {
+    match (result, after) {
+        (result, Ok(())) => result,
+        (Ok(_), Err(after)) => Err(after),
+        (Err(mut original), Err(after)) => {
+            original
+                .message
+                .push_str(&format!("; linux_observation_secondary={after}"));
+            Err(original)
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod native {
     use super::*;
     use std::ffi::{CStr, CString};
     use std::fs::File;
     use std::io::{Read, Seek};
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
     use std::ptr::NonNull;
 
     const PROC_MAGIC: libc::c_long = 0x9fa0;
@@ -887,13 +1037,48 @@ mod native {
         initial: Stat,
     }
 
+    enum RetainedBinding {
+        Unattempted,
+        Bound(pidfd::BoundPidfd),
+        Unavailable(pidfd::BindingUnavailable),
+        Failed,
+    }
+
+    struct MemberLifetime {
+        sequence: u64,
+        binding: RetainedBinding,
+        retired: bool,
+        gone: bool,
+        last_virtual_bytes: u64,
+    }
+
+    struct RetainedOriginalMember {
+        process: ProcDirectory,
+        lifetime: MemberLifetime,
+    }
+
+    struct MemberContext<'a, 'control> {
+        include_rss: bool,
+        is_leader: bool,
+        owner: OwnerContext,
+        retained: Option<&'a mut MemberLifetime>,
+        control: &'a mut ObservationControl<'control>,
+        scan_sequence: u64,
+        evidence: &'a mut LifetimeEvidence,
+    }
+
     /// The supervisor must continue holding its unreaped Child reservation.
     /// Once this observer loses the original leader identity it cannot recover
     /// that reservation, authorize another group signal, or certify drain.
     pub(in super::super) struct OwnedGroup {
         root: File,
         leader: ProcDirectory,
+        leader_lifetime: MemberLifetime,
         reservation_valid: bool,
+        members: Vec<RetainedOriginalMember>,
+        next_lifetime: u64,
+        scan_sequence: u64,
+        evidence: LifetimeEvidence,
     }
 
     impl OwnedGroup {
@@ -930,7 +1115,18 @@ mod native {
             Ok(Self {
                 root,
                 leader,
+                leader_lifetime: MemberLifetime {
+                    sequence: 0,
+                    binding: RetainedBinding::Unattempted,
+                    retired: false,
+                    gone: false,
+                    last_virtual_bytes: 0,
+                },
                 reservation_valid: true,
+                members: Vec::new(),
+                next_lifetime: 0,
+                scan_sequence: 0,
+                evidence: LifetimeEvidence::default(),
             })
         }
 
@@ -938,21 +1134,116 @@ mod native {
             self.reservation_valid
         }
 
+        pub(in super::super) fn lifetime_evidence(&self) -> LifetimeEvidence {
+            self.evidence.clone()
+        }
+
+        pub(in super::super) fn close(
+            self,
+            control: &mut ObservationControl<'_>,
+        ) -> (LifetimeEvidence, Result<(), ProcessError>) {
+            let Self {
+                root,
+                leader,
+                leader_lifetime,
+                members,
+                mut evidence,
+                ..
+            } = self;
+            let mut result = Ok(());
+            for member in members {
+                result = finish_observation(result, close_member(member, control, &mut evidence));
+            }
+            result = finish_observation(
+                result,
+                close_member(
+                    RetainedOriginalMember {
+                        process: leader,
+                        lifetime: leader_lifetime,
+                    },
+                    control,
+                    &mut evidence,
+                ),
+            );
+            result = finish_observation(
+                result,
+                close_file(root, "proc_root_close", control, &mut evidence),
+            );
+            (evidence, result)
+        }
+
         pub(in super::super) fn sample(
             &mut self,
             include_rss: bool,
             held_child_reservation_valid: bool,
             pending: &mut PendingObservations,
+            control: &mut ObservationControl<'_>,
+        ) -> Result<GroupObservation, ProcessError> {
+            let result =
+                self.sample_inner(include_rss, held_child_reservation_valid, pending, control);
+            let held = self
+                .members
+                .iter()
+                .map(|entry| {
+                    2 + usize::from(matches!(entry.lifetime.binding, RetainedBinding::Bound(_)))
+                })
+                .sum();
+            self.evidence.max_retained_fds = self.evidence.max_retained_fds.max(held);
+            if let Err(error) = &result {
+                self.evidence.query_failure_count =
+                    self.evidence.query_failure_count.saturating_add(1);
+                let mut message = error.message.clone();
+                let message_truncated = message.len() > 16 * 1024;
+                if message_truncated {
+                    let mut end = 16 * 1024;
+                    while !message.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    message.truncate(end);
+                }
+                let observed = LifetimeQueryFailure {
+                    phase: control.scope_phase,
+                    kind: error.kind,
+                    message,
+                    message_truncated,
+                    stat_observation: error.linux_stat_diagnostic.as_deref().copied(),
+                    pidfd_observation: error.linux_pidfd_diagnostic,
+                };
+                if self.evidence.first_query_failure.is_none() {
+                    self.evidence.first_query_failure = Some(Box::new(observed.clone()));
+                }
+                self.evidence.last_query_failure = Some(Box::new(observed));
+            }
+            result
+        }
+
+        fn sample_inner(
+            &mut self,
+            include_rss: bool,
+            held_child_reservation_valid: bool,
+            pending: &mut PendingObservations,
+            control: &mut ObservationControl<'_>,
         ) -> Result<GroupObservation, ProcessError> {
             // This output belongs only to this scan, including its failure
             // path. Prior observations live in the tracker, never here.
             *pending = PendingObservations::default();
-            let leader_before = self.check_leader()?;
+            control.check("sample_begin")?;
+            self.scan_sequence = self
+                .scan_sequence
+                .checked_add(1)
+                .ok_or_else(|| metadata("native observation sequence overflow"))?;
+            let leader_before = self.check_leader(control)?;
             let group = leader_before.identity.pid;
             let owner = OwnerContext {
                 leader: leader_before.identity,
                 reservation_valid: self.reservation_valid && held_child_reservation_valid,
             };
+            if !owner.reservation_valid {
+                return Err(ProcessError::new(
+                    "process_identity",
+                    "original Linux leader reservation is no longer held",
+                ));
+            }
             let mut sample = Sample {
                 live_processes: 0,
                 aggregate_rss_bytes: include_rss.then_some(0),
@@ -961,49 +1252,181 @@ mod native {
             };
             // The held leader is observed explicitly, using its original stat
             // FD. Enumeration is only for the remaining process candidates.
-            let leader_sample =
-                match observe_member(&self.root, &mut self.leader, include_rss, true, owner) {
-                    Ok(sample) => sample,
-                    Err(error) => {
-                        if error.kind == "process_identity" {
-                            self.reservation_valid = false;
-                        }
-                        return Err(error);
+            let leader_sample = match observe_member(
+                &self.root,
+                &mut self.leader,
+                MemberContext {
+                    include_rss,
+                    is_leader: true,
+                    owner,
+                    retained: Some(&mut self.leader_lifetime),
+                    control,
+                    scan_sequence: self.scan_sequence,
+                    evidence: &mut self.evidence,
+                },
+            ) {
+                Ok(sample) => sample,
+                Err(error) => {
+                    if error.kind == "process_identity" {
+                        self.reservation_valid = false;
                     }
-                };
+                    return Err(error);
+                }
+            };
             accumulate(&mut sample, leader_sample, pending)?;
-            let mut entries = DirectoryEntries::new(&self.root)?;
-            let mut observed_entries = 0usize;
-            while let Some(name) = entries.next()? {
-                observed_entries += 1;
-                if observed_entries > DIRECTORY_ENTRIES {
-                    return Err(metadata(
-                        "native process enumeration exceeds its entry bound",
-                    ));
-                }
-                if name.is_empty() || !name.iter().all(u8::is_ascii_digit) {
-                    continue;
-                }
-                let pid = positive_pid(&name, NumericField::DirectoryPid)?;
-                if pid == group {
-                    continue;
-                }
-                let Some(mut member) =
-                    open_process(&self.root, pid, ProcessRole::EnumeratedCandidate)?
-                else {
-                    // This candidate disappeared before it had an anchored
-                    // identity. It is not a confirmed owned-process exit.
-                    continue;
-                };
-                let stat = member.initial;
-                if !belongs_to_owned_group(stat, group)? {
-                    continue;
-                }
-                let read_rss = include_rss && sample.live_processes < LIVE_LIMIT;
-                let observation = observe_member(&self.root, &mut member, read_rss, false, owner)?;
+            // Observe the original held inodes first. A missing numeric entry
+            // cannot silently evict an unresolved original lifetime.
+            let mut index = 0;
+            while index < self.members.len() {
+                let member = &mut self.members[index];
+                let observation = observe_member(
+                    &self.root,
+                    &mut member.process,
+                    MemberContext {
+                        include_rss,
+                        is_leader: false,
+                        owner,
+                        retained: Some(&mut member.lifetime),
+                        control,
+                        scan_sequence: self.scan_sequence,
+                        evidence: &mut self.evidence,
+                    },
+                )?;
                 accumulate(&mut sample, observation, pending)?;
+                if member.lifetime.gone {
+                    let member = self.members.remove(index);
+                    close_member(member, control, &mut self.evidence)?;
+                } else {
+                    index += 1;
+                }
             }
-            self.check_leader()?;
+            control.check("enumeration_open")?;
+            let entries = DirectoryEntries::new(&self.root);
+            let mut entries = match (entries, control.check("enumeration_open")) {
+                (Ok(entries), Ok(())) => entries,
+                (Ok(entries), Err(post)) => {
+                    return finish_observation(
+                        Err(post),
+                        entries.close(control, &mut self.evidence),
+                    );
+                }
+                (Err(original), after) => return finish_observation(Err(original), after),
+            };
+            let mut observed_entries = 0usize;
+            let enumerated = (|| {
+                loop {
+                    control.check("enumeration_next")?;
+                    let next = entries.next();
+                    let Some(name) = control.finish(next, "enumeration_next")? else {
+                        break;
+                    };
+                    observed_entries += 1;
+                    if observed_entries > DIRECTORY_ENTRIES {
+                        return Err(metadata(
+                            "native process enumeration exceeds its entry bound",
+                        ));
+                    }
+                    if name.is_empty() || !name.iter().all(u8::is_ascii_digit) {
+                        continue;
+                    }
+                    let pid = positive_pid(&name, NumericField::DirectoryPid)?;
+                    if pid == group {
+                        continue;
+                    }
+                    let Some(member) = open_process_checked(
+                        &self.root,
+                        pid,
+                        ProcessRole::EnumeratedCandidate,
+                        control,
+                        &mut self.evidence,
+                    )?
+                    else {
+                        // This candidate disappeared before it had an anchored
+                        // identity. It is not a confirmed owned-process exit.
+                        continue;
+                    };
+                    let stat = member.initial;
+                    let belongs = belongs_to_owned_group(stat, group);
+                    if !matches!(belongs, Ok(true)) {
+                        let closed = close_directory(member, control, &mut self.evidence);
+                        finish_observation(belongs.map(|_| ()), closed)?;
+                        continue;
+                    }
+                    if let Some(original) = self
+                        .members
+                        .iter()
+                        .find(|entry| entry.process.initial.identity.pid == stat.identity.pid)
+                    {
+                        // Even a same-PID candidate must match the original full
+                        // identity; never replace a retained lifetime by lookup.
+                        let same = verify_identity(original.process.initial, stat);
+                        let closed = close_directory(member, control, &mut self.evidence);
+                        finish_observation(same, closed)?;
+                        continue;
+                    }
+                    if self.members.len() >= LIVE_LIMIT {
+                        let closed = close_directory(member, control, &mut self.evidence);
+                        return finish_observation(
+                            Err(ProcessError::new(
+                                "resource_budget",
+                                "retained original Linux member bound exceeded",
+                            )),
+                            closed,
+                        );
+                    }
+                    self.next_lifetime = self
+                        .next_lifetime
+                        .checked_add(1)
+                        .ok_or_else(|| metadata("native member lifetime sequence overflow"))?;
+                    self.members.push(RetainedOriginalMember {
+                        process: member,
+                        lifetime: MemberLifetime {
+                            sequence: self.next_lifetime,
+                            binding: RetainedBinding::Unattempted,
+                            retired: false,
+                            gone: false,
+                            last_virtual_bytes: stat.virtual_bytes,
+                        },
+                    });
+                    self.evidence.max_retained_members =
+                        self.evidence.max_retained_members.max(self.members.len());
+                    let read_rss = include_rss && sample.live_processes < LIVE_LIMIT;
+                    let member = self
+                        .members
+                        .last_mut()
+                        .ok_or_else(|| metadata("missing retained member"))?;
+                    let observation = observe_member(
+                        &self.root,
+                        &mut member.process,
+                        MemberContext {
+                            include_rss: read_rss,
+                            is_leader: false,
+                            owner,
+                            retained: Some(&mut member.lifetime),
+                            control,
+                            scan_sequence: self.scan_sequence,
+                            evidence: &mut self.evidence,
+                        },
+                    )?;
+                    accumulate(&mut sample, observation, pending)?;
+                    let held = self
+                        .members
+                        .iter()
+                        .map(|entry| {
+                            2 + usize::from(matches!(
+                                entry.lifetime.binding,
+                                RetainedBinding::Bound(_)
+                            ))
+                        })
+                        .sum();
+                    self.evidence.max_retained_fds = self.evidence.max_retained_fds.max(held);
+                }
+                Ok(())
+            })();
+            let closed = entries.close(control, &mut self.evidence);
+            finish_observation(enumerated, closed)?;
+            self.check_leader(control)?;
+            control.check("sample_complete")?;
             // The provisional member facts above never bypass this final
             // check of the original held leader anchor.
             Ok(if !pending.is_empty() {
@@ -1013,17 +1436,21 @@ mod native {
             })
         }
 
-        fn check_leader(&mut self) -> Result<Stat, ProcessError> {
+        fn check_leader(
+            &mut self,
+            control: &mut ObservationControl<'_>,
+        ) -> Result<Stat, ProcessError> {
             if !self.reservation_valid {
                 return Err(ProcessError::new(
                     "process_identity",
                     "reserved Linux leader identity was already lost",
                 ));
             }
-            let result = read_stat(
+            let result = read_stat_checked(
                 &mut self.leader.stat,
                 self.leader.initial.identity.pid,
                 ProcessRole::ReservedLeader,
+                control,
             )
             .and_then(|value| match value {
                 Some(value) => {
@@ -1048,10 +1475,10 @@ mod native {
     fn observe_member(
         root: &File,
         process: &mut ProcDirectory,
-        include_rss: bool,
-        is_leader: bool,
-        owner: OwnerContext,
+        mut context: MemberContext<'_, '_>,
     ) -> Result<MemberObservation, ProcessError> {
+        let include_rss = context.include_rss;
+        let is_leader = context.is_leader;
         let role = if is_leader {
             ProcessRole::ReservedLeader
         } else {
@@ -1059,35 +1486,50 @@ mod native {
         };
         let mut diagnostic =
             StatDiagnostic::observed(role, process.initial.identity, None, None, include_rss);
-        observe_member_with_facts(
-            root,
-            process,
-            include_rss,
-            is_leader,
-            owner,
-            &mut diagnostic,
-        )
-        .map_err(|error| error.with_linux_stat_diagnostic(diagnostic))
+        observe_member_with_facts(root, process, &mut context, &mut diagnostic)
+            .map_err(|error| error.with_linux_stat_diagnostic(diagnostic))
     }
 
     fn observe_member_with_facts(
         root: &File,
         process: &mut ProcDirectory,
-        include_rss: bool,
-        is_leader: bool,
-        owner: OwnerContext,
+        context: &mut MemberContext<'_, '_>,
         diagnostic: &mut StatDiagnostic,
     ) -> Result<MemberObservation, ProcessError> {
+        let include_rss = context.include_rss;
+        let is_leader = context.is_leader;
+        let owner = context.owner;
         let pid = process.initial.identity.pid;
         let role = if is_leader {
             ProcessRole::ReservedLeader
         } else {
             ProcessRole::OwnedMember
         };
-        let Some(before) = read_stat(&mut process.stat, pid, role)? else {
+        let Some(before) = read_stat_checked(&mut process.stat, pid, role, context.control)? else {
+            if let Some(lifetime) = context.retained.as_deref_mut() {
+                lifetime.gone = true;
+            }
             return unavailable_member(is_leader).map(MemberObservation::Settled);
         };
         diagnostic.record_stats(process.initial.identity, Some(before), None);
+        if let Some(lifetime) = context.retained.as_deref_mut()
+            && lifetime.retired
+        {
+            // This is a historical tombstone, not a new exit witness. Keep
+            // its original anchors until their actual ESRCH disappearance.
+            if !retired_stat(process.initial.identity, before) {
+                return Err(ProcessError::new(
+                    "process_identity",
+                    "retired original Linux member changed or reappeared",
+                ));
+            }
+            lifetime.last_virtual_bytes = lifetime.last_virtual_bytes.max(before.virtual_bytes);
+            return Ok(MemberObservation::Settled(Some(MemberSample {
+                live: false,
+                virtual_bytes: lifetime.last_virtual_bytes,
+                rss: None,
+            })));
+        }
         verify_identity(process.initial, before)?;
         if before.definitely_exited() {
             return Ok(MemberObservation::Settled(None));
@@ -1096,17 +1538,64 @@ mod native {
         // Binding is optional: unsupported syscalls or uncertain namespace /
         // mount metadata never turn a later RSS error into a successful sample.
         let mut pidfd_diagnostic = None;
-        let bound = if include_rss {
-            match pidfd::bind(
+        let mut leader_bound = None;
+        if let Some(lifetime) = context.retained.as_deref_mut() {
+            if matches!(lifetime.binding, RetainedBinding::Unattempted)
+                && context.control.allow_new_bindings()
+            {
+                // Set before I/O: a failed or cancelled attempt never rebinds
+                // this lifetime during subsequent cleanup observations.
+                lifetime.binding = RetainedBinding::Failed;
+                diagnostic.pidfd_binding = PidfdBindingState::Failed;
+                context.evidence.binding_attempt_count = context
+                    .evidence
+                    .binding_attempt_count
+                    .checked_add(1)
+                    .ok_or_else(|| metadata("native member binding count overflow"))?;
+                let binding = pidfd::bind_controlled(
+                    root,
+                    &process.directory,
+                    &mut process.stat,
+                    before,
+                    |file, control| read_stat_checked(file, pid, role, control),
+                    context.control,
+                )?;
+                lifetime.binding = match binding {
+                    pidfd::Binding::Bound(bound) => RetainedBinding::Bound(bound),
+                    pidfd::Binding::Unavailable(reason) => RetainedBinding::Unavailable(reason),
+                    pidfd::Binding::OriginalGone => {
+                        lifetime.gone = true;
+                        diagnostic.pidfd_binding = PidfdBindingState::OriginalGone;
+                        return unavailable_member(is_leader).map(MemberObservation::Settled);
+                    }
+                };
+            }
+            match &lifetime.binding {
+                RetainedBinding::Bound(_) => {
+                    diagnostic.pidfd_binding = PidfdBindingState::BoundValidated
+                }
+                RetainedBinding::Unavailable(reason) => {
+                    diagnostic.pidfd_binding = PidfdBindingState::Unavailable;
+                    diagnostic.pidfd_binding_observation = Some(reason.diagnostic());
+                    pidfd_diagnostic = Some(reason.diagnostic());
+                }
+                RetainedBinding::Failed => diagnostic.pidfd_binding = PidfdBindingState::Failed,
+                RetainedBinding::Unattempted => {
+                    diagnostic.pidfd_binding = PidfdBindingState::NotAttempted
+                }
+            }
+        } else if include_rss {
+            match pidfd::bind_controlled(
                 root,
                 &process.directory,
                 &mut process.stat,
                 before,
-                |file| read_stat(file, pid, role),
+                |file, control| read_stat_checked(file, pid, role, control),
+                context.control,
             ) {
                 Ok(pidfd::Binding::Bound(bound)) => {
                     diagnostic.pidfd_binding = PidfdBindingState::BoundValidated;
-                    Some(bound)
+                    leader_bound = Some(bound);
                 }
                 Ok(pidfd::Binding::Unavailable(reason)) => {
                     // Keep the closed reason distinct inside the producer;
@@ -1115,7 +1604,6 @@ mod native {
                     diagnostic.pidfd_binding = PidfdBindingState::Unavailable;
                     diagnostic.pidfd_binding_observation = Some(observation);
                     pidfd_diagnostic = Some(observation);
-                    None
                 }
                 Ok(pidfd::Binding::OriginalGone) => {
                     diagnostic.pidfd_binding = PidfdBindingState::OriginalGone;
@@ -1126,22 +1614,97 @@ mod native {
                     return Err(error);
                 }
             }
-        } else {
-            None
-        };
+        }
+        let bound = context
+            .retained
+            .as_deref()
+            .and_then(|lifetime| match &lifetime.binding {
+                RetainedBinding::Bound(bound) => Some(bound),
+                _ => None,
+            })
+            .or(leader_bound.as_ref());
         let memory = if include_rss {
-            Some(read_rollup(&process.directory))
+            Some(read_rollup_checked(
+                &process.directory,
+                role,
+                context.control,
+                context.evidence,
+            )?)
         } else {
             None
         };
-        let after = read_stat(&mut process.stat, pid, role)?;
+        let after = match read_stat_checked(&mut process.stat, pid, role, context.control) {
+            Ok(after) => after,
+            Err(post) => return Err(rss_post_error(memory, role, post)),
+        };
         diagnostic.record_stats(process.initial.identity, Some(before), after);
         if let Some(after) = after {
-            verify_identity(before, after)?;
+            if let Err(original) = verify_identity(before, after) {
+                // CI87 is a count-only race. RSS terminal/Pending semantics
+                // stay on their existing strict full-identity path.
+                let candidate = !include_rss
+                    && !is_leader
+                    && owner.reservation_valid
+                    && process.initial.identity.pid != owner.leader.pid
+                    && process.initial.identity.group == owner.leader.pid
+                    && process.initial.identity.session == owner.leader.pid
+                    && original_retirement_transition(process.initial.identity, before, after);
+                if !candidate {
+                    return Err(original);
+                }
+                let Some(bound) = bound else {
+                    return Err(original);
+                };
+                let checked = bound.poll_original_retirement(before, after, context.control);
+                let checked = match checked {
+                    Ok(checked) => checked,
+                    Err(post) => return finish_observation(Err(original), Err(post)),
+                };
+                diagnostic.pidfd_terminal_observation = Some(checked.diagnostic);
+                let authorized = checked
+                    .proof
+                    .as_ref()
+                    .is_some_and(|proof| proof.matches(bound, before, after));
+                if !authorized {
+                    return Err(original.with_linux_pidfd_diagnostic(checked.diagnostic));
+                }
+                let lifetime = context
+                    .retained
+                    .as_deref_mut()
+                    .ok_or_else(|| metadata("missing original member lifetime"))?;
+                lifetime.retired = true;
+                lifetime.last_virtual_bytes = before.virtual_bytes.max(after.virtual_bytes);
+                context.evidence.retirement_count = context
+                    .evidence
+                    .retirement_count
+                    .checked_add(1)
+                    .ok_or_else(|| metadata("native retirement count overflow"))?;
+                let observed = LifetimeRetirementObservation {
+                    phase: context.control.scope_phase,
+                    scan_sequence: context.scan_sequence,
+                    lifetime_sequence: lifetime.sequence,
+                    original_failure_kind: original.kind,
+                    stat_observation: *diagnostic,
+                };
+                if context.evidence.first.is_none() {
+                    context.evidence.first = Some(Box::new(observed.clone()));
+                }
+                context.evidence.last = Some(Box::new(observed));
+                return Ok(MemberObservation::Settled(Some(MemberSample {
+                    live: false,
+                    virtual_bytes: lifetime.last_virtual_bytes,
+                    rss: None,
+                })));
+            }
         }
         // Exactly one nonblocking kernel check, after an actual RSS failure.
         // The witness requires a matching post-RSS original stat identity;
         // losing the leader reservation cannot be repaired with a pidfd.
+        let polls_terminal = matches!((&memory, after, bound.as_ref()),
+            (Some(Err(_)), Some(after), Some(_)) if !after.definitely_exited());
+        if polls_terminal && let Err(post) = context.control.check("rss_terminal_poll") {
+            return Err(rss_post_error(memory, role, post));
+        }
         let terminal = match (&memory, after, bound.as_ref()) {
             (Some(Err(_)), Some(after), Some(bound)) if !after.definitely_exited() => {
                 let check = bound.check_terminal_after(after.identity);
@@ -1151,6 +1714,9 @@ mod native {
             }
             _ => None,
         };
+        if polls_terminal && let Err(post) = context.control.check("rss_terminal_poll") {
+            return Err(rss_post_error(memory, role, post));
+        }
         let memory = match memory {
             Some(Err(failure))
                 if pending_exit_transition(
@@ -1188,6 +1754,11 @@ mod native {
             }
             result => result.map(|result| result.map_err(|error| error.into_process_error(role))),
         };
+        if after.is_none()
+            && let Some(lifetime) = context.retained.as_deref_mut()
+        {
+            lifetime.gone = true;
+        }
         // smaps_rollup ESRCH/ENOENT alone never proves death. Except for the
         // narrow incomplete transition above, a live original stat identity
         // makes that exact RSS observation error fatal.
@@ -1216,6 +1787,127 @@ mod native {
             ))
         } else {
             Ok(None)
+        }
+    }
+
+    fn rss_post_error(
+        memory: Option<Result<u64, RssFailure>>,
+        role: ProcessRole,
+        post: ProcessError,
+    ) -> ProcessError {
+        if let Some(Err(failure)) = memory {
+            let mut original = failure.into_process_error(role);
+            original
+                .message
+                .push_str(&format!("; linux_observation_secondary={post}"));
+            original
+        } else {
+            post
+        }
+    }
+
+    fn checked_open_file(
+        opened: Result<File, ProcessError>,
+        phase: &'static str,
+        control: &mut ObservationControl<'_>,
+        evidence: &mut LifetimeEvidence,
+    ) -> Result<File, ProcessError> {
+        let after = control.check(phase);
+        match (opened, after) {
+            (Ok(file), Ok(())) => Ok(file),
+            (Ok(file), Err(post)) => {
+                finish_observation(Err(post), close_file(file, phase, control, evidence))
+            }
+            (Err(original), after) => finish_observation(Err(original), after),
+        }
+    }
+
+    fn open_process_checked(
+        root: &File,
+        pid: i32,
+        role: ProcessRole,
+        control: &mut ObservationControl<'_>,
+        evidence: &mut LifetimeEvidence,
+    ) -> Result<Option<ProcDirectory>, ProcessError> {
+        let name = CString::new(pid.to_string()).map_err(|_| metadata("invalid numeric PID"))?;
+        control.check("candidate_directory_open")?;
+        let descriptor = unsafe {
+            libc::openat(
+                root.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if descriptor < 0 {
+            let error = std::io::Error::last_os_error();
+            let result = if error.raw_os_error() == Some(libc::ENOENT) {
+                Ok(None)
+            } else {
+                Err(metadata_io_error(
+                    role,
+                    MetadataRole::PidDirectory,
+                    MetadataOperation::Open,
+                    error,
+                ))
+            };
+            return control.finish(result, "candidate_directory_open");
+        }
+        let directory = checked_open_file(
+            Ok(unsafe { File::from_raw_fd(descriptor) }),
+            "candidate_directory_open",
+            control,
+            evidence,
+        )?;
+        let stat_open = (|| {
+            control.check("candidate_stat_open")?;
+            let opened = open_file_io(&directory, MetadataRole::Stat.file_name()?);
+            match opened {
+                Ok(file) => {
+                    checked_open_file(Ok(file), "candidate_stat_open", control, evidence).map(Some)
+                }
+                Err(error) => {
+                    let result = if initial_candidate_stat_open_disappeared(
+                        role,
+                        MetadataRole::Stat,
+                        MetadataOperation::Open,
+                        &error,
+                    ) {
+                        Ok(None)
+                    } else {
+                        Err(metadata_io_error(
+                            role,
+                            MetadataRole::Stat,
+                            MetadataOperation::Open,
+                            error,
+                        ))
+                    };
+                    control.finish(result, "candidate_stat_open")
+                }
+            }
+        })();
+        let mut stat = match stat_open {
+            Ok(Some(stat)) => stat,
+            result => {
+                return finish_observation(
+                    result.map(|_| None),
+                    close_file(directory, "candidate_directory_close", control, evidence),
+                );
+            }
+        };
+        match read_stat_checked(&mut stat, pid, role, control) {
+            Ok(Some(initial)) => Ok(Some(ProcDirectory {
+                directory,
+                stat,
+                initial,
+            })),
+            result => {
+                let closed = close_file(stat, "candidate_stat_close", control, evidence);
+                let closed = finish_observation(
+                    closed,
+                    close_file(directory, "candidate_directory_close", control, evidence),
+                );
+                finish_observation(result.map(|_| None), closed)
+            }
         }
     }
 
@@ -1305,6 +1997,163 @@ mod native {
         parse_stat(&bytes, pid).map(Some)
     }
 
+    fn read_stat_checked(
+        file: &mut File,
+        pid: i32,
+        role: ProcessRole,
+        control: &mut ObservationControl<'_>,
+    ) -> Result<Option<Stat>, ProcessError> {
+        control
+            .io("original_stat_rewind", || file.rewind())?
+            .map_err(|error| {
+                metadata_io_error(role, MetadataRole::Stat, MetadataOperation::Rewind, error)
+            })?;
+        let bytes = match read_bounded_checked(file, STAT_BYTES, "original_stat_read", control)? {
+            Ok(bytes) => bytes,
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
+            Err(error) => {
+                return Err(metadata_io_error(
+                    role,
+                    MetadataRole::Stat,
+                    MetadataOperation::Read,
+                    error,
+                ));
+            }
+        };
+        control.finish(parse_stat(&bytes, pid).map(Some), "original_stat_parse")
+    }
+
+    fn read_bounded_checked(
+        file: &mut File,
+        limit: usize,
+        phase: &'static str,
+        control: &mut ObservationControl<'_>,
+    ) -> Result<std::io::Result<Vec<u8>>, ProcessError> {
+        let mut bytes = Vec::with_capacity(limit.min(4096));
+        let mut interrupted = 0usize;
+        for _ in 0..READ_CALLS {
+            let mut buffer = [0u8; 4096];
+            let remaining = limit + 1 - bytes.len();
+            match control.io(phase, || file.read(&mut buffer[..remaining.min(4096)]))? {
+                Ok(0) => return Ok(Ok(bytes)),
+                Ok(read) => {
+                    bytes.extend_from_slice(&buffer[..read]);
+                    if bytes.len() > limit {
+                        return Ok(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "native metadata read exceeds its byte bound",
+                        )));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    interrupted += 1;
+                    if interrupted > INTERRUPTED_READS {
+                        return Ok(Err(error));
+                    }
+                }
+                Err(error) => return Ok(Err(error)),
+            }
+        }
+        Ok(Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "native metadata read exceeds its call bound",
+        )))
+    }
+
+    fn read_rollup_checked(
+        directory: &File,
+        role: ProcessRole,
+        control: &mut ObservationControl<'_>,
+        evidence: &mut LifetimeEvidence,
+    ) -> Result<Result<u64, RssFailure>, ProcessError> {
+        let name = MetadataRole::RssRollup.file_name()?;
+        control.check("rss_rollup_open")?;
+        let mut file = match open_file_io(directory, name) {
+            Ok(file) => checked_open_file(Ok(file), "rss_rollup_open", control, evidence)?,
+            Err(error) => {
+                let original = RssFailure::Open(error);
+                return match control.check("rss_rollup_open") {
+                    Ok(()) => Ok(Err(original)),
+                    Err(post) => {
+                        finish_observation(Err(original.into_process_error(role)), Err(post))
+                    }
+                };
+            }
+        };
+        let bytes = read_bounded_checked(&mut file, ROLLUP_BYTES, "rss_rollup_read", control);
+        let parsed = match bytes {
+            Ok(Ok(bytes)) => Ok(parse_rollup(&bytes).map_err(RssFailure::Parse)),
+            Ok(Err(error)) => Ok(Err(RssFailure::Read(error))),
+            Err(error) => Err(error),
+        };
+        let closed = close_file(file, "rss_rollup_close", control, evidence);
+        match (parsed, closed) {
+            (result, Ok(())) => result,
+            (Ok(Err(original)), Err(post)) => {
+                finish_observation(Err(original.into_process_error(role)), Err(post))
+            }
+            (result, Err(post)) => finish_observation(result, Err(post)),
+        }
+    }
+
+    fn close_file(
+        file: File,
+        phase: &'static str,
+        control: &mut ObservationControl<'_>,
+        evidence: &mut LifetimeEvidence,
+    ) -> Result<(), ProcessError> {
+        let before = control.check(phase);
+        let descriptor = file.into_raw_fd();
+        // Consume exactly once, including EINTR. No numeric FD retry follows.
+        let closed = if unsafe { libc::close(descriptor) } == 0 {
+            Ok(())
+        } else {
+            Err(native_error(phase))
+        };
+        let result = finish_observation(before, closed);
+        let result = control.finish(result, phase);
+        if result.is_err() {
+            evidence.close_stage_failure_count =
+                evidence.close_stage_failure_count.saturating_add(1);
+        }
+        result
+    }
+
+    fn close_directory(
+        process: ProcDirectory,
+        control: &mut ObservationControl<'_>,
+        evidence: &mut LifetimeEvidence,
+    ) -> Result<(), ProcessError> {
+        let ProcDirectory {
+            directory, stat, ..
+        } = process;
+        let result = close_file(stat, "original_stat_close", control, evidence);
+        finish_observation(
+            result,
+            close_file(directory, "original_directory_close", control, evidence),
+        )
+    }
+
+    fn close_member(
+        member: RetainedOriginalMember,
+        control: &mut ObservationControl<'_>,
+        evidence: &mut LifetimeEvidence,
+    ) -> Result<(), ProcessError> {
+        let result = match member.lifetime.binding {
+            RetainedBinding::Bound(bound) => {
+                let result = bound.close(control);
+                if result.is_err() {
+                    evidence.close_stage_failure_count =
+                        evidence.close_stage_failure_count.saturating_add(1);
+                }
+                result
+            }
+            _ => Ok(()),
+        };
+        finish_observation(result, close_directory(member.process, control, evidence))
+    }
+
+    #[cfg(test)]
     fn read_rollup(directory: &File) -> Result<u64, RssFailure> {
         let name = MetadataRole::RssRollup
             .file_name()
@@ -1419,7 +2268,7 @@ mod native {
     }
 
     struct DirectoryEntries {
-        directory: NonNull<libc::DIR>,
+        directory: Option<NonNull<libc::DIR>>,
     }
 
     impl DirectoryEntries {
@@ -1439,15 +2288,25 @@ mod native {
             let pointer = unsafe { libc::fdopendir(descriptor) };
             let Some(directory) = NonNull::new(pointer) else {
                 let error = std::io::Error::last_os_error();
-                unsafe { libc::close(descriptor) };
-                return Err(io_error("begin native process enumeration", error));
+                let original = io_error("begin native process enumeration", error);
+                let closed = if unsafe { libc::close(descriptor) } == 0 {
+                    Ok(())
+                } else {
+                    Err(native_error("enumeration_initialization_close"))
+                };
+                return finish_observation(Err(original), closed);
             };
-            Ok(Self { directory })
+            Ok(Self {
+                directory: Some(directory),
+            })
         }
 
         fn next(&mut self) -> Result<Option<Vec<u8>>, ProcessError> {
             unsafe { *libc::__errno_location() = 0 };
-            let entry = unsafe { libc::readdir(self.directory.as_ptr()) };
+            let directory = self
+                .directory
+                .ok_or_else(|| metadata("native process directory already closed"))?;
+            let entry = unsafe { libc::readdir(directory.as_ptr()) };
             if entry.is_null() {
                 let error = std::io::Error::last_os_error();
                 if error.raw_os_error() == Some(0) {
@@ -1461,11 +2320,36 @@ mod native {
             }
             Ok(Some(name.to_vec()))
         }
+
+        fn close(
+            mut self,
+            control: &mut ObservationControl<'_>,
+            evidence: &mut LifetimeEvidence,
+        ) -> Result<(), ProcessError> {
+            let before = control.check("enumeration_close");
+            let directory = self
+                .directory
+                .take()
+                .ok_or_else(|| metadata("native process directory already closed"))?;
+            let closed = if unsafe { libc::closedir(directory.as_ptr()) } == 0 {
+                Ok(())
+            } else {
+                Err(native_error("enumeration_close"))
+            };
+            let result = control.finish(finish_observation(before, closed), "enumeration_close");
+            if result.is_err() {
+                evidence.close_stage_failure_count =
+                    evidence.close_stage_failure_count.saturating_add(1);
+            }
+            result
+        }
     }
 
     impl Drop for DirectoryEntries {
         fn drop(&mut self) {
-            unsafe { libc::closedir(self.directory.as_ptr()) };
+            if let Some(directory) = self.directory.take() {
+                unsafe { libc::closedir(directory.as_ptr()) };
+            }
         }
     }
 
@@ -2230,6 +3114,33 @@ pub(super) mod tests {
                 threads: 0,
                 ..before
             };
+            assert!(!original_retirement_transition(
+                before.identity,
+                before,
+                after
+            ));
+            // Project a real nonleader identity within this existing pure stat
+            // table. A reserved leader must never satisfy the retirement gate.
+            let member_before = Stat {
+                identity: Identity {
+                    pid: 124,
+                    ..before.identity
+                },
+                threads: 2,
+                ..before
+            };
+            let member_after = Stat {
+                identity: Identity {
+                    pid: 124,
+                    ..after.identity
+                },
+                ..after
+            };
+            assert_eq!(
+                original_retirement_transition(member_before.identity, member_before, member_after),
+                group == -1 && session == -1
+            );
+            assert!(verify_identity(member_before, member_after).is_err());
             let diagnostic = StatDiagnostic::observed(
                 ProcessRole::OwnedMember,
                 before.identity,

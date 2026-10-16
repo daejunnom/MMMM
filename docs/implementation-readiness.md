@@ -2334,6 +2334,57 @@ identity 관측이 거절됐다. 35,035 ms·signal 9·drain·export·정리는 �
 테스트 assertion 실행이나 OOM으로 분류하지 않는다. 원 PIDFD의 실제 종료 증거를
 보유하는 좁은 후속 관측 경로는 별도 worktree에서 구현 중이다.
 
+후속 고정 `e03d8f1d424944c96ec0be0e7277c46e864ef293`의 Windows `530`은 실제 새
+도구 빌드를 통과했다. command 0·9,111 ms·Job peak 292,433,920 bytes·6 process·gap
+145 ms이며 owned-tail 정리 뒤 drain·출력 완료·export·scratch 정리·lease 해제다.
+새 image는 4,704,768 bytes·SHA
+`6ffdc7dd29626bbc92aaf603f8a68bf535c834ef4841400c8ebc1306ef305351`이며 관리 tools
+cache에 두었다. 실제 다음 supervisor로 사용 시 해당 slot의 image 보호를 적용한다.
+앞선 외부 고정 이미지 두 개는 교체하지 않았다. Rust 입력 pin은 `527`/`528`과 같다.
+
+이 도구의 후보 `531`에서는 git_head·git_tracked_inputs 두 실제 명령이 각각 exit 0·
+177/267 ms·drain·출력 완료였고 두 stream의 raw export와 strict read 오류는 0이다.
+이전 Windows sharing 오류는 재발하지 않았다. 이후 Git 명목 335개 중 실제 Rust
+구현 모듈 두 개가 파일명의 credential 부분 문자열 때문에 소스 이름 검사에서
+거절됐다. 파일 내용을 읽기 전의 실패이며 새 source 전용 경계에서만 이 정확한 두
+경로를 구분한다. 일반 비밀 자료·image·dependency·cache 차단은 유지한다. 원 후보는
+production_failed이며 컴파일·archive는 시작하지 않았다. 필요한 원 증거를 모두
+보존한 정상 finish에서 scratch 정리·lease 해제 및 감독/정리 오류 0을 확인했다.
+
+후속 [D078](DECISIONS.md)은 원 directory/stat·flags 0 PIDFD를 보관하는 bounded
+Linux lifetime 경로를 구현한다. 정확한 count-only OwnedMember Z2→X0 및 원 FD의
+실제 Ready에서만 private proof를 소비하고, 일반 identity·RSS·Pending·전체 drain을
+유지한다. 32 occupied member·96 retained FD와 원 기한·고정 drain·한 번씩의 close 및
+원/후행 오류 보존을 연결했다. 독립 소스 검토에서 scope의 취소/기한 분류, Linux test
+initializer 누락과 enumeration 초기화 close 오류 보존을 교정했다. 격리 소스 patch
+99,510 bytes·SHA
+`78486b5b8a13d4c548add4410528bc53b1742954b7ab4ce4e42a0c66dbf9fe1d`를 보존한 뒤
+현재 capture 수정과 충돌 없이 통합했다. Windows source guard의 정확한 두 경로도
+HEAD와 snapshot에만 적용하며 registry·image·cache에는 적용하지 않는다.
+
+`532` format 뒤 실제 Windows `533`은 추가 stat 단언의 변수 범위 오류 E0425 5건으로
+test compile에 실패했다. command 101·12,273 ms·Job peak 406,044,672 bytes·6 process·
+gap 129 ms·owned-tail 정리 뒤 drain·출력 완료·export·scratch 정리·lease 해제다.
+사전 입력 pin
+`572f48fe9eb497820ce986840776d26b3692aad34092234c304489b00f9939b1`과 binding
+45,988 bytes·SHA
+`9a13076ec5c2f24ff8722bc8c22a150d297f21674a825aefde64fa32567f7977`를 보존했다.
+해당 기록은 사전 capture이고 전후 비교를 수행한 것으로 바꾸지 않는다. 단언을 실제
+table 범위로 옮기고 양성 사례를 실제 nonleader identity로 투영한 뒤 `534` format을
+수행했다. production 전이와 native proof 조건은 변경하지 않았다.
+
+실제 Windows `535`는 xtask library 244개 통과·기존 1 ignored와 binary 9개 통과,
+`536` all-target strict도 통과했다. `535`는 command 0·47,413 ms·Job peak 468,525,056
+bytes·10 process·gap 134 ms·owned-tail 정리이고 `536`은 command 0·9,676 ms·Job peak
+363,548,672 bytes·7 process·gap 102 ms·자연 종료다. 두 실행은 drain·완전한 출력·
+export·scratch 정리·lease 해제 및 감독/정리 오류 0이다. 입력 324개·8,918,533 bytes의
+전후 pin은
+`5dc4f0b57c1915c5317ec71ac104f8c0b7f46ba84185db95769cee341acd04c4`로 같았으며,
+전체 binding 46,060 bytes·SHA
+`c74777ac2940940123a7380014968f2f8046d3b9f611d8734a69fd7b0557b689`를 보존했다.
+실제 Windows toolchain의 설치 target은 Windows뿐이다. 이 검사로 Linux cfg의 실제
+compile·native Ready/close·CI87 회귀를 완료했다고 보지 않으며 WSL은 사용하지 않았다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

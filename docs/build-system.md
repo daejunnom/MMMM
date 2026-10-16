@@ -478,6 +478,24 @@ member의 Z4를 종료나 RSS 0으로 바꾸지 않으며 prior Complete·1000ms
 Complete와 reap fence를 그대로 적용한다. 새 조회·retry·sleep·상한 변경은 없다. 이 조건의
 소스·순수 검사와 실제 Linux Pending 진입/회복은 실행별 근거로 구분한다.
 
+[D078](DECISIONS.md)의 count-only 경로는 이전 RSS Pending과 별개다. 실제 원
+directory/stat와 flags 0 PIDFD를 lifetime마다 한 번 묶고 nonleader occupied 슬롯을
+최대 32개로 보존한다. 실패·unavailable·retired도 슬롯을 차지하며 원 stat의 실제
+ESRCH 전에는 임의 eviction·재bind하지 않는다. 96 FD는 이 member 보존 상한이고
+별도 leader/root·유한 namespace와 enumeration 임시 FD를 포함한 전체 peak가 아니다.
+정확한 OwnedMember Z2→X0·동일 PID/start·후행 group/session -1/-1·유효한 원 leader
+reservation에서 같은 PIDFD의 실제 poll(0) Ready로 발급된 private proof만 소비한다.
+leader·다른 전이·실제 Ready 부재는 원 오류로 남긴다. 이 결과는 member 하나의 역사적
+퇴출이며 RSS 0·기존 Pending 해소·전체 group drain을 발급하지 않는다. 전체 scan과
+마지막 leader 검사, 기존 empty·출력 EOF·reap 조건은 계속 필요하다.
+
+Linux native 관측 control은 호출마다 원 취소·command/absolute deadline을 빌린다.
+hard-stop 뒤에는 이미 고정한 stopping_at+drain_timeout에서 기존 FD 관측과 close만
+허용하며 새 bind를 막는다. close는 원 기한·취소 실패도 보존하면서 실제 소유 FD를
+한 번씩 소비하고 후행 오류를 함께 기록한다. Linux close/EINTR에 같은 숫자 FD를
+재시도하지 않는다. first/last/count/peak와 실제 before/after·poll·query/close 진단은
+보존 자료이며 identity나 종료 권한으로 다시 입력하지 않는다.
+
 RSS 합계는 각 process를 순서대로 읽은 관측이다. 공유 페이지를 process마다 포함하며
 그룹 전체의 동시 snapshot, 유일한 물리 메모리 사용량이나 kernel resident quota가
 아니다. `kernel_resident_quota=false`, `kernel_process_quota=false`,
@@ -535,6 +553,15 @@ mode로 다시 열거나, export를 위해 writer 보호를 완화하지 않는�
 이 진단용 판독은 nonzero·취소·불완전 출력의 원 outcome을 보존한다. 성공한 stdout의
 strict 소비자 gate를 충족한 것으로 바꾸지 않으며, export 실패에는 stream과 단계를
 남긴다. 명령·strict 판독·export·finalization 실패는 함께 남겨 최초 원인을 덮지 않는다.
+
+HEAD source의 `crates/mmmm-coordinator/src/credential.rs`와 `credential_owner.rs`는
+Cargo에 등록된 Rust 구현 모듈이며 비밀 저장 자료가 아니다. 실제 Git HEAD 목록과
+그 byte 검증된 source snapshot에서 이 두 정확한 저장소 상대 경로만 구분한다.
+일반 파일·image·registry dependency·cache의 비밀 이름 차단에는 예외를 적용하지
+않으며 `.json`, 임의 `.rs`, 다른 경로·접미어·대소문자나 separator 정규화로 확대하지
+않는다. source 목록은 archive가 내용을 읽기 전에 전체 검사하고 snapshot은 source
+루트 기준의 경로를 다시 검사한다. 이 두 모듈의 경로·역할이 바뀌면 소스 등록과 검사
+경계를 다시 검토하며 다른 비밀 파일을 읽어 예외 여부를 판단하지 않는다.
 
 Linux JVM native VM probe는 일반 `checks`의 이미 낮아진 hard limit 안에서 실행하지
 않는다. 고정 `jvm` 소유 실행에서만 명시적으로 선택하는 ignored 검사이며, inherited

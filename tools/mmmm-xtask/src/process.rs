@@ -252,6 +252,8 @@ pub struct ProcessOutcome {
     pub minecraft_stop: Option<MinecraftStopEvidence>,
     #[cfg(any(windows, target_os = "linux"))]
     pub resource_limits: Option<resource_policy::Evidence>,
+    #[cfg(target_os = "linux")]
+    pub linux_original_lifetimes: Option<linux_resources::LifetimeEvidence>,
     #[cfg(target_os = "macos")]
     pub darwin_resources: Option<darwin_resources::Evidence>,
 }
@@ -630,6 +632,8 @@ fn supervise_bound(
             .map(|_| MinecraftStopEvidence::new()),
         #[cfg(any(windows, target_os = "linux"))]
         resource_limits: None,
+        #[cfg(target_os = "linux")]
+        linux_original_lifetimes: None,
         #[cfg(target_os = "macos")]
         darwin_resources: None,
     };
@@ -676,7 +680,18 @@ fn supervise_bound(
     loop {
         #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
         if failure_checks_active(&outcome, stopping_at) {
-            if let Err(error) = process.observe_resources() {
+            #[cfg(target_os = "linux")]
+            let observed = linux_observation_control(
+                spec,
+                cancellation,
+                started,
+                stopping_at,
+                LinuxObservationPhase::Resource,
+                |control| process.observe_resources(control),
+            );
+            #[cfg(not(target_os = "linux"))]
+            let observed = process.observe_resources();
+            if let Err(error) = observed {
                 request_stop(
                     &mut process,
                     &mut outcome,
@@ -719,7 +734,9 @@ fn supervise_bound(
                 }
                 #[cfg(target_os = "macos")]
                 if failure_checks_active(&outcome, stopping_at) {
-                    if let Err(error) = progress_sample(&mut process, spec, cancellation, started) {
+                    if let Err(error) =
+                        progress_sample(&mut process, spec, cancellation, started, stopping_at)
+                    {
                         request_stop(
                             &mut process,
                             &mut outcome,
@@ -759,7 +776,7 @@ fn supervise_bound(
                 &mut |checkpoint| observe(ObservationPhase::Running, checkpoint),
                 || {
                     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-                    progress_sample(&mut process, spec, cancellation, started)?;
+                    progress_sample(&mut process, spec, cancellation, started, stopping_at)?;
                     Ok(())
                 },
             );
@@ -788,7 +805,7 @@ fn supervise_bound(
         {
             // observation callback/OS 호출 동안 원 취소나 기한이 끝났으면 새 입력을 보내지 않는다.
             #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-            let checked = progress_sample(&mut process, spec, cancellation, started);
+            let checked = progress_sample(&mut process, spec, cancellation, started, stopping_at);
             #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
             let checked = Err(ProcessError::new(
                 "unsupported_os",
@@ -835,14 +852,34 @@ fn supervise_bound(
             outcome.command_signal = exit.signal;
             leader_exited_at.get_or_insert_with(Instant::now);
         }
-        let raw_scope_empty = match process.scope_empty() {
+        #[cfg(target_os = "linux")]
+        let scope_observation = linux_observation_control(
+            spec,
+            cancellation,
+            started,
+            stopping_at,
+            LinuxObservationPhase::Scope,
+            |control| process.scope_empty(control),
+        );
+        #[cfg(not(target_os = "linux"))]
+        let scope_observation = process.scope_empty();
+        #[cfg(target_os = "linux")]
+        {
+            outcome.linux_original_lifetimes = Some(process.lifetime_evidence());
+        }
+        let raw_scope_empty = match scope_observation {
             Ok(value) => value,
             Err(error) => {
+                let reason = if matches!(error.kind, "command_cancelled" | "command_timeout") {
+                    observation_reason(&error)
+                } else {
+                    TerminationReason::SupervisorFailure
+                };
                 request_stop(
                     &mut process,
                     &mut outcome,
                     &mut stopping_at,
-                    TerminationReason::SupervisorFailure,
+                    reason,
                     error.to_string(),
                 );
                 false
@@ -934,6 +971,30 @@ fn supervise_bound(
         }
         std::thread::sleep(POLL);
     }
+    #[cfg(target_os = "linux")]
+    {
+        let closed = linux_observation_control(
+            spec,
+            cancellation,
+            started,
+            stopping_at,
+            LinuxObservationPhase::Close,
+            |control| {
+                let (evidence, result) = process.close_linux_observation(control);
+                outcome.linux_original_lifetimes = Some(evidence);
+                result
+            },
+        );
+        if let Err(error) = closed {
+            outcome.supervisor_errors.push(error.to_string());
+            if matches!(
+                outcome.termination_reason,
+                TerminationReason::Completed | TerminationReason::CompletedAfterOwnedTailCleanup
+            ) {
+                outcome.termination_reason = observation_reason(&error);
+            }
+        }
+    }
     if let Err(error) = close_minecraft_stdin(&mut process, &mut outcome.minecraft_stop) {
         outcome.supervisor_errors.push(error.to_string());
         if matches!(
@@ -1000,9 +1061,81 @@ fn record_resource_evidence(process: &native::Process, outcome: &mut ProcessOutc
     #[cfg(any(windows, target_os = "linux"))]
     {
         outcome.resource_limits = Some(process.resource_evidence());
+        #[cfg(target_os = "linux")]
+        {
+            outcome.linux_original_lifetimes = Some(process.lifetime_evidence());
+        }
     }
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     let _ = (process, outcome);
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum LinuxObservationPhase {
+    Resource,
+    Scope,
+    Close,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_observation_control<T>(
+    spec: &ProcessSpec,
+    cancellation: &AtomicBool,
+    started: Instant,
+    stopping_at: Option<Instant>,
+    phase: LinuxObservationPhase,
+    observe: impl FnOnce(&mut linux_resources::ObservationControl<'_>) -> Result<T, ProcessError>,
+) -> Result<T, ProcessError> {
+    let physical_drain = matches!(
+        phase,
+        LinuxObservationPhase::Scope | LinuxObservationPhase::Close
+    );
+    let scope_phase = match (phase, stopping_at.is_some()) {
+        (LinuxObservationPhase::Resource, false) => "running_resource",
+        (LinuxObservationPhase::Resource, true) => "active_build_tail_resource",
+        (LinuxObservationPhase::Scope, false) => "running_scope",
+        (LinuxObservationPhase::Scope, true) => "fixed_drain_scope",
+        (LinuxObservationPhase::Close, false) => "command_close",
+        (LinuxObservationPhase::Close, true) => "fixed_drain_close",
+    };
+    // A hard-stop's original failure remains sticky in ProcessOutcome. Its
+    // already fixed drain interval permits only native queries and close;
+    // it never restarts the command or authorizes a new lifetime binding.
+    let mut checkpoint = |phase| {
+        if physical_drain && let Some(stopped) = stopping_at {
+            if stopped.elapsed() >= spec.drain_timeout {
+                return Err(ProcessError::new(
+                    "command_timeout",
+                    format!("Linux fixed drain deadline exceeded; phase={phase}"),
+                ));
+            }
+            return Ok(());
+        }
+        if cancellation.load(Ordering::Acquire) {
+            return Err(ProcessError::new(
+                "command_cancelled",
+                format!("command cancelled during Linux observation; phase={phase}"),
+            ));
+        }
+        if command_deadline_expired(spec, started)
+            || stopping_at.is_some_and(|at| at.elapsed() >= spec.drain_timeout)
+        {
+            return Err(ProcessError::new(
+                "command_timeout",
+                format!("original Linux observation deadline exceeded; phase={phase}"),
+            ));
+        }
+        Ok(())
+    };
+    let mut control =
+        linux_resources::ObservationControl::new(&mut checkpoint, stopping_at.is_none())
+            .in_scope(scope_phase);
+    // Do not skip consuming close merely because the original budget expired.
+    // Every normal query checks before doing I/O; close records that failure
+    // while independently attempting all owned descriptors exactly once.
+    let result = observe(&mut control);
+    control.finish(result, "observation_return")
 }
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
@@ -1011,8 +1144,22 @@ fn progress_sample(
     spec: &ProcessSpec,
     cancellation: &AtomicBool,
     started: Instant,
+    stopping_at: Option<Instant>,
 ) -> Result<(), ProcessError> {
-    process.observe_resources()?;
+    #[cfg(target_os = "linux")]
+    linux_observation_control(
+        spec,
+        cancellation,
+        started,
+        stopping_at,
+        LinuxObservationPhase::Resource,
+        |control| process.observe_resources(control),
+    )?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = stopping_at;
+        process.observe_resources()?;
+    }
     if cancellation.load(Ordering::Acquire) {
         return Err(ProcessError::new("command_cancelled", "command cancelled"));
     }
@@ -2386,10 +2533,13 @@ mod native {
                 }))
             }
         }
-        pub(super) fn scope_empty(&mut self) -> Result<bool, ProcessError> {
+        pub(super) fn scope_empty(
+            &mut self,
+            #[cfg(target_os = "linux")] control: &mut linux_resources::ObservationControl<'_>,
+        ) -> Result<bool, ProcessError> {
             #[cfg(target_os = "linux")]
             {
-                self.linux_sample(false)
+                self.linux_sample(false, control)
                     .map(|observation| observation.scope_empty())
                     .map_err(|error| self.resources.with_linux_pending_diagnostics(error))
             }
@@ -2460,13 +2610,16 @@ mod native {
             self.resources.evidence.clone()
         }
         #[cfg(target_os = "linux")]
-        pub(super) fn observe_resources(&mut self) -> Result<(), ProcessError> {
+        pub(super) fn observe_resources(
+            &mut self,
+            control: &mut linux_resources::ObservationControl<'_>,
+        ) -> Result<(), ProcessError> {
             let result = (|| {
                 if !self.resources.begin_linux_sample()? {
                     return Ok(());
                 }
                 let include_rss = self.resources.requires_linux_rss();
-                let observation = self.linux_sample(include_rss)?;
+                let observation = self.linux_sample(include_rss, control)?;
                 self.resources.finish_linux_sample(observation)
             })();
             result.map_err(|error| self.resources.with_linux_pending_diagnostics(error))
@@ -2486,6 +2639,7 @@ mod native {
         fn linux_sample(
             &mut self,
             include_rss: bool,
+            control: &mut linux_resources::ObservationControl<'_>,
         ) -> Result<linux_resources::GroupObservation, ProcessError> {
             let group = self.linux_group.as_mut().ok_or_else(|| {
                 ProcessError::new("process_identity", "missing anchored Linux group identity")
@@ -2495,6 +2649,7 @@ mod native {
                 include_rss,
                 self.reservation_valid && !self.reaped,
                 &mut pending,
+                control,
             );
             if !group.reservation_valid() {
                 self.reservation_valid = false;
@@ -2503,6 +2658,32 @@ mod native {
             // later enumeration/member/identity or partial-budget error.
             self.resources.record_linux_pending_observations(pending);
             result
+        }
+        #[cfg(target_os = "linux")]
+        pub(super) fn lifetime_evidence(&self) -> linux_resources::LifetimeEvidence {
+            self.linux_group
+                .as_ref()
+                .map(|group| group.lifetime_evidence())
+                .unwrap_or_default()
+        }
+        #[cfg(target_os = "linux")]
+        pub(super) fn close_linux_observation(
+            &mut self,
+            control: &mut linux_resources::ObservationControl<'_>,
+        ) -> (linux_resources::LifetimeEvidence, Result<(), ProcessError>) {
+            let Some(group) = self.linux_group.take() else {
+                return (
+                    linux_resources::LifetimeEvidence::default(),
+                    Err(ProcessError::new(
+                        "process_identity",
+                        "Linux observer was already closed",
+                    )),
+                );
+            };
+            // Once anchors are consumed, Drop cannot authorize another group
+            // signal. Reap/drain facts were established independently above.
+            self.reservation_valid = false;
+            group.close(control)
         }
         #[cfg(target_os = "linux")]
         pub(super) fn resource_evidence(&self) -> resource_policy::Evidence {
@@ -3314,6 +3495,64 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_observation_keeps_original_control_and_fixed_drain_distinct() {
+        let mut spec = ProcessSpec::new(
+            PathBuf::new(),
+            PathBuf::new(),
+            PathBuf::new(),
+            PathBuf::new(),
+        );
+        let now = Instant::now();
+        spec.absolute_deadline = Some(now);
+        let cancelled = AtomicBool::new(true);
+        let running = linux_observation_control(
+            &spec,
+            &cancelled,
+            now,
+            None,
+            LinuxObservationPhase::Resource,
+            |control| control.check("test_running"),
+        )
+        .unwrap_err();
+        assert_eq!(running.kind, "command_cancelled");
+        // This is a local control test, without child creation or native proof.
+        linux_observation_control(
+            &spec,
+            &cancelled,
+            now,
+            Some(now),
+            LinuxObservationPhase::Scope,
+            |control| {
+                assert!(!control.allow_new_bindings());
+                control.check("test_existing_drain")
+            },
+        )
+        .unwrap();
+        let expired = now.checked_sub(spec.drain_timeout).unwrap();
+        let result = linux_observation_control(
+            &spec,
+            &cancelled,
+            now,
+            Some(expired),
+            LinuxObservationPhase::Scope,
+            |control| {
+                control.finish(
+                    Err::<(), _>(ProcessError::new(
+                        "process_identity",
+                        "original query failure",
+                    )),
+                    "test_expired_drain",
+                )
+            },
+        )
+        .unwrap_err();
+        assert_eq!(result.kind, "process_identity");
+        assert!(result.message.contains("original query failure"));
+        assert!(result.message.contains("fixed drain deadline"));
+    }
     use std::sync::{Arc, atomic::AtomicU64};
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     #[test]
@@ -4048,6 +4287,8 @@ mod tests {
                 minecraft_stop: None,
                 #[cfg(any(windows, target_os = "linux"))]
                 resource_limits: None,
+                #[cfg(target_os = "linux")]
+                linux_original_lifetimes: None,
                 #[cfg(target_os = "macos")]
                 darwin_resources: None,
             },

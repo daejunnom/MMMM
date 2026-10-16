@@ -877,7 +877,7 @@ fn source_pins(
     }
     // Reject secret names before Git status or any content read under these roots.
     for path in &paths {
-        safe_relative(path)?;
+        admit_tracked_source_path(path)?;
     }
     let mut status_args = args(&[
         "--no-optional-locks",
@@ -1607,6 +1607,17 @@ fn safe_relative(path: &str) -> Result<()> {
     admit_relative(path, false)
 }
 
+fn admit_tracked_source_path(path: &str) -> Result<()> {
+    // These exact Git/Cargo-registered Rust implementation modules are not
+    // credential storage data. This exception belongs only to HEAD source and
+    // its checked snapshot, never arbitrary inputs, tools, registry or cache.
+    match path {
+        "crates/mmmm-coordinator/src/credential.rs"
+        | "crates/mmmm-coordinator/src/credential_owner.rs" => Ok(()),
+        _ => safe_relative(path),
+    }
+}
+
 fn admit_relative(path: &str, owned_cargo_target: bool) -> Result<()> {
     if path.len() > 1024
         || path.split('/').count() > 64
@@ -1942,7 +1953,15 @@ fn dependency_pins(
             .ok_or("candidate dependency root missing")?;
         verify_plain_ancestors(root)?;
         let mut files = Vec::new();
-        pin_input_tree(run, root, root, &mut files, &mut total, &mut entries)?;
+        pin_input_tree(
+            run,
+            root,
+            root,
+            InputTreeKind::RegistryPackage,
+            &mut files,
+            &mut total,
+            &mut entries,
+        )?;
         files.sort_by(|a, b| a.path.cmp(&b.path));
         if result
             .packages
@@ -1957,7 +1976,15 @@ fn dependency_pins(
 
 fn check_snapshot_inputs(run: &Run, source: &Path, expected: &SourcePins) -> Result<()> {
     let mut files = Vec::new();
-    pin_input_tree(run, source, source, &mut files, &mut 0, &mut 0)?;
+    pin_input_tree(
+        run,
+        source,
+        source,
+        InputTreeKind::TrackedSourceSnapshot,
+        &mut files,
+        &mut 0,
+        &mut 0,
+    )?;
     files.sort_by(|a, b| a.path.cmp(&b.path));
     if files != expected.files {
         return Err(
@@ -1967,10 +1994,42 @@ fn check_snapshot_inputs(run: &Run, source: &Path, expected: &SourcePins) -> Res
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum InputTreeKind {
+    RegistryPackage,
+    TrackedSourceSnapshot,
+}
+
+fn admit_input_tree_path(kind: InputTreeKind, root: &Path, path: &Path) -> Result<String> {
+    // Project actual native components without replacing filename characters:
+    // a backslash in a Unix filename must never become a source separator.
+    let relative = path
+        .strip_prefix(root)?
+        .components()
+        .map(|part| match part {
+            Component::Normal(name) => name
+                .to_str()
+                .ok_or("candidate input tree path is not UTF-8"),
+            _ => Err("candidate input tree path is not a normal relative path"),
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .join("/");
+    match kind {
+        InputTreeKind::RegistryPackage => safe_relative(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("candidate dependency entry is not UTF-8")?,
+        )?,
+        InputTreeKind::TrackedSourceSnapshot => admit_tracked_source_path(&relative)?,
+    }
+    Ok(relative)
+}
+
 fn pin_input_tree(
     run: &Run,
     root: &Path,
     directory: &Path,
+    kind: InputTreeKind,
     files: &mut Vec<Pin>,
     total: &mut u64,
     entries: &mut usize,
@@ -1992,15 +2051,12 @@ fn pin_input_tree(
             return Err("candidate dependency entry budget exceeded".into());
         }
         let entry = entry?;
-        let name = entry.file_name();
-        safe_relative(
-            name.to_str()
-                .ok_or("candidate dependency entry is not UTF-8")?,
-        )?;
-        children.push(entry.path());
+        let path = entry.path();
+        let relative = admit_input_tree_path(kind, root, &path)?;
+        children.push((path, relative));
     }
     children.sort();
-    for path in children {
+    for (path, relative) in children {
         run.check()?;
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
@@ -2014,7 +2070,7 @@ fn pin_input_tree(
             }
         }
         if metadata.is_dir() {
-            pin_input_tree(run, root, &path, files, total, entries)?;
+            pin_input_tree(run, root, &path, kind, files, total, entries)?;
         } else if metadata.is_file() {
             let bytes = read_plain(&path, MAX_DEPENDENCY_FILE, || run.check())?;
             *total = total
@@ -2023,16 +2079,6 @@ fn pin_input_tree(
             if *total > MAX_DEPENDENCY_BYTES {
                 return Err("candidate dependency byte budget exceeded".into());
             }
-            let relative = path
-                .strip_prefix(root)?
-                .components()
-                .map(|part| {
-                    part.as_os_str()
-                        .to_str()
-                        .ok_or("candidate dependency path is not UTF-8")
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()?
-                .join("/");
             files.push(Pin {
                 path: relative,
                 sha256: sha(&bytes),
@@ -2197,9 +2243,68 @@ mod tests {
             "crates/x/api_key.json",
         ] {
             assert!(safe_relative(path).is_err());
+            assert!(admit_tracked_source_path(path).is_err());
         }
         assert!(safe_relative("crates/mmmm-runtime/src/storage/journal.rs").is_ok());
+        for path in [
+            "crates/mmmm-coordinator/src/credential.rs",
+            "crates/mmmm-coordinator/src/credential_owner.rs",
+        ] {
+            assert!(admit_tracked_source_path(path).is_ok());
+            assert!(safe_relative(path).is_err());
+            assert!(admit_relative(path, true).is_err());
+        }
+        for path in [
+            "crates/mmmm-coordinator/src/credential.json",
+            "crates/mmmm-coordinator/src/credential.rs.bak",
+            "crates/mmmm-coordinator/src/credential_owner.rs.tmp",
+            "crates/mmmm-coordinator/src/Credential.rs",
+            "crates/other/src/credential.rs",
+            "crates/mmmm-coordinator/src/credential.rs/.env",
+        ] {
+            assert!(admit_tracked_source_path(path).is_err());
+        }
         assert!(!source_input("docs/private.md"));
+    }
+
+    #[test]
+    fn tracked_snapshot_path_exception_never_enters_registry_or_filename_aliases() {
+        let root = Path::new("source");
+        for relative in [
+            "crates/mmmm-coordinator/src/credential.rs",
+            "crates/mmmm-coordinator/src/credential_owner.rs",
+        ] {
+            let path = root.join(relative);
+            assert_eq!(
+                admit_input_tree_path(InputTreeKind::TrackedSourceSnapshot, root, &path).unwrap(),
+                relative,
+            );
+            assert!(admit_input_tree_path(InputTreeKind::RegistryPackage, root, &path).is_err());
+        }
+        for relative in [
+            "crates/other/src/credential.rs",
+            "crates/mmmm-coordinator/src/credential.json",
+            "crates/mmmm-coordinator/src/.env",
+            "../crates/mmmm-coordinator/src/credential.rs",
+        ] {
+            assert!(
+                admit_input_tree_path(
+                    InputTreeKind::TrackedSourceSnapshot,
+                    root,
+                    &root.join(relative),
+                )
+                .is_err()
+            );
+        }
+        #[cfg(unix)]
+        assert!(
+            admit_input_tree_path(
+                InputTreeKind::TrackedSourceSnapshot,
+                root,
+                &root.join(r"crates\mmmm-coordinator\src\credential.rs"),
+            )
+            .is_err()
+        );
     }
 
     #[test]

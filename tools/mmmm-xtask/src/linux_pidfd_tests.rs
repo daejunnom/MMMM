@@ -21,6 +21,186 @@ fn stat() -> Stat {
     }
 }
 
+fn retirement_pair() -> (Stat, Stat) {
+    let before = Stat {
+        identity: Identity {
+            pid: 124,
+            ..stat().identity
+        },
+        state: b'Z',
+        ..stat()
+    };
+    let after = Stat {
+        identity: Identity {
+            group: -1,
+            session: -1,
+            ..before.identity
+        },
+        state: b'X',
+        threads: 0,
+        ..before
+    };
+    (before, after)
+}
+
+#[test]
+fn original_lifetime_retirement_requires_the_exact_owned_member_transition() {
+    // This extends the existing stat fixture only. It creates no descriptor,
+    // proof or kernel result; the native Ready issuer remains untested here.
+    let (before, after) = retirement_pair();
+    assert!(retirement_transition(before.identity, before, after));
+    for changed in [
+        Stat {
+            state: b'R',
+            ..before
+        },
+        Stat {
+            threads: 1,
+            ..before
+        },
+        Stat {
+            threads: 3,
+            ..before
+        },
+        Stat {
+            threads: 4,
+            ..before
+        },
+        Stat {
+            identity: Identity {
+                start_ticks: before.identity.start_ticks + 1,
+                ..before.identity
+            },
+            ..before
+        },
+        Stat {
+            identity: Identity {
+                group: before.identity.group + 1,
+                ..before.identity
+            },
+            ..before
+        },
+        Stat {
+            identity: Identity {
+                session: before.identity.session + 1,
+                ..before.identity
+            },
+            ..before
+        },
+    ] {
+        assert!(!retirement_transition(before.identity, changed, after));
+    }
+    for changed in [
+        Stat {
+            state: b'Z',
+            ..after
+        },
+        Stat {
+            state: b'x',
+            ..after
+        },
+        Stat {
+            threads: 1,
+            ..after
+        },
+        Stat {
+            identity: Identity {
+                pid: after.identity.pid + 1,
+                ..after.identity
+            },
+            ..after
+        },
+        Stat {
+            identity: Identity {
+                start_ticks: after.identity.start_ticks + 1,
+                ..after.identity
+            },
+            ..after
+        },
+        Stat {
+            identity: Identity {
+                group: before.identity.group,
+                ..after.identity
+            },
+            ..after
+        },
+        Stat {
+            identity: Identity {
+                session: before.identity.session,
+                ..after.identity
+            },
+            ..after
+        },
+        Stat {
+            identity: Identity {
+                group: 0,
+                ..after.identity
+            },
+            ..after
+        },
+        Stat {
+            identity: Identity {
+                session: 0,
+                ..after.identity
+            },
+            ..after
+        },
+    ] {
+        assert!(!retirement_transition(before.identity, before, changed));
+    }
+}
+
+#[test]
+fn retirement_predicate_never_adopts_a_leader_or_changes_general_identity_checks() {
+    let (before, after) = retirement_pair();
+    for identity in [
+        Identity {
+            pid: before.identity.group,
+            ..before.identity
+        },
+        Identity {
+            pid: 0,
+            ..before.identity
+        },
+        Identity {
+            group: -1,
+            session: -1,
+            ..before.identity
+        },
+        Identity {
+            session: before.identity.group + 1,
+            ..before.identity
+        },
+    ] {
+        let changed_before = Stat { identity, ..before };
+        let changed_after = Stat {
+            identity: Identity {
+                pid: identity.pid,
+                start_ticks: identity.start_ticks,
+                ..after.identity
+            },
+            ..after
+        };
+        assert!(!retirement_transition(
+            identity,
+            changed_before,
+            changed_after
+        ));
+    }
+    assert_eq!(
+        super::super::verify_identity(before, after)
+            .unwrap_err()
+            .kind,
+        "process_identity"
+    );
+    assert_eq!(
+        settle_member_with_terminal(before, Some(after), None, false, None)
+            .unwrap_err()
+            .kind,
+        "process_identity"
+    );
+}
+
 #[test]
 fn fdinfo_requires_one_positive_canonical_pid_within_the_byte_bound() {
     assert_eq!(
