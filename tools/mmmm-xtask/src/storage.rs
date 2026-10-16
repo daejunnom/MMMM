@@ -3,7 +3,7 @@
 pub mod retained_game;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -290,6 +290,278 @@ impl std::error::Error for StorageError {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SupervisorFileIdentity {
+    volume: u64,
+    file: u64,
+}
+
+/// 실행 이미지가 있는 slot은 lease 상태와 별개로 이 supervisor가 끝날 때까지 보존한다.
+/// Unix 경로 재검사는 협력적이며, 같은 UID의 적대적인 원자적 경로 변경을 격리하지 않는다.
+struct SupervisorImagePin {
+    path: PathBuf,
+    file: File,
+    identity: SupervisorFileIdentity,
+    slot_id: Option<String>,
+}
+
+impl SupervisorImagePin {
+    fn open(path: &Path) -> Result<Self, StorageError> {
+        verify_supervisor_path(path)?;
+        let original = open_supervisor_image(path)?;
+        let original_identity = supervisor_file_identity(&original)?;
+        let physical = fs::canonicalize(path)
+            .map_err(|error| StorageError::io("resolve supervisor image path", error))?;
+        verify_supervisor_path(&physical)?;
+        let file = open_supervisor_image(&physical)?;
+        let identity = supervisor_file_identity(&file)?;
+        verify_supervisor_path(path)?;
+        if identity != original_identity
+            || supervisor_file_identity(&open_supervisor_image(path)?)? != original_identity
+        {
+            return Err(StorageError::new(
+                "supervisor_image",
+                "supervisor image changed while resolving its path",
+            ));
+        }
+        let pin = Self {
+            path: physical,
+            file,
+            identity,
+            slot_id: None,
+        };
+        pin.recheck()?;
+        Ok(pin)
+    }
+
+    fn bind_catalog(
+        &mut self,
+        catalog_path: &Path,
+        catalog: &CatalogRecord,
+    ) -> Result<(), StorageError> {
+        self.recheck()?;
+        verify_directory(catalog_path)?;
+        let physical = fs::canonicalize(catalog_path)
+            .map_err(|error| StorageError::io("resolve supervisor catalog", error))?;
+        let catalog_identity = path_identity(&physical);
+        let image_identity = path_identity(&self.path);
+        if image_identity == catalog_identity {
+            return Err(StorageError::new(
+                "supervisor_image",
+                "supervisor image is not a slot cache file",
+            ));
+        }
+        let prefix = format!("{catalog_identity}{}", std::path::MAIN_SEPARATOR);
+        let Some(relative) = image_identity.strip_prefix(&prefix) else {
+            // 외부 이미지도 위의 실제 handle/ancestry 검사를 통과해야 한다.
+            return Ok(());
+        };
+        let components: Vec<_> = Path::new(relative).components().collect();
+        if components.len() < 4
+            || components.len() > MAX_DEPTH
+            || components
+                .iter()
+                .any(|part| !matches!(part, Component::Normal(_)))
+            || components[0].as_os_str() != "slots"
+            || components[2].as_os_str() != "cache"
+        {
+            return Err(StorageError::new(
+                "supervisor_image",
+                "supervisor inside catalog must use a recognized slot cache; scratch is not executable storage",
+            ));
+        }
+        let slot_id = components[1]
+            .as_os_str()
+            .to_str()
+            .ok_or_else(|| StorageError::new("supervisor_image", "supervisor slot is not UTF-8"))?;
+        let slot_path = physical.join("slots").join(slot_id);
+        verify_directory(&slot_path)?;
+        let record: SlotRecord = read_record(&slot_path.join("owner.json"))?;
+        validate_slot_record(&record, slot_id, catalog)?;
+        validate_slot_entries(&slot_path)?;
+        self.slot_id = Some(slot_id.to_owned());
+        self.recheck()
+    }
+
+    fn recheck(&self) -> Result<(), StorageError> {
+        verify_supervisor_path(&self.path)?;
+        let physical = fs::canonicalize(&self.path)
+            .map_err(|error| StorageError::io("recheck supervisor image path", error))?;
+        if path_identity(&physical) != path_identity(&self.path)
+            || supervisor_file_identity(&self.file)? != self.identity
+            || supervisor_file_identity(&open_supervisor_image(&self.path)?)? != self.identity
+        {
+            return Err(StorageError::new(
+                "supervisor_image",
+                "supervisor image path or file identity changed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn verify_supervisor_path(path: &Path) -> Result<(), StorageError> {
+    validate_absolute_path(path)?;
+    reject_secret_leaf_file(path)?;
+    if path.to_str().is_none() {
+        return Err(StorageError::new(
+            "supervisor_image",
+            "supervisor path identity must be lossless UTF-8",
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| StorageError::new("supervisor_image", "supervisor image has no parent"))?;
+    verify_directory(parent)?;
+    reject_link(path)?;
+    if !fs::symlink_metadata(path)
+        .map_err(|error| StorageError::io("inspect supervisor image", error))?
+        .is_file()
+    {
+        return Err(StorageError::new(
+            "supervisor_image",
+            "supervisor image must be an ordinary file",
+        ));
+    }
+    Ok(())
+}
+
+fn open_supervisor_image(path: &Path) -> Result<File, StorageError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        options
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .share_mode(FILE_SHARE_READ);
+    }
+    let file = options.open(path).map_err(|error| {
+        StorageError::io("open supervisor image without following links", error)
+    })?;
+    supervisor_file_identity(&file)?;
+    Ok(file)
+}
+
+fn supervisor_file_identity(file: &File) -> Result<SupervisorFileIdentity, StorageError> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| StorageError::io("inspect supervisor image handle", error))?;
+    if !metadata.is_file() || is_link(&metadata) {
+        return Err(StorageError::new(
+            "supervisor_image",
+            "supervisor handle must be an ordinary file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Cargo는 top-level/deps 이름을 hardlink할 수 있다. 보호하는 것은 확인한
+        // 실제 path와 그 slot이며, 다른 alias의 존속이나 같은 UID의 쓰기를 보장하지 않는다.
+        if metadata.nlink() == 0 {
+            return Err(StorageError::new(
+                "supervisor_image",
+                "supervisor image has no live file link",
+            ));
+        }
+        Ok(SupervisorFileIdentity {
+            volume: metadata.dev(),
+            file: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        // SAFETY: File owns the live handle and the initialized output buffer is writable.
+        let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+            return Err(StorageError::io(
+                "identify supervisor image handle",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        if information.nNumberOfLinks == 0 {
+            return Err(StorageError::new(
+                "supervisor_image",
+                "supervisor image has no live file link",
+            ));
+        }
+        Ok(SupervisorFileIdentity {
+            volume: u64::from(information.dwVolumeSerialNumber),
+            file: (u64::from(information.nFileIndexHigh) << 32)
+                | u64::from(information.nFileIndexLow),
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(StorageError::new(
+            "supervisor_image",
+            "native supervisor image identity is unsupported",
+        ))
+    }
+}
+
+fn plan_completed_evictions(
+    slots: &[(PathBuf, SlotRecord)],
+    sizes: &BTreeMap<String, u64>,
+    budgets: &Budgets,
+    current_slot: &str,
+    include_current: bool,
+    protected_slot: Option<&str>,
+) -> Result<BTreeSet<String>, StorageError> {
+    let mut total = 0;
+    let mut completed = 0;
+    for (_, record) in slots {
+        total = checked_sum(total, sizes[&record.slot_id])?;
+        completed += usize::from(record.state == SlotState::Complete);
+    }
+    let mut selected = BTreeSet::new();
+    for (_, record) in slots {
+        if record.state != SlotState::Complete
+            || (!include_current && record.slot_id == current_slot)
+            || protected_slot == Some(record.slot_id.as_str())
+        {
+            continue;
+        }
+        let size = sizes[&record.slot_id];
+        if size > budgets.slot_bytes
+            || total > budgets.catalog_bytes
+            || completed > budgets.completed_slots
+        {
+            selected.insert(record.slot_id.clone());
+            total -= size;
+            completed -= 1;
+        }
+    }
+    let oversized = slots.iter().any(|(_, record)| {
+        (record.state == SlotState::Complete || protected_slot == Some(record.slot_id.as_str()))
+            && !selected.contains(&record.slot_id)
+            && sizes[&record.slot_id] > budgets.slot_bytes
+    });
+    if total > budgets.catalog_bytes || completed > budgets.completed_slots || oversized {
+        return Err(StorageError::new(
+            if protected_slot.is_some() {
+                "eviction_blocked"
+            } else {
+                "budget"
+            },
+            "managed limits cannot be met without removing a protected or ineligible slot",
+        ));
+    }
+    Ok(selected)
+}
+
 pub struct ManagedBuild {
     config: StorageConfig,
     paths: BuildPaths,
@@ -298,10 +570,21 @@ pub struct ManagedBuild {
     lease_bytes: Vec<u8>,
     slot: SlotRecord,
     slot_bytes: Vec<u8>,
+    supervisor_image: SupervisorImagePin,
 }
 
 impl ManagedBuild {
     pub fn acquire(config: StorageConfig, checkout: &Path) -> Result<Self, StorageError> {
+        let image = std::env::current_exe()
+            .map_err(|error| StorageError::io("resolve supervisor image", error))?;
+        Self::acquire_with_image(config, checkout, SupervisorImagePin::open(&image)?)
+    }
+
+    fn acquire_with_image(
+        config: StorageConfig,
+        checkout: &Path,
+        mut supervisor_image: SupervisorImagePin,
+    ) -> Result<Self, StorageError> {
         validate_config(&config)?;
         reject_secret_root(checkout)?;
         let checkout =
@@ -348,6 +631,7 @@ impl ManagedBuild {
         let catalog_file = catalog_path.join("catalog.json");
         let catalog = initialize_catalog(&catalog_path, &catalog_file)?;
         validate_catalog_entries(&catalog_path)?;
+        supervisor_image.bind_catalog(&catalog_path, &catalog)?;
         let checkout_digest = digest_bytes(path_identity(&checkout).as_bytes());
         let slot_id = slot_id(&checkout_digest, &config.purpose);
         let token = new_token();
@@ -428,6 +712,7 @@ impl ManagedBuild {
             lease,
             lease_bytes,
             slot_bytes: Vec::new(),
+            supervisor_image,
         };
         // Reclaim recognized, complete caches before admitting this new build.
         build.evict_completed(true)?;
@@ -464,6 +749,9 @@ impl ManagedBuild {
         drained: bool,
         evidence_exported: bool,
     ) -> Result<Self, StorageError> {
+        let image = std::env::current_exe()
+            .map_err(|error| StorageError::io("resolve supervisor image", error))?;
+        let mut supervisor_image = SupervisorImagePin::open(&image)?;
         validate_config(&config)?;
         if !drained || !evidence_exported {
             return Err(StorageError::new(
@@ -512,6 +800,7 @@ impl ManagedBuild {
                 "bootstrap catalog identity changed",
             ));
         }
+        supervisor_image.bind_catalog(&catalog_path, &catalog)?;
         let lease_bytes = read_record_bytes(&catalog_path.join("lease.json"))?;
         let lease: LeaseRecord = serde_json::from_slice(&lease_bytes)
             .map_err(|e| StorageError::new("record", e.to_string()))?;
@@ -584,6 +873,7 @@ impl ManagedBuild {
             lease_bytes,
             slot: own.1.clone(),
             slot_bytes: read_record_bytes(&own.0.join("owner.json"))?,
+            supervisor_image,
         };
         build.verify_ownership()?;
         // A crash between these atomic records remains an interrupted, preserved lease.
@@ -818,6 +1108,7 @@ impl ManagedBuild {
 
     pub fn finish(mut self, outcome: FinishOutcome) -> Result<FinishReceipt, StorageError> {
         self.verify_ownership()?;
+        self.supervisor_image.recheck()?;
         if !outcome.drained {
             return Err(StorageError::new(
                 "undrained",
@@ -915,8 +1206,17 @@ impl ManagedBuild {
 
     fn evict_completed(&self, include_current: bool) -> Result<Vec<String>, StorageError> {
         self.verify_lease()?;
+        self.supervisor_image.recheck()?;
         let mut slots = load_slots(&self.paths.catalog, &self.catalog)?;
         self.validate_active_slots(&slots)?;
+        if let Some(protected) = &self.supervisor_image.slot_id
+            && !slots.iter().any(|(_, record)| &record.slot_id == protected)
+        {
+            return Err(StorageError::new(
+                "supervisor_image",
+                "supervisor image slot ownership disappeared",
+            ));
+        }
         slots.sort_by_key(|(_, r)| (r.completed_ms.unwrap_or(u64::MAX), r.slot_id.clone()));
         let mut sizes = BTreeMap::new();
         let mut total = 0u64;
@@ -928,18 +1228,26 @@ impl ManagedBuild {
             completed += usize::from(record.state == SlotState::Complete);
         }
         let mut removed = Vec::new();
+        // 부족이 이미 확정되면 다른 cache도 지우지 않고 원 lease와 모든 slot을 보존한다.
+        let selected = plan_completed_evictions(
+            &slots,
+            &sizes,
+            &self.config.budgets,
+            &self.slot.slot_id,
+            include_current,
+            self.supervisor_image.slot_id.as_deref(),
+        )?;
+        let protected_size = self
+            .supervisor_image
+            .slot_id
+            .as_ref()
+            .and_then(|slot| sizes.get(slot))
+            .copied();
         for (path, record) in slots {
-            let own_current = record.slot_id == self.slot.slot_id;
-            if record.state != SlotState::Complete || (own_current && !include_current) {
+            if !selected.contains(&record.slot_id) {
                 continue;
             }
             let size = sizes[&record.slot_id];
-            if size <= self.config.budgets.slot_bytes
-                && total <= self.config.budgets.catalog_bytes
-                && completed <= self.config.budgets.completed_slots
-            {
-                continue;
-            }
             self.verify_lease()?;
             let expected = read_record_bytes(&path.join("owner.json"))?;
             let fresh: SlotRecord = serde_json::from_slice(&expected)
@@ -956,6 +1264,7 @@ impl ManagedBuild {
             validate_slot_record(&fresh, &record.slot_id, &self.catalog)?;
             validate_slot_entries(&path)?;
             verify_record_bytes(&path.join("owner.json"), &expected)?;
+            self.supervisor_image.recheck()?;
             remove_tree(
                 &path,
                 &self.paths.catalog.join("slots"),
@@ -963,14 +1272,22 @@ impl ManagedBuild {
                 &expected,
                 &|| self.verify_lease(),
             )?;
+            self.supervisor_image.recheck()?;
             total = total.saturating_sub(size);
             completed = completed.saturating_sub(1);
             removed.push(record.slot_id);
         }
-        if total > self.config.budgets.catalog_bytes {
+        if total > self.config.budgets.catalog_bytes
+            || completed > self.config.budgets.completed_slots
+            || protected_size.is_some_and(|size| size > self.config.budgets.slot_bytes)
+        {
             return Err(StorageError::new(
-                "budget",
-                "catalog exceeds byte budget and no eligible owned cache remains",
+                if protected_size.is_some() {
+                    "eviction_blocked"
+                } else {
+                    "budget"
+                },
+                "managed limits cannot be met without removing a protected or ineligible slot",
             ));
         }
         Ok(removed)

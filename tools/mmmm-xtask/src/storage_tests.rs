@@ -351,6 +351,264 @@ fn size_measurement_detects_growth_and_completed_oversized_slot_is_evicted() {
 }
 
 #[test]
+fn supervisor_parent_slot_and_cargo_hardlink_survive_admission_and_finish_eviction() {
+    let mut fixture = Fixture::new("parent-image");
+    let parent = fixture.acquire();
+    let parent_paths = parent.paths().clone();
+    let parent_id = parent.slot.slot_id.clone();
+    let image = parent_paths.cargo_target.join("supervisor-image");
+    fs::write(&image, b"actual fixture image").unwrap();
+    // 기존 작은 regular-file fixture로 Cargo의 top-level/deps hardlink만 재현한다.
+    let alias = fixture.root.join("image-alias");
+    fs::hard_link(&image, &alias).unwrap();
+    parent.finish(outcome(0)).unwrap();
+    fixture.config.purpose = "other-cache".into();
+    let other = fixture.acquire();
+    let other_path = other.paths().slot.clone();
+    other.finish(outcome(0)).unwrap();
+
+    fixture.config.purpose = "candidate-image".into();
+    fixture.config.budgets.completed_slots = 1;
+    let build = ManagedBuild::acquire_with_image(
+        fixture.config.clone(),
+        &fixture.checkout,
+        SupervisorImagePin::open(&image).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        build.supervisor_image.slot_id.as_deref(),
+        Some(parent_id.as_str())
+    );
+    assert!(parent_paths.slot.is_dir());
+    assert!(
+        !other_path.exists(),
+        "admission must reclaim the unprotected completed slot"
+    );
+    let candidate_path = build.paths().slot.clone();
+    let receipt = build.finish(outcome(0)).unwrap();
+    assert!(receipt.lease_released && receipt.slot_evicted);
+    assert!(
+        !candidate_path.exists(),
+        "the protected parent still counts against completed retention"
+    );
+    assert!(parent_paths.slot.is_dir());
+    assert_eq!(fs::read(&image).unwrap(), b"actual fixture image");
+    assert_eq!(fs::read(alias).unwrap(), b"actual fixture image");
+}
+
+#[test]
+fn supervisor_current_slot_is_preserved_and_unaffordable_limits_keep_the_lease() {
+    for limit in [None, Some(false), Some(true)] {
+        let fixture = Fixture::new("current-image");
+        let first = fixture.acquire();
+        let paths = first.paths().clone();
+        let image = paths.cargo_target.join("supervisor-image");
+        fs::write(&image, b"image").unwrap();
+        first.finish(outcome(0)).unwrap();
+        let mut build = ManagedBuild::acquire_with_image(
+            fixture.config.clone(),
+            &fixture.checkout,
+            SupervisorImagePin::open(&image).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            build.supervisor_image.slot_id.as_deref(),
+            Some(build.slot.slot_id.as_str())
+        );
+        if limit == Some(true) {
+            build.config.budgets.slot_bytes = 4096;
+            fs::write(paths.cargo_target.join("growth"), vec![0; 8192]).unwrap();
+        } else if limit == Some(false) {
+            build.config.budgets.completed_slots = 0;
+        }
+        let lease = fs::read(paths.catalog.join("lease.json")).unwrap();
+        let receipt = build.finish(outcome(23)).unwrap();
+        assert_eq!(receipt.command_exit, Some(23));
+        assert!(receipt.scratch_removed && !receipt.slot_evicted);
+        if limit.is_none() {
+            assert!(receipt.lease_released && receipt.cleanup_errors.is_empty());
+        } else {
+            assert!(!receipt.lease_released);
+            assert!(
+                receipt
+                    .cleanup_errors
+                    .iter()
+                    .any(|error| error.starts_with("eviction_blocked:"))
+            );
+            assert_eq!(fs::read(paths.catalog.join("lease.json")).unwrap(), lease);
+        }
+        assert_eq!(fs::read(image).unwrap(), b"image");
+        assert!(paths.slot.join("owner.json").is_file());
+    }
+}
+
+#[test]
+fn protected_oversized_parent_blocks_admission_before_any_other_cache_is_removed() {
+    let mut fixture = Fixture::new("large-parent");
+    let parent = fixture.acquire();
+    let image = parent.paths().cargo_target.join("supervisor-image");
+    fs::write(&image, vec![0; 8192]).unwrap();
+    parent.finish(outcome(0)).unwrap();
+    fixture.config.purpose = "other-cache".into();
+    let other = fixture.acquire();
+    let other_path = other.paths().slot.clone();
+    other.finish(outcome(0)).unwrap();
+    let before = fs::read(other_path.join("owner.json")).unwrap();
+    fixture.config.purpose = "blocked-candidate".into();
+    fixture.config.budgets.slot_bytes = 4096;
+    assert_eq!(
+        error_kind(ManagedBuild::acquire_with_image(
+            fixture.config.clone(),
+            &fixture.checkout,
+            SupervisorImagePin::open(&image).unwrap(),
+        )),
+        "eviction_blocked"
+    );
+    assert_eq!(fs::read(other_path.join("owner.json")).unwrap(), before);
+    assert_eq!(fs::metadata(image).unwrap().len(), 8192);
+    assert!(fixture.catalog().join("lease.json").is_file());
+
+    let mut aggregate = Fixture::new("aggregate-parent");
+    let parent = aggregate.acquire();
+    let parent_id = parent.slot.slot_id.clone();
+    let image = parent.paths().cargo_target.join("supervisor-image");
+    fs::write(&image, b"parent image").unwrap();
+    parent.finish(outcome(0)).unwrap();
+    aggregate.config.purpose = "reclaimable".into();
+    let other = aggregate.acquire();
+    let other_path = other.paths().slot.clone();
+    other.finish(outcome(0)).unwrap();
+    aggregate.config.purpose = "active-child".into();
+    let mut active = ManagedBuild::acquire_with_image(
+        aggregate.config.clone(),
+        &aggregate.checkout,
+        SupervisorImagePin::open(&image).unwrap(),
+    )
+    .unwrap();
+    let parent_size = tree_bytes(
+        &active.paths().catalog.join("slots").join(parent_id),
+        &active.paths().catalog,
+    )
+    .unwrap();
+    let active_size = tree_bytes(&active.paths().slot, &active.paths().catalog).unwrap();
+    active.config.budgets.slot_bytes = parent_size.max(active_size);
+    active.config.budgets.catalog_bytes = parent_size + active_size - 1;
+    assert_eq!(error_kind(active.evict_completed(true)), "eviction_blocked");
+    assert!(
+        other_path.join("owner.json").is_file(),
+        "a doomed aggregate plan must delete no eligible cache"
+    );
+    assert!(active.paths().catalog.join("lease.json").is_file());
+}
+
+#[test]
+fn external_supervisor_image_does_not_exempt_a_cache_from_existing_eviction() {
+    let mut fixture = Fixture::new("external-image");
+    let image = fixture.root.join("external-supervisor");
+    fs::write(&image, b"outside catalog").unwrap();
+    fixture.config.budgets.completed_slots = 0;
+    let build = ManagedBuild::acquire_with_image(
+        fixture.config.clone(),
+        &fixture.checkout,
+        SupervisorImagePin::open(&image).unwrap(),
+    )
+    .unwrap();
+    assert!(build.supervisor_image.slot_id.is_none());
+    let slot = build.paths().slot.clone();
+    let receipt = build.finish(outcome(0)).unwrap();
+    assert!(receipt.lease_released && receipt.slot_evicted);
+    assert!(!slot.exists());
+    assert_eq!(fs::read(image).unwrap(), b"outside catalog");
+}
+
+#[test]
+fn unknown_or_scratch_supervisor_image_is_rejected_without_unprotected_fallback() {
+    let mut fixture = Fixture::new("image-boundary");
+    assert_eq!(
+        error_kind(SupervisorImagePin::open(
+            &fixture.root.join("missing-image")
+        )),
+        "io"
+    );
+    let original = fixture.acquire();
+    let paths = original.paths().clone();
+    original.finish(outcome(0)).unwrap();
+    fs::create_dir(&paths.scratch).unwrap();
+    let scratch_image = paths.scratch.join("supervisor-image");
+    fs::write(&scratch_image, b"scratch image").unwrap();
+    fixture.config.purpose = "rejected-image".into();
+    assert_eq!(
+        error_kind(ManagedBuild::acquire_with_image(
+            fixture.config.clone(),
+            &fixture.checkout,
+            SupervisorImagePin::open(&scratch_image).unwrap(),
+        )),
+        "supervisor_image"
+    );
+    assert!(!fixture.catalog().join("lease.json").exists());
+    assert_eq!(fs::read(scratch_image).unwrap(), b"scratch image");
+
+    let source = fixture.root.join("image-directory");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("image"), b"source image").unwrap();
+    let link = fixture.root.join("image-directory-link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&source, &link).unwrap();
+    #[cfg(windows)]
+    create_junction(&link, &source);
+    #[cfg(any(unix, windows))]
+    {
+        assert_eq!(
+            error_kind(SupervisorImagePin::open(&link.join("image"))),
+            "link"
+        );
+        #[cfg(unix)]
+        fs::remove_file(link).unwrap();
+        #[cfg(windows)]
+        fs::remove_dir(link).unwrap();
+    }
+}
+
+#[test]
+fn supervisor_path_replacement_cannot_fall_back_to_unprotected_eviction() {
+    let fixture = Fixture::new("image-currentness");
+    let image = fixture.root.join("external-supervisor");
+    fs::write(&image, b"original image").unwrap();
+    let build = ManagedBuild::acquire_with_image(
+        fixture.config.clone(),
+        &fixture.checkout,
+        SupervisorImagePin::open(&image).unwrap(),
+    )
+    .unwrap();
+    let paths = build.paths().clone();
+    fs::write(paths.scratch.join("diagnostic"), b"must remain").unwrap();
+    let moved = fixture.root.join("moved-image");
+    #[cfg(unix)]
+    {
+        fs::rename(&image, &moved).unwrap();
+        fs::write(&image, b"replacement image").unwrap();
+        assert_eq!(error_kind(build.finish(outcome(23))), "supervisor_image");
+        assert_eq!(
+            fs::read(paths.scratch.join("diagnostic")).unwrap(),
+            b"must remain"
+        );
+        assert!(paths.catalog.join("lease.json").is_file());
+    }
+    #[cfg(windows)]
+    {
+        assert!(
+            fs::rename(&image, &moved).is_err(),
+            "held image denies delete sharing"
+        );
+        assert!(
+            OpenOptions::new().write(true).open(&image).is_err(),
+            "held image denies write sharing"
+        );
+        assert!(build.finish(outcome(23)).unwrap().lease_released);
+    }
+}
+
+#[test]
 fn checkout_and_evidence_overlap_is_rejected_before_creation() {
     let mut fixture = Fixture::new("overlap");
     fixture.config.output_root = Some(fixture.checkout.join("generated"));

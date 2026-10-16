@@ -856,6 +856,7 @@ dependencies = [
  "sha2",
  "unicode-normalization",
  "windows-sys",
+ "zip",
 ]
 
 [[package]]

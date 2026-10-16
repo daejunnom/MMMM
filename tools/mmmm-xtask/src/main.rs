@@ -8,6 +8,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, Instant};
 
+mod candidate;
+
 fn main() {
     match entry() {
         Ok(exit) => std::process::exit(exit),
@@ -20,9 +22,9 @@ fn main() {
 
 fn entry() -> Result<i32, Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let command = args
-        .next()
-        .ok_or("expected run, definition-startup, check-repository or bootstrap-complete")?;
+    let command = args.next().ok_or(
+        "expected run, candidate-build, definition-startup, check-repository or bootstrap-complete",
+    )?;
     let mut flags = BTreeMap::new();
     let mut child_args = Vec::new();
     let mut child_separator = false;
@@ -41,6 +43,12 @@ fn entry() -> Result<i32, Box<dyn std::error::Error>> {
     let checkout = optional_path(&mut flags, "--checkout").unwrap_or(std::env::current_dir()?);
     match command.as_str() {
         "run" => run_managed(checkout, flags, child_args),
+        "candidate-build" => {
+            if child_separator || !child_args.is_empty() {
+                return Err("candidate-build accepts no child command or arguments".into());
+            }
+            candidate::run(checkout, flags)
+        }
         "definition-startup" => {
             if child_separator || !child_args.is_empty() {
                 return Err("definition-startup accepts no child command or arguments".into());

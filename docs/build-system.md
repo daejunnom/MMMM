@@ -51,6 +51,16 @@ Linux의 XDG data 및 state 영역, macOS의 사용자 Application Support 영�
 commit SHA, PID, GUID 또는 시각마다 새 대형 빌드 트리를 만들지 않는다.
 식별 token은 lease 검증에 사용할 수 있지만 출력 디렉터리의 무제한 누적 기준으로 사용하지 않는다.
 
+실행할 개발 도구를 cache 밖에 보존할 때는 [D076](DECISIONS.md)의 별도 고정 이미지
+소유권과 유한한 수명을 적용한다. 초기 Windows bootstrap/candidate 도구는 최대 2개,
+각 32 MiB·합계 64 MiB이고 실행 중 교체하거나 자동 회수하지 않는다. source와 사본의
+전체 bytes·SHA, 원 owner와 완료/drain/export, 목적지 재읽기 및 별도 완료 영수증을
+확인한다. copy 성공과 실제 실행 성공, 원 도구의 빌드 revision은 각각 다른 사실이다.
+원 catalog lease를 이 보존물의 lease로 승계하지 않으며 partial·unknown 경로는 보존한다.
+새 도구를 관리 slot에서 컴파일할 때 필요한 이미지는 finish의 cache 회수 전에 별도
+보존을 완료해야 한다. 새 도구가 자체 관리 lease를 얻는 명령은 부모 관리 run의 lease가
+해제된 뒤 직접 호출한다. 보호한 실행 slot도 원 예산 계산에서 제외하지 않는다.
+
 슬롯에는 소유 schema, checkout 식별, 용도, 소유 token, 프로세스 식별,
 상태와 마지막 완료 시각을 기록한다. 원자적 기록 교체와 flush를 사용한다.
 개인 절대 경로가 필요한 소유 기록은 로컬 내부에 두고 공유 영수증에서는 제거한다.

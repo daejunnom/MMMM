@@ -2202,6 +2202,66 @@ bytes의 전후 pin은
 146 ms이며 owned-tail 정리 뒤 drain·완전한 출력·export·scratch 정리·lease 해제다.
 이 fixture는 실제 Java emitter 실행·NBT 크기·게임 및 ADMIN 관측의 근거가 아니다.
 
+고정 `bef4a37e54b437545e8311f1908a87ad2a70af60`의 실제 Windows JVM `512`는
+7모듈 417개·원 XML 36개·필수 11 task가 모두 실행·통과했고 failure/error/skip은 0이다.
+host-core 97·Fabric 130개에는 새 purpose gate·Throwable·실제 frame prefix helper 회귀가
+포함된다. 입력 203개의 전후 pin은
+`83260dc61ce46c6a89fd94017a8cee2f548eceeb522e768b9e23c802b692d6a2`로 같았다.
+원 XML과 summary 12,595 bytes·SHA
+`cdfcc1498ddf9dd2fb7343bbc53b405a99d5cf177dfe41e10702ca2b0d25f4b6`를 보존했다.
+command 0·69,478 ms·Job commit peak 1,387,356,160 bytes·6 process·최대 gap 148 ms,
+자연 종료·drain·완전한 출력·export·scratch 정리·lease 해제다. 실제 ADMIN·게임·reload
+source 인과·pack root 연속성과 settled readback은 계속 미입증이다.
+
+## 개발 도구 이미지와 후보 생산자의 수명 준비
+
+회수 코드의 읽기 전용 검토에서 실행 중 supervisor가 든 완료 slot도 예산 회수 대상이
+될 수 있음을 확인했다. 별도 purpose만으로 실행 이미지의 존속을 보장하지 않으며,
+Windows의 EXE 잠금을 보존 정책으로 취급하지 않는다. 실제 image/slot 보호 교정을
+구현하고 아래 Windows 단위 검사를 확인했다. [D076](DECISIONS.md)의 외부 고정 tools 경로에 기존 bootstrap 이미지
+3,073,024 bytes·SHA
+`1550b1921fd45ba67500a2f00e934111c78d57fa333209632146da4df9e83d2b`를 별도 보존했다.
+원 source owner·catalog lease 부재를 전후 대조하고 source held 두 pass와 목적지
+재열기의 전체 SHA가 같음을 확인했다. 이 전후 관측을 catalog 독점 lease 취득이나
+native inode·hostile rename 원자성 증명으로 기록하지 않았다.
+
+첫 시도는 owner의 전체 checkout digest를 짧은 slot prefix와 비교해 복사 전에 거절됐다.
+교정한 복사는 검증까지 완료됐으나 마지막 PowerShell generic 배열 비교가 실패해 별도
+tools lease를 보존했다. 종료된 원 생성 process·같은 owner/lease·원 copy 영수증·원본과
+사본의 bytes/pin을 다시 검사해 해당 lease만 해제하고 복구 영수증을 CreateNew로 남겼다.
+원 copy 기록과 실패를 덮지 않았고 다른 cache·제품 자료를 삭제하지 않았다. `513`은
+이 사본을 실제 Windows 관리 child로 실행해 repository 검사를 통과했다. 사본 보존과
+실제 실행을 구분하고 이후 tool 교체 전까지 이 고정 이미지를 사용한다.
+
+development CLI 후보 생산자는 실제 source·dependency·tool images와 고정 target 및
+archive를 연결한다. 실행별 대형 target을 만들지 않고 같은 fixed target과 scratch source를
+사용한다. 이전 actual source/dependency/tool/선택 환경/고정 인자·전체 workproduct·원
+build stdout·archive·binding 및 실제 finish/complete가 일치할 때만 재사용에 입장한다.
+알 수 없거나 불일치한 preflight cache는 finish를 호출하지 않고 실제 자식 시작·drain·
+export 상태 및 보존 단계의 미변경을 별도 기록하여 owner/lease와 자료를 보존한다.
+획득 단계의 owner/lease 쓰기는 이 보존 단계와 구분한다. 명시적 소유 수명 처리 없이
+재시도하거나 pointer를 합성하지 않는다. 입장 뒤 정리는 현재 CLI package의 고정 clean만
+사용하며 실제 새 executable의 원 Cargo completion을 검사한다. 전체 제품 bundle과 FN36
+생산자·신뢰된 결과 index·82개 인수 및 공개 배포 완료와 구분한다.
+
+`514`의 format 뒤 실제 Windows `515`는 새 fixed tools slot에서 xtask library 241개
+통과·기존 1 ignored와 binary 8개 통과를 확인했다. supervisor 보호 회귀와 candidate의
+네 pure 검사가 포함된다. `516` all-target strict도 통과했다. 두 실행 전후 로컬 Rust 입력
+324개·8,834,422 bytes의 pin은
+`94ba3c9b0c5055c7a008f646af4cd008e0e770c6806b1e9d60ab7a968f46fcbc`로 같았다.
+별도 binding 45,961 bytes·SHA
+`ab50a26a43d54a56e48a406a457e600499fc58218745f9021865fc5aec1c122c`를 보존했다.
+`515`는 command 0·104,766 ms·Job peak 549,343,232 bytes·10 process·gap 141 ms·
+owned-tail 정리이며 완료된 원 bootstrap cache 1개 회수를 기록했다. `516`은 command 0·
+14,154 ms·Job peak 364,433,408 bytes·7 process·gap 132 ms·자연 종료다. 모두 실제
+drain·완전한 출력·export·scratch 정리·lease 해제·감독/정리 오류 0이다. source 독립
+cross-OS 검토의 확정 P1/P2·타입 지적은 0이며 실제 Unix/macOS 실행과 구분한다.
+
+[D077](DECISIONS.md)의 입력 예산을 채택했다. 아직 실제 후보 실행 전이므로 Cargo worker
+초기값 한 곳을 2에서 기존 Windows 검사와 같은 1로 고정했다. 앞선 `515`/`516`의 원 pin을
+새 소스의 pin으로 바꾸지 않으며, 이 단일 설정 변경 뒤 실제 도구 빌드와 후보 생산을
+진행한다. 새 producer의 실제 archive 생성·dependency fetch/target 상태는 아직 미실행이다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

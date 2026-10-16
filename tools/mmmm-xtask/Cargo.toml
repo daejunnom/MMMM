@@ -15,6 +15,7 @@ serde_json.workspace = true
 sha2.workspace = true
 unicode-normalization.workspace = true
 ctrlc.workspace = true
+zip = { version = "=6.0.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
