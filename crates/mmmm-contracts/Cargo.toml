@@ -1,0 +1,18 @@
+[package]
+name = "mmmm-contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MMMM canonical wire contracts, strict JSON boundaries and content digests"
+
+[dependencies]
+jsonschema = { version = "=0.58.6", default-features = false }
+num-bigint = "0.4"
+num-integer = "0.1"
+num-traits = "0.2"
+serde.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+serde_jcs = "=0.2.0"
+sha2.workspace = true

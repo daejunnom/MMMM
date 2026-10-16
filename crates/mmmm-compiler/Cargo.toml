@@ -1,0 +1,17 @@
+[package]
+name = "mmmm-compiler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MMMM deterministic, exact-target vanilla Minecraft fragments and pack drafts"
+
+[dependencies]
+mmmm-contracts = { path = "../mmmm-contracts" }
+mmmm-domain = { path = "../mmmm-domain" }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

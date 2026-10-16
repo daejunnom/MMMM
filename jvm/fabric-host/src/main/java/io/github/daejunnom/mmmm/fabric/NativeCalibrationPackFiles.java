@@ -1,0 +1,251 @@
+package io.github.daejunnom.mmmm.fabric;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.daejunnom.mmmm.host.HostDispatcher;
+import io.github.daejunnom.mmmm.host.HostSession;
+import io.github.daejunnom.mmmm.observer.DefinitionOwnedPackFilesBridge;
+import io.github.daejunnom.mmmm.sdk.ContractException;
+import io.github.daejunnom.mmmm.sdk.ContractJson;
+import io.github.daejunnom.mmmm.sdk.Invocation;
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.util.HexFormat;
+import java.util.Objects;
+import java.util.Set;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.storage.LevelResource;
+
+/** Platform path issuer only. Rust owns the sealed roster and all physical I/O. */
+final class NativeCalibrationPackFiles {
+    private static final String BASENAME = "mmmm-calibration-normative47";
+    private static final String TARGET = "calibration-bootstrap-pack";
+    private NativeCalibrationPackFiles() { }
+
+    /** A bounded snapshot of received private Rust bytes, never Java-generated sources. */
+    static final class SealedFiles {
+        private final String digest;
+        private final byte[] frame;
+        private SealedFiles(String digest, byte[] frame) { this.digest = digest; this.frame = frame; }
+        static SealedFiles fromPrivateRustBundle(ObjectNode source) {
+            HostDispatcher.exactFields(source, Set.of("bundleDigest", "rawResource", "entries"));
+            String digest = digest(source, "bundleDigest");
+            JsonNode entries = source.get("entries");
+            if (!(entries instanceof ArrayNode) || entries.size() != 48) throw failure("CALIBRATION_SOURCE_BUNDLE_INVALID");
+            long total = 0; String previous = "";
+            try {
+                ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+                try (DataOutputStream out = new DataOutputStream(bytes)) {
+                    out.write("MMMMPK01".getBytes(StandardCharsets.US_ASCII)); out.write(HexFormat.of().parseHex(digest)); out.writeShort(48);
+                    for (JsonNode value : entries) {
+                        ObjectNode entry = ContractJson.object(value);
+                        HostDispatcher.exactFields(entry, Set.of("path", "rawSha256", "byteLength", "rawBytesHex"));
+                        String path = text(entry, "path"); String sha = digest(entry, "rawSha256");
+                        if (path.length() < 1 || path.length() > 240 || !path.matches("[a-z0-9_./-]+")
+                                || path.compareTo(previous) <= 0 || !entry.path("byteLength").isIntegralNumber()
+                                || !entry.path("byteLength").canConvertToInt()) throw failure("CALIBRATION_SOURCE_BUNDLE_INVALID");
+                        int size = entry.path("byteLength").intValue();
+                        if (size < 1 || size > 65536 || (total += size) > 1024 * 1024) throw failure("CALIBRATION_SOURCE_BUNDLE_INVALID");
+                        String raw = text(entry, "rawBytesHex");
+                        if (raw.length() != size * 2 || !raw.matches("[0-9a-f]+")) throw failure("CALIBRATION_SOURCE_BUNDLE_INVALID");
+                        byte[] original = HexFormat.of().parseHex(raw);
+                        if (!ContractJson.sha256(original).equals(sha)) throw failure("CALIBRATION_SOURCE_BUNDLE_INVALID");
+                        byte[] name = path.getBytes(StandardCharsets.US_ASCII);
+                        out.writeShort(name.length); out.write(name); out.writeInt(size); out.write(HexFormat.of().parseHex(sha)); out.write(original);
+                        previous = path;
+                    }
+                }
+                byte[] canonical = ContractJson.canonical(entries);
+                if (!ContractJson.sha256(canonical).equals(digest)) throw failure("CALIBRATION_SOURCE_BUNDLE_INVALID");
+                ObjectNode resource = ContractJson.object(source.get("rawResource"));
+                HostDispatcher.exactFields(resource, Set.of("resourceId", "sha256", "mediaType", "sizeBytes"));
+                if (!text(resource, "resourceId").matches("[a-z0-9][a-z0-9._:-]{0,127}") || text(resource, "mediaType").isEmpty()
+                        || !digest(resource, "sha256").equals(digest) || !resource.path("sizeBytes").isIntegralNumber()
+                        || !resource.path("sizeBytes").canConvertToLong() || resource.path("sizeBytes").longValue() != canonical.length) {
+                    throw failure("CALIBRATION_SOURCE_BUNDLE_INVALID");
+                }
+                return new SealedFiles(digest, bytes.toByteArray());
+            } catch (IOException impossible) { throw new IllegalStateException("In-memory source frame failed", impossible); }
+        }
+        String bundleDigest() { return digest; }
+    }
+
+    static PreparedFiles prepare(MinecraftServer server, ServerLevel level, HostSession owner, ObjectNode context,
+                                 SealedFiles sealed, Runnable current) {
+        Objects.requireNonNull(sealed);
+        return NativeCalibrationStateReader.currentContext(server, level, owner, context, current::run, (actual, checkpoint) -> {
+            Path root = actualAbsolute(server.getWorldPath(LevelResource.DATAPACK_DIR));
+            PreparedFiles prepared = new PreparedFiles(server, level, owner, actual, sealed, root);
+            prepared.checkCurrent(checkpoint::check);
+            return prepared;
+        });
+    }
+    static final class PreparedFiles {
+        private final MinecraftServer server;
+        private final ServerLevel level;
+        private final HostSession owner;
+        private final ObjectNode context;
+        private final SealedFiles sealed;
+        private final Path root;
+        private boolean attempted;
+        private PreparedFiles(MinecraftServer server, ServerLevel level, HostSession owner, ObjectNode context, SealedFiles sealed, Path root) {
+            this.server = server; this.level = level; this.owner = owner; this.context = context.deepCopy(); this.sealed = sealed; this.root = root;
+        }
+        void checkCurrent(Runnable current) {
+            if (attempted) throw failure("CALIBRATION_PACK_ALREADY_ATTEMPTED");
+            NativeCalibrationStateReader.currentContext(server, level, owner, context, current::run, (actual, checkpoint) -> {
+                NativeCall port = packCall(this, checkpoint::check);
+                DefinitionOwnedPackFilesBridge.observePackAbsence(port, sealed.frame); return null;
+            });
+        }
+        ObjectNode beforeTargets() {
+            ObjectNode raw = object(); raw.put("format", "mmmm.native.calibration-bootstrap-absence/1"); raw.put("targetId", TARGET);
+            raw.put("status", "known"); raw.put("presence", "absent"); raw.put("coverage", "full_target");
+            raw.put("captureScope", "native_bootstrap_pack_directory_absence");
+            ObjectNode selector = raw.putObject("selector"); selector.put("kind", "calibration_pack"); selector.put("sourceBundleDigest", sealed.digest);
+            byte[] bytes = ContractJson.canonical(raw);
+            ObjectNode target = object(); target.put("targetId", TARGET); target.put("rawBytesHex", HexFormat.of().formatHex(bytes));
+            target.put("rawSha256", ContractJson.sha256(bytes)); return target;
+        }
+        FileFacts execute(Invocation invocation, Runnable current) {
+            Objects.requireNonNull(invocation); Objects.requireNonNull(current);
+            if (attempted || !invocation.context().equals(context) || !"mmmm:calibration_bootstrap_execute".equals(invocation.actionId())) {
+                throw failure("CALIBRATION_PACK_INVOCATION_MISMATCH");
+            }
+            HostDispatcher.exactFields(invocation.arguments(), Set.of("sourceBundleDigest"));
+            if (!sealed.digest.equals(text(invocation.arguments(), "sourceBundleDigest"))) throw failure("CALIBRATION_PACK_INVOCATION_MISMATCH");
+            return NativeCalibrationStateReader.currentContext(server, level, owner, context, current::run, (actual, checkpoint) -> {
+                NativeCall port = packCall(this, checkpoint::check);
+                // Sticky before the first CreateNew. Any uncertain partial effect
+                // stays preserved and this prepared capability cannot retry.
+                if (attempted) throw failure("CALIBRATION_PACK_ALREADY_ATTEMPTED"); attempted = true;
+                DefinitionOwnedPackFilesBridge.Receipt receipt = DefinitionOwnedPackFilesBridge.createNew(port, sealed.frame);
+                return new FileFacts(root.resolve(BASENAME), sealed.digest, receipt);
+            });
+        }
+    }
+    static final class FileFacts {
+        private final Path root;
+        private final String bundleDigest;
+        private final DefinitionOwnedPackFilesBridge.Receipt receipt;
+        private FileFacts(Path root, String bundleDigest, DefinitionOwnedPackFilesBridge.Receipt receipt) {
+            this.root = root; this.bundleDigest = bundleDigest; this.receipt = receipt;
+        }
+        String repositoryId() { return "file/" + BASENAME; }
+        Path createdPackRoot() { return root; }
+        ObjectNode toWire() {
+            ObjectNode result = object(); result.put("sourceBundleDigest", bundleDigest); result.put("verifiedFileCount", receipt.files().size());
+            ArrayNode entries = result.putArray("files");
+            for (DefinitionOwnedPackFilesBridge.FileFact fact : receipt.files()) {
+                ObjectNode row = entries.addObject(); row.put("path", fact.path()); row.put("byteLength", fact.byteLength()); row.put("rawSha256", fact.rawSha256());
+            }
+            return result;
+        }
+    }
+
+    static AbsentStorage prepareStorageAbsence(MinecraftServer server, ServerLevel level, HostSession owner, ObjectNode context,
+                                               Path actualDataFolder, Path actualDataFile, Runnable current) {
+        return NativeCalibrationStateReader.currentContext(server, level, owner, context, current::run, (actual, checkpoint) -> {
+            AbsentStorage result = new AbsentStorage(server, level, owner, actual, actualDataFolder, actualDataFile);
+            result.recheck(checkpoint::check); return result;
+        });
+    }
+    /** Only the actual SavedDataStorage accessor/invoker may supply these paths. */
+    static final class AbsentStorage {
+        private final MinecraftServer server;
+        private final ServerLevel level;
+        private final HostSession owner;
+        private final ObjectNode context;
+        private final Path worldRoot;
+        private final Path folder;
+        private final Path file;
+        private final String relative;
+        private AbsentStorage(MinecraftServer server, ServerLevel level, HostSession owner, ObjectNode context, Path folder, Path file) {
+            this.server = Objects.requireNonNull(server); this.level = Objects.requireNonNull(level); this.owner = Objects.requireNonNull(owner);
+            this.context = context.deepCopy(); this.folder = actualAbsolute(folder); this.file = actualAbsolute(file);
+            // ROOT is the actual server's fixed world storage anchor. The data
+            // directory itself may be absent; never search for another parent.
+            this.worldRoot = actualAbsolute(server.getWorldPath(LevelResource.ROOT));
+            this.relative = storageRelative(worldRoot, this.folder, this.file);
+        }
+        void recheck(Runnable current) {
+            NativeCalibrationStateReader.currentContext(server, level, owner, context, current::run, (actual, checkpoint) -> {
+                Runnable check = () -> {
+                    checkpoint.check();
+                    if (!actualAbsolute(server.getWorldPath(LevelResource.ROOT)).equals(worldRoot)
+                            || !storageRelative(worldRoot, folder, file).equals(relative)) throw failure("CALIBRATION_STORAGE_PATH_CHANGED");
+                    checkpoint.check();
+                };
+                check.run();
+                // Existing parents are held by the shared kernel. Only its
+                // first actual missing component proves historical absence.
+                DefinitionOwnedPackFilesBridge.observeStorageAbsence(new NativeCall(worldRoot, relative, check)); return null;
+            });
+        }
+        ObjectNode facts() {
+            ObjectNode result = object(); result.put("format", "mmmm.native.calibration-storage-backing-absence/1"); result.put("presence", "absent"); return result;
+        }
+    }
+    private static NativeCall packCall(PreparedFiles prepared, Runnable current) {
+        Runnable check = () -> {
+            current.run();
+            if (!actualAbsolute(prepared.server.getWorldPath(LevelResource.DATAPACK_DIR)).equals(prepared.root)) throw failure("CALIBRATION_PACK_ROOT_CHANGED");
+            current.run();
+        };
+        check.run(); return new NativeCall(prepared.root, BASENAME, check);
+    }
+    /** Private, single-call callback carrier. No request callback is retained by a receipt. */
+    private static final class NativeCall {
+        private final Path root;
+        private final String relative;
+        private final Runnable current;
+        private NativeCall(Path root, String relative, Runnable current) { this.root = root; this.relative = relative; this.current = current; }
+        private void checkpoint() { current.run(); }
+        private String nativeRoot() { checkpoint(); return root.toString(); }
+        private String nativeRelative() { checkpoint(); return relative; }
+    }
+    private static ObjectNode object() { return JsonNodeFactory.instance.objectNode(); }
+    private static String storageRelative(Path root, Path folder, Path file) {
+        if (!folder.startsWith(root) || folder.equals(root) || !file.startsWith(folder) || file.equals(folder)) {
+            throw failure("CALIBRATION_STORAGE_PATH_UNSUPPORTED");
+        }
+        Path relative = root.relativize(file);
+        if (relative.isAbsolute() || relative.getNameCount() < 1 || relative.getNameCount() > 64) {
+            throw failure("CALIBRATION_STORAGE_PATH_UNSUPPORTED");
+        }
+        StringBuilder logical = new StringBuilder();
+        for (Path component : relative) {
+            String name = component.toString();
+            if (name.isEmpty() || name.equals(".") || name.equals("..") || name.length() > 255
+                    || name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 || name.indexOf(':') >= 0
+                    || name.chars().anyMatch(Character::isISOControl)) throw failure("CALIBRATION_STORAGE_PATH_UNSUPPORTED");
+            if (!logical.isEmpty()) logical.append('/'); logical.append(name);
+        }
+        if (logical.isEmpty() || logical.length() > 4096) throw failure("CALIBRATION_STORAGE_PATH_UNSUPPORTED");
+        // This is lexical selection only. Secret/reserved component policy,
+        // physical ancestry, links and actual absence remain in the one kernel.
+        return logical.toString();
+    }
+    private static Path actualAbsolute(Path actual) {
+        Objects.requireNonNull(actual);
+        if (actual.toString().isEmpty()) throw failure("CALIBRATION_STORAGE_PATH_UNSUPPORTED");
+        for (Path component : actual) if (component.toString().equals("..")) throw failure("CALIBRATION_STORAGE_PATH_UNSUPPORTED");
+        // The game's own paths may start with './'. Remove only that harmless
+        // spelling after rejecting every parent traversal. Kernel pins/checks
+        // all actual physical ancestors; no caller path or toRealPath is used.
+        return actual.toAbsolutePath().normalize();
+    }
+    private static String text(ObjectNode node, String field) {
+        if (!node.path(field).isTextual()) throw failure("CALIBRATION_SOURCE_BUNDLE_INVALID"); return node.path(field).textValue();
+    }
+    private static String digest(ObjectNode node, String field) {
+        String value = text(node, field); if (!value.matches("[0-9a-f]{64}")) throw failure("CALIBRATION_SOURCE_BUNDLE_INVALID"); return value;
+    }
+    private static ContractException failure(String code) { return new ContractException(code, "The actual owned calibration file boundary is unavailable or changed"); }
+}

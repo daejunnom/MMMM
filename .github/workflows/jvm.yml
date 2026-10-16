@@ -1,0 +1,261 @@
+name: JVM verification
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Keep one active run for a ref. A new source SHA does not cancel an active run.
+concurrency:
+  group: jvm-verification-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '2'
+  CARGO_INCREMENTAL: '0'
+  PYTHONDONTWRITEBYTECODE: '1'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  jvm:
+    name: jvm (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 85
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - runner: windows-2025
+            target: windows-x64
+            rust_target: x86_64-pc-windows-msvc
+            os: Windows
+            arch: X64
+          - runner: ubuntu-24.04
+            target: linux-x64
+            rust_target: x86_64-unknown-linux-gnu
+            os: Linux
+            arch: X64
+          - runner: macos-15
+            target: macos-arm64
+            rust_target: aarch64-apple-darwin
+            os: Darwin
+            arch: Arm64
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      MMMM_RUST_TARGET: ${{ matrix.rust_target }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+
+      - name: Register actual source and runner
+        id: source
+        env:
+          EXPECTED_OS: ${{ matrix.os }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          MATRIX_TARGET: ${{ matrix.target }}
+          EXPECTED_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          SOURCE_EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || '' }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actualOS = if ($IsWindows) { 'Windows' } elseif ($IsMacOS) { 'Darwin' } elseif ($IsLinux) { 'Linux' } else { 'unsupported' }
+          $actualArch = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
+          if ($actualOS -cne $env:EXPECTED_OS -or $actualArch -cne $env:EXPECTED_ARCH) { throw 'Runner OS or architecture differs from the matrix target.' }
+          $expectedRustTarget = switch ($actualOS) {
+            'Windows' { 'x86_64-pc-windows-msvc' }
+            'Linux' { 'x86_64-unknown-linux-gnu' }
+            'Darwin' { 'aarch64-apple-darwin' }
+            default { throw 'Unsupported native Rust target.' }
+          }
+          if ($env:MMMM_RUST_TARGET -cne $expectedRustTarget) { throw 'Rust target differs from the actual runner profile.' }
+          $outputRoot = Join-Path $env:RUNNER_TEMP 'MMMM'
+          $evidenceRoot = Join-Path $outputRoot 'evidence/jvm'
+          [System.IO.Directory]::CreateDirectory($evidenceRoot) | Out-Null
+          $sourceSha = (& git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $sourceSha -cnotmatch '^[0-9a-f]{40}$') { throw 'Cannot establish the checked-out source SHA.' }
+          if ($env:EXPECTED_SOURCE_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:EVENT_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'Event source SHA metadata is invalid.' }
+          $pullRequest = $null
+          if ($env:SOURCE_EVENT_NAME -ceq 'pull_request') {
+            $prNumber = 0
+            if ($env:PR_NUMBER -cnotmatch '^[1-9][0-9]*$' -or -not [int]::TryParse($env:PR_NUMBER, [ref]$prNumber)) { throw 'Pull request number metadata is invalid.' }
+            if ($env:PR_HEAD_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:PR_BASE_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:PR_HEAD_SHA -cne $env:EXPECTED_SOURCE_SHA) { throw 'Pull request source SHA metadata is invalid.' }
+            $pullRequest = [ordered]@{ number = $prNumber; head_sha = $env:PR_HEAD_SHA; base_sha = $env:PR_BASE_SHA }
+          } elseif ($env:SOURCE_EVENT_NAME -cin @('push', 'workflow_dispatch')) {
+            if ($env:PR_NUMBER -or $env:PR_HEAD_SHA -or $env:PR_BASE_SHA -or $env:EVENT_SHA -cne $env:EXPECTED_SOURCE_SHA) { throw 'Non-PR source metadata is inconsistent.' }
+          } else { throw 'Unsupported CI source event.' }
+          $record = [ordered]@{
+            schema = 'mmmm-ci-context/1'; source_sha = $sourceSha;
+            expected_source_sha = $env:EXPECTED_SOURCE_SHA; source_matches_expected = ($sourceSha -ceq $env:EXPECTED_SOURCE_SHA);
+            event_name = $env:SOURCE_EVENT_NAME; event_sha = $env:EVENT_SHA; pull_request = $pullRequest;
+            repository = $env:GITHUB_REPOSITORY; workflow = $env:GITHUB_WORKFLOW;
+            run_id = $env:GITHUB_RUN_ID; run_attempt = $env:GITHUB_RUN_ATTEMPT;
+            target = $env:MATRIX_TARGET; os = $actualOS; arch = $actualArch;
+            runner_image = $env:ImageOS; runner_image_version = $env:ImageVersion;
+            rust_toolchain = '1.96.0'; rust_target = $env:MMMM_RUST_TARGET; build_jobs = 2;
+            command_timeout_seconds = 1200; artifact_retention_days = 14;
+            gradle_version = '9.6.0'; jdk_archive_release = '25.0.4.1+1'; gradle_workers = 2; junit_forks = 1;
+            launcher_heap_bytes = 268435456; daemon_heap_bytes = 1073741824; test_heap_bytes = 536870912;
+            managed_output_bytes = 67108864; bootstrap_output_bytes = 134217728;
+            slot_bytes = 8589934592; catalog_bytes = 12884901888; disk_observation_seconds = 5
+          }
+          $record | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $evidenceRoot 'ci-context.json') -Encoding utf8NoBOM
+          if ($sourceSha -cne $env:EXPECTED_SOURCE_SHA) { throw 'Checked-out source SHA differs from the expected candidate SHA.' }
+          if (-not (Test-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'Cargo.lock') -PathType Leaf)) { throw 'CI requires the checked-in Cargo lock.' }
+          "MMMM_OUTPUT_ROOT=$outputRoot" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "MMMM_EVIDENCE_ROOT=$evidenceRoot" | Add-Content -LiteralPath $env:GITHUB_ENV
+
+      - name: Install pinned Rust into temporary toolchain root
+        id: rust
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rustup = (Get-Command rustup -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+          if ($rustup -isnot [string] -or -not [System.IO.Path]::IsPathFullyQualified($rustup) -or -not (Test-Path -LiteralPath $rustup -PathType Leaf)) { throw 'A single absolute Rustup application path is required.' }
+          $toolchainRoot = Join-Path $env:MMMM_OUTPUT_ROOT 'toolchain'
+          $env:RUSTUP_HOME = Join-Path $toolchainRoot 'rustup'
+          $env:CARGO_HOME = Join-Path $toolchainRoot 'cargo'
+          & $rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Rust installation failed.' }
+          $cargoOutput = @(& $rustup which --toolchain 1.96.0 cargo)
+          if ($LASTEXITCODE -ne 0 -or $cargoOutput.Count -ne 1 -or $cargoOutput[0] -isnot [string]) { throw 'Pinned Cargo path probe must return one line.' }
+          $cargo = $cargoOutput[0].Trim()
+          if (-not [System.IO.Path]::IsPathFullyQualified($cargo) -or -not (Test-Path -LiteralPath $cargo -PathType Leaf)) { throw 'Pinned Cargo executable is unavailable.' }
+          $bin = Split-Path -Parent $cargo
+          "RUSTUP_HOME=$env:RUSTUP_HOME" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "MMMM_CARGO=$cargo" | Add-Content -LiteralPath $env:GITHUB_ENV
+          $bin | Add-Content -LiteralPath $env:GITHUB_PATH
+          & $cargo --version
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Cargo version probe failed.' }
+
+      - name: Bootstrap supervised Rust runner
+        id: bootstrap
+        timeout-minutes: 22
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:MMMM_EVIDENCE_ROOT 'bootstrap'
+          if ($IsWindows) {
+            & ./tools/bootstrap/bootstrap.ps1 -Checkout $env:GITHUB_WORKSPACE -OutputRoot $env:MMMM_OUTPUT_ROOT -EvidenceRoot $evidence -TimeoutSeconds 1200 -Jobs 2
+          } else {
+            $python = (Get-Command python3 -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+            if ($python -isnot [string] -or -not [System.IO.Path]::IsPathFullyQualified($python) -or -not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'A single absolute Python application path is required.' }
+            & $python -B ./tools/bootstrap/bootstrap-unix.py --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root $evidence --timeout-seconds 1200 --jobs 2
+            if ($LASTEXITCODE -ne 0) { throw 'Supervised Unix bootstrap did not complete.' }
+          }
+          # Windows bootstrap is a PowerShell script that throws on failure and
+          # validates its native receipts. LASTEXITCODE belongs to the most
+          # recent native command and can be unset or stale after this script.
+          $receipt = Get-Content -LiteralPath (Join-Path $evidence 'bootstrap-complete.json') -Raw | ConvertFrom-Json
+          if ($receipt.schema -cne 'mmmm-bootstrap-complete/1' -or $receipt.lease_released -ne $true -or $receipt.slot_id -cnotmatch '^(windows|linux|macos)-(x86_64|aarch64)-[0-9a-f]{24}-bootstrap$') { throw 'Bootstrap completion receipt is invalid.' }
+          $exe = if ($IsWindows) { 'mmmm-xtask.exe' } else { 'mmmm-xtask' }
+          $tool = Join-Path $env:MMMM_OUTPUT_ROOT "build/managed-v1/slots/$($receipt.slot_id)/cache/cargo-target/debug/$exe"
+          if (-not (Test-Path -LiteralPath $tool -PathType Leaf)) { throw 'Completed bootstrap tool is missing.' }
+          "MMMM_XTASK=$tool" | Add-Content -LiteralPath $env:GITHUB_ENV
+
+      - name: Run JVM tests, Fabric compilation, and observer and fixture JAR tasks
+        id: verify
+        timeout-minutes: 22
+        env:
+          EXPECTED_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pythonName = if ($IsWindows) { 'python' } else { 'python3' }
+          $pythonCommand = Get-Command $pythonName -CommandType Application -ErrorAction Stop | Select-Object -First 1
+          $pythonItem = Get-Item -LiteralPath $pythonCommand.Source -Force
+          $pythonTarget = $pythonItem.ResolveLinkTarget($true)
+          $python = if ($null -eq $pythonTarget) { $pythonItem.FullName } else { $pythonTarget.FullName }
+          if (-not [System.IO.Path]::IsPathFullyQualified($python) -or -not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'A resolved absolute Python application is required.' }
+          $pwsh = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+          if (-not [System.IO.Path]::IsPathFullyQualified($pwsh) -or -not (Test-Path -LiteralPath $pwsh -PathType Leaf)) { throw 'A resolved absolute PowerShell application is required.' }
+          $evidence = Join-Path $env:MMMM_EVIDENCE_ROOT 'verification'
+          [System.IO.Directory]::CreateDirectory($evidence) | Out-Null
+          . (Join-Path $env:GITHUB_WORKSPACE 'tools/bootstrap/jvm-runtime-probe.ps1')
+          $outsideProbe = Get-MmmmJvmRuntimeProbe -SourceSha $env:EXPECTED_SOURCE_SHA -Target $env:MATRIX_TARGET -Scope outside
+          $probeBytes = [System.Text.UTF8Encoding]::new($false, $true).GetBytes((ConvertTo-Json -InputObject $outsideProbe -Depth 8 -Compress))
+          if ($probeBytes.Length -gt 16384) { throw 'Runtime probe evidence exceeded its fixed budget.' }
+          $probeStream = [System.IO.File]::Open((Join-Path $evidence 'jvm-runtime-outside.json'), [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+          try { $probeStream.Write($probeBytes, 0, $probeBytes.Length); $probeStream.Flush($true) } finally { $probeStream.Dispose() }
+          & $env:MMMM_XTASK run --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root (Join-Path $env:MMMM_EVIDENCE_ROOT 'managed') --purpose jvm --timeout-seconds 1200 --owned-tail-policy terminate-build -- $pwsh -NoProfile -File (Join-Path $env:GITHUB_WORKSPACE 'tools/bootstrap/jvm-ci.ps1') -Checkout $env:GITHUB_WORKSPACE -EvidenceRoot $evidence -ExpectedSourceSha $env:EXPECTED_SOURCE_SHA -Target $env:MATRIX_TARGET -Python $python
+          $managedExit = $LASTEXITCODE
+          if ($managedExit -ne 0) { throw 'Managed JVM verification failed. Exported individual outcomes remain separate.' }
+          $result = Get-Content -LiteralPath (Join-Path $evidence 'jvm-result.json') -Raw | ConvertFrom-Json
+          if ($result.schema -cne 'mmmm-jvm-ci-result/1' -or $result.source_sha -cne $env:EXPECTED_SOURCE_SHA -or $result.status -cne 'passed' -or $result.gradle_exit -ne 0) { throw 'JVM verification result does not establish success for this source.' }
+
+      - name: Build observer and observe actual JDK ABI and controlled startup
+        id: observer
+        timeout-minutes: 27
+        env:
+          EXPECTED_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:MMMM_EVIDENCE_ROOT 'observer'
+          if (Test-Path -LiteralPath $evidence) { throw 'Observer evidence already exists.' }
+          [System.IO.Directory]::CreateDirectory($evidence) | Out-Null
+          $pwsh = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+          & $pwsh -NoProfile -File (Join-Path $env:GITHUB_WORKSPACE 'tools/bootstrap/observer-ci.ps1') -Checkout $env:GITHUB_WORKSPACE -OutputRoot $env:MMMM_OUTPUT_ROOT -JvmEvidenceRoot $env:MMMM_EVIDENCE_ROOT -EvidenceRoot $evidence -Xtask $env:MMMM_XTASK -Cargo $env:MMMM_CARGO -ExpectedSourceSha $env:EXPECTED_SOURCE_SHA -Target $env:MATRIX_TARGET -RustTarget $env:MMMM_RUST_TARGET
+          if ($LASTEXITCODE -ne 0) { throw 'Observer verification failed; original stage records remain in the artifact.' }
+          $result = Get-Content -LiteralPath (Join-Path $evidence 'observer-result.json') -Raw | ConvertFrom-Json
+          if ($result.schema -cne 'mmmm-observer-ci-result/1' -or $result.source_sha -cne $env:EXPECTED_SOURCE_SHA -or $result.target -cne $env:MATRIX_TARGET -or $result.rust_target -cne $env:MMMM_RUST_TARGET -or $result.status -cne 'passed' -or $result.native_build -cne 'passed' -or $result.header_witness -cne 'passed' -or $result.definition_startup -cne 'observed') { throw 'Observer result does not establish all actual stages for this source.' }
+
+      - name: Record actual workflow step outcomes
+        if: always()
+        env:
+          SOURCE_OUTCOME: ${{ steps.source.outcome }}
+          RUST_OUTCOME: ${{ steps.rust.outcome }}
+          BOOTSTRAP_OUTCOME: ${{ steps.bootstrap.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          OBSERVER_OUTCOME: ${{ steps.observer.outcome }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:RUNNER_TEMP 'MMMM/evidence/jvm'
+          [System.IO.Directory]::CreateDirectory($evidence) | Out-Null
+          $record = [ordered]@{
+            schema = 'mmmm-jvm-workflow-outcomes/1'; source = $env:SOURCE_OUTCOME; rust_install = $env:RUST_OUTCOME;
+            bootstrap = $env:BOOTSTRAP_OUTCOME; jvm_verification = $env:VERIFY_OUTCOME;
+            observer_verification = $env:OBSERVER_OUTCOME;
+            game_verification = 'not_run'; release_verification = 'not_run'
+          }
+          $record | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $evidence 'workflow-outcomes.json') -Encoding utf8NoBOM
+
+      - name: Export JVM evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: jvm-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/MMMM/evidence/jvm/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
+
+  jvm-result:
+    name: jvm-result
+    if: always()
+    needs: [jvm]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require all three actual JVM jobs
+        env:
+          MATRIX_RESULT: ${{ needs.jvm.result }}
+        shell: bash
+        run: |
+          printf 'JVM verification matrix: %s\n' "$MATRIX_RESULT"
+          test "$MATRIX_RESULT" = success

@@ -1,0 +1,32 @@
+plugins { id 'net.fabricmc.fabric-loom' }
+
+dependencies {
+    minecraft 'com.mojang:minecraft:26.3'
+    implementation 'net.fabricmc:fabric-loader:0.19.5'
+    implementation 'net.fabricmc.fabric-api:fabric-api:0.162.0+26.3'
+    implementation project(':host-core')
+    implementation project(':public-java-adapter')
+    compileOnly project(':definition-observer')
+    testImplementation project(':definition-observer')
+    include project(':host-core')
+    include project(':provider-sdk')
+    include project(':public-java-adapter')
+    include 'com.fasterxml.jackson.core:jackson-databind:2.18.3'
+    include 'com.fasterxml.jackson.core:jackson-core:2.18.3'
+    include 'com.fasterxml.jackson.core:jackson-annotations:2.18.3'
+    include 'com.networknt:json-schema-validator:1.5.9'
+    include 'com.ethlo.time:itu:1.14.0'
+    include 'com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:2.18.3'
+    include 'org.yaml:snakeyaml:2.3'
+    include 'io.github.erdtman:java-json-canonicalization:1.1'
+}
+
+loom {
+    runConfigs.configureEach {
+        runDir = new File(System.getenv('TMP') ?: System.getenv('TMPDIR'), "fabric-${name}").absolutePath
+    }
+}
+tasks.named('processResources') {
+    inputs.property 'version', project.version
+    filesMatching('fabric.mod.json') { expand version: project.version }
+}

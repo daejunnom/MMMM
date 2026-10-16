@@ -1,0 +1,38 @@
+plugins { id 'base' }
+
+allprojects {
+    group = 'io.github.daejunnom.mmmm'
+    version = '0.1.0'
+    def ownedCache = new File(System.getenv('GRADLE_USER_HOME')).canonicalFile.parentFile
+    layout.buildDirectory = new File(ownedCache, "gradle-build/${project.name}")
+    repositories { mavenCentral() }
+}
+
+subprojects {
+    apply plugin: 'java-library'
+    java {
+        toolchain { languageVersion = JavaLanguageVersion.of(25) }
+        withSourcesJar()
+    }
+    tasks.withType(JavaCompile).configureEach {
+        options.encoding = 'UTF-8'
+        options.compilerArgs += ['-Xlint:all', '-Werror']
+    }
+    tasks.withType(AbstractArchiveTask).configureEach {
+        preserveFileTimestamps = false
+        reproducibleFileOrder = true
+    }
+    tasks.withType(Test).configureEach {
+        useJUnitPlatform()
+        maxParallelForks = 1
+        maxHeapSize = '512m'
+        systemProperty 'java.io.tmpdir', System.getenv('TMP') ?: System.getenv('TMPDIR')
+        systemProperty 'mmmm.checkout', rootProject.projectDir.parentFile.absolutePath
+        testLogging { events 'failed'; exceptionFormat = 'short' }
+    }
+    dependencies {
+        testImplementation platform('org.junit:junit-bom:5.12.2')
+        testImplementation 'org.junit.jupiter:junit-jupiter'
+        testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    }
+}

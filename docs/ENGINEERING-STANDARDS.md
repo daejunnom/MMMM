@@ -128,7 +128,11 @@ unmerged index는 거절하며 정책 JSON은 regular blob, 최대 64 KiB로 제
 허용 root 이름은 정확히 비교한다. 비밀 이름과 생성물 디렉터리, suffix 및 basename
 pattern은 대소문자를 구분하지 않고 비교한다. pattern의 `*`와 `?`는 basename에만
 적용하며 디렉터리를 넘지 않는다. 충돌 비교에는 Unicode NFC와 대소문자 정규화를
-사용하되 실제 Git 경로를 바꾸지 않는다. 정책의 필드, 타입, 중복과 예외 종류를 검증한다.
+사용하되 실제 Git 경로를 바꾸지 않는다. 이식성 검사에는 보수적인
+`NFC → Unicode lowercase → Unicode uppercase → NFC` 키를 사용한다.
+이는 정확한 Unicode Default Case Folding이나 특정 파일시스템의 이름 판정과 동일하다는
+주장이 아니다. Rust toolchain의 문자 표를 고정하고 sigma 및 확장 대소문자 충돌을 검증한다.
+정책의 필드, 타입, 중복과 예외 종류를 검증한다.
 
 이 검사는 stage되지 않은 변경, 파일 내용의 보안과 전체 코드 품질을 증명하지 않는다.
 실제 검사 명령은 도구 도입 및 오류 경로 검증 후 등록한다.

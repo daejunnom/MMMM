@@ -1,0 +1,10 @@
+dependencies {
+    api 'com.fasterxml.jackson.core:jackson-databind:2.18.3'
+    api 'com.networknt:json-schema-validator:1.5.9'
+    implementation 'io.github.erdtman:java-json-canonicalization:1.1'
+}
+
+tasks.named('processResources') {
+    from('../../contracts') { include 'mmmm.schema.json', 'digest-projections.json'; into 'mmmm/contracts' }
+}
+tasks.named('test') { systemProperty 'mmmm.checkout', rootProject.projectDir.parentFile.absolutePath }

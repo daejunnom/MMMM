@@ -1,0 +1,23 @@
+[package]
+name = "mmmm-exchange"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MMMM bounded neutral scene exchange, physics and immutable import semantics"
+
+[dependencies]
+mmmm-contracts = { path = "../mmmm-contracts" }
+mmmm-domain = { path = "../mmmm-domain" }
+mmmm-application = { path = "../mmmm-application" }
+mmmm-adapters = { path = "../mmmm-adapters" }
+serde.workspace = true
+serde_json.workspace = true
+zip = { version = "=6.0.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+crc32fast = "=1.5.0"
+flate2 = { version = "=1.1.10", default-features = false, features = ["zlib-rs"] }
+unicode-normalization.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,354 @@
+use mmmm_coordinator::{
+    daemon::DaemonError,
+    native_entry::{self, EntryError},
+    stdio_io::{self, NativeStdioPort, StdioLimits},
+};
+use std::{fmt, path::PathBuf, sync::Arc};
+
+mod command_io;
+mod mcp;
+
+const USAGE: &str = "Usage:\n\
+  mmmm init --data-root <absolute root> --name <name> --target-profile <profile>\n\
+  mmmm start --data-root <absolute root> --project <projectId>\n\
+  mmmm daemon --data-root <absolute root> --project <projectId> [--lifetime-seconds <1..1800>]\n\
+  mmmm host-setup --data-root <absolute root> --project <projectId> --host-jar <absolute jar> --output <absolute config> --scope-json <json> [--shape-mode survival|creative|adventure|spectator ...] [--native-observation user_local_only] [--calibration-bootstrap-scope --expected-revision <sha256>]\n\
+    Calibration bootstrap scope requires an empty externalTargetIds array in the input scope and the current Project revision. It selects the fixed calibration targets for host setup; game administrator approval and a later plan.apply request remain separate.\n\
+    Shape modes are explicit unique selections. Native observations need their own opt-in; absent policy flags leave the corresponding sources unavailable. The same protected Store retains immutable policy; mmmm-host.json contains public locators only.\n\
+    A changed policy for the same native owner/Project/host artifact is refused. An existing public config is preserved; a policy committed before config/output failure remains retained and is reported by digest.\n\
+  mmmm source-import --data-root <absolute root> --project <projectId> --expected-revision <sha256> <source inputs>\n\
+    Inputs may instead use repeated --document-file <kind>:<absolute JSON path> and adjacent --resource-descriptor-file <absolute JSON path> --resource-bytes-file <absolute content path> pairs.\n\
+    Source import is a cold native management command: at least one --document <prefab|instance|clip>:<JSON>, document file or raw resource pair, <=256 combined document/resource inputs, each document <=8 MiB, descriptors <=16 KiB, documents+descriptors <=32 MiB, raw content <=128 MiB total; actual OS argv limits may be smaller.\n\
+    Prefab, Clip and new raw resources can share one atomic batch; raw resource pairs can also be imported alone. The data root must contain an initialized Project and have no active daemon owner.\n\
+    Select regular files directly. Links, hardlinks, special files and known secret paths are refused; source files are read without replacement or deletion.\n\
+  mmmm call <function.name> --data-root <absolute root> [--json|--summary] < request.json\n\
+  mmmm manual-import --data-root <absolute root> --project <projectId> --expected-revision <sha256> --context <contextId> --selection-resource <FN24 resourceId> --source-map-file <absolute JSON path> --source-map-resource <resourceId> --edit-payload-file <absolute JSON path> --edit-payload-resource <resourceId> --allow-delta <kind,instanceId,nodeId> ...\n\
+    Use the active daemon and its original exported selection. Static delta choices create a proposal only; source rights remain unknown and automatic bake stays unavailable without an actual provider. Selected files are bounded reads, while Project head and user originals are preserved.\n\
+  mmmm calibration-plan --data-root <absolute root> --project <projectId> --expected-revision <sha256> --context <contextId>\n\
+  mmmm calibration-bootstrap-plan --data-root <absolute root> --project <projectId> --expected-revision <sha256> --context <contextId>\n\
+    Bootstrap planning selects the fixed source installation and fresh state initialization purpose. Numeric calibration planning selects the separate normative47 execution purpose.\n\
+  mmmm calibration-approve --data-root <absolute root> --project <projectId> --plan-id <planId> --plan-hash <sha256>\n\
+    Select one existing frozen numeric calibration or calibration bootstrap plan through the active daemon's same-user native peer. The daemon checks its original Project revision against the same protected Store; this command does not reopen or replace the daemon owner.\n\
+    This commits the native owner's selection only. The currently paired game administrator must separately approve that exact plan and complete the private handshake. This grants no general write profile or caller-supplied administrator authority.\n\
+  mmmm compatibility-profile-approve --data-root <absolute root> --project <projectId> --expected-revision <sha256> --profile-resource-id <resourceId> --profile-resource-sha256 <raw sha256> --approved-profile-ref <reference> --artifact-sha256 <sha256> --interface-sha256 <sha256>\n\
+    This cold native owner command approves one existing Project profile resource (1..65536 bytes) for local_use_only. Import the original profile bytes first; raw resource SHA-256, canonical profile digest, implementation artifact digest and interface digest remain separate.\n\
+    The initialized data root must have no active daemon. Approval checks the current Project revision, actual Policy and source rights. The same owner/Project/reference is immutable; identical replay is allowed. No profile JSON, caller authority or public host config grants approval.\n\
+    The receipt records approval only; loaded Java interface observation, current context binding and game verification remain separate. A committed receipt is retained and identified when result delivery fails.\n\
+  mmmm catalog-source-use --data-root <absolute root> --project <projectId> --expected-revision <sha256> --mode inspect\n\
+  mmmm catalog-source-use --data-root <absolute root> --project <projectId> --expected-revision <sha256> --mode replace --expected-state-digest <sha256> [--game-artifact <resourceId>] [--mod <canonicalId>,<nativeId>,<resourceId> ...]\n\
+    Replace selects the complete new set of existing whole Project resource containers for user_local_only catalog use. At most 256 selections and 64 KiB metadata; original source bytes, Project revision and game state are retained.\n\
+    To withdraw the complete set explicitly, use replace with --withdraw true and no resource selectors. Inspect supplies the current state digest; stale state is refused and withdrawal retains a new generation.\n\
+    This cold owner command requires an initialized data root with no active daemon. Import, host setup and native observation opt-in do not select container use. Game/native target verification remains separate.\n\
+  mmmm mcp --data-root <absolute root>\n\
+  mmmm --version\n";
+
+#[derive(Debug)]
+enum CliError {
+    Arguments,
+    Native(EntryError),
+    Command(command_io::CommandIoError),
+    Mcp(mcp::FacadeError),
+    Diagnostic {
+        primary: Box<CliError>,
+        delivery: command_io::CommandIoError,
+    },
+}
+impl fmt::Display for CliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Arguments => write!(f, "CLI arguments are invalid.\n{USAGE}"),
+            Self::Native(error) => PublicEntryError(error).fmt(f),
+            Self::Command(error) => error.fmt(f),
+            Self::Mcp(error) => error.fmt(f),
+            Self::Diagnostic { delivery, .. } => {
+                write!(f, "CLI failure diagnostic delivery failed: {delivery}")
+            }
+        }
+    }
+}
+impl std::error::Error for CliError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Arguments => None,
+            Self::Native(error) => Some(error),
+            Self::Command(error) => Some(error),
+            Self::Mcp(error) => Some(error),
+            Self::Diagnostic { primary, .. } => Some(primary.as_ref()),
+        }
+    }
+}
+
+/// Caller DTOs and server messages are retained in typed errors, never copied
+/// into stderr. Public committed locators and fixed native error codes remain
+/// available even when result delivery or shutdown failed.
+struct PublicEntryError<'a>(&'a EntryError);
+impl fmt::Display for PublicEntryError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            EntryError::Daemon(error) => PublicDaemonError(error).fmt(f),
+            EntryError::Output(error) => write!(f, "Native result delivery failed: {error}"),
+            EntryError::OutputDrain { primary, cleanup } => write!(
+                f,
+                "Native result output failed: {}; output drain failed: {}",
+                PublicEntryError(primary),
+                PublicEntryError(cleanup)
+            ),
+            EntryError::Shutdown { primary, cleanup } => {
+                if let Some(primary) = primary {
+                    write!(f, "{}; ", PublicEntryError(primary))?;
+                }
+                write!(f, "Coordinator shutdown is unresolved: {cleanup}")
+            }
+            EntryError::Initialized {
+                project,
+                revision,
+                delivery,
+            } => write!(
+                f,
+                "Project {project} at revision {revision} was initialized and retained; result delivery failed: {}",
+                PublicEntryError(delivery)
+            ),
+            EntryError::SourcesCommitted { receipt, delivery } => write!(
+                f,
+                "Project {} advanced from {} to {} with committed sources retained; result delivery failed: {}",
+                receipt.project_id,
+                receipt.base_revision,
+                receipt.project_revision,
+                PublicEntryError(delivery)
+            ),
+            EntryError::HostReadPolicyCommitted { record, delivery } => write!(
+                f,
+                "Host read policy {} for Project {} was committed and retained; result delivery failed: {}",
+                record.policy_digest(),
+                record.project_id(),
+                PublicEntryError(delivery)
+            ),
+            EntryError::HostSetupCommitted {
+                project,
+                scope_digest,
+                delivery,
+            } => write!(
+                f,
+                "Host setup for Project {project} with scope {scope_digest} was committed and retained; result delivery failed: {}",
+                PublicEntryError(delivery)
+            ),
+            EntryError::CatalogSourceUsesCommitted { snapshot, delivery } => write!(
+                f,
+                "Catalog source use {} at generation {} for Project {} was committed and retained; result delivery failed: {}",
+                snapshot.state_digest(),
+                snapshot.generation(),
+                snapshot.project_id(),
+                PublicEntryError(delivery)
+            ),
+            EntryError::CompatibilityProfileCommitted { record, delivery } => write!(
+                f,
+                "Compatibility profile approval {} for profile {} in Project {} was committed and retained; result delivery failed: {}",
+                record.approved_profile_ref(),
+                record.profile_digest(),
+                record.project_id(),
+                PublicEntryError(delivery)
+            ),
+            EntryError::CalibrationSelectionCommitted {
+                selection_digest,
+                delivery,
+            } => write!(
+                f,
+                "Calibration owner selection {selection_digest} was committed and retained; result delivery failed: {}",
+                PublicEntryError(delivery)
+            ),
+            EntryError::CalibrationPlanCommitted {
+                project,
+                plan,
+                hash,
+                checkpoint_failed,
+                delivery,
+            } => {
+                write!(
+                    f,
+                    "Calibration plan {plan} ({hash}) for Project {project} was saved and retained"
+                )?;
+                if *checkpoint_failed {
+                    f.write_str("; its final source checkpoint failed (SETUP_PLAN_COMMITTED); the Coordinator retains the original cause")?;
+                }
+                if let Some(delivery) = delivery {
+                    write!(
+                        f,
+                        "; result delivery failed: {}",
+                        PublicEntryError(delivery)
+                    )?;
+                }
+                Ok(())
+            }
+            // EntryError's other diagnostics contain fixed text, public pins,
+            // or static native-operation codes with bounded numeric metadata.
+            error => error.fmt(f),
+        }
+    }
+}
+struct PublicDaemonError<'a>(&'a DaemonError);
+impl fmt::Display for PublicDaemonError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            DaemonError::Application(error) => write!(
+                f,
+                "{}: Native daemon application admission failed",
+                error.code
+            ),
+            DaemonError::AfterInitialization {
+                project,
+                revision,
+                source,
+            } => write!(
+                f,
+                "Project {project} at revision {revision} was initialized and retained; daemon composition failed: {}",
+                PublicDaemonError(source)
+            ),
+            error => error.fmt(f),
+        }
+    }
+}
+
+fn main() {
+    let primary = match run() {
+        Ok(()) => std::process::exit(0),
+        Err(error) => error,
+    };
+    // A failed diagnostic has one separate finite attempt. Keep its cause and
+    // original command error together until exit; no recursive stderr owner.
+    let failure = match command_io::diagnostic(&primary) {
+        Ok(()) => primary,
+        Err(delivery) => CliError::Diagnostic {
+            primary: Box::new(primary),
+            delivery,
+        },
+    };
+    let exit = if matches!(&failure, CliError::Diagnostic { .. }) {
+        3
+    } else {
+        2
+    };
+    std::process::exit(exit);
+}
+
+fn run() -> Result<(), CliError> {
+    let args = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.into_string().map_err(|_| CliError::Arguments))
+        .collect::<Result<Vec<_>, _>>()?;
+    // The inherited helper must run before native command parsing or any
+    // facade initialization. Its private protocol has no application output.
+    if args.first().map(String::as_str) == Some(stdio_io::WORKER_COMMAND) {
+        stdio_io::worker_entry_exit(&args[1..]);
+    }
+    if native_entry::dispatch(&args).map_err(CliError::Native)? {
+        return Ok(());
+    }
+    match args.as_slice() {
+        [command] if command == "--version" => command_io::public_output(
+            format!(
+                "MMMM {} (contract {})\n",
+                env!("CARGO_PKG_VERSION"),
+                mmmm_contracts::CONTRACT_VERSION
+            )
+            .as_bytes(),
+        )
+        .map_err(CliError::Command),
+        [command] if matches!(command.as_str(), "--help" | "help") => {
+            command_io::public_output(USAGE.as_bytes()).map_err(CliError::Command)
+        }
+        [command, option, root] if command == "mcp" && option == "--data-root" => {
+            let root = absolute_root(root)?;
+            let native = NativeStdioPort::spawn_current(StdioLimits::default())
+                .map_err(command_io::CommandIoError::Stdio)
+                .map_err(CliError::Command)?;
+            mcp::run_with_io(&root.join("runtime"), Arc::new(native)).map_err(CliError::Mcp)
+        }
+        [command, method, option, root] if command == "call" && option == "--data-root" => {
+            command_io::call(method, &absolute_root(root)?, false).map_err(CliError::Command)
+        }
+        [command, method, option, root, mode]
+            if command == "call"
+                && option == "--data-root"
+                && matches!(mode.as_str(), "--json" | "--summary") =>
+        {
+            command_io::call(method, &absolute_root(root)?, mode == "--summary")
+                .map_err(CliError::Command)
+        }
+        _ => Err(CliError::Arguments),
+    }
+}
+
+fn absolute_root(raw: &str) -> Result<PathBuf, CliError> {
+    let root = PathBuf::from(raw);
+    if root.is_absolute() {
+        Ok(root)
+    } else {
+        Err(CliError::Arguments)
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn static_session_failure_code_and_original_typed_cause_survive_public_formatting() {
+        let authentication = EntryError::Daemon(DaemonError::Coordinator(
+            mmmm_coordinator::lifecycle::CoordinatorError::Authentication(
+                mmmm_coordinator::auth::AuthError::InvalidPolicy,
+            ),
+        ));
+        assert!(
+            PublicEntryError(&authentication)
+                .to_string()
+                .contains("INVALID_SESSION_POLICY")
+        );
+        assert!(
+            std::error::Error::source(match &authentication {
+                EntryError::Daemon(DaemonError::Coordinator(error)) => error,
+                _ => unreachable!(),
+            })
+            .unwrap()
+            .is::<mmmm_coordinator::auth::AuthError>()
+        );
+        let selected = EntryError::CalibrationSelectionCommitted {
+            selection_digest: mmmm_contracts::Sha256Digest::new("1".repeat(64)).unwrap(),
+            delivery: Box::new(authentication),
+        };
+        let rendered = PublicEntryError(&selected).to_string();
+        assert!(rendered.contains("was committed and retained; result delivery failed"));
+        assert!(rendered.contains("INVALID_SESSION_POLICY"));
+        assert!(
+            std::error::Error::source(&selected)
+                .unwrap()
+                .is::<EntryError>()
+        );
+        let prepared = EntryError::CalibrationPlanCommitted {
+            project: mmmm_contracts::ProjectId::new("project-fixture").unwrap(),
+            plan: mmmm_contracts::PlanId::new("plan-fixture").unwrap(),
+            hash: mmmm_contracts::Sha256Digest::new("2".repeat(64)).unwrap(),
+            checkpoint_failed: true,
+            delivery: Some(Box::new(selected)),
+        };
+        let rendered = PublicEntryError(&prepared).to_string();
+        assert!(rendered.contains("plan-fixture"));
+        assert!(rendered.contains("SETUP_PLAN_COMMITTED"));
+        assert!(rendered.contains("INVALID_SESSION_POLICY"));
+        assert!(
+            std::error::Error::source(&prepared)
+                .unwrap()
+                .is::<EntryError>()
+        );
+        assert!(USAGE.contains("mmmm calibration-plan --data-root <absolute root> --project <projectId> --expected-revision <sha256> --context <contextId>"));
+    }
+
+    #[test]
+    fn compatibility_approval_help_keeps_cold_approval_and_runtime_observation_distinct() {
+        let failure = EntryError::CompatibilityProfileArguments;
+        let public = PublicEntryError(&failure).to_string();
+        assert!(public.contains("no profile JSON or authority options"));
+        assert!(USAGE.contains("--profile-resource-sha256 <raw sha256>"));
+        assert!(USAGE.contains("No profile JSON"));
+        assert!(USAGE.contains("loaded Java interface observation"));
+    }
+}
