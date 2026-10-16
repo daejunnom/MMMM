@@ -1790,6 +1790,113 @@ fn reject_cargo_configs(source: &Path, cargo_home: &Path) -> Result<()> {
     Ok(())
 }
 
+fn cargo_path_matches(reported: &Path, expected: &Path) -> bool {
+    if reported == expected {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        windows_cargo_prefix_pair(reported, expected)
+            .is_some_and(|(reported, expected)| reported == expected)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn cargo_strip_prefix<'a>(reported: &'a Path, root: &Path) -> Option<&'a Path> {
+    if let Ok(relative) = reported.strip_prefix(root) {
+        return Some(relative);
+    }
+    #[cfg(windows)]
+    {
+        let (reported_body, root_body) = windows_cargo_prefix_pair(reported, root)?;
+        if !reported_body.starts_with(&root_body)
+            || (reported_body.len() > root_body.len()
+                && root_body.last() != Some(&92)
+                && reported_body.get(root_body.len()) != Some(&92))
+        {
+            return None;
+        }
+        // Raw UTF-16 already proved the exact root and boundary. Every body
+        // component is plain, so components only locates the original tail;
+        // it is never used to normalize or compare the cross-prefix paths.
+        let mut tail = reported.components();
+        for _ in root.components() {
+            tail.next()?;
+        }
+        Some(tail.as_path())
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn windows_cargo_prefix_pair(first: &Path, second: &Path) -> Option<(Vec<u16>, Vec<u16>)> {
+    let (first_verbatim, first_body) = windows_cargo_drive_body(first)?;
+    let (second_verbatim, second_body) = windows_cargo_drive_body(second)?;
+    (first_verbatim != second_verbatim).then_some((first_body, second_body))
+}
+
+#[cfg(windows)]
+fn windows_cargo_drive_body(path: &Path) -> Option<(bool, Vec<u16>)> {
+    use std::os::windows::ffi::OsStrExt;
+    let units = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    // Exactly one \\?\ prefix on one side, with the same drive/body afterward.
+    // UNC, device namespaces, drive-relative and repeated prefixes are excluded.
+    let verbatim = units.starts_with(&[92, 92, 63, 92]);
+    let body = units.get(if verbatim { 4.. } else { 0.. })?;
+    if body.len() < 3 || !matches!(body[0], 65..=90 | 97..=122) || body[1] != 58 || body[2] != 92 {
+        return None;
+    }
+    if body.len() != 3
+        && body[3..]
+            .split(|unit| *unit == 92)
+            .any(|component| !plain_windows_cargo_component(component))
+    {
+        return None;
+    }
+    Some((verbatim, body.to_vec()))
+}
+
+#[cfg(windows)]
+fn plain_windows_cargo_component(component: &[u16]) -> bool {
+    if component.is_empty()
+        || component
+            .last()
+            .is_some_and(|unit| *unit == 32 || *unit == 46)
+        || component
+            .iter()
+            .any(|unit| *unit < 32 || matches!(*unit, 34 | 42 | 47 | 58 | 60 | 62 | 63 | 124 | 127))
+    {
+        return false;
+    }
+    let stem = component.split(|unit| *unit == 46).next().unwrap_or(&[]);
+    if stem.last() == Some(&32) {
+        return false;
+    }
+    // Case-insensitive recognition is deny-only; accepted path units are never
+    // folded, trimmed, slash-converted, resolved or reassembled.
+    let reserved = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$"]
+        .iter()
+        .any(|name| windows_device_name(stem, name));
+    let numbered_device = stem.len() == 4
+        && (windows_device_name(&stem[..3], "COM") || windows_device_name(&stem[..3], "LPT"))
+        && matches!(stem[3], 49..=57 | 0x00b9 | 0x00b2 | 0x00b3);
+    !reserved && !numbered_device
+}
+
+#[cfg(windows)]
+fn windows_device_name(units: &[u16], expected: &str) -> bool {
+    units.len() == expected.len()
+        && units.iter().zip(expected.bytes()).all(|(unit, byte)| {
+            *unit == u16::from(byte) || *unit == u16::from(byte.to_ascii_lowercase())
+        })
+}
+
 fn cli_package_id(metadata: &[u8], manifest: &Path) -> Result<String> {
     let value: Value = serde_json::from_slice(metadata)?;
     let packages = value["packages"]
@@ -1801,7 +1908,9 @@ fn cli_package_id(metadata: &[u8], manifest: &Path) -> Result<String> {
     let mut matched = packages.iter().filter(|package| {
         package["name"] == "mmmm"
             && package["version"] == "0.1.0"
-            && package["manifest_path"].as_str().map(Path::new) == Some(manifest)
+            && package["manifest_path"]
+                .as_str()
+                .is_some_and(|path| cargo_path_matches(Path::new(path), manifest))
     });
     let package = matched
         .next()
@@ -1904,7 +2013,7 @@ fn dependency_pins(
                 .ok_or("candidate resolved manifest missing")?,
         );
         if package["source"].is_null() {
-            if !manifest.starts_with(source) {
+            if cargo_strip_prefix(manifest, source).is_none() {
                 return Err("candidate external path dependency rejected".into());
             }
             continue; // Every tracked workspace source was copied and pinned above.
@@ -1928,9 +2037,8 @@ fn dependency_pins(
             return Err("candidate dependency public identity rejected".into());
         }
         let package_name = format!("{name}-{version}");
-        let relative = manifest
-            .strip_prefix(&registry)
-            .map_err(|_| "candidate dependency is outside its managed registry source")?;
+        let relative = cargo_strip_prefix(manifest, &registry)
+            .ok_or("candidate dependency is outside its managed registry source")?;
         let parts = relative.components().collect::<Vec<_>>();
         if parts.len() != 3
             || parts
@@ -2113,8 +2221,12 @@ fn compiler_artifact(
                     && value["target"]["kind"] == json!(["bin"]) =>
             {
                 if artifact.is_some()
-                    || value["manifest_path"].as_str().map(Path::new) != Some(manifest)
-                    || value["executable"].as_str().map(Path::new) != Some(executable)
+                    || !value["manifest_path"]
+                        .as_str()
+                        .is_some_and(|path| cargo_path_matches(Path::new(path), manifest))
+                    || !value["executable"]
+                        .as_str()
+                        .is_some_and(|path| cargo_path_matches(Path::new(path), executable))
                     || value["profile"]["test"] != false
                     || value["package_id"] != package_id
                 {
@@ -2343,6 +2455,155 @@ mod tests {
             )
             .is_err()
         );
+        #[cfg(windows)]
+        {
+            // Actual Cargo observations use a Disk manifest and VerbatimDisk
+            // executable. Exercise those two fields without creating files.
+            let manifest = Path::new(r"\\?\C:\owned\source\apps\mmmm\Cargo.toml");
+            let executable = Path::new(r"\\?\C:\owned\cargo-target\release\mmmm.exe");
+            let mut actual = artifact.clone();
+            actual["manifest_path"] = json!(r"C:\owned\source\apps\mmmm\Cargo.toml");
+            actual["executable"] = json!(executable);
+            actual["fresh"] = json!(false);
+            let metadata = json!({"packages":[{
+                "name":"mmmm","version":"0.1.0","id":package,
+                "manifest_path":actual["manifest_path"],
+            }]});
+            assert_eq!(
+                cli_package_id(&serde_json::to_vec(&metadata).unwrap(), manifest).unwrap(),
+                package
+            );
+            assert!(
+                !compiler_artifact(
+                    format!("{actual}\n{complete}\n").as_bytes(),
+                    package,
+                    manifest,
+                    executable,
+                )
+                .unwrap()
+            );
+            actual["executable"] = json!(r"C:\owned\foreign\mmmm.exe");
+            assert!(
+                compiler_artifact(
+                    format!("{actual}\n{complete}\n").as_bytes(),
+                    package,
+                    manifest,
+                    executable,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cargo_drive_prefix_view_does_not_admit_other_windows_aliases() {
+        let source = Path::new(r"\\?\C:\owned\source");
+        let manifest = Path::new(r"C:\owned\source\apps\mmmm\Cargo.toml");
+        let verbatim_manifest = Path::new(r"\\?\C:\owned\source\apps\mmmm\Cargo.toml");
+        assert!(cargo_path_matches(manifest, verbatim_manifest));
+        assert!(cargo_path_matches(verbatim_manifest, manifest));
+        assert_eq!(
+            cargo_strip_prefix(manifest, source),
+            Some(Path::new(r"apps\mmmm\Cargo.toml"))
+        );
+        assert_eq!(
+            cargo_strip_prefix(source, Path::new(r"C:\owned\source")),
+            Some(Path::new(""))
+        );
+        assert_eq!(
+            cargo_strip_prefix(Path::new(r"C:\owned\source"), Path::new(r"\\?\C:\")),
+            Some(Path::new(r"owned\source"))
+        );
+        assert!(
+            cargo_strip_prefix(Path::new(r"C:\owned\source-other\Cargo.toml"), source).is_none()
+        );
+        let registry = Path::new(r"\\?\C:\owned\cargo-home\registry\src");
+        assert_eq!(
+            cargo_strip_prefix(
+                Path::new(r"C:\owned\cargo-home\registry\src\index\package-1.0\Cargo.toml"),
+                registry,
+            ),
+            Some(Path::new(r"index\package-1.0\Cargo.toml"))
+        );
+        assert!(
+            cargo_strip_prefix(
+                Path::new(r"C:\owned\cargo-home\registry\src-other\index\package-1.0\Cargo.toml"),
+                registry,
+            )
+            .is_none()
+        );
+        assert!(cargo_path_matches(
+            Path::new(r"C:\한글 폴더\source\Cargo.toml"),
+            Path::new(r"\\?\C:\한글 폴더\source\Cargo.toml"),
+        ));
+        for reported in [
+            r"C:\owned\source\.\apps\mmmm\Cargo.toml",
+            r"C:/owned/source/apps/mmmm/Cargo.toml",
+            r"C:\owned\\source\apps\mmmm\Cargo.toml",
+        ] {
+            // Existing same-prefix Path semantics remain available; the new
+            // cross-prefix branch must not add their normalization to a pair.
+            assert!(cargo_path_matches(Path::new(reported), manifest));
+            assert!(!cargo_path_matches(Path::new(reported), verbatim_manifest));
+        }
+        for body in [
+            r"C:\owned\..\Cargo.toml",
+            r"C:\owned\.\Cargo.toml",
+            r"C:\owned\\Cargo.toml",
+            r"C:\owned\Cargo.toml\",
+            r"C:/owned/Cargo.toml",
+            r"C:\owned\file:stream",
+            r"C:\owned\file ",
+            r"C:\owned\file.",
+            r"C:\owned\file .txt",
+            r"C:\owned\CON",
+            r"C:\owned\prn.txt",
+            r"C:\owned\AUX.rs",
+            r"C:\owned\NUL.json",
+            r"C:\owned\COM1.txt",
+            r"C:\owned\lpt9.rs",
+            r"C:\owned\COM¹.txt",
+            r"C:\owned\COM²",
+            r"C:\owned\LPT³.txt",
+            r"C:\owned\CONIN$",
+            r"C:\owned\conout$",
+            r"C:\owned\NUL .txt",
+            r"C:\owned\file?",
+            r"C:\owned\file*",
+            r"C:\owned\file<",
+            r"C:\owned\file>",
+            r"C:\owned\file|",
+            "C:\\owned\\file\"",
+            "C:\\owned\\file\0",
+            "C:\\owned\\file\u{1f}",
+        ] {
+            let verbatim = PathBuf::from(format!(r"\\?\{body}"));
+            assert!(!cargo_path_matches(Path::new(body), &verbatim), "{body:?}");
+            assert!(
+                cargo_strip_prefix(Path::new(body), &verbatim).is_none(),
+                "{body:?}"
+            );
+        }
+        for reported in [
+            r"c:\owned\source\apps\mmmm\Cargo.toml",
+            r"D:\owned\source\apps\mmmm\Cargo.toml",
+            r"C:\owned\SOURCE\apps\mmmm\Cargo.toml",
+            r"C:owned\source\apps\mmmm\Cargo.toml",
+            r"\\server\owned\source\apps\mmmm\Cargo.toml",
+            r"\\?\UNC\server\owned\source\apps\mmmm\Cargo.toml",
+            r"\\.\C:\owned\source\apps\mmmm\Cargo.toml",
+            r"\\?\\?\C:\owned\source\apps\mmmm\Cargo.toml",
+        ] {
+            assert!(
+                !cargo_path_matches(Path::new(reported), verbatim_manifest),
+                "{reported:?}"
+            );
+            assert!(
+                cargo_strip_prefix(Path::new(reported), source).is_none(),
+                "{reported:?}"
+            );
+        }
     }
 
     #[test]

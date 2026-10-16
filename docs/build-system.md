@@ -554,6 +554,16 @@ mode로 다시 열거나, export를 위해 writer 보호를 완화하지 않는�
 strict 소비자 gate를 충족한 것으로 바꾸지 않으며, export 실패에는 stream과 단계를
 남긴다. 명령·strict 판독·export·finalization 실패는 함께 남겨 최초 원인을 덮지 않는다.
 
+Cargo metadata와 compiler-artifact의 경로는 Windows에서 일반 drive와 verbatim drive
+표기를 섞어 반환할 수 있다. 후보의 경로 검사는 기존 `Path` 비교가 실패한 경우에만
+정확한 두 drive 표기의 native UTF-16을 대응시킨다. drive와 나머지 경로의 대소문자 및
+component 경계를 그대로 비교하고, prefix strip은 원 reported 경로의 tail을 빌린다.
+UNC·device namespace·상대 경로·dot/parent component·중복 separator·slash 차이·ADS·
+후행 dot/space와 DOS 장치 이름은 이 추가 분기에서 거절한다. 허용 경로에 case folding·
+trim·파일시스템 resolve를 적용하지 않고 실제 파일을 읽는 대상도 바꾸지 않는다.
+Unix와 일반 비밀 경로 guard는 유지한다. 이는 Cargo의 경로 표현을 비교하는 경계이며
+파일 identity, source provenance나 전체 toolchain closure의 별도 증명을 대체하지 않는다.
+
 HEAD source의 `crates/mmmm-coordinator/src/credential.rs`와 `credential_owner.rs`는
 Cargo에 등록된 Rust 구현 모듈이며 비밀 저장 자료가 아니다. 실제 Git HEAD 목록과
 그 byte 검증된 source snapshot에서 이 두 정확한 저장소 상대 경로만 구분한다.

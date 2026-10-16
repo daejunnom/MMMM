@@ -1638,64 +1638,64 @@ mod native {
             Err(post) => return Err(rss_post_error(memory, role, post)),
         };
         diagnostic.record_stats(process.initial.identity, Some(before), after);
-        if let Some(after) = after {
-            if let Err(original) = verify_identity(before, after) {
-                // CI87 is a count-only race. RSS terminal/Pending semantics
-                // stay on their existing strict full-identity path.
-                let candidate = !include_rss
-                    && !is_leader
-                    && owner.reservation_valid
-                    && process.initial.identity.pid != owner.leader.pid
-                    && process.initial.identity.group == owner.leader.pid
-                    && process.initial.identity.session == owner.leader.pid
-                    && original_retirement_transition(process.initial.identity, before, after);
-                if !candidate {
-                    return Err(original);
-                }
-                let Some(bound) = bound else {
-                    return Err(original);
-                };
-                let checked = bound.poll_original_retirement(before, after, context.control);
-                let checked = match checked {
-                    Ok(checked) => checked,
-                    Err(post) => return finish_observation(Err(original), Err(post)),
-                };
-                diagnostic.pidfd_terminal_observation = Some(checked.diagnostic);
-                let authorized = checked
-                    .proof
-                    .as_ref()
-                    .is_some_and(|proof| proof.matches(bound, before, after));
-                if !authorized {
-                    return Err(original.with_linux_pidfd_diagnostic(checked.diagnostic));
-                }
-                let lifetime = context
-                    .retained
-                    .as_deref_mut()
-                    .ok_or_else(|| metadata("missing original member lifetime"))?;
-                lifetime.retired = true;
-                lifetime.last_virtual_bytes = before.virtual_bytes.max(after.virtual_bytes);
-                context.evidence.retirement_count = context
-                    .evidence
-                    .retirement_count
-                    .checked_add(1)
-                    .ok_or_else(|| metadata("native retirement count overflow"))?;
-                let observed = LifetimeRetirementObservation {
-                    phase: context.control.scope_phase,
-                    scan_sequence: context.scan_sequence,
-                    lifetime_sequence: lifetime.sequence,
-                    original_failure_kind: original.kind,
-                    stat_observation: *diagnostic,
-                };
-                if context.evidence.first.is_none() {
-                    context.evidence.first = Some(Box::new(observed.clone()));
-                }
-                context.evidence.last = Some(Box::new(observed));
-                return Ok(MemberObservation::Settled(Some(MemberSample {
-                    live: false,
-                    virtual_bytes: lifetime.last_virtual_bytes,
-                    rss: None,
-                })));
+        if let Some(after) = after
+            && let Err(original) = verify_identity(before, after)
+        {
+            // CI87 is a count-only race. RSS terminal/Pending semantics
+            // stay on their existing strict full-identity path.
+            let candidate = !include_rss
+                && !is_leader
+                && owner.reservation_valid
+                && process.initial.identity.pid != owner.leader.pid
+                && process.initial.identity.group == owner.leader.pid
+                && process.initial.identity.session == owner.leader.pid
+                && original_retirement_transition(process.initial.identity, before, after);
+            if !candidate {
+                return Err(original);
             }
+            let Some(bound) = bound else {
+                return Err(original);
+            };
+            let checked = bound.poll_original_retirement(before, after, context.control);
+            let checked = match checked {
+                Ok(checked) => checked,
+                Err(post) => return finish_observation(Err(original), Err(post)),
+            };
+            diagnostic.pidfd_terminal_observation = Some(checked.diagnostic);
+            let authorized = checked
+                .proof
+                .as_ref()
+                .is_some_and(|proof| proof.matches(bound, before, after));
+            if !authorized {
+                return Err(original.with_linux_pidfd_diagnostic(checked.diagnostic));
+            }
+            let lifetime = context
+                .retained
+                .as_deref_mut()
+                .ok_or_else(|| metadata("missing original member lifetime"))?;
+            lifetime.retired = true;
+            lifetime.last_virtual_bytes = before.virtual_bytes.max(after.virtual_bytes);
+            context.evidence.retirement_count = context
+                .evidence
+                .retirement_count
+                .checked_add(1)
+                .ok_or_else(|| metadata("native retirement count overflow"))?;
+            let observed = LifetimeRetirementObservation {
+                phase: context.control.scope_phase,
+                scan_sequence: context.scan_sequence,
+                lifetime_sequence: lifetime.sequence,
+                original_failure_kind: original.kind,
+                stat_observation: *diagnostic,
+            };
+            if context.evidence.first.is_none() {
+                context.evidence.first = Some(Box::new(observed.clone()));
+            }
+            context.evidence.last = Some(Box::new(observed));
+            return Ok(MemberObservation::Settled(Some(MemberSample {
+                live: false,
+                virtual_bytes: lifetime.last_virtual_bytes,
+                rss: None,
+            })));
         }
         // Exactly one nonblocking kernel check, after an actual RSS failure.
         // The witness requires a matching post-RSS original stat identity;

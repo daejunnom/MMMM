@@ -2385,6 +2385,59 @@ export·scratch 정리·lease 해제 및 감독/정리 오류 0이다. 입력 32
 실제 Windows toolchain의 설치 target은 Windows뿐이다. 이 검사로 Linux cfg의 실제
 compile·native Ready/close·CI87 회귀를 완료했다고 보지 않으며 WSL은 사용하지 않았다.
 
+고정 `4d789ae8be79c74b3e712be0b4915d8c47307557`의 Windows `538`에서 선택한 물리
+Cargo의 실제 metadata를 확인했다. command 0·224 ms·drain·출력 완료·export·scratch
+정리·lease 해제다. CLI manifest와 workspace root는 일반 drive 경로, 관리 target은
+verbatim drive 경로로 반환됐다. 이어진 `539`의 실제 tool build도 command 0·16,993 ms·
+Job peak 293,797,888 bytes·6 process·gap 136 ms·owned-tail 정리 뒤 같은 수명을 완료했다.
+실제 compiler-artifact는 manifest에 일반 drive, executable에 verbatim drive 표기를
+사용했고 fresh=false·build-finished=true였다. 새 image는 4,726,272 bytes·SHA
+`09b18146a54ce818b965326b69611e7914706e5961e22830c343d6afc2e93aa0`이다.
+이는 경로 표현 차이의 실제 관측이며 후보 archive 생성이나 전체 toolchain 증명이 아니다.
+
+같은 고정 SHA의 [Rust CI 89](https://github.com/daejunnom/MMMM/actions/runs/38876343392)는
+Linux의 actual tests 단계 성공과 lint 단계 실패이며 최종 집계도 실패다.
+[JVM CI 80](https://github.com/daejunnom/MMMM/actions/runs/38876343384)은 Windows/macOS의
+JVM·native 단계 성공, Linux JVM 단계 실패·native 단계 skipped 및 집계 실패다.
+원 Linux Rust ZIP 54,894 bytes·SHA
+`158133639773f38655b704fd28f458356381202ece38208d209387494bb6e5f6`를 API digest와
+대조하고 34개 entry 중 원 process·finish·stderr·source를 선택해 확인했다. tests는
+exit 0·225,115 ms, lint는 exit 101·30,819 ms이며 모두 정상 drain·완전한 출력·자연
+종료다. lint 원인은 `linux_resources.rs`의 중첩 if 한 곳에 대한 collapsible_if이고
+동일한 short-circuit let-chain으로 교정했다. 두 실행의 retirement count는 0이므로
+실제 Linux 컴파일/테스트 성공을 D078의 정확한 Z2→X0·Ready 재발생 증거로 올리지 않는다.
+
+Linux JVM 원 ZIP 21,668 bytes·SHA
+`d1c89ee4749bb6bd4fa1a1cbd9525a5138970f79f6fb86305ad0835d7dd8f2e3`도 API digest와
+대조하고 저장소 밖에 보존했다. 원 감독은 running_scope에서 retained OwnedMember의
+PID/start는 같지만 group/session이 달라진 관측을 거절했다. 당시 Sleeping·21 threads,
+after/poll 미관측이고 진단의 not_required_by_sample만으로 실제 retained binding의
+유무를 판정할 수 없다. 25,900 ms·signal 9·output_complete=true·drained=false와 고정
+drain 만료·후행 close/control 오류 및 export 불가·slot/lease 보존을 기록한다. 실제
+Gradle session 이탈 여부와 안전한 원 lifetime 정리는 미입증이며 원 identity 검사를
+완화하거나 CI87의 다른 전이로 분류하지 않는다. 두 CI의 명시 checkout은 고정 head,
+event merge SHA는 `c601c2ae95b3d7cf93b7a3f15a9f489665b1ec7f`로 별개다.
+
+Windows 후보의 경로 비교에는 위 실제 Cargo 관측을 반영했다. 일반 `Path` 비교의 성공을
+유지하고 추가 분기에서만 정확한 일반/verbatim drive의 원 UTF-16과 component 경계를
+확인한다. 다른 alias를 허용하지 않으며 metadata·workspace/registry 범위·artifact의
+네 경계와 실제 읽기 대상을 구분한다. 독립 소스 검토 뒤 `540` format과 `541`에서
+xtask library 244개 통과·기존 1 ignored, binary 10개 통과를 확인했다. 실제 Windows
+경로 형태와 한글 및 금지 alias는 순수 검사이며 새 filesystem fixture는 없다.
+`541`은 32,727 ms·Job peak 266,657,792 bytes·10 process·gap 143 ms·owned-tail 정리다.
+입력 324개·8,928,509 bytes의 전후 pin은
+`cba1f8c7c5cbc0068a57c3267e292278ef51494a07167468147b7137e6cf1cf3`, 전체 binding은
+45,933 bytes·SHA `b49a7b4d5af4772a9cc78239cae436fc0a22e0e58a5f1d40826ff61945860c63`다.
+
+Linux 조건식을 동치로 정리한 뒤 `542` format·`543` Windows all-target strict도 통과했다.
+`543`은 9,323 ms·Job peak 363,859,968 bytes·7 process·gap 133 ms·자연 종료다. 입력
+324개·8,928,281 bytes의 전후 pin은
+`20840237d3450769f740252423b8c391c04bf3f6b0b8582695196cc640cdb50b`, 전체 binding은
+45,933 bytes·SHA `947e4991ad84c7c5717015e7dd318391e771d864152559b1ac3beefb27755c3c`다.
+두 검사 모두 drain·출력 완료·export·scratch 정리·lease 해제 및 감독/정리 오류 0이다.
+Linux 전용 조건식의 실제 strict 통과와 새 후보 archive 생성은 후속이며 WSL은 사용하지
+않았다. 원 ZIP 보존과 로컬 검사 자료를 제품 인수나 공개 배포 근거로 대체하지 않는다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.
