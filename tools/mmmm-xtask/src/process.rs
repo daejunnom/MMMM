@@ -256,13 +256,21 @@ pub struct ProcessOutcome {
     pub darwin_resources: Option<darwin_resources::Evidence>,
 }
 
-/// The original stdout capture handle and its native completion outcome.
+/// Closed selection of an original native capture stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureStream {
+    Stdout,
+    Stderr,
+}
+
+/// The original stdout/stderr capture handles and their native completion outcome.
 /// Construction is private to supervision; neither JSON nor a log pathname can
 /// construct this value. Its bytes are evidence, never a grant or target proof.
 /// The caller must retain its managed ownership and lease while reading.
 pub struct CapturedProcessOutcome {
     outcome: ProcessOutcome,
     stdout_log: File,
+    stderr_log: File,
     process_started: bool,
 }
 
@@ -287,7 +295,7 @@ impl CapturedProcessOutcome {
         self.process_started
     }
 
-    /// Close the original capture handle and retain the unchanged JSON outcome.
+    /// Close both original capture handles and retain the unchanged JSON outcome.
     pub fn into_outcome(self) -> ProcessOutcome {
         self.outcome
     }
@@ -302,7 +310,7 @@ impl CapturedProcessOutcome {
     pub fn read_stdout(
         &mut self,
         max_bytes: usize,
-        mut check: impl FnMut() -> Result<(), String>,
+        check: impl FnMut() -> Result<(), String>,
     ) -> Result<Vec<u8>, ProcessError> {
         if self.outcome.command_exit != Some(0)
             || self.outcome.command_signal.is_some()
@@ -321,85 +329,116 @@ impl CapturedProcessOutcome {
             error.drained = self.outcome.drained;
             return Err(error);
         }
-        if max_bytes == 0 || max_bytes > MAX_CAPTURE_READ_BYTES {
-            return Err(ProcessError::new(
-                "capture_read_budget",
-                "stdout read cap must be positive and at most 64 MiB",
-            ));
-        }
-        let expected = usize::try_from(self.outcome.stdout_bytes).map_err(|_| {
-            ProcessError::new("capture_read_budget", "stdout length exceeds the read cap")
-        })?;
-        if expected > max_bytes {
-            return Err(ProcessError::new(
-                "capture_read_budget",
-                "stdout length exceeds the read cap",
-            ));
-        }
-        let started = Instant::now();
-        capture_read_checkpoint(&mut check, started)?;
-        let metadata = self
-            .stdout_log
-            .metadata()
-            .map_err(|error| ProcessError::io("inspect original stdout capture", error))?;
-        capture_read_checkpoint(&mut check, started)?;
-        if !metadata.is_file() || metadata.len() != self.outcome.stdout_bytes {
-            return Err(ProcessError::new(
-                "capture_changed",
-                "original stdout capture size or file type changed",
-            ));
-        }
-        self.stdout_log
-            .seek(SeekFrom::Start(0))
-            .map_err(|error| ProcessError::io("seek original stdout capture", error))?;
-        capture_read_checkpoint(&mut check, started)?;
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(expected).map_err(|_| {
-            ProcessError::new("capture_read_budget", "stdout read allocation failed")
-        })?;
-        let mut buffer = [0; CAPTURE_READ_BYTES];
-        while bytes.len() < expected {
-            capture_read_checkpoint(&mut check, started)?;
-            let remaining = (expected - bytes.len()).min(buffer.len());
-            let read = self
-                .stdout_log
-                .read(&mut buffer[..remaining])
-                .map_err(|error| ProcessError::io("read original stdout capture", error))?;
-            capture_read_checkpoint(&mut check, started)?;
-            if read == 0 {
-                return Err(ProcessError::new(
-                    "capture_changed",
-                    "original stdout capture ended before its recorded length",
-                ));
-            }
-            bytes.extend_from_slice(&buffer[..read]);
-        }
-        capture_read_checkpoint(&mut check, started)?;
-        let mut excess = [0; 1];
-        let excess_bytes = self
-            .stdout_log
-            .read(&mut excess)
-            .map_err(|error| ProcessError::io("confirm original stdout capture EOF", error))?;
-        capture_read_checkpoint(&mut check, started)?;
-        if excess_bytes != 0 {
-            return Err(ProcessError::new(
-                "capture_changed",
-                "original stdout capture grew beyond its recorded length",
-            ));
-        }
-        let final_metadata = self
-            .stdout_log
-            .metadata()
-            .map_err(|error| ProcessError::io("recheck original stdout capture", error))?;
-        capture_read_checkpoint(&mut check, started)?;
-        if !final_metadata.is_file() || final_metadata.len() != self.outcome.stdout_bytes {
-            return Err(ProcessError::new(
-                "capture_changed",
-                "original stdout capture final size or file type changed",
-            ));
-        }
-        Ok(bytes)
+        self.read_drained_log(CaptureStream::Stdout, max_bytes, check)
     }
+
+    /// Read retained diagnostic bytes from the original held stream after native drain.
+    /// Nonzero exit, cancellation or incomplete output remain unchanged in `outcome`.
+    /// These bytes are evidence only; this method does not satisfy the strict stdout
+    /// consumer gate or certify command success, complete output or product acceptance.
+    /// The 64 MiB cap, 64 KiB chunks, five-second local bound and original caller
+    /// ownership/deadline/cancellation checkpoints are shared with `read_stdout`.
+    pub fn read_drained_log(
+        &mut self,
+        stream: CaptureStream,
+        max_bytes: usize,
+        check: impl FnMut() -> Result<(), String>,
+    ) -> Result<Vec<u8>, ProcessError> {
+        if !self.outcome.drained {
+            let mut error = ProcessError::new(
+                "capture_incomplete",
+                "raw capture evidence requires a drained native owned scope",
+            );
+            error.drained = false;
+            return Err(error);
+        }
+        let (log, expected) = match stream {
+            CaptureStream::Stdout => (&mut self.stdout_log, self.outcome.stdout_bytes),
+            CaptureStream::Stderr => (&mut self.stderr_log, self.outcome.stderr_bytes),
+        };
+        read_captured_log(log, expected, max_bytes, check)
+    }
+}
+
+fn read_captured_log(
+    log: &mut File,
+    recorded_bytes: u64,
+    max_bytes: usize,
+    mut check: impl FnMut() -> Result<(), String>,
+) -> Result<Vec<u8>, ProcessError> {
+    if max_bytes == 0 || max_bytes > MAX_CAPTURE_READ_BYTES {
+        return Err(ProcessError::new(
+            "capture_read_budget",
+            "capture read cap must be positive and at most 64 MiB",
+        ));
+    }
+    let expected = usize::try_from(recorded_bytes).map_err(|_| {
+        ProcessError::new("capture_read_budget", "capture length exceeds the read cap")
+    })?;
+    if expected > max_bytes {
+        return Err(ProcessError::new(
+            "capture_read_budget",
+            "capture length exceeds the read cap",
+        ));
+    }
+    let started = Instant::now();
+    capture_read_checkpoint(&mut check, started)?;
+    let metadata = log
+        .metadata()
+        .map_err(|error| ProcessError::io("inspect original retained capture", error))?;
+    capture_read_checkpoint(&mut check, started)?;
+    if !metadata.is_file() || metadata.len() != recorded_bytes {
+        return Err(ProcessError::new(
+            "capture_changed",
+            "original retained capture size or file type changed",
+        ));
+    }
+    log.seek(SeekFrom::Start(0))
+        .map_err(|error| ProcessError::io("seek original retained capture", error))?;
+    capture_read_checkpoint(&mut check, started)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(expected)
+        .map_err(|_| ProcessError::new("capture_read_budget", "capture read allocation failed"))?;
+    let mut buffer = [0; CAPTURE_READ_BYTES];
+    while bytes.len() < expected {
+        capture_read_checkpoint(&mut check, started)?;
+        let remaining = (expected - bytes.len()).min(buffer.len());
+        let read = log
+            .read(&mut buffer[..remaining])
+            .map_err(|error| ProcessError::io("read original retained capture", error))?;
+        capture_read_checkpoint(&mut check, started)?;
+        if read == 0 {
+            return Err(ProcessError::new(
+                "capture_changed",
+                "original retained capture ended before its recorded length",
+            ));
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    capture_read_checkpoint(&mut check, started)?;
+    let mut excess = [0; 1];
+    let excess_bytes = log
+        .read(&mut excess)
+        .map_err(|error| ProcessError::io("confirm original retained capture EOF", error))?;
+    capture_read_checkpoint(&mut check, started)?;
+    if excess_bytes != 0 {
+        return Err(ProcessError::new(
+            "capture_changed",
+            "original retained capture grew beyond its recorded length",
+        ));
+    }
+    let final_metadata = log
+        .metadata()
+        .map_err(|error| ProcessError::io("recheck original retained capture", error))?;
+    capture_read_checkpoint(&mut check, started)?;
+    if !final_metadata.is_file() || final_metadata.len() != recorded_bytes {
+        return Err(ProcessError::new(
+            "capture_changed",
+            "original retained capture final size or file type changed",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn capture_read_checkpoint(
@@ -409,7 +448,7 @@ fn capture_read_checkpoint(
     let timeout = || {
         ProcessError::new(
             "capture_read_timeout",
-            "original stdout capture read deadline exceeded",
+            "original retained capture read deadline exceeded",
         )
     };
     if started.elapsed() >= CAPTURE_READ_TIMEOUT {
@@ -507,7 +546,7 @@ pub fn supervise_with_progress(
         .map(CapturedProcessOutcome::into_outcome)
 }
 
-/// Preserve the original stdout handle for a bounded post-drain read. The
+/// Preserve both original log handles for bounded post-drain reads. The
 /// existing observation callback and native completion requirements are shared
 /// with `supervise_with_progress`; this API does not acquire a managed lease.
 pub fn supervise_with_progress_captured(
@@ -603,6 +642,7 @@ fn supervise_bound(
         return Ok(CapturedProcessOutcome {
             outcome,
             stdout_log,
+            stderr_log,
             process_started: false,
         });
     }
@@ -618,6 +658,7 @@ fn supervise_bound(
         return Ok(CapturedProcessOutcome {
             outcome,
             stdout_log,
+            stderr_log,
             process_started: false,
         });
     }
@@ -926,6 +967,7 @@ fn supervise_bound(
     Ok(CapturedProcessOutcome {
         outcome,
         stdout_log,
+        stderr_log,
         process_started: true,
     })
 }
@@ -3459,7 +3501,13 @@ mod tests {
                 );
                 println!("owned explicit environment verified");
             }
-            "failure" => std::process::exit(23),
+            "failure" => {
+                println!("owned-failure-output");
+                eprintln!("owned-failure-error");
+                std::io::stdout().flush().unwrap();
+                std::io::stderr().flush().unwrap();
+                std::process::exit(23);
+            }
             "hold" => std::thread::sleep(Duration::from_secs(30)),
             "brief_hold" => std::thread::sleep(Duration::from_millis(500)),
             "resource_probe" => {
@@ -3606,6 +3654,85 @@ mod tests {
                 .contains("owned-error")
         );
         run.cleanup(result.drained);
+    }
+
+    #[test]
+    fn drained_raw_logs_keep_both_original_handles_for_success_and_failure() {
+        // 기존 native child의 두 stream과 exit23을 재사용한다. 기존 검사는
+        // stdout held-read만 다루어 immutable reader의 Windows OS32를 재현하지 못했다.
+        for (mode, exit, stdout_marker, stderr_marker) in [
+            ("normal", 0, "owned-output", "owned-error"),
+            ("failure", 23, "owned-failure-output", "owned-failure-error"),
+        ] {
+            let run = TestRun::new(mode);
+            let mut captured =
+                supervise_with_progress_captured(&run.spec, &AtomicBool::new(false), |_| Ok(()))
+                    .unwrap();
+            assert!(captured.process_started() && captured.outcome().drained);
+            assert_eq!(captured.outcome().command_exit, Some(exit));
+            let original_outcome = serde_json::to_value(captured.outcome()).unwrap();
+            let strict = captured.read_stdout(64 * 1024, || Ok(()));
+            if exit == 0 {
+                assert!(
+                    String::from_utf8(strict.unwrap())
+                        .unwrap()
+                        .contains(stdout_marker)
+                );
+            } else {
+                assert_eq!(strict.unwrap_err().kind, "capture_incomplete");
+            }
+            for (stream, path, marker, bytes) in [
+                (
+                    CaptureStream::Stdout,
+                    &run.spec.stdout_log,
+                    stdout_marker,
+                    captured.outcome().stdout_bytes,
+                ),
+                (
+                    CaptureStream::Stderr,
+                    &run.spec.stderr_log,
+                    stderr_marker,
+                    captured.outcome().stderr_bytes,
+                ),
+            ] {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    let reopen = OpenOptions::new()
+                        .read(true)
+                        .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
+                        .open(path)
+                        .unwrap_err();
+                    assert_eq!(reopen.raw_os_error(), Some(32));
+                    assert_eq!(
+                        OpenOptions::new()
+                            .write(true)
+                            .open(path)
+                            .unwrap_err()
+                            .raw_os_error(),
+                        Some(32)
+                    );
+                    assert_eq!(fs::remove_file(path).unwrap_err().raw_os_error(), Some(32));
+                }
+                #[cfg(unix)]
+                {
+                    fs::rename(path, path.with_extension("original")).unwrap();
+                    fs::write(path, b"foreign replacement bytes").unwrap();
+                }
+                let raw = captured
+                    .read_drained_log(stream, 64 * 1024, || Ok(()))
+                    .unwrap();
+                assert_eq!(u64::try_from(raw.len()).unwrap(), bytes);
+                assert!(String::from_utf8(raw).unwrap().contains(marker));
+            }
+            assert_eq!(
+                serde_json::to_value(captured.outcome()).unwrap(),
+                original_outcome
+            );
+            let outcome = captured.into_outcome();
+            assert_eq!(serde_json::to_value(&outcome).unwrap(), original_outcome);
+            run.cleanup(outcome.drained);
+        }
     }
 
     #[test]
@@ -3903,6 +4030,7 @@ mod tests {
         stdout_log.sync_all().unwrap();
         CapturedProcessOutcome {
             stdout_log,
+            stderr_log: create_log(&run.spec.stderr_log).unwrap(),
             process_started: false,
             outcome: ProcessOutcome {
                 command_exit: Some(0),
@@ -3955,6 +4083,25 @@ mod tests {
             assert_eq!(error.kind, "capture_incomplete");
             assert_eq!(error.drained, captured.outcome.drained);
             assert_eq!(checks, 0);
+            if case == 0 {
+                let raw_error = captured
+                    .read_drained_log(CaptureStream::Stderr, 1024, || {
+                        checks += 1;
+                        Ok(())
+                    })
+                    .unwrap_err();
+                assert_eq!(raw_error.kind, "capture_incomplete");
+                assert!(!raw_error.drained);
+                assert_eq!(checks, 0);
+            } else if case == 1 {
+                assert_eq!(
+                    captured
+                        .read_drained_log(CaptureStream::Stdout, 1024, || Ok(()))
+                        .unwrap(),
+                    b"retained evidence"
+                );
+                assert!(!captured.outcome.output_complete);
+            }
             drop(captured);
             run.cleanup(true);
         }

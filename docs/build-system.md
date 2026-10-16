@@ -527,6 +527,15 @@ receipt가 실제 spawn 뒤 true, 생성 전 취소·만료에 false를 기록�
 오류를 보존한 뒤 기존 export·finish 수명을 따른다. 이 관측은 실제 게임 target
 profile, 쓰기 허가, SAM·참조 전체 closure 또는 제품 인수 완료를 의미하지 않는다.
 
+후보 생산자의 raw stdout·stderr 보존은 supervisor가 실제 생성한 두 원 capture
+핸들에서 수행한다. Windows의 원 쓰기 핸들이 열린 동안 같은 경로를 더 좁은 share
+mode로 다시 열거나, export를 위해 writer 보호를 완화하지 않는다. native drain 뒤
+원 stream의 기록된 길이·regular file·EOF·전후 크기를 검사하고 최대 64 MiB,
+64 KiB chunk와 5초의 로컬 판독 예산 및 원 요청의 소유·취소·기한 검사를 적용한다.
+이 진단용 판독은 nonzero·취소·불완전 출력의 원 outcome을 보존한다. 성공한 stdout의
+strict 소비자 gate를 충족한 것으로 바꾸지 않으며, export 실패에는 stream과 단계를
+남긴다. 명령·strict 판독·export·finalization 실패는 함께 남겨 최초 원인을 덮지 않는다.
+
 Linux JVM native VM probe는 일반 `checks`의 이미 낮아진 hard limit 안에서 실행하지
 않는다. 고정 `jvm` 소유 실행에서만 명시적으로 선택하는 ignored 검사이며, inherited
 512 GiB readback과 8 GiB의 유한한 VM 예약을 확인한다. 실제 resident allocation은

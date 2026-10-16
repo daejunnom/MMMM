@@ -2262,6 +2262,78 @@ cross-OS 검토의 확정 P1/P2·타입 지적은 0이며 실제 Unix/macOS 실�
 새 소스의 pin으로 바꾸지 않으며, 이 단일 설정 변경 뒤 실제 도구 빌드와 후보 생산을
 진행한다. 새 producer의 실제 archive 생성·dependency fetch/target 상태는 아직 미실행이다.
 
+후속 Windows 준비 `518`은 canonical 경로의 접두사 비교 오류로 fetch 전에 실패했고,
+경로 비교를 교정한 `519`의 locked fetch는 통과했다. 최초 빈 candidate target에 이
+fetch가 만든 단일 `.rustc_info.json`은 원 영수증·정확한 소유·bytes·부재 상태를 대조한
+`520`에서 해당 파일만 정리했다. 알 수 없는 cache를 채택하거나 성공 pointer를 만들지
+않았다. 도구 빌드 helper의 `521`/`522` 실패는 compiler 이전의 경로 검사 오류였다.
+복수 Git application의 배열 선택과 Cargo shim의 reparse를 구분하고, `523`에서 실제
+선택한 물리 Cargo/Rustc 경로를 확인했다. 일반 Windows 오류였으므로 WSL로 전환하지
+않았다. 첫 helper의 원 bytes는 보존되지 않았으며 hash와 실패 로그만 남아 있다.
+이후 helper는 실행 전에 CreateNew snapshot과 전체 SHA를 보존했다.
+
+고정 `41b0f44f7da34a3d9e30b6e30c5d18b8ae03f968`의 `524`는 실제 Windows에서
+새 도구를 빌드하고 외부 고정 이미지에 별도 보존했다. command 0·7,407 ms·Job commit
+peak 333,692,928 bytes·7 process·최대 gap 144 ms이며 owned-tail 정리 뒤 drain·출력
+완료·export·scratch 정리·lease 해제다. helper snapshot 26,979 bytes의 SHA는
+`017b36963da3e6bb6e5615b207056a31731a63d7e2b500ba48dda603862b326c`이고, 실제 도구
+4,640,256 bytes의 SHA는
+`fd25a8ae751ec3167eea099a57cd06af206f93101c097f2813253836bb99bab8`다. 입력 26개·
+1,167,998 bytes의 전후 pin은
+`96ba0ea2cb852ae4032d966784795aad96c1309f797ea6342fa1a5f63baec958`로 같았다.
+도구 복사 시점의 기록과 이후 관리 완료 및 실제 실행은 각각 다른 사실이다.
+
+이 이미지의 첫 실제 `candidate-build`인 `525`는 컴파일 전에 실패했다. 유일한 명령
+`git_head`는 exit 0·119 ms·drain·출력 완료였고 stdout 41 bytes·stderr 0 bytes였다.
+원 stdout 쓰기 핸들을 보유한 채 `FILE_SHARE_READ`로 다시 연 export가 Windows 오류
+32로 거절됐다. private diagnostics·attempt·별도 finalization failure 및 빈 stderr를
+보존했고, required evidence export가 false여서 원 active owner와 catalog lease를
+유지했다. 원 stdout과 빈 source staging도 scratch에 남았다. archive 생성·Cargo
+build·후보 완료·제품 proof는 발급되지 않았다. 이 오류는 SAC/WDAC 차단이 아니며
+Windows 경로에서 진단과 교정을 계속한다. 누락 export와 소유 수명 복구 결과는 원
+실패 기록을 수정하지 않고 별도 기록한다.
+
+`525`의 원 PID 종료·정확한 owner/lease·다른 3개 완료 owner·원 raw bytes와 비어 있는
+staging을 다시 대조했다. 복구 절차의 사전 검토에서 owner schema에 추가하려던 필드를
+제거하여 기존 닫힌 record와 호환되게 했다. 실제 별도 복구는 누락 raw 두 개의 보존과
+정확한 scratch 정리 뒤, PowerShell의 null backup 경로 인자 처리로 owner 교체 전에
+실패했다. 해당 실패와 준비된 owner를 보존하고, 앞 단계를 반복하지 않는 별도 tail에서
+실제 backup 경로를 사용해 원 owner를 함께 보존하며 교체했다. 정확한 lease 하나만
+해제했고 scratch·임시 owner의 부재를 확인했다. tail은 347 ms·exit 0·stderr 0이며 최종
+별도 영수증 SHA는
+`8d2a0371561f21fa4dfefa76388be49365a111052516133254a388de52b174f3`다. 원 attempt의
+required export=false와 production_failed는 유지하며 이 복구를 후보 생성 성공으로
+바꾸지 않는다. cache·제품 자료 및 다른 실행의 owner는 수정하지 않았다.
+
+후속 소스는 실제 stdout/stderr capture handle을 함께 보관한다. 성공 stdout은 strict
+reader가 소비한 동일 Vec를 export하고 실패 stdout·stderr는 원 held handle에서 진단
+bytes만 읽는다. native supervisor, strict read, stream별 export와 managed finish의 원
+오류를 각각 남기고 후행 실패가 최초 오류를 덮지 않게 했다. 기존 native fixture를 쓰는
+단일 table 회귀는 Windows 재개방 오류 32와 원 handle의 read 성공, Unix 경로 교체,
+성공·exit 23·원 outcome 불변을 검사하도록 추가했다. 실제 검증 결과는 후속 기록이다.
+
+`526` format 뒤 Windows `527`의 xtask library 242개 통과·기존 1 ignored, binary
+8개 통과를 확인했다. 새 양 stream native 회귀도 실제 통과했다. command 0·53,219 ms·
+Job peak 505,217,024 bytes·10 process·gap 147 ms·owned-tail 정리다. `528` all-target
+strict는 command 0·8,976 ms·Job peak 364,072,960 bytes·7 process·gap 104 ms·자연
+종료로 통과했다. 두 실행은 모두 drain·출력 완료·export·scratch 정리·lease 해제 및
+감독/정리 오류 0이다. 입력 324개·8,849,133 bytes의 전후 pin은
+`8ff244f8ffc52c8ddaff8a8d2948a3be54fbfdb9b194ef11fa4cf052dddda4c6`로 같았으며,
+전체 입력 binding 45,915 bytes·SHA
+`e7d64c40ec139e90abd0c1841ec82aa5fc7f2c4388dbef920f0b6261e6b53cdb`를 별도 보존했다.
+이 검사는 새 CLI archive 생성이나 Unix의 실제 실행 성공을 발급하지 않는다.
+
+같은 `41b0f44`의 JVM CI 78 (`38866355372`) 집계 성공은 job/step metadata로 확인했으며
+새 원 ZIP 감사는 미실행이다. Rust CI 87 (`38866355418`)은 Windows/macOS 테스트와
+lint가 통과했지만 Linux 테스트 명령의 native 관측에서 실패했고 Linux lint는 skipped,
+집계는 실패다. Linux 원 artifact 16,661 bytes의 SHA
+`6aaffab66f480b84605a74af41ba12f962d370764b0b9c001d9ae2923a8256ec`를 API digest와
+대조한 뒤 원 process/finish 및 stderr를 감사했다. dependency compile 중 원 owned
+member의 Z·2 threads가 같은 PID/start의 X·0 threads로 바뀌면서 pgid/sid가 -1이 되어
+identity 관측이 거절됐다. 35,035 ms·signal 9·drain·export·정리는 관측했으며 Rust
+테스트 assertion 실행이나 OOM으로 분류하지 않는다. 원 PIDFD의 실제 종료 증거를
+보유하는 좁은 후속 관측 경로는 별도 worktree에서 구현 중이다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

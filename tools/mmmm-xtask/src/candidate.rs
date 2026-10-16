@@ -19,6 +19,30 @@ use std::{
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+#[derive(Debug)]
+struct CandidateFailures {
+    failures: Vec<(String, Box<dyn std::error::Error>)>,
+}
+
+impl std::fmt::Display for CandidateFailures {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, (stage, error)) in self.failures.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str("; ")?;
+            }
+            write!(formatter, "{stage}: {error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CandidateFailures {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.failures.first().map(|(_, error)| error.as_ref())
+    }
+}
+
 const PURPOSE: &str = "candidate";
 const MAX_INPUT_FILES: usize = 4096;
 const MAX_INPUT_BYTES: u64 = 32 * 1024 * 1024;
@@ -198,37 +222,111 @@ impl Run {
                 let outcome = serde_json::to_value(capture.outcome())?;
                 self.commands.push(json!({"ordinal":ordinal,"label":label,"process_started":capture.process_started(),"process":outcome}));
                 let read = capture.read_stdout(MAX_COMMAND_BYTES, || self.check());
-                let mut export_errors = Vec::new();
+                self.commands[ordinal]["stdout_read"] = match &read {
+                    Ok(bytes) => json!({"status":"verified","bytes":bytes.len()}),
+                    Err(error) => json!({"status":"failed","error":local_error(error)}),
+                };
+                let mut export_failures = Vec::new();
+                let mut exports = Vec::new();
                 // Original raw logs remain local evidence, including failed commands.
-                // Never export before the native owned scope has drained.
+                // Keep both original capture handles: reopening their paths would
+                // conflict with the Windows writer-sharing boundary and would
+                // replace their identity with a later pathname observation.
                 if capture.outcome().drained {
-                    for (source, suffix) in [(&stdout, "stdout"), (&stderr, "stderr")] {
-                        let exported =
-                            read_plain(source, MAX_COMMAND_BYTES as u64, || self.check()).and_then(
-                                |bytes| {
-                                    write_new(
-                                        &self
-                                            .build
-                                            .paths()
-                                            .evidence
-                                            .join(format!("candidate-{ordinal}.{suffix}")),
-                                        &bytes,
-                                    )
-                                },
-                            );
-                        if let Err(error) = exported {
-                            export_errors.push(error.to_string());
+                    for (stream, suffix) in [
+                        (process::CaptureStream::Stdout, "stdout"),
+                        (process::CaptureStream::Stderr, "stderr"),
+                    ] {
+                        let mut stage = "read_held_capture";
+                        let exported = (|| -> Result<usize> {
+                            // Preserve the exact stdout bytes consumed by the
+                            // strict reader, including on Unix where another
+                            // writer could change the same held file afterward.
+                            let bytes: std::borrow::Cow<'_, [u8]> = match (stream, &read) {
+                                (process::CaptureStream::Stdout, Ok(bytes)) => {
+                                    std::borrow::Cow::Borrowed(bytes.as_slice())
+                                }
+                                _ => std::borrow::Cow::Owned(capture.read_drained_log(
+                                    stream,
+                                    MAX_COMMAND_BYTES,
+                                    || self.check(),
+                                )?),
+                            };
+                            stage = "check_export_ownership";
+                            self.check()?;
+                            stage = "create_destination";
+                            let destination = self
+                                .build
+                                .paths()
+                                .evidence
+                                .join(format!("candidate-{ordinal}.{suffix}"));
+                            let mut file = OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(destination)?;
+                            for chunk in bytes.chunks(65_536) {
+                                stage = "check_write_ownership";
+                                self.check()?;
+                                stage = "write_destination";
+                                file.write_all(chunk)?;
+                                stage = "check_write_ownership";
+                                self.check()?;
+                            }
+                            stage = "check_sync_ownership";
+                            self.check()?;
+                            stage = "sync_destination";
+                            file.sync_all()?;
+                            stage = "check_sync_ownership";
+                            self.check()?;
+                            Ok(bytes.len())
+                        })();
+                        match exported {
+                            Ok(bytes) => exports.push(json!({
+                                "stream":suffix,"status":"exported","bytes":bytes,
+                            })),
+                            Err(error) => {
+                                exports.push(json!({
+                                    "stream":suffix,"status":"failed","stage":stage,
+                                    "error":local_error(error.as_ref()),
+                                }));
+                                export_failures.push((
+                                    format!("command {ordinal} ({label}) {suffix} {stage}"),
+                                    error,
+                                ));
+                            }
                         }
                     }
-                }
-                if !export_errors.is_empty() {
+                } else {
+                    for stream in ["stdout", "stderr"] {
+                        exports.push(json!({
+                            "stream":stream,"status":"not_attempted","stage":"unconfirmed_drain",
+                        }));
+                    }
                     self.evidence_complete = false;
-                    self.supervisor_errors.extend(export_errors);
-                    if read.is_ok() {
-                        return Err("candidate required raw evidence export failed".into());
+                }
+                self.commands[ordinal]["raw_exports"] = json!(exports);
+                if !export_failures.is_empty() {
+                    self.evidence_complete = false;
+                }
+                match read {
+                    Ok(bytes) if export_failures.is_empty() => Ok(bytes),
+                    Ok(_) => Err(Box::new(CandidateFailures {
+                        failures: export_failures,
+                    })),
+                    Err(error) if export_failures.is_empty() => Err(Box::new(error)),
+                    Err(error) => {
+                        export_failures.insert(
+                            0,
+                            (
+                                format!("command {ordinal} ({label}) strict_stdout_read"),
+                                Box::new(error),
+                            ),
+                        );
+                        Err(Box::new(CandidateFailures {
+                            failures: export_failures,
+                        }))
                     }
                 }
-                Ok(read?)
             }
             Err(error) => {
                 self.drained &= error.drained;
@@ -307,6 +405,8 @@ pub(super) fn run(checkout: PathBuf, mut flags: BTreeMap<String, String>) -> Res
             "schema":"mmmm-rust-cli-candidate-private-diagnostics/1", "local_only":true,
             "commands":run.commands, "error":result.as_ref().err().map(|e| e.to_string()),
             "supervisor_errors":run.supervisor_errors,
+            "strict_stdout_read_error_count":strict_stdout_read_error_count(&run.commands),
+            "raw_export_error_count":raw_export_error_count(&run.commands),
         }),
     );
     let report = json!({
@@ -315,6 +415,8 @@ pub(super) fn run(checkout: PathBuf, mut flags: BTreeMap<String, String>) -> Res
         "result":if result.is_ok() { "prepared" } else { "production_failed" },
         "required_evidence_exported":run.evidence_complete && private_audit.is_ok(),
         "supervisor_error_count":run.supervisor_errors.len(), "drained":child_observations(&run.commands, run.drained)["scope_drained"],"last_command_exit":run.last_exit,
+        "strict_stdout_read_error_count":strict_stdout_read_error_count(&run.commands),
+        "raw_export_error_count":raw_export_error_count(&run.commands),
         "child_observations":child_observations(&run.commands, run.drained),
         "cache_preservation_requested":run.preserve_cache,
         "product_proof_issued":false, "acceptance_verification":"not_run", "release_verification":"not_run",
@@ -339,13 +441,26 @@ pub(super) fn run(checkout: PathBuf, mut flags: BTreeMap<String, String>) -> Res
             &preserved,
         );
         println!("{}", serde_json::to_string_pretty(&preserved)?);
-        private_audit?;
-        exported?;
-        preserved_export?;
-        return match result {
-            Err(error) => Err(error),
-            Ok(_) => Err("candidate cache preservation requires explicit owned lifecycle handling; no completion issued".into()),
-        };
+        let mut failures = Vec::new();
+        if let Err(error) = result {
+            failures.push(("production".into(), error));
+        }
+        for (stage, export) in [
+            ("private_diagnostics_export", private_audit),
+            ("attempt_export", exported),
+            ("storage_preservation_export", preserved_export),
+        ] {
+            if let Err(error) = export {
+                failures.push((stage.into(), error));
+            }
+        }
+        if failures.is_empty() {
+            failures.push((
+                "storage_preservation".into(),
+                "candidate cache preservation requires explicit owned lifecycle handling; no completion issued".into(),
+            ));
+        }
+        return Err(Box::new(CandidateFailures { failures }));
     }
     let finish = run.build.finish(storage::FinishOutcome {
         command_exit: run.last_exit,
@@ -353,29 +468,58 @@ pub(super) fn run(checkout: PathBuf, mut flags: BTreeMap<String, String>) -> Res
         drained: run.drained,
         evidence_exported: exported.is_ok() && private_audit.is_ok() && run.evidence_complete,
     });
-    private_audit?;
-    exported?;
-    let receipt = match finish {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            // Finalization failure is independent of the original production failure.
-            let _ = crate::write_new_json(
-                &evidence.join("candidate-finalization-failure.private.json"),
-                &json!({
-                    "schema":"mmmm-rust-cli-candidate-finalization-failure/1","local_only":true,
-                    "production_error":result.as_ref().err().map(|e| e.to_string()),"finish_error":error.to_string(),
-                }),
-            );
-            return Err(Box::new(error));
+    let incomplete_finish = finish.as_ref().is_ok_and(|receipt| {
+        !receipt.lease_released
+            || !receipt.cleanup_errors.is_empty()
+            || !receipt.supervisor_errors.is_empty()
+    });
+    if private_audit.is_err() || exported.is_err() || finish.is_err() || incomplete_finish {
+        // Preserve every original cause. Evidence or finalization failures must
+        // not replace a command/read/export failure with a generic last error.
+        let failure_export = crate::write_new_json(
+            &evidence.join("candidate-finalization-failure.private.json"),
+            &json!({
+                "schema":"mmmm-rust-cli-candidate-finalization-failure/1","local_only":true,
+                "production_error":result.as_ref().err().map(|error| error.to_string()),
+                "production_error_detail":result.as_ref().err().map(|error| local_error(error.as_ref())),
+                "private_diagnostics_export_error":private_audit.as_ref().err().map(|error| local_error(error.as_ref())),
+                "attempt_export_error":exported.as_ref().err().map(|error| local_error(error.as_ref())),
+                "finish_error":finish.as_ref().err().map(|error| error.to_string()),
+                "finish_error_detail":finish.as_ref().err().map(|error| local_error(error)),
+                "finish_receipt":finish.as_ref().ok(),
+            }),
+        );
+        let mut failures = Vec::new();
+        if let Err(error) = result {
+            failures.push(("production".into(), error));
         }
-    };
-    let prepared = result?;
-    if !receipt.lease_released
-        || !receipt.cleanup_errors.is_empty()
-        || !receipt.supervisor_errors.is_empty()
-    {
-        return Err("candidate bytes prepared but managed completion did not succeed".into());
+        for (stage, export) in [
+            ("private_diagnostics_export", private_audit),
+            ("attempt_export", exported),
+        ] {
+            if let Err(error) = export {
+                failures.push((stage.into(), error));
+            }
+        }
+        match finish {
+            Err(error) => failures.push(("managed_finalization".into(), Box::new(error))),
+            Ok(receipt) if incomplete_finish => failures.push((
+                "managed_finalization".into(),
+                format!(
+                    "lease_released={}, supervisor_errors={:?}, cleanup_errors={:?}",
+                    receipt.lease_released, receipt.supervisor_errors, receipt.cleanup_errors,
+                )
+                .into(),
+            )),
+            Ok(_) => {}
+        }
+        if let Err(error) = failure_export {
+            failures.push(("finalization_diagnostics_export".into(), error));
+        }
+        return Err(Box::new(CandidateFailures { failures }));
     }
+    let receipt = finish?;
+    let prepared = result?;
     if Instant::now() >= run.deadline || run.cancellation.load(Ordering::Acquire) {
         return Err("candidate completed storage after its request deadline or cancellation; candidate completion withheld".into());
     }
@@ -874,7 +1018,46 @@ fn public_commands(commands: &[Value]) -> Vec<Value> {
         "process_started":record["process_started"],"command_exit":record["process"]["command_exit"],
         "drained":record["process"]["drained"].as_bool().or_else(|| record["error"]["drained"].as_bool()),
         "output_complete":record["process"]["output_complete"],"error_kind":record["error"]["kind"],
+        "stdout_read_status":record["stdout_read"]["status"],
+        "stdout_read_error_kind":record["stdout_read"]["error"]["kind"],
+        "raw_exports":record["raw_exports"].as_array().map(|exports| exports.iter().map(|export| json!({
+            "stream":export["stream"],"status":export["status"],"stage":export["stage"],
+            "bytes":export["bytes"],"error_kind":export["error"]["kind"],
+        })).collect::<Vec<_>>()),
     })).collect()
+}
+
+fn local_error(error: &(dyn std::error::Error + 'static)) -> Value {
+    let mut diagnostic = json!({"message":error.to_string()});
+    if let Some(error) = error.downcast_ref::<process::ProcessError>() {
+        diagnostic["kind"] = json!(error.kind);
+        diagnostic["drained"] = json!(error.drained);
+    } else if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        diagnostic["kind"] = json!("io");
+        diagnostic["io_kind"] = json!(format!("{:?}", error.kind()));
+        diagnostic["raw_os_error"] = json!(error.raw_os_error());
+    } else if let Some(error) = error.downcast_ref::<storage::StorageError>() {
+        diagnostic["kind"] = json!(error.kind);
+    } else {
+        diagnostic["kind"] = json!("candidate");
+    }
+    diagnostic
+}
+
+fn strict_stdout_read_error_count(commands: &[Value]) -> usize {
+    commands
+        .iter()
+        .filter(|command| command["stdout_read"]["status"] == "failed")
+        .count()
+}
+
+fn raw_export_error_count(commands: &[Value]) -> usize {
+    commands
+        .iter()
+        .filter_map(|command| command["raw_exports"].as_array())
+        .flat_map(|exports| exports.iter())
+        .filter(|export| export["status"] == "failed")
+        .count()
 }
 
 fn child_observations(commands: &[Value], drained: bool) -> Value {
