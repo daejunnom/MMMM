@@ -630,6 +630,26 @@ impl ApplicationService {
         budget: &RequestBudget,
         hosts: &crate::host::HostBridge,
     ) -> Result<crate::calibration_planning::CalibrationPlanReceipt, ServiceError> {
+        self.prepare_selected_calibration_plan(principal, selection, budget, hosts, None)
+    }
+    pub(crate) fn prepare_bootstrap_plan(
+        &mut self,
+        principal: &AuthenticatedPrincipal,
+        selection: &mmmm_application::SetupSelection,
+        budget: &RequestBudget,
+        hosts: &crate::host::HostBridge,
+        registry: &crate::calibration_bootstrap::BootstrapRegistry,
+    ) -> Result<crate::calibration_planning::CalibrationPlanReceipt, ServiceError> {
+        self.prepare_selected_calibration_plan(principal, selection, budget, hosts, Some(registry))
+    }
+    fn prepare_selected_calibration_plan(
+        &mut self,
+        principal: &AuthenticatedPrincipal,
+        selection: &mmmm_application::SetupSelection,
+        budget: &RequestBudget,
+        hosts: &crate::host::HostBridge,
+        bootstrap: Option<&crate::calibration_bootstrap::BootstrapRegistry>,
+    ) -> Result<crate::calibration_planning::CalibrationPlanReceipt, ServiceError> {
         budget.check()?;
         if crate::peer::fatal_stop_requested() {
             return Err(ServiceError::new(
@@ -681,13 +701,23 @@ impl ApplicationService {
             ids: self.ports.ids.as_mut(),
             clock: self.ports.clock.as_ref(),
         };
-        crate::calibration_planning::prepare_normative47_plan(
-            &mut application,
-            &request,
-            &owner,
-            hosts,
-            selection,
-        )
+        match bootstrap {
+            Some(registry) => crate::calibration_planning::prepare_bootstrap_plan(
+                &mut application,
+                &request,
+                &owner,
+                hosts,
+                selection,
+                registry,
+            ),
+            None => crate::calibration_planning::prepare_normative47_plan(
+                &mut application,
+                &request,
+                &owner,
+                hosts,
+                selection,
+            ),
+        }
         .map_err(|cause| ServiceError::caused_by(cause.code, cause.message, cause))
     }
     /// Authenticated bootstrap composition may persist initial authoring data;
@@ -938,6 +968,20 @@ impl ProviderPort for GuardedProvider<'_> {
             precondition,
             context,
         )
+    }
+    fn observe_plan_preconditions_retained_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        plan: &Value,
+        step: &Value,
+        conditions: &[&Value],
+        context: &Value,
+    ) -> mmmm_application::AppResult<Option<Vec<mmmm_contracts::Sha256Digest>>> {
+        self.admission()?;
+        let observed = self
+            .inner
+            .observe_plan_preconditions_retained_with_store(store, plan, step, conditions, context);
+        crate::observer::finish_native_observation(observed, self.admission())
     }
     fn verify_dependencies(
         &mut self,

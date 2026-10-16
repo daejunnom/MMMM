@@ -221,6 +221,20 @@ pub trait ProviderPort {
     ) -> AppResult<Sha256Digest> {
         self.observe_plan_precondition_with_store(store, plan, step, precondition, context)
     }
+    /// One stack-scoped observation for this exact preflight. A concrete
+    /// platform may return digests in the supplied condition order; the common
+    /// application still compares every digest with its phase expectation.
+    /// None preserves the existing per-condition fail-fast observation path.
+    fn observe_plan_preconditions_retained_with_store(
+        &mut self,
+        _store: &mut DurableStore,
+        _plan: &Value,
+        _step: &Value,
+        _conditions: &[&Value],
+        _context: &Value,
+    ) -> AppResult<Option<Vec<Sha256Digest>>> {
+        Ok(None)
+    }
     /// This short unique-store borrow is granted only after durable intent. The
     /// composition may commit authenticated owned projection evidence there;
     /// it must never redispatch a world mutation after a local commit failure.

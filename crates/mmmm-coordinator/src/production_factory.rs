@@ -300,6 +300,7 @@ impl DaemonSourceFactory for ProductionFactory {
             backend: native_backend,
             metadata,
             calibration: handles.calibration.clone(),
+            bootstrap: handles.bootstrap.clone(),
         })
         .map_err(composition_error)?;
         let observer = provider.observer();

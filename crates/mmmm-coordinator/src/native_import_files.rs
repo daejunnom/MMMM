@@ -8,7 +8,7 @@
 use crate::{service::RequestBudget, workspace_bootstrap::NativeOwnerWitness};
 use mmmm_owned_files::{Control, HeldFile};
 use sha2::{Digest, Sha256};
-#[cfg(test)]
+#[cfg(all(test, windows))]
 use std::path::Component;
 use std::{
     collections::TryReserveError,

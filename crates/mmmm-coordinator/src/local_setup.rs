@@ -5,15 +5,15 @@
 use crate::{
     bootstrap::{
         NativeWorkspacePermit, register_explicit_host_setup,
-        register_explicit_host_setup_with_read_policy,
+        register_explicit_host_setup_with_deadline, register_explicit_host_setup_with_read_policy,
     },
     credential::local_owner_principal,
     setup::PublicHostSetup,
     workspace_bootstrap::NativeOwnerWitness,
 };
-use mmmm_contracts::{PrincipalId, ProjectId};
+use mmmm_contracts::{PrincipalId, ProjectId, Sha256Digest, canonical_digest, projected_digest};
 use mmmm_runtime::storage::host_setup::{HostReadPolicy, HostReadPolicyRecord};
-use mmmm_runtime::storage::{DurableStore, StorageError, StoreConfig};
+use mmmm_runtime::storage::{DurableStore, StorageError, StoreConfig, WriteScope};
 use serde_json::Value;
 use std::{
     path::Path,
@@ -63,6 +63,7 @@ impl std::error::Error for LocalSetupError {}
 #[derive(Debug)]
 pub struct LocalReadPolicySetupError {
     pub retained_policy: Option<Box<HostReadPolicyRecord>>,
+    pub retained_setup: Option<Box<PublicHostSetup>>,
     pub failure: LocalSetupError,
     cause: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
@@ -70,6 +71,7 @@ impl LocalReadPolicySetupError {
     fn before(failure: LocalSetupError) -> Self {
         Self {
             retained_policy: None,
+            retained_setup: None,
             failure,
             cause: None,
         }
@@ -84,6 +86,7 @@ impl LocalReadPolicySetupError {
         };
         Self {
             retained_policy: None,
+            retained_setup: None,
             failure,
             cause: Some(Box::new(cause)),
         }
@@ -91,6 +94,7 @@ impl LocalReadPolicySetupError {
     fn retained(record: &HostReadPolicyRecord, failure: LocalSetupError) -> Self {
         Self {
             retained_policy: Some(Box::new(record.clone())),
+            retained_setup: None,
             failure,
             cause: None,
         }
@@ -108,6 +112,12 @@ impl std::fmt::Display for LocalReadPolicySetupError {
                 "Host read policy {} for Project {} was committed and retained; ",
                 record.policy_digest(),
                 record.project_id()
+            )?;
+        } else if let Some(setup) = &self.retained_setup {
+            write!(
+                formatter,
+                "Host setup for Project {} was committed and retained; ",
+                setup.project_id
             )?;
         }
         self.failure.fmt(formatter)
@@ -240,6 +250,148 @@ pub fn register_local_host_setup_with_read_policy(
         || setup.write_new(request.destination),
     )?;
     Ok((setup, record))
+}
+
+/// This opt-in selects only the compiler's fixed bootstrap locators. It is not
+/// a game ADMIN, source pin, verified-write profile or bootstrap Apply grant.
+pub fn register_local_host_setup_with_calibration_scope(
+    config: StoreConfig,
+    mut request: LocalHostSetup<'_>,
+    expected_revision: &Sha256Digest,
+    read_policy: Option<&HostReadPolicy>,
+    deadline: Instant,
+) -> Result<(PublicHostSetup, Option<HostReadPolicyRecord>, Sha256Digest), LocalReadPolicySetupError>
+{
+    let deadline = deadline.min(Instant::now() + Duration::from_secs(15));
+    validate_calibration_base_scope(&request.scope, &request.project)
+        .map_err(LocalReadPolicySetupError::before)?;
+    if !config.data_root.is_absolute()
+        || request
+            .destination
+            .file_name()
+            .is_none_or(|name| name != "mmmm-host.json")
+    {
+        return Err(LocalReadPolicySetupError::before(
+            LocalSetupError::InvalidInput,
+        ));
+    }
+    let owner = local_owner_principal()
+        .map_err(|_| LocalReadPolicySetupError::before(LocalSetupError::OwnerUnavailable))?;
+    current_owner(&owner, deadline).map_err(LocalReadPolicySetupError::before)?;
+    let mut store =
+        DurableStore::open_existing(config).map_err(LocalReadPolicySetupError::storage)?;
+    let witness = NativeOwnerWitness::capture(&store, deadline)
+        .map_err(LocalReadPolicySetupError::storage)?;
+    if witness.principal() != &owner {
+        return Err(LocalReadPolicySetupError::before(
+            LocalSetupError::OwnerUnavailable,
+        ));
+    }
+    check_calibration_project(&store, &witness, &request.project, expected_revision)?;
+    let targets =
+        crate::calibration_bootstrap::normative_bootstrap_target_ids().map_err(|cause| {
+            LocalReadPolicySetupError {
+                retained_policy: None,
+                retained_setup: None,
+                failure: LocalSetupError::Verification,
+                cause: Some(Box::new(cause)),
+            }
+        })?;
+    request.scope["externalTargetIds"] = serde_json::json!(targets);
+    let scope_digest = canonical_digest(&request.scope)
+        .map_err(|_| LocalReadPolicySetupError::before(LocalSetupError::InvalidInput))?;
+    check_calibration_project(&store, &witness, &request.project, expected_revision)?;
+    let (setup, record) = if let Some(policy) = read_policy {
+        let (setup, record) = register_explicit_host_setup_with_read_policy(
+            &mut store,
+            request.executable,
+            request.installed_host_jar,
+            request.project,
+            request.scope,
+            policy,
+            deadline,
+        )
+        .map_err(LocalReadPolicySetupError::storage)?;
+        (setup, Some(record))
+    } else {
+        (
+            register_explicit_host_setup_with_deadline(
+                &mut store,
+                request.executable,
+                request.installed_host_jar,
+                request.project,
+                request.scope,
+                deadline,
+            )
+            .map_err(LocalReadPolicySetupError::storage)?,
+            None,
+        )
+    };
+    // The registration may already be committed. Keep its receipt around every
+    // remaining head/owner/deadline/config check without replacing a config.
+    let delivered = (|| {
+        check_calibration_project(&store, &witness, &setup.project_id, expected_revision)?;
+        setup
+            .write_new(request.destination)
+            .map_err(|cause| LocalReadPolicySetupError {
+                retained_policy: None,
+                retained_setup: None,
+                failure: LocalSetupError::PublicConfigNotWritten,
+                cause: Some(Box::new(cause)),
+            })?;
+        check_calibration_project(&store, &witness, &setup.project_id, expected_revision)
+    })();
+    delivered.map_err(|mut error| {
+        error.retained_setup = Some(Box::new(setup.clone()));
+        if let Some(record) = &record {
+            error = error.with_receipt(record);
+        }
+        error
+    })?;
+    Ok((setup, record, scope_digest))
+}
+
+pub(crate) fn validate_calibration_base_scope(
+    scope: &Value,
+    project: &ProjectId,
+) -> Result<(), LocalSetupError> {
+    let selected: WriteScope =
+        serde_json::from_value(scope.clone()).map_err(|_| LocalSetupError::InvalidInput)?;
+    selected
+        .validate()
+        .map_err(|_| LocalSetupError::InvalidInput)?;
+    if selected.project_id != *project || !selected.external_target_ids.is_empty() {
+        return Err(LocalSetupError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn check_calibration_project(
+    store: &DurableStore,
+    witness: &NativeOwnerWitness,
+    project: &ProjectId,
+    expected_revision: &Sha256Digest,
+) -> Result<(), LocalReadPolicySetupError> {
+    witness
+        .check_project(store, project)
+        .map_err(LocalReadPolicySetupError::storage)?;
+    let current = store
+        .project(project)
+        .map_err(LocalReadPolicySetupError::storage)?;
+    let revision = projected_digest("Project", &current).map_err(|_| {
+        LocalReadPolicySetupError::storage(StorageError::Corrupt(
+            "Current host setup Project revision".into(),
+        ))
+    })?;
+    if &revision != expected_revision {
+        return Err(LocalReadPolicySetupError::storage(StorageError::Conflict(
+            "Explicit calibration host setup Project revision",
+        )));
+    }
+    witness
+        .check_project(store, project)
+        .map_err(LocalReadPolicySetupError::storage)?;
+    Ok(())
 }
 
 fn finish_read_policy_setup(

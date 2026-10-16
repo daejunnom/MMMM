@@ -6,6 +6,9 @@ use crate::{
     auth::AuthenticatedPrincipal,
     authority::LocalAuthority,
     bootstrap::NativeWorkspacePermit,
+    calibration_bootstrap::{
+        BootstrapAccess, BootstrapPreflight, BootstrapRegistry, EnteredBootstrap,
+    },
     calibration_execution::{CalibrationAccess, CalibrationRegistry, EnteredCalibration},
     host::{
         DependencyProvenance, HostBridge, HostContextWitness, HttpProviderPort, VerifiedDependency,
@@ -268,6 +271,7 @@ pub struct CompositeComposition {
     pub backend: Rc<HostNativeBackend>,
     pub metadata: RustMetadataRegistry,
     pub calibration: CalibrationRegistry,
+    pub bootstrap: BootstrapRegistry,
 }
 #[derive(Clone)]
 struct Shared {
@@ -277,6 +281,7 @@ struct Shared {
     backend: Rc<HostNativeBackend>,
     metadata: RustMetadataRegistry,
     calibration: CalibrationRegistry,
+    bootstrap: BootstrapRegistry,
     phases: Rc<RefCell<BTreeMap<InvocationId, Rc<FrozenPhase>>>>,
 }
 struct FrozenPhase {
@@ -309,6 +314,7 @@ impl CompositeProvider {
                 backend: composition.backend,
                 metadata: composition.metadata,
                 calibration: composition.calibration,
+                bootstrap: composition.bootstrap,
                 phases: Rc::new(RefCell::new(BTreeMap::new())),
             },
         })
@@ -325,6 +331,12 @@ impl CompositeProvider {
         receipt: Option<&str>,
     ) -> AppResult<()> {
         let request = self.shared.calibration_request()?;
+        if let Some(entered) =
+            self.shared
+                .enter_bootstrap(store, &request, invocation, BootstrapAccess::Cancel)?
+        {
+            return entered.cancel(store);
+        }
         if let Some(entered) =
             self.shared
                 .enter_calibration(store, &request, invocation, CalibrationAccess::Cancel)?
@@ -355,6 +367,16 @@ impl CompositeProvider {
     }
 }
 impl Shared {
+    fn enter_bootstrap<'a>(
+        &'a self,
+        store: &DurableStore,
+        request: &'a RequestContextWitness,
+        original: &Value,
+        access: BootstrapAccess,
+    ) -> AppResult<Option<EnteredBootstrap<'a>>> {
+        self.bootstrap
+            .enter(store, request, &self.authority, original, access)
+    }
     fn calibration_request(&self) -> AppResult<RequestContextWitness> {
         self.request
             .occupied_witness()
@@ -1230,6 +1252,20 @@ impl ProviderPort for CompositeProvider {
         condition: &Value,
         context: &Value,
     ) -> AppResult<Sha256Digest> {
+        if self.shared.bootstrap.matches_plan(plan)? {
+            let request = self.shared.calibration_request()?;
+            return self.shared.bootstrap.precondition(
+                store,
+                &request,
+                &self.shared.authority,
+                BootstrapPreflight {
+                    plan,
+                    step,
+                    context,
+                },
+                condition,
+            );
+        }
         if self.shared.calibration.matches_plan(plan)? {
             return Err(store_required());
         }
@@ -1259,6 +1295,33 @@ impl ProviderPort for CompositeProvider {
         }
         self.observe_precondition_with_store(store, condition, context)
     }
+    fn observe_plan_preconditions_retained_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        plan: &Value,
+        step: &Value,
+        conditions: &[&Value],
+        context: &Value,
+    ) -> AppResult<Option<Vec<Sha256Digest>>> {
+        if !self.shared.bootstrap.matches_plan(plan)? {
+            return Ok(None);
+        }
+        let request = self.shared.calibration_request()?;
+        self.shared
+            .bootstrap
+            .preconditions(
+                store,
+                &request,
+                &self.shared.authority,
+                BootstrapPreflight {
+                    plan,
+                    step,
+                    context,
+                },
+                conditions,
+            )
+            .map(Some)
+    }
     fn observe_plan_precondition_retained_with_store(
         &mut self,
         store: &mut DurableStore,
@@ -1267,6 +1330,20 @@ impl ProviderPort for CompositeProvider {
         condition: &Value,
         context: &Value,
     ) -> AppResult<Sha256Digest> {
+        if self.shared.bootstrap.matches_plan(plan)? {
+            let request = self.shared.calibration_request()?;
+            return self.shared.bootstrap.precondition(
+                store,
+                &request,
+                &self.shared.authority,
+                BootstrapPreflight {
+                    plan,
+                    step,
+                    context,
+                },
+                condition,
+            );
+        }
         if self.shared.calibration.matches_plan(plan)? {
             return calibration_precondition(&self.shared, store, plan, step, condition, context);
         }
@@ -1363,6 +1440,12 @@ impl ProviderPort for CompositeProvider {
         let request = self.shared.calibration_request()?;
         if let Some(entered) =
             self.shared
+                .enter_bootstrap(store, &request, invocation, BootstrapAccess::Apply)?
+        {
+            return entered.persist_intent(store, step, invocation, resolution);
+        }
+        if let Some(entered) =
+            self.shared
                 .enter_calibration(store, &request, invocation, CalibrationAccess::Apply)?
         {
             if &entered.operation().operation_id != operation {
@@ -1394,6 +1477,12 @@ impl ProviderPort for CompositeProvider {
         invocation: &Value,
     ) -> AppResult<Value> {
         let request = self.shared.calibration_request()?;
+        if let Some(entered) =
+            self.shared
+                .enter_bootstrap(store, &request, invocation, BootstrapAccess::Apply)?
+        {
+            return entered.dispatch(store);
+        }
         if let Some(entered) =
             self.shared
                 .enter_calibration(store, &request, invocation, CalibrationAccess::Apply)?
@@ -1482,6 +1571,12 @@ impl ProviderPort for CompositeProvider {
         receipt: Option<&str>,
     ) -> AppResult<Option<Value>> {
         let request = self.shared.calibration_request()?;
+        if let Some(entered) =
+            self.shared
+                .enter_bootstrap(store, &request, invocation, BootstrapAccess::Observe)?
+        {
+            return entered.poll(store, receipt);
+        }
         if let Some(entered) = self.shared.enter_calibration(
             store,
             &request,
@@ -1879,6 +1974,16 @@ impl IndependentObserverPort for CompositeObserver {
         scope: &WriteScope,
         target: &str,
     ) -> AppResult<()> {
+        if invocation["actionId"] == crate::calibration_bootstrap::ACTION {
+            let request = self.shared.calibration_request()?;
+            return self.shared.bootstrap.validate_capture_target(
+                &request,
+                &self.shared.authority,
+                invocation,
+                scope,
+                target,
+            );
+        }
         self.shared.call(&invocation["context"])?;
         if registered_direct_block(invocation) {
             return self
@@ -1900,6 +2005,13 @@ impl IndependentObserverPort for CompositeObserver {
         scope: &WriteScope,
     ) -> AppResult<Option<BeforeCapture>> {
         let request = self.shared.calibration_request()?;
+        if self
+            .shared
+            .enter_bootstrap(store, &request, invocation, BootstrapAccess::Apply)?
+            .is_some()
+        {
+            return Err(store_required());
+        }
         if let Some(entered) =
             self.shared
                 .enter_calibration(store, &request, invocation, CalibrationAccess::Apply)?
@@ -1929,6 +2041,15 @@ impl IndependentObserverPort for CompositeObserver {
         scope: &WriteScope,
     ) -> AppResult<Option<BeforeCapture>> {
         let request = self.shared.calibration_request()?;
+        if let Some(entered) =
+            self.shared
+                .enter_bootstrap(store, &request, invocation, BootstrapAccess::Apply)?
+        {
+            if entered.scope() != scope {
+                return Err(forbidden());
+            }
+            return entered.capture(store).map(Some);
+        }
         if let Some(entered) =
             self.shared
                 .enter_calibration(store, &request, invocation, CalibrationAccess::Apply)?
@@ -1982,6 +2103,16 @@ impl IndependentObserverPort for CompositeObserver {
         scope: &WriteScope,
     ) -> AppResult<ReadbackEvidence> {
         let request = self.shared.calibration_request()?;
+        if self
+            .shared
+            .enter_bootstrap(store, &request, invocation, BootstrapAccess::Observe)?
+            .is_some()
+        {
+            return Err(error(
+                "CAPABILITY_UNAVAILABLE",
+                "Bootstrap readback requires a newly paired owner and independently observed loaded source",
+            ));
+        }
         if let Some(entered) = self.shared.enter_calibration(
             store,
             &request,

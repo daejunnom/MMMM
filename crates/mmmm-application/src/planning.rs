@@ -382,7 +382,26 @@ impl Application<'_> {
             return Ok((context, descriptor, true));
         }
         let phase_expected = self.phase_expected_digests(plan, step, operation)?;
-        for precondition in preconditions {
+        let conditions: Vec<&Value> = preconditions.iter().collect();
+        let observed_batch = self
+            .provider
+            .observe_plan_preconditions_retained_with_store(
+                self.store,
+                plan,
+                step,
+                &conditions,
+                &context,
+            )?;
+        if observed_batch
+            .as_ref()
+            .is_some_and(|digests| digests.len() != preconditions.len())
+        {
+            return Err(AppError::new(
+                "TARGET_DRIFT",
+                "A frozen precondition observation batch changed its target count",
+            ));
+        }
+        for (index, precondition) in preconditions.iter().enumerate() {
             let expected: Sha256Digest = phase_expected
                 .get(&(
                     text(precondition, "kind")?.to_owned(),
@@ -391,15 +410,18 @@ impl Application<'_> {
                 .cloned()
                 .map(Ok)
                 .unwrap_or_else(|| decode(&precondition["expected"]))?;
-            let observed = self
-                .provider
-                .observe_plan_precondition_retained_with_store(
-                    self.store,
-                    plan,
-                    step,
-                    precondition,
-                    &context,
-                )?;
+            let observed = match &observed_batch {
+                Some(digests) => digests[index].clone(),
+                None => self
+                    .provider
+                    .observe_plan_precondition_retained_with_store(
+                        self.store,
+                        plan,
+                        step,
+                        precondition,
+                        &context,
+                    )?,
+            };
             if observed != expected {
                 return Err(AppError::new(
                     "TARGET_DRIFT",

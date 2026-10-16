@@ -557,6 +557,7 @@ impl Fixture {
             authority: authority.clone(),
             request: RequestContextSlot::default(),
             calibration: crate::calibration_execution::CalibrationRegistry::default(),
+            bootstrap: crate::calibration_bootstrap::BootstrapRegistry::default(),
             configured_project: Some(project.clone()),
             workspace: Some(workspace),
         };

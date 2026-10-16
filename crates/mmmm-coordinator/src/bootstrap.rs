@@ -37,6 +37,8 @@ use std::{
 
 #[path = "calibration_approval.rs"]
 pub(crate) mod calibration_approval;
+#[path = "calibration_bootstrap_management.rs"]
+pub(crate) mod calibration_bootstrap_management;
 
 const SESSION_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const MAX_PENDING: usize = 8;
@@ -204,18 +206,38 @@ pub fn register_explicit_host_setup(
     project: ProjectId,
     scope: Value,
 ) -> StorageResult<PublicHostSetup> {
-    let rpc = OwnerSetupRpcContext::for_store(store, None)?;
+    register_explicit_host_setup_with_deadline(
+        store,
+        executable,
+        installed_host_jar,
+        project,
+        scope,
+        Instant::now() + Duration::from_secs(10),
+    )
+}
+
+/// The explicitly selected local setup keeps the original caller deadline in
+/// owner checkpoints, both artifact hashes and the registration transaction.
+pub fn register_explicit_host_setup_with_deadline(
+    store: &mut DurableStore,
+    executable: &Path,
+    installed_host_jar: &Path,
+    project: ProjectId,
+    scope: Value,
+    deadline: Instant,
+) -> StorageResult<PublicHostSetup> {
+    let rpc = OwnerSetupRpcContext::capture(store, deadline, None)?;
     rpc.check_store(store)?;
     store.project(&project)?;
-    let setup = PublicHostSetup::create(
+    let setup = PublicHostSetup::create_with_deadline(
         executable,
         installed_host_jar,
         store.data_root(),
         project,
         scope,
-    )
-    .map_err(|_| StorageError::InvalidInput("Explicit host setup verification failed".into()))?;
-    rpc.check()?;
+        deadline,
+    );
+    let setup = finish_explicit_setup_verification(setup, rpc.check_store(store))?;
     let registration = HostSetupRegistration {
         project_id: setup.project_id.clone(),
         host_artifact_digest: setup.host_artifact_digest.clone(),
@@ -226,6 +248,22 @@ pub fn register_explicit_host_setup(
     authority.registration = Some(registration.clone());
     register_host_setup(store, &rpc, &mut authority, &registration)?;
     Ok(setup)
+}
+
+fn finish_explicit_setup_verification(
+    result: Result<PublicHostSetup, crate::setup::SetupError>,
+    checkpoint: StorageResult<()>,
+) -> StorageResult<PublicHostSetup> {
+    let result = result.map_err(|cause| StorageError::Io(std::io::Error::other(cause)));
+    match (result, checkpoint) {
+        (Ok(setup), Ok(())) => Ok(setup),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(checkpoint)) => Err(checkpoint),
+        (Err(primary), Err(checkpoint)) => Err(StorageError::CalibrationCheckpointFailure {
+            primary: Box::new(primary),
+            checkpoint: Box::new(checkpoint),
+        }),
+    }
 }
 
 /// Explicit native selection only. Its original caller deadline survives file
@@ -248,15 +286,15 @@ pub(crate) fn register_explicit_host_setup_with_read_policy(
         return Err(owner_error());
     }
     store.project(&project)?;
-    let setup = PublicHostSetup::create(
+    let setup = PublicHostSetup::create_with_deadline(
         executable,
         installed_host_jar,
         store.data_root(),
         project,
         scope,
-    )
-    .map_err(|_| StorageError::InvalidInput("Explicit host setup verification failed".into()))?;
-    rpc.check_store(store)?;
+        deadline,
+    );
+    let setup = finish_explicit_setup_verification(setup, rpc.check_store(store))?;
     let request = HostSetupRegistration {
         project_id: setup.project_id.clone(),
         host_artifact_digest: setup.host_artifact_digest.clone(),
@@ -424,12 +462,18 @@ pub struct HostBootstrapProcessor {
     rejected_completions: BTreeMap<RequestId, RejectedPairingCompletion>,
     rejected_encoded_bytes: usize,
     calibration: calibration_approval::CalibrationApprovals,
+    pack_bootstrap: calibration_bootstrap_management::BootstrapApprovals,
 }
 impl HostBootstrapProcessor {
     /// The native management caller uses the same registered read-map handle
     /// while entering the existing ApplicationService; this creates no grant.
     pub(crate) fn calibration_planning_hosts(&self) -> HostBridge {
         self.hosts.clone()
+    }
+    pub(crate) fn bootstrap_planning_registry(
+        &self,
+    ) -> crate::calibration_bootstrap::BootstrapRegistry {
+        self.pack_bootstrap.registry.clone()
     }
     pub fn new(hosts: HostBridge, authority: LocalAuthority) -> Result<Self, ManagementError> {
         Self::with_calibration_registry(
@@ -443,6 +487,19 @@ impl HostBootstrapProcessor {
         authority: LocalAuthority,
         calibration: crate::calibration_execution::CalibrationRegistry,
     ) -> Result<Self, ManagementError> {
+        Self::with_registries(
+            hosts,
+            authority,
+            calibration,
+            crate::calibration_bootstrap::BootstrapRegistry::default(),
+        )
+    }
+    pub(crate) fn with_registries(
+        hosts: HostBridge,
+        authority: LocalAuthority,
+        calibration: crate::calibration_execution::CalibrationRegistry,
+        bootstrap: crate::calibration_bootstrap::BootstrapRegistry,
+    ) -> Result<Self, ManagementError> {
         Ok(Self {
             owner: local_owner_principal().map_err(|_| ManagementError::InvalidFrame)?,
             hosts,
@@ -453,6 +510,7 @@ impl HostBootstrapProcessor {
             rejected_completions: BTreeMap::new(),
             rejected_encoded_bytes: 0,
             calibration: calibration_approval::CalibrationApprovals::with_registry(calibration),
+            pack_bootstrap: calibration_bootstrap_management::BootstrapApprovals::new(bootstrap),
         })
     }
     /// Trusted composition has independently verified this Project's current
@@ -547,7 +605,9 @@ impl HostBootstrapProcessor {
     ) -> Result<Option<PublicFrame>, ManagementError> {
         match request {
             ManagementRequest::Finished(receipt) => {
-                if self.has_calibration_witness(receipt.witness()) {
+                if self.has_bootstrap_witness(receipt.witness()) {
+                    self.finish_bootstrap(store, receipt)?;
+                } else if self.has_calibration_witness(receipt.witness()) {
                     self.finish_calibration(store, receipt)?;
                 } else {
                     self.finish(receipt)?;
@@ -560,7 +620,12 @@ impl HostBootstrapProcessor {
                 if Instant::now() >= reply_deadline {
                     return Err(ManagementError::Deadline);
                 }
-                if matches!(
+                if offer.public().value()["kind"] == "host_apply_approval_offer"
+                    && offer.public().value()["purpose"] == crate::calibration_bootstrap::PURPOSE
+                {
+                    self.bootstrap_offer(store, offer, budget, reply_deadline)
+                        .map(Some)
+                } else if matches!(
                     offer.public().value()["kind"].as_str(),
                     Some("native_calibration_owner_offer" | "host_apply_approval_offer")
                 ) {
@@ -571,7 +636,16 @@ impl HostBootstrapProcessor {
                 }
             }
             ManagementRequest::Installed { public, witness } => {
-                if self.has_calibration_witness(&witness) {
+                if self.has_bootstrap_witness(&witness) {
+                    self.install_bootstrap(
+                        public,
+                        witness,
+                        coordinator_epoch,
+                        budget,
+                        reply_deadline,
+                    )
+                    .map(Some)
+                } else if self.has_calibration_witness(&witness) {
                     self.install_calibration(
                         store,
                         public,
@@ -1041,6 +1115,7 @@ impl HostBootstrapProcessor {
         }
     }
     pub fn cleanup_expired(&mut self) -> Result<(), ManagementError> {
+        self.cleanup_bootstrap(false)?;
         self.cleanup_calibration(false)?;
         // Only this processor's exact expired grant/context generation is
         // retired. Durable operations, CAS, fences and principal ownership
@@ -1103,7 +1178,8 @@ impl HostBootstrapProcessor {
     /// Drop. A failed record remains owned for a retry/report; discovery must
     /// be retained by composition whenever this method returns an error.
     pub fn shutdown(&mut self) -> Result<(), ManagementError> {
-        let mut failed = self.cleanup_calibration(true).is_err();
+        let mut failed = self.cleanup_bootstrap(true).is_err();
+        failed |= self.cleanup_calibration(true).is_err();
         let pending_ids = self.pending.keys().cloned().collect::<Vec<_>>();
         for id in pending_ids {
             if let Some(pending) = self.pending.remove(&id)
@@ -1142,6 +1218,7 @@ impl HostBootstrapProcessor {
     pub fn has_pending_completion(&self) -> bool {
         self.pending.values().any(|pending| pending.complete_issued)
             || self.has_calibration_completion()
+            || self.has_bootstrap_completion()
     }
     /// Exact rollback observations and native completion truth have distinct
     /// lifetimes. Neither successful cleanup nor capacity pressure discards a

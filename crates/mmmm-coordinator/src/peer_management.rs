@@ -342,7 +342,10 @@ fn validate_public(value: &Value) -> Result<ManagementKind, ManagementError> {
                     "contextId",
                 ],
             )?;
-            if text(value, "purpose")? != CALIBRATION_PLAN_PURPOSE {
+            if !matches!(
+                text(value, "purpose")?,
+                CALIBRATION_PLAN_PURPOSE | crate::calibration_bootstrap::PURPOSE
+            ) {
                 return Err(ManagementError::InvalidFrame);
             }
             let root = text(value, "dataRoot")?;
@@ -371,12 +374,13 @@ fn validate_public(value: &Value) -> Result<ManagementKind, ManagementError> {
                     "outcome",
                 ],
             )?;
-            if text(value, "purpose")? != CALIBRATION_PLAN_PURPOSE
-                || !matches!(
-                    text(value, "outcome")?,
-                    "prepared" | "committed_checkpoint_failed"
-                )
-            {
+            if !matches!(
+                text(value, "purpose")?,
+                CALIBRATION_PLAN_PURPOSE | crate::calibration_bootstrap::PURPOSE
+            ) || !matches!(
+                text(value, "outcome")?,
+                "prepared" | "committed_checkpoint_failed"
+            ) {
                 return Err(ManagementError::InvalidFrame);
             }
             ProjectId::new(text(value, "projectId")?).map_err(|_| ManagementError::InvalidFrame)?;
@@ -390,7 +394,11 @@ fn validate_public(value: &Value) -> Result<ManagementKind, ManagementError> {
         | "host_apply_approval_authority"
         | "host_apply_approval_installed"
         | "host_apply_approval_complete" => {
-            crate::bootstrap::calibration_approval::validate_frame(value, validator)
+            if value["purpose"] == crate::calibration_bootstrap::PURPOSE {
+                crate::bootstrap::calibration_bootstrap_management::validate_frame(value, validator)
+            } else {
+                crate::bootstrap::calibration_approval::validate_frame(value, validator)
+            }
         }
         "host_pairing_offer" => {
             exact(

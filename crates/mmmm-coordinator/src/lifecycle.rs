@@ -268,6 +268,9 @@ impl HostManagement {
     ) -> Result<PublicFrame, ManagementError> {
         let witness = offer.witness().clone();
         let frame = offer.public().value();
+        let purpose = frame["purpose"]
+            .as_str()
+            .ok_or(ManagementError::InvalidFrame)?;
         let selection = mmmm_application::SetupSelection {
             project_id: ProjectId::new(
                 frame["projectId"]
@@ -333,6 +336,7 @@ impl HostManagement {
                 .ok_or(ManagementError::WrongReply)?;
             let reply = calibration_plan_reply(
                 &witness,
+                purpose,
                 &selection.project_id,
                 attempt.committed.as_ref(),
                 attempt.failure.is_some(),
@@ -361,7 +365,12 @@ impl HostManagement {
                 )
             })?;
             let hosts = self.processor.calibration_planning_hosts();
-            service.prepare_calibration_plan(&principal, &selection, &request, &hosts)
+            if purpose == crate::calibration_bootstrap::PURPOSE {
+                let registry = self.processor.bootstrap_planning_registry();
+                service.prepare_bootstrap_plan(&principal, &selection, &request, &hosts, &registry)
+            } else {
+                service.prepare_calibration_plan(&principal, &selection, &request, &hosts)
+            }
         })();
         let (committed, failure) = match result {
             Ok(receipt) => (
@@ -372,6 +381,7 @@ impl HostManagement {
         };
         let reply = calibration_plan_reply(
             &witness,
+            purpose,
             &selection.project_id,
             committed.as_ref(),
             failure.is_some(),
@@ -408,6 +418,7 @@ impl HostManagement {
 }
 fn calibration_plan_reply(
     witness: &BootstrapWitness,
+    purpose: &str,
     project: &ProjectId,
     committed: Option<&(PlanId, Sha256Digest)>,
     checkpoint_failed: bool,
@@ -415,7 +426,7 @@ fn calibration_plan_reply(
     let (plan, hash) = committed.ok_or(ManagementError::InvalidFrame)?;
     PublicFrame::from_value(serde_json::json!({
         "kind":"native_calibration_plan_prepared", "protocolVersion":mmmm_contracts::CONTRACT_VERSION,
-        "nonce":witness.nonce(), "purpose":crate::peer_management::CALIBRATION_PLAN_PURPOSE,
+        "nonce":witness.nonce(), "purpose":purpose,
         "projectId":project, "planId":plan, "planHash":hash,
         "outcome":if checkpoint_failed { "committed_checkpoint_failed" } else { "prepared" }
     }))
@@ -893,6 +904,7 @@ mod calibration_delivery_tests {
         );
         let recovered = calibration_plan_reply(
             &witness,
+            crate::peer_management::CALIBRATION_PLAN_PURPOSE,
             &ProjectId::new("project-fixture").unwrap(),
             attempt.committed.as_ref(),
             true,

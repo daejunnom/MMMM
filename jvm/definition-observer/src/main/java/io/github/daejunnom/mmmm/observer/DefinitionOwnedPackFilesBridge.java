@@ -151,8 +151,8 @@ public final class DefinitionOwnedPackFilesBridge {
         private final String code;
         private final Integer nativeError;
         private final boolean effectsMayExist;
-        private final Receipt completedReceipt;
-        private NativeCreateFact nativeCreate;
+        private final transient Receipt completedReceipt;
+        private transient NativeCreateFact nativeCreate;
         private NativeFailure(String code, Integer nativeError, boolean effectsMayExist, Receipt completedReceipt) {
             super("Native owned-file operation did not complete its current checks");
             this.code = code; this.nativeError = nativeError; this.effectsMayExist = effectsMayExist; this.completedReceipt = completedReceipt;

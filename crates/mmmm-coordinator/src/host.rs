@@ -241,6 +241,414 @@ pub(crate) struct CalibrationHostRoute {
     generation: [u8; 16],
     expires: Instant,
 }
+
+/// One borrowed original control and its already-started reply deadline.
+pub(crate) struct BootstrapRouteBudget<'a> {
+    pub(crate) original: &'a BootstrapBudget,
+    pub(crate) reply_deadline: Instant,
+}
+
+/// Bootstrap transport has its own generation and sticky attempts. It grants
+/// no numeric execution and never aliases the ordinary route or its attempts.
+#[derive(Clone)]
+pub(crate) struct BootstrapHostRoute {
+    host: Arc<Mutex<Option<PairedHost>>>,
+    attempts: Arc<Mutex<BTreeSet<OriginalInvocationKey>>>,
+    read_owner: HostContextWitness,
+    generation: [u8; 16],
+    expires: Instant,
+}
+impl BootstrapHostRoute {
+    pub(crate) fn context(&self) -> &Value {
+        self.read_owner.context()
+    }
+    pub(crate) fn lease_expires(&self) -> Instant {
+        self.expires
+    }
+    pub(crate) fn retire(&self) -> AppResult<()> {
+        self.host
+            .lock()
+            .map_err(|_| error("HOST_UNAVAILABLE", "Bootstrap route state is unavailable"))?
+            .take();
+        Ok(())
+    }
+    fn checked_host(
+        &self,
+        deadline: Instant,
+        control: &dyn Fn() -> AppResult<()>,
+    ) -> AppResult<PairedHost> {
+        let checkpoint = || {
+            control()?;
+            bounded_host_deadline(deadline)?;
+            if crate::peer::fatal_stop_requested() || Instant::now() >= self.expires {
+                return Err(error(
+                    "SESSION_ROUTE_CHANGED",
+                    "Original bootstrap route stopped",
+                ));
+            }
+            self.read_owner.check_local()
+        };
+        checkpoint()?;
+        let selected = self
+            .host
+            .lock()
+            .map_err(|_| error("HOST_UNAVAILABLE", "Bootstrap route state is unavailable"))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| error("SESSION_ROUTE_CHANGED", "Bootstrap route was retired"));
+        let selected = calibration_route_finish(selected, checkpoint())?;
+        if selected.generation != self.generation
+            || selected.expires != self.expires
+            || selected.principal != self.read_owner.principal
+            || selected.context != self.read_owner.context
+        {
+            return Err(error(
+                "SESSION_ROUTE_CHANGED",
+                "Bootstrap route identity changed",
+            ));
+        }
+        let retained = self
+            .host
+            .lock()
+            .map_err(|_| error("HOST_UNAVAILABLE", "Bootstrap route state is unavailable"))?
+            .as_ref()
+            .is_some_and(|host| host.generation == self.generation);
+        checkpoint()?;
+        if !retained {
+            return Err(error(
+                "SESSION_ROUTE_CHANGED",
+                "Bootstrap route was retired",
+            ));
+        }
+        Ok(selected)
+    }
+    pub(crate) fn check_current(&self, request: &RequestContextWitness) -> AppResult<()> {
+        self.checked_host(request.budget().deadline(), &|| {
+            request
+                .check_local()
+                .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
+            if request.authenticated().principal() != &self.read_owner.principal
+                || !request
+                    .authenticated()
+                    .permits_context(self.read_owner.context_id.as_str())
+            {
+                return Err(error(
+                    "PERMISSION_REQUIRED",
+                    "Bootstrap route belongs to another request",
+                ));
+            }
+            Ok(())
+        })
+        .map(|_| ())
+    }
+    pub(crate) fn check_bootstrap_current(&self, budget: &BootstrapBudget) -> AppResult<()> {
+        self.check_bootstrap_current_until(budget, budget.deadline())
+    }
+    fn check_bootstrap_current_until(
+        &self,
+        budget: &BootstrapBudget,
+        deadline: Instant,
+    ) -> AppResult<()> {
+        let deadline = budget.deadline().min(deadline);
+        let control = || calibration_bootstrap_check(budget);
+        for _ in 0..2 {
+            self.identity(deadline, &control)?;
+        }
+        self.checked_host(deadline, &control).map(|_| ())
+    }
+    fn identity(&self, deadline: Instant, control: &dyn Fn() -> AppResult<()>) -> AppResult<()> {
+        for (method, id, payload) in [
+            ("hello", None, json!({})),
+            (
+                "inspect",
+                Some(&self.read_owner.context_id),
+                json!({"kind":"execution_context"}),
+            ),
+        ] {
+            let host = self.checked_host(deadline, control)?;
+            let expires = bounded_host_deadline(deadline.min(self.expires))?;
+            let observed =
+                exchange(&host.client, method, id, payload, Some(&expires)).and_then(|actual| {
+                    let expected = if method == "hello" {
+                        validate("HostHello", &actual)?;
+                        &host.hello
+                    } else {
+                        validate("ExecutionContext", &actual)?;
+                        verify_projected_digest("ExecutionContext", &actual).map_err(|_| {
+                            error("STALE_CONTEXT", "Bootstrap context digest is invalid")
+                        })?;
+                        &host.context
+                    };
+                    if &actual != expected {
+                        return Err(error(
+                            "STALE_CONTEXT",
+                            "Actual bootstrap host identity changed",
+                        ));
+                    }
+                    Ok(())
+                });
+            calibration_route_finish(observed, self.checked_host(deadline, control).map(|_| ()))?;
+        }
+        Ok(())
+    }
+    fn validate_original(&self, original: &Value) -> AppResult<()> {
+        validate("Invocation", original)?;
+        if original["actionId"] != crate::calibration_bootstrap::ACTION
+            || original["context"] != self.read_owner.context
+            || original["contextDigest"] != self.read_owner.context["contextDigest"]
+        {
+            return Err(error(
+                "STALE_CONTEXT",
+                "Original bootstrap invocation changed",
+            ));
+        }
+        Ok(())
+    }
+    fn expires(
+        &self,
+        request: &RequestContextWitness,
+        original: &Value,
+        preserve: bool,
+    ) -> AppResult<String> {
+        let bounded = bounded_host_deadline(request.budget().deadline().min(self.expires))?;
+        if !preserve {
+            return Ok(bounded);
+        }
+        let format = &time::format_description::well_known::Rfc3339;
+        let original_at = text(original, "deadlineAt")?;
+        let actual = time::OffsetDateTime::parse(original_at, format)
+            .map_err(|_| error("INVALID_INPUT", "Original bootstrap deadline is invalid"))?;
+        let bound = time::OffsetDateTime::parse(&bounded, format)
+            .map_err(|_| error("INVALID_INPUT", "Bootstrap deadline is invalid"))?;
+        if actual <= time::OffsetDateTime::now_utc() {
+            return Err(error(
+                "TIME_BUDGET_EXCEEDED",
+                "Original bootstrap deadline ended",
+            ));
+        }
+        Ok(if actual < bound {
+            original_at.into()
+        } else {
+            bounded
+        })
+    }
+    pub(crate) fn prepare_observed(
+        &self,
+        store: &mut DurableStore,
+        request: &RequestContextWitness,
+        original: &Value,
+        current: &dyn Fn(&DurableStore) -> AppResult<()>,
+    ) -> AppResult<Value> {
+        self.validate_original(original)?;
+        current(store)?;
+        let operation: OperationId = serde_json::from_value(original["operationId"].clone())
+            .map_err(|_| error("INVALID_INPUT", "Bootstrap operation is invalid"))?;
+        let result = (|| {
+            let record = store
+                .operation(&operation)
+                .map_err(|cause| AppError::storage("STALE_CONTEXT", cause))?;
+            let plan = store
+                .plan(&record.plan_id, &record.plan_hash)
+                .map_err(|cause| AppError::storage("STALE_CONTEXT", cause))?;
+            if record.principal != *request.authenticated().principal()
+                || plan["steps"][0]["stepId"] != original["stepId"]
+                || [
+                    "bindingId",
+                    "actionId",
+                    "actionContractVersion",
+                    "actionDigest",
+                    "implementationDigest",
+                    "arguments",
+                ]
+                .iter()
+                .any(|field| plan["steps"][0][*field] != original[*field])
+            {
+                return Err(error(
+                    "STALE_CONTEXT",
+                    "Prepared bootstrap differs from its frozen step",
+                ));
+            }
+            self.identity(request.budget().deadline(), &|| {
+                current(store)?;
+                self.check_current(request)
+            })?;
+            let host = self.checked_host(request.budget().deadline(), &|| current(store))?;
+            let expires = self.expires(request, original, true)?;
+            current(store)?;
+            let acquired = exchange_acquired(
+                &host,
+                "prepare",
+                Some(&self.read_owner.context_id),
+                original.clone(),
+                &expires,
+                request.budget().deadline(),
+            )?;
+            let acquired = retain_prepared_calibration_truth(store, &operation, acquired)?;
+            response_payload(acquired.into_response()?)
+        })();
+        calibration_route_finish(
+            result,
+            self.identity(request.budget().deadline(), &|| {
+                current(store)?;
+                self.check_current(request)
+            }),
+        )
+    }
+    /// Read only through the already completed bootstrap manifest. A public
+    /// bundle hash or ordinary read route cannot select this endpoint.
+    pub(crate) fn inspect_targets(
+        &self,
+        request: &RequestContextWitness,
+        source_bundle: &Value,
+        current: &dyn Fn() -> AppResult<()>,
+    ) -> AppResult<Value> {
+        let control = || {
+            current()?;
+            self.check_current(request)
+        };
+        self.identity(request.budget().deadline(), &control)?;
+        let host = self.checked_host(request.budget().deadline(), &control)?;
+        let expires = bounded_host_deadline(request.budget().deadline().min(self.expires))?;
+        let result = exchange_acquired(
+            &host,
+            "inspect",
+            Some(&self.read_owner.context_id),
+            json!({"kind":"calibration_bootstrap_target_state","sourceBundleDigest":source_bundle}),
+            &expires,
+            request.budget().deadline(),
+        )
+        .and_then(|acquired| response_payload(acquired.into_response()?));
+        calibration_route_finish(result, self.identity(request.budget().deadline(), &control))
+    }
+    fn durable_call(
+        &self,
+        store: &mut DurableStore,
+        request: &RequestContextWitness,
+        original: &Value,
+        method: &str,
+        current: &dyn Fn(&DurableStore) -> AppResult<()>,
+    ) -> AppResult<Value> {
+        self.validate_original(original)?;
+        current(store)?;
+        let result = (|| {
+            let key = durable_invocation_key(store, original, request.budget().deadline())?;
+            self.identity(request.budget().deadline(), &|| {
+                current(store)?;
+                self.check_current(request)
+            })?;
+            let host = self.checked_host(request.budget().deadline(), &|| current(store))?;
+            let dispatch = method == "dispatch";
+            if dispatch {
+                let record = store
+                    .operation(&key.operation)
+                    .map_err(|cause| AppError::storage("STALE_CONTEXT", cause))?;
+                let step = record
+                    .steps
+                    .iter()
+                    .find(|step| step.step_id == key.step)
+                    .ok_or_else(|| error("STALE_CONTEXT", "Original bootstrap step is absent"))?;
+                if record.state != mmmm_runtime::storage::OperationState::Running
+                    || record.reconciliation_required
+                    || record.cancellation_requested
+                    || step.finished
+                    || step.dispatch != mmmm_runtime::storage::DispatchEvidence::IntentDurable
+                {
+                    return Err(error(
+                        "DISPATCH_ALREADY_ATTEMPTED",
+                        "Bootstrap durable intent is not dispatchable",
+                    ));
+                }
+            }
+            let expires = self.expires(request, original, dispatch)?;
+            current(store)?;
+            self.check_current(request)?;
+            {
+                let mut attempts = self.attempts.lock().map_err(|_| {
+                    error("HOST_UNAVAILABLE", "Bootstrap attempt state is unavailable")
+                })?;
+                if dispatch {
+                    if attempts.len() >= MAX_RETAINED_INVOCATIONS || !attempts.insert(key.clone()) {
+                        return Err(error(
+                            "DISPATCH_ALREADY_ATTEMPTED",
+                            "Original bootstrap was already attempted",
+                        ));
+                    }
+                } else if !attempts.contains(&key) {
+                    return Err(error(
+                        "ORIGINAL_ROUTE_UNAVAILABLE",
+                        "Original bootstrap attempt is absent",
+                    ));
+                }
+            }
+            current(store)?;
+            self.check_current(request)?;
+            let payload = if dispatch {
+                original.clone()
+            } else {
+                json!({"invocationId":original["invocationId"]})
+            };
+            let acquired = exchange_acquired(
+                &host,
+                method,
+                Some(&self.read_owner.context_id),
+                payload,
+                &expires,
+                request.budget().deadline(),
+            )?;
+            let acquired = retain_acquired_operation_truth(store, &key, acquired)?;
+            response_payload(acquired.into_response()?)
+        })();
+        // Reload intentionally invalidates this old route. Actual acquired
+        // truth is retained above before that failure is returned to Runtime.
+        calibration_route_finish(
+            result,
+            self.identity(request.budget().deadline(), &|| {
+                current(store)?;
+                self.check_current(request)
+            }),
+        )
+    }
+    pub(crate) fn dispatch_with_store(
+        &self,
+        store: &mut DurableStore,
+        request: &RequestContextWitness,
+        original: &Value,
+        current: &dyn Fn(&DurableStore) -> AppResult<()>,
+    ) -> AppResult<Value> {
+        let value = self.durable_call(store, request, original, "dispatch", current)?;
+        validate("ProviderResult", &value)?;
+        Ok(value)
+    }
+    pub(crate) fn poll_with_store(
+        &self,
+        store: &mut DurableStore,
+        request: &RequestContextWitness,
+        original: &Value,
+        receipt: Option<&str>,
+        current: &dyn Fn(&DurableStore) -> AppResult<()>,
+    ) -> AppResult<Option<Value>> {
+        let value = self.durable_call(store, request, original, "operation.get", current)?;
+        validate_job_observation(original, receipt, value)
+    }
+    pub(crate) fn cancel_with_store(
+        &self,
+        store: &mut DurableStore,
+        request: &RequestContextWitness,
+        original: &Value,
+        current: &dyn Fn(&DurableStore) -> AppResult<()>,
+    ) -> AppResult<()> {
+        let value = self.durable_call(store, request, original, "operation.cancel", current)?;
+        if value["invocationId"] != original["invocationId"]
+            || value["cancellationRequested"] != true
+        {
+            return Err(error(
+                "CANCEL_UNCONFIRMED",
+                "Bootstrap cancellation was not acknowledged",
+            ));
+        }
+        Ok(())
+    }
+}
 impl CalibrationHostRoute {
     pub(crate) fn context(&self) -> &Value {
         self.read_owner.context()
@@ -1097,6 +1505,92 @@ impl HostContextWitness {
     }
 }
 impl HostBridge {
+    /// A completed bootstrap purpose receives a separate private transport.
+    /// Creation preserves the current ordinary read owner and grants no effect.
+    pub(crate) fn prepare_bootstrap_route(
+        &self,
+        client: HostRpcClient,
+        principal: PrincipalId,
+        context: Value,
+        hello: Value,
+        lease_expires: Instant,
+        budget: BootstrapRouteBudget<'_>,
+    ) -> AppResult<BootstrapHostRoute> {
+        let BootstrapRouteBudget {
+            original: budget,
+            reply_deadline,
+        } = budget;
+        calibration_bootstrap_check(budget)?;
+        let deadline = budget.deadline().min(reply_deadline);
+        bounded_host_deadline(deadline)?;
+        validate("ExecutionContext", &context)?;
+        validate("HostHello", &hello)?;
+        verify_projected_digest("ExecutionContext", &context)
+            .map_err(|_| error("STALE_CONTEXT", "Bootstrap context digest is invalid"))?;
+        if context["principalRef"] != principal.as_str()
+            || context["environment"] != hello["environment"]
+            || context["environment"]["kind"] != "game"
+            || context["environment"]["side"] != "server"
+            || hello["hostProtocolVersion"] != "0.2.0"
+            || !lease_expires
+                .checked_duration_since(Instant::now())
+                .is_some_and(|left| !left.is_zero() && left <= Duration::from_secs(24 * 60 * 60))
+        {
+            return Err(error(
+                "STALE_CONTEXT",
+                "Bootstrap route exceeds its approved identity or lease",
+            ));
+        }
+        let id = context_id(&context)?;
+        let (read_owner, expires) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
+            let host = checked_host(&state, &id, Some(&principal))?;
+            if host.context != context || host.hello != hello {
+                return Err(error(
+                    "STALE_CONTEXT",
+                    "Bootstrap differs from the current read owner",
+                ));
+            }
+            (
+                HostContextWitness {
+                    state: self.state.clone(),
+                    context_id: id,
+                    principal: principal.clone(),
+                    context: context.clone(),
+                    generation: host.generation,
+                },
+                lease_expires.min(host.expires),
+            )
+        };
+        calibration_bootstrap_check(budget)?;
+        let mut generation = [0u8; 16];
+        getrandom::fill(&mut generation).map_err(|_| {
+            error(
+                "HOST_UNAVAILABLE",
+                "Bootstrap route identity is unavailable",
+            )
+        })?;
+        let route = BootstrapHostRoute {
+            host: Arc::new(Mutex::new(Some(PairedHost {
+                client: Arc::new(client),
+                principal,
+                context,
+                hello,
+                expires,
+                generation,
+                completed_pairing: None,
+            }))),
+            attempts: Arc::new(Mutex::new(BTreeSet::new())),
+            read_owner,
+            generation,
+            expires,
+        };
+        route.check_bootstrap_current_until(budget, deadline)?;
+        Ok(route)
+    }
     /// Bootstrap alone can construct this actual completion observation.
     /// Publication checks route ownership and active grant under the same
     /// route lock, so a replacement cannot inherit another exchange's receipt.
@@ -2694,6 +3188,36 @@ mod tests {
         assert_send_sync::<HostBridge>();
         assert_send_sync::<CalibrationHostRoute>();
         assert_send_sync::<CompletedPairingObservation>();
+    }
+    #[test]
+    fn bootstrap_reply_deadline_and_original_cancellation_stop_before_host_io() {
+        let (bridge, witness) = local_route_witness();
+        let host = bridge.state.lock().unwrap().hosts[&witness.context_id].clone();
+        let route = BootstrapHostRoute {
+            generation: host.generation,
+            expires: host.expires,
+            host: Arc::new(Mutex::new(Some(host))),
+            attempts: Arc::new(Mutex::new(BTreeSet::new())),
+            read_owner: witness,
+        };
+        let budget = BootstrapBudget::new();
+        let original_deadline = budget.deadline();
+        assert_eq!(
+            route
+                .check_bootstrap_current_until(&budget, Instant::now())
+                .unwrap_err()
+                .code,
+            "TIME_BUDGET_EXCEEDED"
+        );
+        assert_eq!(budget.deadline(), original_deadline);
+        budget.clone().cancel();
+        assert_eq!(
+            route
+                .check_bootstrap_current_until(&budget, original_deadline)
+                .unwrap_err()
+                .code,
+            "CANCELLED"
+        );
     }
     fn local_route_witness() -> (HostBridge, HostContextWitness) {
         // This fixture checks local transaction fencing only. No listener or

@@ -47,6 +47,9 @@ pub struct DaemonHandles {
     /// Same opaque completed-issuance registry used by the bootstrap processor
     /// and production Provider/observer. Empty construction grants nothing.
     pub calibration: crate::calibration_execution::CalibrationRegistry,
+    /// Same purpose-scoped source and completed ADMIN registry shared by the
+    /// management producer and common-operation consumer.
+    pub bootstrap: crate::calibration_bootstrap::BootstrapRegistry,
     /// Explicit daemon setup locator, checked against the protected Store.
     /// Per-call sources still require current principal/project authority.
     pub configured_project: Option<ProjectId>,
@@ -214,6 +217,7 @@ impl PreparedDaemon {
             authority,
             request,
             calibration: crate::calibration_execution::CalibrationRegistry::default(),
+            bootstrap: crate::calibration_bootstrap::BootstrapRegistry::default(),
             configured_project,
             workspace,
         };
@@ -272,10 +276,11 @@ impl PreparedDaemon {
             .bind_undo_execution(handles.authority.clone(), handles.hosts.clone())
             .map_err(DaemonError::Composition)?;
         service.set_extensions(extensions);
-        let mut processor = HostBootstrapProcessor::with_calibration_registry(
+        let mut processor = HostBootstrapProcessor::with_registries(
             handles.hosts.clone(),
             handles.authority.clone(),
             handles.calibration.clone(),
+            handles.bootstrap.clone(),
         )
         .map_err(|_| {
             DaemonError::Composition(ServiceError::new(

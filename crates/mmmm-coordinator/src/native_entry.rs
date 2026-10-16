@@ -13,7 +13,8 @@ use crate::{
     lifecycle::{Coordinator, CoordinatorError},
     local_setup::{
         LocalHostSetup, LocalReadPolicySetupError, LocalSetupError, register_local_host_setup,
-        register_local_host_setup_with_read_policy,
+        register_local_host_setup_with_calibration_scope,
+        register_local_host_setup_with_read_policy, validate_calibration_base_scope,
     },
     native_import_files::{ImportReadBudget, InputRole, read_selected, validate_selection},
     native_source_ingress::{
@@ -108,6 +109,11 @@ pub enum EntryError {
         record: Box<HostReadPolicyRecord>,
         delivery: Box<EntryError>,
     },
+    HostSetupCommitted {
+        project: ProjectId,
+        scope_digest: Sha256Digest,
+        delivery: Box<EntryError>,
+    },
     CatalogSourceUsesCommitted {
         snapshot: Box<CatalogSourceUseSnapshot>,
         delivery: Box<EntryError>,
@@ -184,6 +190,8 @@ impl std::fmt::Display for EntryError {
             Self::HostReadPolicyCommitted { record, delivery } => write!(f,
                 "Host read policy {} for Project {} was committed and retained; result delivery failed: {delivery}",
                 record.policy_digest(), record.project_id()),
+            Self::HostSetupCommitted { project, scope_digest, delivery } => write!(f,
+                "Host setup scope {scope_digest} for Project {project} was committed and retained; result delivery failed: {delivery}"),
             Self::CatalogSourceUsesCommitted { snapshot, delivery } => write!(f,
                 "Catalog source use {} at generation {} for Project {} was committed and retained; result delivery failed: {delivery}",
                 snapshot.state_digest(), snapshot.generation(), snapshot.project_id()),
@@ -213,6 +221,7 @@ impl std::error::Error for EntryError {
             Self::Initialized { delivery, .. } => Some(delivery.as_ref()),
             Self::SourcesCommitted { delivery, .. } => Some(delivery.as_ref()),
             Self::HostReadPolicyCommitted { delivery, .. } => Some(delivery.as_ref()),
+            Self::HostSetupCommitted { delivery, .. } => Some(delivery.as_ref()),
             Self::CatalogSourceUsesCommitted { delivery, .. } => Some(delivery.as_ref()),
             Self::CompatibilityProfileCommitted { delivery, .. } => Some(delivery.as_ref()),
             Self::CalibrationSelectionCommitted { delivery, .. } => Some(delivery.as_ref()),
@@ -251,6 +260,7 @@ enum Command {
         destination: PathBuf,
         scope: Value,
         read_policy: Option<HostReadPolicy>,
+        calibration_revision: Option<Sha256Digest>,
     },
     SourceImport {
         root: PathBuf,
@@ -279,6 +289,7 @@ enum Command {
     CalibrationPlan {
         root: PathBuf,
         selection: mmmm_application::SetupSelection,
+        bootstrap: bool,
     },
     HostBridge {
         approval: bool,
@@ -386,7 +397,11 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
                 });
             }
         }
-        Command::CalibrationPlan { root, selection } => {
+        Command::CalibrationPlan {
+            root,
+            selection,
+            bootstrap,
+        } => {
             use crate::{
                 credential::CredentialRef,
                 host_relay::CoordinatorLocator,
@@ -397,12 +412,18 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
             let endpoint = host_relay::ExistingCoordinator
                 .ensure_endpoint(&root, &selection.project_id, deadline)
                 .map_err(EntryError::Relay)?;
+            let purpose = if bootstrap {
+                crate::calibration_bootstrap::PURPOSE
+            } else {
+                crate::peer_management::CALIBRATION_PLAN_PURPOSE
+            };
+            let nonce = format!("calibration-plan-{}", mmmm_contracts::canonical_digest(&json!({
+                "purpose":purpose,"projectId":selection.project_id,"expectedRevision":selection.expected_revision,"contextId":selection.context_id
+            })).map_err(|_| EntryError::Arguments)?);
             let offer = PublicFrame::from_value(json!({
                 "kind":"native_calibration_plan_offer", "protocolVersion":mmmm_contracts::CONTRACT_VERSION,
-                "nonce":format!("calibration-plan-{}", mmmm_contracts::canonical_digest(&json!({
-                    "projectId":selection.project_id,"expectedRevision":selection.expected_revision,"contextId":selection.context_id
-                })).map_err(|_| EntryError::Arguments)?),
-                "purpose":crate::peer_management::CALIBRATION_PLAN_PURPOSE, "dataRoot":root,
+                "nonce":nonce,
+                "purpose":purpose, "dataRoot":root,
                 "projectId":selection.project_id, "expectedRevision":selection.expected_revision, "contextId":selection.context_id
             })).map_err(|_| EntryError::Arguments)?;
             let offer =
@@ -418,6 +439,8 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
             .map_err(EntryError::Peer)?;
             if !prepared.is_calibration_plan()
                 || prepared.value()["projectId"] != selection.project_id.as_str()
+                || prepared.value()["purpose"] != purpose
+                || prepared.value()["nonce"] != nonce
             {
                 return Err(EntryError::OutputInvalid);
             }
@@ -434,7 +457,8 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
             )
             .map_err(|_| EntryError::OutputInvalid)?;
             let checkpoint_failed = prepared.value()["outcome"] == "committed_checkpoint_failed";
-            let result = json!({"kind":"calibration_plan_prepared", "projectId":selection.project_id,
+            let result = json!({"kind":if bootstrap {"calibration_bootstrap_plan_prepared"} else {"calibration_plan_prepared"},
+                "purpose":purpose,"projectId":selection.project_id,
                 "planId":plan,"planHash":hash,"outcome":prepared.value()["outcome"]});
             let delivery = pending
                 .complete_calibration_plan()
@@ -628,6 +652,7 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
             destination,
             scope,
             read_policy,
+            calibration_revision,
         } => {
             let executable = std::env::current_exe().map_err(|_| EntryError::Arguments)?;
             let request = LocalHostSetup {
@@ -637,7 +662,32 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
                 project,
                 scope,
             };
-            if let Some(policy) = read_policy {
+            if let Some(expected_revision) = calibration_revision {
+                let deadline = started + Duration::from_secs(15);
+                let (setup, record, scope_digest) =
+                    register_local_host_setup_with_calibration_scope(
+                        StoreConfig::new(root),
+                        request,
+                        &expected_revision,
+                        read_policy.as_ref(),
+                        deadline,
+                    )
+                    .map_err(EntryError::ReadPolicySetup)?;
+                let confirmation = json!({"kind":"host_setup_registered","projectId":setup.project_id,
+                    "executableSha256":setup.executable_sha256,"hostArtifactDigest":setup.host_artifact_digest,
+                    "scopeDigest":scope_digest,"expectedProjectRevision":expected_revision,
+                    "readPolicyDigest":record.as_ref().map(HostReadPolicyRecord::policy_digest)});
+                let delivered = if let Some(record) = record {
+                    deliver_host_read_policy(record, || output(&confirmation, deadline))
+                } else {
+                    output(&confirmation, deadline)
+                };
+                delivered.map_err(|delivery| EntryError::HostSetupCommitted {
+                    project: setup.project_id,
+                    scope_digest,
+                    delivery: Box::new(delivery),
+                })?;
+            } else if let Some(policy) = read_policy {
                 let deadline = started + Duration::from_secs(15);
                 let (setup, record) = register_local_host_setup_with_read_policy(
                     StoreConfig::new(root),
@@ -882,11 +932,14 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
             | "compatibility-profile-approve"
             | "calibration-approve"
             | "calibration-plan"
+            | "calibration-bootstrap-plan"
     ) {
         return Ok(None);
     }
-    if matches!(command, "calibration-approve" | "calibration-plan")
-        && (args.len() != 9 || args.iter().any(|arg| arg.len() > 4096))
+    if matches!(
+        command,
+        "calibration-approve" | "calibration-plan" | "calibration-bootstrap-plan"
+    ) && (args.len() != 9 || args.iter().any(|arg| arg.len() > 4096))
     {
         return Err(EntryError::Arguments);
     }
@@ -906,10 +959,19 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
     let mut shape_modes = Vec::new();
     let mut catalog_mods = Vec::new();
     let mut catalog_selector_bytes = 0usize;
-    for pair in args[1..].chunks(2) {
-        if pair.len() != 2 {
-            return Err(EntryError::Arguments);
+    let mut calibration_bootstrap_scope = false;
+    let mut index = 1;
+    while index < args.len() {
+        if command == "host-setup" && args[index] == "--calibration-bootstrap-scope" {
+            if calibration_bootstrap_scope {
+                return Err(EntryError::Arguments);
+            }
+            calibration_bootstrap_scope = true;
+            index += 1;
+            continue;
         }
+        let pair = args.get(index..index + 2).ok_or(EntryError::Arguments)?;
+        index += 2;
         if command == "host-setup" && pair[0] == "--shape-mode" {
             if shape_modes.len() >= 4 || pair[1].len() > 16 || shape_modes.contains(&pair[1]) {
                 return Err(EntryError::HostReadPolicyArguments);
@@ -978,8 +1040,9 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
         return Err(EntryError::Arguments);
     }
     let parsed = match command {
-        "calibration-plan" => Command::CalibrationPlan {
+        "calibration-plan" | "calibration-bootstrap-plan" => Command::CalibrationPlan {
             root,
+            bootstrap: command == "calibration-bootstrap-plan",
             selection: mmmm_application::SetupSelection {
                 project_id: ProjectId::new(
                     options.remove("--project").ok_or(EntryError::Arguments)?,
@@ -1044,6 +1107,16 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
             }
         }
         "host-setup" => {
+            let calibration_revision = match (
+                calibration_bootstrap_scope,
+                options.remove("--expected-revision"),
+            ) {
+                (true, Some(revision)) => {
+                    Some(Sha256Digest::new(revision).map_err(|_| EntryError::Arguments)?)
+                }
+                (false, None) => None,
+                _ => return Err(EntryError::Arguments),
+            };
             let observation = options.remove("--native-observation");
             if observation.is_some_and(|value| value != "user_local_only") {
                 return Err(EntryError::HostReadPolicyArguments);
@@ -1073,6 +1146,10 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
                 },
             )
             .map_err(|_| EntryError::Arguments)?;
+            if calibration_revision.is_some() {
+                validate_calibration_base_scope(&scope, &project)
+                    .map_err(|_| EntryError::Arguments)?;
+            }
             if !jar.is_absolute() || !destination.is_absolute() {
                 return Err(EntryError::Arguments);
             }
@@ -1083,6 +1160,7 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
                 destination,
                 scope,
                 read_policy,
+                calibration_revision,
             }
         }
         "source-import" => {
@@ -1736,8 +1814,28 @@ mod tests {
         ]);
         assert!(matches!(
             parse(&planning),
-            Ok(Some(Command::CalibrationPlan { .. }))
+            Ok(Some(Command::CalibrationPlan {
+                bootstrap: false,
+                ..
+            }))
         ));
+        let mut bootstrap_planning = planning.clone();
+        bootstrap_planning[0] = "calibration-bootstrap-plan".into();
+        assert!(matches!(
+            parse(&bootstrap_planning),
+            Ok(Some(Command::CalibrationPlan {
+                bootstrap: true,
+                ..
+            }))
+        ));
+        for extra in [
+            ["--purpose", "numeric_calibration_bootstrap/1"],
+            ["--admin", "true"],
+        ] {
+            let mut forged = bootstrap_planning.clone();
+            forged.extend(args(&extra));
+            assert!(parse(&forged).is_err());
+        }
         for (position, replacement) in [
             (1, "--principal"),
             (3, "--plan-json"),
@@ -1754,6 +1852,12 @@ mod tests {
         let mut duplicate_plan = planning;
         duplicate_plan[7] = "--project".into();
         assert!(matches!(parse(&duplicate_plan), Err(EntryError::Arguments)));
+        let mut duplicate_bootstrap = bootstrap_planning;
+        duplicate_bootstrap[7] = "--project".into();
+        assert!(matches!(
+            parse(&duplicate_bootstrap),
+            Err(EntryError::Arguments)
+        ));
         let calibration = args(&[
             "calibration-approve",
             "--data-root",
@@ -1848,6 +1952,7 @@ mod tests {
             parse(&base()),
             Ok(Some(Command::Setup {
                 read_policy: None,
+                calibration_revision: None,
                 ..
             }))
         ));
@@ -1914,6 +2019,69 @@ mod tests {
             args(&["start", "--data-root", root(), "--project", "project-test"]);
         other_command.extend(args(&["--shape-mode", "survival"]));
         assert!(parse(&other_command).is_err());
+        let revision = "a".repeat(64);
+        let mut bootstrap = base();
+        bootstrap[10] = json!({"projectId":"project-test","resourceIds":[],"objectIds":[],"regions":[],"externalTargetIds":[]}).to_string();
+        bootstrap.push("--calibration-bootstrap-scope".into());
+        bootstrap.extend(args(&["--expected-revision", &revision]));
+        let Some(Command::Setup {
+            scope,
+            calibration_revision: Some(selected),
+            read_policy: None,
+            ..
+        }) = parse(&bootstrap).unwrap()
+        else {
+            panic!("explicit bootstrap scope must keep a selected Project revision");
+        };
+        assert_eq!(selected.as_str(), revision);
+        assert_eq!(scope["externalTargetIds"], json!([]));
+        for extra in [
+            vec!["--calibration-bootstrap-scope"],
+            vec!["--calibration-bootstrap-scope", "true"],
+            vec!["--expected-revision", &revision],
+        ] {
+            let mut invalid = bootstrap.clone();
+            invalid.extend(args(&extra));
+            assert!(parse(&invalid).is_err());
+        }
+        let mut no_revision = bootstrap.clone();
+        no_revision.truncate(no_revision.len() - 2);
+        assert!(parse(&no_revision).is_err());
+        let mut no_flag = bootstrap.clone();
+        no_flag.remove(11);
+        assert!(parse(&no_flag).is_err());
+        for (field, values) in [
+            ("externalTargetIds", json!(["outside-target"])),
+            (
+                "externalTargetIds",
+                json!(["duplicate-target", "duplicate-target"]),
+            ),
+            (
+                "resourceIds",
+                json!(["duplicate-resource", "duplicate-resource"]),
+            ),
+        ] {
+            let mut invalid = bootstrap.clone();
+            let mut scope: Value = mmmm_contracts::parse_json(invalid[10].as_bytes()).unwrap();
+            scope[field] = values;
+            invalid[10] = scope.to_string();
+            assert!(parse(&invalid).is_err());
+        }
+        let mut other_command =
+            args(&["start", "--data-root", root(), "--project", "project-test"]);
+        other_command.push("--calibration-bootstrap-scope".into());
+        assert!(parse(&other_command).is_err());
+        let error = EntryError::HostSetupCommitted {
+            project: ProjectId::new("project-test").unwrap(),
+            scope_digest: Sha256Digest::new(revision).unwrap(),
+            delivery: Box::new(EntryError::OutputInvalid),
+        };
+        assert!(error.to_string().contains("committed and retained"));
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .is::<EntryError>()
+        );
     }
     #[test]
     fn committed_locator_survives_failed_delivery_and_expired_startup_is_rejected() {

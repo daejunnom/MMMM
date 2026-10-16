@@ -12,7 +12,8 @@ const USAGE: &str = "Usage:\n\
   mmmm init --data-root <absolute root> --name <name> --target-profile <profile>\n\
   mmmm start --data-root <absolute root> --project <projectId>\n\
   mmmm daemon --data-root <absolute root> --project <projectId> [--lifetime-seconds <1..1800>]\n\
-  mmmm host-setup --data-root <absolute root> --project <projectId> --host-jar <absolute jar> --output <absolute config> --scope-json <json> [--shape-mode survival|creative|adventure|spectator ...] [--native-observation user_local_only]\n\
+  mmmm host-setup --data-root <absolute root> --project <projectId> --host-jar <absolute jar> --output <absolute config> --scope-json <json> [--shape-mode survival|creative|adventure|spectator ...] [--native-observation user_local_only] [--calibration-bootstrap-scope --expected-revision <sha256>]\n\
+    Calibration bootstrap scope requires an empty externalTargetIds array in the input scope and the current Project revision. It selects the fixed calibration targets for host setup; game administrator approval and a later plan.apply request remain separate.\n\
     Shape modes are explicit unique selections. Native observations need their own opt-in; absent policy flags leave the corresponding sources unavailable. The same protected Store retains immutable policy; mmmm-host.json contains public locators only.\n\
     A changed policy for the same native owner/Project/host artifact is refused. An existing public config is preserved; a policy committed before config/output failure remains retained and is reported by digest.\n\
   mmmm source-import --data-root <absolute root> --project <projectId> --expected-revision <sha256> <source inputs>\n\
@@ -24,8 +25,10 @@ const USAGE: &str = "Usage:\n\
   mmmm manual-import --data-root <absolute root> --project <projectId> --expected-revision <sha256> --context <contextId> --selection-resource <FN24 resourceId> --source-map-file <absolute JSON path> --source-map-resource <resourceId> --edit-payload-file <absolute JSON path> --edit-payload-resource <resourceId> --allow-delta <kind,instanceId,nodeId> ...\n\
     Use the active daemon and its original exported selection. Static delta choices create a proposal only; source rights remain unknown and automatic bake stays unavailable without an actual provider. Selected files are bounded reads, while Project head and user originals are preserved.\n\
   mmmm calibration-plan --data-root <absolute root> --project <projectId> --expected-revision <sha256> --context <contextId>\n\
+  mmmm calibration-bootstrap-plan --data-root <absolute root> --project <projectId> --expected-revision <sha256> --context <contextId>\n\
+    Bootstrap planning selects the fixed source installation and fresh state initialization purpose. Numeric calibration planning selects the separate normative47 execution purpose.\n\
   mmmm calibration-approve --data-root <absolute root> --project <projectId> --plan-id <planId> --plan-hash <sha256>\n\
-    Select one existing frozen normative47 plan through the active daemon's same-user native peer. The daemon checks its original Project revision against the same protected Store; this command does not reopen or replace the daemon owner.\n\
+    Select one existing frozen numeric calibration or calibration bootstrap plan through the active daemon's same-user native peer. The daemon checks its original Project revision against the same protected Store; this command does not reopen or replace the daemon owner.\n\
     This commits the native owner's selection only. The currently paired game administrator must separately approve that exact plan and complete the private handshake. This grants no general write profile or caller-supplied administrator authority.\n\
   mmmm compatibility-profile-approve --data-root <absolute root> --project <projectId> --expected-revision <sha256> --profile-resource-id <resourceId> --profile-resource-sha256 <raw sha256> --approved-profile-ref <reference> --artifact-sha256 <sha256> --interface-sha256 <sha256>\n\
     This cold native owner command approves one existing Project profile resource (1..65536 bytes) for local_use_only. Import the original profile bytes first; raw resource SHA-256, canonical profile digest, implementation artifact digest and interface digest remain separate.\n\
@@ -118,6 +121,15 @@ impl fmt::Display for PublicEntryError<'_> {
                 "Host read policy {} for Project {} was committed and retained; result delivery failed: {}",
                 record.policy_digest(),
                 record.project_id(),
+                PublicEntryError(delivery)
+            ),
+            EntryError::HostSetupCommitted {
+                project,
+                scope_digest,
+                delivery,
+            } => write!(
+                f,
+                "Host setup for Project {project} with scope {scope_digest} was committed and retained; result delivery failed: {}",
                 PublicEntryError(delivery)
             ),
             EntryError::CatalogSourceUsesCommitted { snapshot, delivery } => write!(

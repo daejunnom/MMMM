@@ -6,11 +6,12 @@ use super::*;
 use crate::{
     local_setup::{
         LocalHostSetup, LocalSetupError, finish_read_policy_setup_for_test,
-        register_local_host_setup, register_local_host_setup_with_read_policy,
+        register_local_host_setup, register_local_host_setup_with_calibration_scope,
+        register_local_host_setup_with_read_policy,
     },
     setup::{PublicHostSetup, SetupError},
 };
-use mmmm_contracts::{ProjectId, TargetProfileId};
+use mmmm_contracts::{ProjectId, Sha256Digest, TargetProfileId, projected_digest};
 use mmmm_runtime::storage::StoreConfig;
 use serde_json::json;
 use std::{
@@ -102,6 +103,34 @@ impl Root {
                 None,
             ))
         }
+    }
+    fn calibration_setup(
+        &self,
+        project: &ProjectId,
+        revision: &Sha256Digest,
+        scope: Value,
+        policy: Option<&HostReadPolicy>,
+        deadline: Instant,
+    ) -> Result<
+        (PublicHostSetup, Option<HostReadPolicyRecord>, Sha256Digest),
+        crate::local_setup::LocalReadPolicySetupError,
+    > {
+        let executable = std::env::current_exe().unwrap();
+        let jar = self.0.join("selected-host.jar");
+        let destination = self.0.join("mmmm-host.json");
+        register_local_host_setup_with_calibration_scope(
+            self.config(),
+            LocalHostSetup {
+                executable: &executable,
+                installed_host_jar: &jar,
+                destination: &destination,
+                project: project.clone(),
+                scope,
+            },
+            revision,
+            policy,
+            deadline,
+        )
     }
 }
 fn plain_tree(path: &Path, root: &Path, count: &mut usize) -> bool {
@@ -336,4 +365,124 @@ fn canonical_project_without_actual_native_registration_cannot_approve_policy() 
         Some(StorageError::NotFound("Native Project owner registration"))
     ));
     assert!(!root.0.join("mmmm-host.json").exists());
+    let revision = projected_digest("Project", &value).unwrap();
+    let error = root
+        .calibration_setup(&project, &revision, Root::scope(&project), None, deadline())
+        .unwrap_err();
+    assert!(error.retained_setup.is_none() && error.retained_policy.is_none());
+    assert!(matches!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<StorageError>(),
+        Some(StorageError::NotFound("Native Project owner registration"))
+    ));
+    assert!(!root.0.join("mmmm-host.json").exists());
+}
+
+#[test]
+fn explicit_calibration_scope_registers_only_canonical_targets_and_checks_original_project_head() {
+    let root = Root::new();
+    let project = root.project();
+    let original_project = root.open().project(&project).unwrap();
+    let revision = projected_digest("Project", &original_project).unwrap();
+    let mut base = Root::scope(&project);
+    base["resourceIds"] = json!(["resource-explicit-existing"]);
+    let mut expected_scope = base.clone();
+    expected_scope["externalTargetIds"] =
+        json!(crate::calibration_bootstrap::normative_bootstrap_target_ids().unwrap());
+    let (setup, no_policy, scope_digest) = root
+        .calibration_setup(&project, &revision, base.clone(), None, deadline())
+        .unwrap();
+    assert!(no_policy.is_none());
+    assert_eq!(setup.scope, expected_scope);
+    assert_eq!(
+        scope_digest,
+        mmmm_contracts::canonical_digest(&expected_scope).unwrap()
+    );
+    assert_eq!(
+        setup.scope["externalTargetIds"].as_array().unwrap().len(),
+        95
+    );
+    assert!(matches!(
+        retained(&root.open(), &setup),
+        Err(StorageError::NotFound(_))
+    ));
+    let before = fs::read(root.0.join("mmmm-host.json")).unwrap();
+    let repeated = root
+        .calibration_setup(&project, &revision, base.clone(), None, deadline())
+        .unwrap_err();
+    assert!(matches!(
+        repeated.failure,
+        LocalSetupError::PublicConfigNotWritten
+    ));
+    assert_eq!(
+        repeated.retained_setup.as_ref().unwrap().scope,
+        expected_scope
+    );
+    assert!(repeated.retained_policy.is_none());
+    assert!(
+        std::error::Error::source(&repeated)
+            .unwrap()
+            .is::<SetupError>()
+    );
+    assert_eq!(fs::read(root.0.join("mmmm-host.json")).unwrap(), before);
+    let mut advanced = original_project;
+    advanced["name"] = json!("Advanced explicit host setup fixture");
+    advanced["revision"] = json!(projected_digest("Project", &advanced).unwrap());
+    root.open()
+        .save_project(&advanced, Some(&revision))
+        .unwrap();
+    let stale = root
+        .calibration_setup(&project, &revision, base.clone(), None, deadline())
+        .unwrap_err();
+    assert!(stale.retained_setup.is_none() && stale.retained_policy.is_none());
+    assert!(matches!(
+        std::error::Error::source(&stale)
+            .unwrap()
+            .downcast_ref::<StorageError>(),
+        Some(StorageError::Conflict(
+            "Explicit calibration host setup Project revision"
+        ))
+    ));
+    assert_eq!(fs::read(root.0.join("mmmm-host.json")).unwrap(), before);
+    let current = projected_digest("Project", &advanced).unwrap();
+    let expired = root
+        .calibration_setup(&project, &current, base, None, Instant::now())
+        .unwrap_err();
+    assert!(matches!(expired.failure, LocalSetupError::Deadline));
+    assert!(expired.retained_setup.is_none() && expired.retained_policy.is_none());
+
+    let legacy = Root::new();
+    let project = legacy.project();
+    let revision = projected_digest("Project", &legacy.open().project(&project).unwrap()).unwrap();
+    let (old_setup, _) = legacy.selected_setup(&project, None).unwrap();
+    let before = fs::read(legacy.0.join("mmmm-host.json")).unwrap();
+    let conflict = legacy
+        .calibration_setup(&project, &revision, Root::scope(&project), None, deadline())
+        .unwrap_err();
+    assert!(matches!(
+        conflict.failure,
+        LocalSetupError::ReadPolicyConflict
+    ));
+    assert!(conflict.retained_setup.is_none() && conflict.retained_policy.is_none());
+    assert_eq!(old_setup.scope["externalTargetIds"], json!([]));
+    assert_eq!(fs::read(legacy.0.join("mmmm-host.json")).unwrap(), before);
+
+    let selected = Root::new();
+    let project = selected.project();
+    let revision =
+        projected_digest("Project", &selected.open().project(&project).unwrap()).unwrap();
+    let (setup, record, scope_digest) = selected
+        .calibration_setup(
+            &project,
+            &revision,
+            Root::scope(&project),
+            Some(&policy()),
+            deadline(),
+        )
+        .unwrap();
+    let record = record.unwrap();
+    assert_eq!(record.approved_scope_digest(), &scope_digest);
+    assert_eq!(retained(&selected.open(), &setup).unwrap(), record);
+    assert_eq!(record.policy(), &policy());
 }

@@ -56,6 +56,29 @@ impl PublicHostSetup {
         scope: Value,
     ) -> Result<Self, SetupError> {
         let deadline = Instant::now() + Duration::from_secs(10);
+        Self::create_with_deadline(
+            executable,
+            installed_host_jar,
+            data_root,
+            project_id,
+            scope,
+            deadline,
+        )
+    }
+    /// Explicit native setup preserves its original finite caller deadline
+    /// through both exact artifact reads. The path and hash checks are shared
+    /// with the default constructor and do not issue a host or game grant.
+    pub fn create_with_deadline(
+        executable: &Path,
+        installed_host_jar: &Path,
+        data_root: &Path,
+        project_id: ProjectId,
+        scope: Value,
+        deadline: Instant,
+    ) -> Result<Self, SetupError> {
+        if Instant::now() >= deadline {
+            return Err(SetupError::Timeout);
+        }
         let executable = verified_regular_path(executable, ArtifactKind::Executable)?;
         let jar = verified_regular_path(installed_host_jar, ArtifactKind::HostJar)?;
         verify_local_path(data_root, true)?;

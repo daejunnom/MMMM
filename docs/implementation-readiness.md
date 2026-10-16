@@ -2073,6 +2073,55 @@ pin·frame 한도·두 fresh preflight·만료 reply의 I/O 전 중단 회귀도
 게임 ADMIN·Mixin/JNI 적중·최종 3OS 및 client 인수는 아직 미실행이다. closed file facts를
 이후 root의 identity 연속성이나 loaded 함수의 source 인과 증명으로 바꾸지 않는다.
 
+## 최초 설치의 공통 계획과 작업 원장 연결
+
+Rust 공통 bootstrap은 같은 daemon의 하나의 제한된 registry를 management·Provider·
+observer가 공유한다. 실제 native owner·현재 Project revision과 원 요청을 확인한 뒤
+정본 48개 source와 recipe를 같은 CAS에 보존하고 기존 Application setup/freeze로 계획을
+만든다. CLI의 `calibration-bootstrap-plan`은 고정 purpose만 선택한다. host-setup의 명시
+opt-in은 빈 externalTargetIds 입력에 정본 95개 target을 채울 뿐이며, owner 선택·게임
+ADMIN의 실제 ACK/EOF 완료·새 plan.apply 요청은 각각 별도 조건이다. 일반 numeric route와
+write profile은 확대하지 않는다.
+
+실제 before는 완료된 private route에서 새로 얻어 operation에 보존하고, capture 뒤와
+intent 직전에도 새 관측으로 확인한다. 공통 ProviderPort의 optional batch 경계는 bootstrap
+preflight마다 실제 95-target 관측 한 번을 반환하고 Application이 원 순서와 phase expected를
+직접 비교한다. 일반 provider는 None으로 기존 개별 fail-fast 루프를 유지한다. 원 durable
+Invocation의 raw encode_json SHA와 길이는 canonical capture-map key와 구분하며, 실제
+consuming RPC 전 sticky attempt를 남긴다. 원 host 응답은 후행 현재성 검사보다 먼저 CAS에
+보존하고 원 실패·후행 취소/철회 실패를 함께 남긴다. management의 더 짧은 reply 기한도
+원 cancel을 유지하며 실제 RPC deadline까지 전달한다.
+
+`493`의 관련 unit 결과와 입력 pin은 앞 절에 기록했다. 독립 재리뷰에서 이전 raw/canonical
+혼동·반복 관측·reply 기한 누락 세 결함은 해소됐으며 새 확정 P0–P2는 없었다. 후속 `494`
+Clippy 진단은 동작을 유지하는 두 borrow 구조체와 let-chain 두 곳으로 교정했고 `498`의
+명시 5파일 format 뒤 `499`에서 Application/Coordinator/CLI/kernel all-target strict가
+통과했다. command 0·41,327 ms·Job commit peak 960,348,160 bytes·7 process·최대 gap
+151 ms이며 자연 종료·drain·완전한 출력·export·scratch 정리·lease 해제다. `493`은 lint
+교정 전의 unit 실행이며, 교정 후 unit 전체를 다시 실행한 것으로 표시하지 않는다.
+
+고정 `bfc509a`의 Windows JVM `497`은 입력 203개가 전후 같았고 manifest SHA는
+`59ad6e90e12310ac32bc0d47b23ea31ea6c1443d76fef4a2118f215854d39ab5`였다.
+definition-observer 예외의 nonserializable receipt 필드 두 개가 serial 경고를 내어 실제
+compileJava가 실패했고 나머지 dependency task는 실행되지 않았다. command 1·52,697 ms·
+Job commit peak 1,341,911,040 bytes·6 process·최대 gap 145 ms이며 자연 종료·drain·
+완전한 출력·export·scratch 정리·lease 해제를 별도로 확인했다. 두 필드의 프로세스 내
+보존은 유지하며 transient로 교정했고 새 JVM 검증 전이다. 전체 11 task나 새 JNI header
+검사를 성공으로 기록하지 않는다.
+
+같은 source의 Rust CI 84 (`38816348469`)는 세 OS의 tests 단계 성공, Windows job 성공,
+Linux/macOS lint 및 집계 실패를 관측했다. 두 원 ZIP의 byte/SHA를 API metadata와 대조한
+뒤 실제 clippy stderr에서 Windows 테스트 전용 Component import 한 건을 확인했다.
+그 import를 cfg(all(test, windows))로 좁혔고 Unix의 실제 재검증은 후속 CI 대상이다.
+JVM CI 75 (`38816348441`)는 세 OS와 집계 실패, native observer 단계 skipped다.
+이 metadata 관측을 새 원 JVM ZIP 감사로 확대하지 않는다.
+
+reload는 마지막 효과이며 원 route가 종료된 결과를 성공으로 바꾸지 않는다. 현재 새
+pairing을 통한 readonly reconcile은 unavailable이며 실제 original-result capsule과
+원 operation의 관측 연결을 추가해야 한다. 새 pairing의 현재 파일·상태가 기대와 같아도
+원 ProviderResult나 추가 효과 가능성 해소를 합성하지 않고 원 journal의 fence를 유지한다.
+scene/animation 발급자, DataPack calibration 및 실제 target-profile 생산자도 후속 구현이다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

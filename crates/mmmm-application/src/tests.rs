@@ -147,6 +147,12 @@ struct TargetChange {
     before: Vec<u8>,
     after: Vec<u8>,
 }
+#[derive(Clone, Copy)]
+enum PreconditionBatchMode {
+    Live,
+    Empty,
+    DriftSecond,
+}
 struct TargetState {
     targets: BTreeMap<String, Vec<u8>>,
     invocations: BTreeMap<String, TargetChange>,
@@ -190,6 +196,9 @@ struct TargetState {
     last_operation_scope: Option<WriteScope>,
     raw_failed_summary_metadata: Option<bool>,
     legacy_history_uncovered: Option<bool>,
+    precondition_batch_mode: Option<PreconditionBatchMode>,
+    precondition_batch_calls: usize,
+    single_precondition_calls: usize,
 }
 impl TargetState {
     fn new() -> Self {
@@ -236,6 +245,9 @@ impl TargetState {
             last_operation_scope: None,
             raw_failed_summary_metadata: None,
             legacy_history_uncovered: None,
+            precondition_batch_mode: None,
+            precondition_batch_calls: 0,
+            single_precondition_calls: 0,
         }
     }
 }
@@ -477,12 +489,45 @@ impl ProviderPort for Provider {
         precondition: &Value,
         _context: &Value,
     ) -> AppResult<Sha256Digest> {
-        let target = self.target.borrow();
+        let mut target = self.target.borrow_mut();
+        target.single_precondition_calls += 1;
         let bytes = target
             .targets
             .get(precondition["subject"].as_str().unwrap())
             .unwrap();
         Ok(raw_digest(bytes))
+    }
+    fn observe_plan_preconditions_retained_with_store(
+        &mut self,
+        _store: &mut DurableStore,
+        _plan: &Value,
+        _step: &Value,
+        conditions: &[&Value],
+        _context: &Value,
+    ) -> AppResult<Option<Vec<Sha256Digest>>> {
+        let mut target = self.target.borrow_mut();
+        let Some(mode) = target.precondition_batch_mode else {
+            return Ok(None);
+        };
+        target.precondition_batch_calls += 1;
+        if matches!(mode, PreconditionBatchMode::Empty) {
+            return Ok(Some(vec![]));
+        }
+        if matches!(mode, PreconditionBatchMode::DriftSecond)
+            && target.precondition_batch_calls == 2
+        {
+            target
+                .targets
+                .insert(TARGET.into(), b"external-edit-after-capture".to_vec());
+        }
+        Ok(Some(
+            conditions
+                .iter()
+                .map(|condition| {
+                    raw_digest(&target.targets[condition["subject"].as_str().unwrap()])
+                })
+                .collect(),
+        ))
     }
     fn verify_dependencies(&mut self, pins: &[Value], _context: &Value) -> AppResult<()> {
         assert!(pins.is_empty());
@@ -2357,6 +2402,83 @@ fn legacy_failed_provider_body_remains_visible_after_new_summary_markers_are_add
     let mut fixture = fixture.reopen();
     assert_eq!(fixture.get(&reconciled).unwrap(), reconciled);
     assert_eq!(fixture.target.borrow().dispatches, 1);
+}
+
+#[test]
+fn precondition_batches_are_fresh_after_capture_and_keep_common_drift_checks() {
+    // Reuse the existing fake target and real SQLite/CAS fixture. The second
+    // batch edits the target after capture; this is no native/game approval.
+    let mut live = Fixture::new(1);
+    let plan = live.plan();
+    live.target.borrow_mut().precondition_batch_mode = Some(PreconditionBatchMode::Live);
+    let report = live.apply(&plan, "live-precondition-batch").unwrap();
+    assert_eq!(report["state"], "succeeded");
+    assert_eq!(live.target.borrow().precondition_batch_calls, 2);
+    assert_eq!(live.target.borrow().single_precondition_calls, 0);
+    assert_eq!(live.target.borrow().captures, 1);
+    assert_eq!(live.target.borrow().dispatches, 1);
+
+    let mut drift = Fixture::new(1);
+    let plan = drift.plan();
+    drift.target.borrow_mut().precondition_batch_mode = Some(PreconditionBatchMode::DriftSecond);
+    let report = drift
+        .apply(&plan, "changed-second-precondition-batch")
+        .unwrap();
+    assert_eq!(report["state"], "failed_before_effects");
+    assert!(has_diagnostic(&report, "TARGET_DRIFT"));
+    assert_eq!(drift.target.borrow().precondition_batch_calls, 2);
+    assert_eq!(drift.target.borrow().single_precondition_calls, 0);
+    assert_eq!(drift.target.borrow().captures, 1);
+    assert_eq!(drift.target.borrow().dispatches, 0);
+    assert_eq!(
+        drift.target.borrow().targets[TARGET],
+        b"external-edit-after-capture"
+    );
+
+    let mut short = Fixture::new(1);
+    let plan = short.plan();
+    short.target.borrow_mut().precondition_batch_mode = Some(PreconditionBatchMode::Empty);
+    let report = short.apply(&plan, "short-precondition-batch").unwrap();
+    assert_eq!(report["state"], "failed_before_effects");
+    assert!(has_diagnostic(&report, "TARGET_DRIFT"));
+    assert_eq!(short.target.borrow().precondition_batch_calls, 1);
+    assert_eq!(short.target.borrow().single_precondition_calls, 0);
+    assert_eq!(short.target.borrow().captures, 0);
+    assert_eq!(short.target.borrow().dispatches, 0);
+
+    let mut fallback = Fixture::new(1);
+    let plan = fallback.plan();
+    fallback.target.borrow_mut().precondition_batch_mode = Some(PreconditionBatchMode::Empty);
+    fallback
+        .target
+        .borrow_mut()
+        .targets
+        .insert(TARGET.into(), b"external-edit".to_vec());
+    // This existing wrapper does not override the new optional method, so the
+    // trait's None path must observe the single condition and fail immediately.
+    let mut provider = DefaultRegisteredReadProvider(Provider {
+        target: fallback.target.clone(),
+        live_context: fallback.provider.live_context.clone(),
+        descriptor: fallback.provider.descriptor.clone(),
+        extra_descriptors: BTreeMap::new(),
+        codec: None,
+    });
+    let principal = fallback.principal.clone();
+    let report =
+        {
+            let mut app = fallback.app();
+            app.provider = &mut provider;
+            app.plan_apply(&principal, &json!({
+            "contractVersion":"0.2.0", "planId":plan["planId"], "planHash":plan["planHash"],
+            "contextId":plan["contextId"], "idempotencyKey":"default-none-precondition-batch"
+        })).unwrap()
+        };
+    assert_eq!(report["state"], "failed_before_effects");
+    assert!(has_diagnostic(&report, "TARGET_DRIFT"));
+    assert_eq!(fallback.target.borrow().precondition_batch_calls, 0);
+    assert_eq!(fallback.target.borrow().single_precondition_calls, 1);
+    assert_eq!(fallback.target.borrow().captures, 0);
+    assert_eq!(fallback.target.borrow().dispatches, 0);
 }
 
 #[test]

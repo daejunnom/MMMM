@@ -4,6 +4,7 @@ pub mod artifacts;
 pub mod auth;
 pub mod authority;
 pub mod bootstrap;
+pub mod calibration_bootstrap;
 pub mod calibration_execution;
 mod calibration_observer;
 mod calibration_planning;

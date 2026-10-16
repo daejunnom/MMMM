@@ -3,6 +3,7 @@
 
 use crate::{
     bootstrap::NativeWorkspacePermit,
+    calibration_bootstrap::{BootstrapRegistry, BootstrapSource},
     host::{HostBridge, HostContextWitness, HttpProviderPort},
     observer::finish_native_observation,
     service::RequestContextWitness,
@@ -20,7 +21,7 @@ use mmmm_runtime::storage::{
     project_resources::{ProjectHeadPin, ProjectSourceRpcContext, current_project_head_pin},
 };
 use serde_json::{Value, json};
-use std::{cell::RefCell, collections::BTreeSet, path::PathBuf};
+use std::{cell::RefCell, collections::BTreeSet, path::PathBuf, rc::Rc};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const MAX_PROJECT_BYTES: u64 = 8 * 1024 * 1024;
@@ -46,6 +47,28 @@ pub(crate) fn prepare_normative47_plan(
     owner: &NativeOwnerWitness,
     hosts: &HostBridge,
     selection: &SetupSelection,
+) -> AppResult<CalibrationPlanReceipt> {
+    prepare_selected_plan(app, request, owner, hosts, selection, None)
+}
+
+pub(crate) fn prepare_bootstrap_plan(
+    app: &mut Application<'_>,
+    request: &RequestContextWitness,
+    owner: &NativeOwnerWitness,
+    hosts: &HostBridge,
+    selection: &SetupSelection,
+    registry: &BootstrapRegistry,
+) -> AppResult<CalibrationPlanReceipt> {
+    prepare_selected_plan(app, request, owner, hosts, selection, Some(registry))
+}
+
+fn prepare_selected_plan(
+    app: &mut Application<'_>,
+    request: &RequestContextWitness,
+    owner: &NativeOwnerWitness,
+    hosts: &HostBridge,
+    selection: &SetupSelection,
+    bootstrap: Option<&BootstrapRegistry>,
 ) -> AppResult<CalibrationPlanReceipt> {
     request_check(request, owner)?;
     if !request
@@ -110,8 +133,25 @@ pub(crate) fn prepare_normative47_plan(
         expires_at,
         time_budget_ms: options.time_budget_ms,
         prepared: false,
+        bootstrap,
+        staged: None,
     };
     let plan = app.prepare_setup(owner.principal(), selection, &mut creator)?;
+    if let Some(registry) = bootstrap {
+        let source = creator.staged.take().ok_or_else(unavailable)?;
+        // This association adds no target effect or approval. A failure keeps
+        // the committed ordinary plan locator in the diagnostic source.
+        if let Err(cause) = registry.retain_plan(app.store, source, &plan) {
+            return Err(AppError::caused_by(
+                "SETUP_PLAN_COMMITTED",
+                "Bootstrap plan was saved before its source association failed",
+                BootstrapPlanCommitted {
+                    plan: plan.clone(),
+                    cause,
+                },
+            ));
+        }
+    }
     // No extra fallible checkpoint follows the common committed-plan postcheck.
     Ok(CalibrationPlanReceipt {
         plan_id: decode(&plan["planId"])?,
@@ -132,6 +172,8 @@ struct Creator<'a> {
     expires_at: String,
     time_budget_ms: u64,
     prepared: bool,
+    bootstrap: Option<&'a BootstrapRegistry>,
+    staged: Option<Rc<BootstrapSource>>,
 }
 impl Creator<'_> {
     fn check_local(&self) -> AppResult<()> {
@@ -175,6 +217,11 @@ impl Creator<'_> {
         store: &DurableStore,
         context: &Value,
     ) -> AppResult<(BindingId, Value, Value)> {
+        let action_id = if self.bootstrap.is_some() {
+            crate::calibration_bootstrap::ACTION
+        } else {
+            "mmmm:calibration_command_execute"
+        };
         self.check_store(store)?;
         let inventory = finish_native_observation(
             self.hosts.inventory_with_deadline(
@@ -194,9 +241,7 @@ impl Creator<'_> {
                     && provider["environment"] == context["environment"]
                     && provider["availability"] == "available"
                     && provider["actions"].as_array().is_some_and(|actions| {
-                        actions
-                            .iter()
-                            .any(|action| action["actionId"] == "mmmm:calibration_command_execute")
+                        actions.iter().any(|action| action["actionId"] == action_id)
                     })
             });
         let provider = candidates.next().ok_or_else(unavailable)?;
@@ -204,13 +249,13 @@ impl Creator<'_> {
             return Err(unavailable());
         }
         let binding: BindingId = decode(&provider["bindingId"])?;
-        let stub = json!({"bindingId":binding,"actionId":"mmmm:calibration_command_execute"});
+        let stub = json!({"bindingId":binding,"actionId":action_id});
         let descriptor = finish_native_observation(
             HttpProviderPort::with_deadline(self.hosts.clone(), self.request.budget().deadline())
                 .action_descriptor(&stub, context),
             self.check_store(store),
         )?;
-        validate_descriptor(&descriptor)?;
+        validate_descriptor_for(&descriptor, action_id)?;
         if descriptor["implementationDigest"] != provider["origin"]["sourceDigest"] {
             return Err(unavailable());
         }
@@ -294,6 +339,52 @@ impl SetupPlanningPort for Creator<'_> {
             return Err(denied());
         }
         let (binding, descriptor, dependency) = self.observed_action(store, context)?;
+        if self.bootstrap.is_some() {
+            let source = crate::calibration_bootstrap::stage_source(
+                store,
+                self.request,
+                self.owner,
+                selection,
+                &self.sealed,
+            )?;
+            let targets = source.targets();
+            let scope = WriteScope {
+                project_id: selection.project_id.clone(),
+                resource_ids: vec![],
+                object_ids: vec![],
+                regions: vec![],
+                external_target_ids: targets.to_vec(),
+            };
+            scope.validate().map_err(storage)?;
+            let action_digest = canonical_digest(&descriptor).map_err(|_| invalid())?;
+            let step = json!({"stepId":"calibration-bootstrap","bindingId":binding,"actionId":crate::calibration_bootstrap::ACTION,
+                "actionContractVersion":descriptor["contractVersion"],"actionDigest":action_digest,
+                "arguments":{"sourceBundleDigest":source.digest()},"dependsOn":[],"effect":descriptor["effect"],
+                "completion":descriptor["completion"],"recovery":descriptor["recovery"],"resourcesRead":targets,
+                "resourcesWritten":targets,"verificationRequirement":descriptor["verificationRequirement"],
+                "contextId":context["contextId"],"implementationDigest":descriptor["implementationDigest"],"resultBindings":[]});
+            mmmm_contracts::ContractValidator::shared()
+                .map_err(|_| invalid())?
+                .validate("PlanStep", &step)
+                .map_err(|_| invalid())?;
+            let preconditions = source.preconditions();
+            self.check_store(store)?;
+            self.staged = Some(source);
+            self.prepared = true;
+            return Ok(PreparedPlan {
+                contexts: vec![context.clone()],
+                scope,
+                preconditions,
+                steps: vec![step],
+                atomicity: "none".into(),
+                losses: vec![],
+                diagnostics: vec![],
+                approval_requirement: "explicit_approval".into(),
+                dependency_pins: vec![dependency],
+                expires_at: self.expires_at.clone(),
+                time_budget_ms: self.time_budget_ms,
+            });
+        }
         let facts = finish_native_observation(
             self.hosts.inspect_with_deadline(
                 principal,
@@ -436,11 +527,14 @@ fn project_steps(
     Ok((scope, steps))
 }
 fn validate_descriptor(descriptor: &Value) -> AppResult<()> {
+    validate_descriptor_for(descriptor, "mmmm:calibration_command_execute")
+}
+fn validate_descriptor_for(descriptor: &Value, action: &str) -> AppResult<()> {
     mmmm_contracts::ContractValidator::shared()
         .map_err(|_| invalid())?
         .validate("ActionDescriptor", descriptor)
         .map_err(|_| invalid())?;
-    if descriptor["actionId"] != "mmmm:calibration_command_execute"
+    if descriptor["actionId"] != action
         || !matches!(descriptor["effect"].as_str(), Some("write" | "unknown"))
         || descriptor["completion"] != "synchronous"
         || descriptor["recovery"] != "none"
@@ -450,6 +544,26 @@ fn validate_descriptor(descriptor: &Value) -> AppResult<()> {
         return Err(unavailable());
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct BootstrapPlanCommitted {
+    plan: Value,
+    cause: AppError,
+}
+impl std::fmt::Display for BootstrapPlanCommitted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Committed bootstrap plan {} / {} could not retain its protected source",
+            self.plan["planId"], self.plan["planHash"]
+        )
+    }
+}
+impl std::error::Error for BootstrapPlanCommitted {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
 }
 fn request_check(request: &RequestContextWitness, owner: &NativeOwnerWitness) -> AppResult<()> {
     request
