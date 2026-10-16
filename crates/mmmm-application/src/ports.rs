@@ -120,6 +120,22 @@ pub trait ProviderPort {
         ))
     }
     fn context(&mut self, principal: &PrincipalId, context_id: &ContextId) -> AppResult<Value>;
+    /// A trusted composition may admit a fresh read-only context for one
+    /// original durable invocation after its actual host session was replaced.
+    /// It must verify this store's original operation and retained actual host
+    /// attempt, the new pairing and its current observation authority. Public
+    /// JSON, equal digests or an old approval cannot issue this admission.
+    /// None retains the ordinary exact-session observation path; an admission
+    /// failure must be returned as an error rather than downgraded to None.
+    /// This never permits dispatch, cancellation, recovery or another mutation.
+    fn successor_observation_context_with_store(
+        &mut self,
+        _store: &mut DurableStore,
+        _principal: &PrincipalId,
+        _original: &Value,
+    ) -> AppResult<Option<Value>> {
+        Ok(None)
+    }
     /// Return the currently observed descriptor for this exact binding/action.
     fn action_descriptor(&mut self, step: &Value, context: &Value) -> AppResult<Value>;
     fn observe_precondition(

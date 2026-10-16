@@ -61,6 +61,9 @@ public final class MmmmFabricHost implements ModInitializer {
     private final Map<HostSession, Map<String, Invocation>> nativeHistory = new IdentityHashMap<>();
     private final Map<String, PendingCalibrationOffer> calibrationOffers = new HashMap<>();
     private final Map<String, PendingBootstrapOffer> bootstrapOffers = new HashMap<>();
+    // These eight actual attempts survive route retirement, but never a server instance.
+    private final Map<String, NativeCalibrationBootstrap.Attempt> bootstrapAttempts = new HashMap<>();
+    private final Map<HostSession, String> completedReadonlyPairings = new IdentityHashMap<>();
     private NativeCalibrationApproval.Runner calibrationRunner;
     private int nativeHistoryCount;
     private long nativeHistoryBytes;
@@ -96,6 +99,7 @@ public final class MmmmFabricHost implements ModInitializer {
         ServerEntityEvents.ENTITY_LOAD.register(tombstones::loaded);
         ServerEntityEvents.ENTITY_UNLOAD.register(entities::unloaded);
         ServerLifecycleEvents.SERVER_STARTED.register(current -> {
+            bootstrapAttempts.clear(); completedReadonlyPairings.clear();
             server = current;
             reloading = false;
             gameInstanceId = "game-" + UUID.randomUUID();
@@ -103,7 +107,7 @@ public final class MmmmFabricHost implements ModInitializer {
             newGeneration();
         });
         ServerLifecycleEvents.SERVER_STOPPING.register(current -> disconnect());
-        ServerLifecycleEvents.SERVER_STOPPED.register(current -> { disconnect(); tombstones.clear(); loaded.clear(); entities.clear(); reloading = false; server = null; });
+        ServerLifecycleEvents.SERVER_STOPPED.register(current -> { disconnect(); bootstrapAttempts.clear(); tombstones.clear(); loaded.clear(); entities.clear(); reloading = false; server = null; });
         ServerLifecycleEvents.START_DATA_PACK_RELOAD.register((current, resources) -> {
             // The asynchronous reload interval cannot retain an old write grant or target profile.
             if (server == current) { reloading = true; disconnect(); newGeneration(); }
@@ -785,7 +789,7 @@ public final class MmmmFabricHost implements ModInitializer {
         try {
             contexts.forEach(context -> approved.installContext(contracts, context));
             grant = new NativeCalibrationBootstrap(contracts, manifest, approved, Clock.systemUTC(), this::gameTask,
-                    this::checkBootstrapCurrent, invocation -> retainAcceptedBootstrap(approved, invocation), server, () -> player(approved), this::level);
+                    this::checkBootstrapCurrent, attempt -> retainAcceptedBootstrap(approved, attempt), server, () -> player(approved), this::level);
             approved.whenClosed(() -> { definitionCollection.retire(approved); grant.close(); });
         } catch (RuntimeException failure) { approved.close(); throw failure; }
         PairedLoopbackServer listener = null;
@@ -830,9 +834,16 @@ public final class MmmmFabricHost implements ModInitializer {
         original.run();
     }
 
-    private void retainAcceptedBootstrap(HostSession paired, Invocation invocation) {
+    private void retainAcceptedBootstrap(HostSession paired, NativeCalibrationBootstrap.Attempt attempt) {
         requireServerThread(); if (sessionRoute(paired).bootstrap() == null) throw authorityInvalid();
+        Invocation invocation = attempt.original(); attempt.requireActualOwner(server, gameInstanceId, worldId);
         synchronized (routes) {
+            NativeCalibrationBootstrap.Attempt previousAttempt = bootstrapAttempts.get(invocation.invocationId());
+            if (previousAttempt != null) {
+                if (previousAttempt != attempt) throw authorityInvalid(); return;
+            }
+            // Reject before the first effect. Unresolved history is never evicted to make room.
+            if (bootstrapAttempts.size() >= 8) throw new ContractException("CALIBRATION_BOOTSTRAP_HISTORY_FULL", "The bounded actual bootstrap history is full");
             Map<String, Invocation> retained = nativeHistory.computeIfAbsent(paired, ignored -> new HashMap<>());
             Invocation previous = retained.get(invocation.invocationId());
             if (previous != null) { if (!previous.wire().equals(invocation.wire())) throw authorityInvalid(); return; }
@@ -841,7 +852,20 @@ public final class MmmmFabricHost implements ModInitializer {
             String key = invocationRouteKey(invocation); HostSession owner = invocationRoutes.putIfAbsent(key, paired);
             if (owner != null && owner != paired) throw new ContractException("SESSION_ROUTE_CHANGED", "원 Invocation의 route를 바꿀 수 없습니다");
             retained.put(invocation.invocationId(), invocation); nativeHistoryCount++; nativeHistoryBytes += bytes;
+            bootstrapAttempts.put(invocation.invocationId(), attempt);
         }
+    }
+
+    /** Called only after the ordinary private bridge has consumed and checked its actual completion reply. */
+    void confirmReadonlyPairing(UUID playerId, String expectedEpoch, ObjectNode completed, Runnable original) {
+        original.run(); requireServerThread(); HostSession actual = requireSession(); SessionRoute route = sessionRoute(actual);
+        if (!playerId.equals(actual.playerId()) || !expectedEpoch.equals(epoch) || !expectedEpoch.equals(actual.epoch())
+                || !expectedEpoch.equals(completed.path("hostEpoch").asText()) || !completed.path("ready").isBoolean()
+                || !completed.path("ready").booleanValue() || !ContractJson.VERSION.equals(completed.path("protocolVersion").asText())
+                || !actual.context(completed.path("contextId").asText()).path("contextId").equals(completed.path("contextId"))
+                || route.bootstrap() != null || route.calibration() != null || route.approval() != null
+                || player(actual).createCommandSourceStack().getPermissionContext().permissionLevel() != PermissionLevel.ADMINS) throw authorityInvalid();
+        original.run(); completedReadonlyPairings.put(actual, completed.path("contextId").asText()); original.run();
     }
 
     private static ContractException authorityInvalid() { return new ContractException("HOST_AUTHORITY_INVALID", "Plan authority reply does not match the installed immutable host pairing"); }
@@ -1103,6 +1127,34 @@ public final class MmmmFabricHost implements ModInitializer {
                             (installed, step, index, parsed, admitted) -> {
                                 throw new ContractException("NATIVE_READONLY_GUARD_UNAVAILABLE", "No admitted loaded-definition parser closure is installed");
                             }));
+                } else if ("calibration_bootstrap_successor".equals(kind)) {
+                    HostDispatcher.exactFields(payload, Set.of("kind", "invocationId", "invocationDigest", "sourceBundleDigest", "frozenManifestDigest"));
+                    NativeCalibrationBootstrap.Attempt attempt = bootstrapAttempts.get(HostDispatcher.string(payload, "invocationId"));
+                    if (attempt == null || !attempt.invocationDigest().equals(HostDispatcher.string(payload, "invocationDigest"))
+                            || !attempt.sourceBundleDigest().equals(HostDispatcher.string(payload, "sourceBundleDigest"))
+                            || !attempt.frozenManifestDigest().equals(HostDispatcher.string(payload, "frozenManifestDigest"))) throw authorityInvalid();
+                    SessionRoute originalRoute = sessionRoute(paired); MinecraftServer originalServer = server;
+                    HostRuntime originalRuntime = runtime; long originalGeneration = registryGeneration;
+                    Runnable current = () -> {
+                        control.checkpoint(); requireServerThread(); paired.checkOpen();
+                        if (result.isDone() || sessionRoute(paired) != originalRoute || server != originalServer || runtime != originalRuntime
+                                || registryGeneration != originalGeneration || !context.path("contextId").asText().equals(completedReadonlyPairings.get(paired))
+                                || !context.equals(paired.context(context.path("contextId").asText()))) throw authorityInvalid();
+                        attempt.requireActualOwner(server, gameInstanceId, worldId);
+                        ObjectNode before = attempt.original().context();
+                        if (!paired.principalRef().equals(before.path("principalRef").asText())
+                                || !paired.principalRef().equals(context.path("principalRef").asText())
+                                || !before.path("projectId").equals(context.path("projectId"))
+                                || !before.path("dimension").equals(context.path("dimension"))
+                                || player(paired).createCommandSourceStack().getPermissionContext().permissionLevel() != PermissionLevel.ADMINS) throw authorityInvalid();
+                        new PlatformAuthority(null).check(paired, context, Set.of("mmmm:world_read"), false);
+                        attempt.requireScope(context);
+                        control.checkpoint();
+                    };
+                    result.complete(NativeCalibrationFunctions.checked(() -> {
+                        current.run();
+                        return attempt.observeSuccessor(server, level(context.path("dimension").asText()), paired, context, current);
+                    }, current));
                 } else if ("calibration_bootstrap_target_state".equals(kind)) {
                     HostDispatcher.exactFields(payload, Set.of("kind", "sourceBundleDigest"));
                     NativeCalibrationBootstrap bootstrap = sessionRoute(paired).bootstrap();
@@ -1762,6 +1814,7 @@ public final class MmmmFabricHost implements ModInitializer {
             oldMetadata = compatibilityMetadataResolver; compatibilityMetadataResolver = null;
             owners.forEach(HostSession::close); if (oldSession != null) oldSession.close();
             routes.clear(); routeOrder.clear(); calibrationOffers.clear(); bootstrapOffers.clear(); nativeHistory.clear(); nativeHistoryCount = 0; nativeHistoryBytes = 0;
+            completedReadonlyPairings.clear();
             invocationRoutes.clear(); installedSources = Map.of(); installedActions = Set.of(); installedContexts = List.of();
             endpoint = null; runtime = null; session = null;
         }

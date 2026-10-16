@@ -362,6 +362,14 @@ final class ManualHostConnection {
             if (!installedContexts.get().contains(completed.path("contextId").asText()) || !completed.path("coordinatorEpoch").isTextual()
                     || !completed.path("coordinatorEpoch").asText().matches("[a-z0-9][a-z0-9._:-]{0,127}")) throw invalid();
             pairingControl.run();
+            long completionRemaining = java.util.concurrent.TimeUnit.SECONDS.toNanos(30) - (System.nanoTime() - connectStarted);
+            pairingControl.run();
+            host.gameTask(() -> {
+                pairingControl.run(); host.confirmReadonlyPairing(playerId, installedEpoch.get(), completed, pairingControl);
+                pairingControl.run(); return null;
+            }).toCompletableFuture().orTimeout(Math.max(1, Math.min(java.util.concurrent.TimeUnit.SECONDS.toNanos(10), completionRemaining)),
+                    java.util.concurrent.TimeUnit.NANOSECONDS).join();
+            pairingControl.run();
         } catch (RuntimeException exception) {
             cancelled.set(true); host.revokePairing(installedEpoch.get()); throw exception;
         } finally { Arrays.fill(raw, (byte) 0); }

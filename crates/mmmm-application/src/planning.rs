@@ -304,6 +304,69 @@ impl Application<'_> {
         Ok(context)
     }
 
+    /// Reconciliation alone can use an independently admitted successor read
+    /// context. The original invocation and its frozen pin remain unchanged.
+    pub(crate) fn reconciliation_context(
+        &mut self,
+        principal: &PrincipalId,
+        plan: &Value,
+        original: &Value,
+        scope: &WriteScope,
+    ) -> AppResult<Value> {
+        let Some(context) = self
+            .provider
+            .successor_observation_context_with_store(self.store, principal, original)?
+        else {
+            return self.observation_context(
+                principal,
+                plan,
+                &decode(&original["context"]["contextId"])?,
+            );
+        };
+        let project: ProjectId = decode(&plan["projectId"])?;
+        let current_id: ContextId = decode(&context["contextId"])?;
+        check_context(principal, &project, &current_id, &context)?;
+        let original_context = &original["context"];
+        validate("ExecutionContext", original_context)?;
+        verify_projected_digest("ExecutionContext", original_context).map_err(|_| {
+            AppError::new(
+                "STALE_CONTEXT",
+                "Original observation context digest is invalid",
+            )
+        })?;
+        let pin = plan["contextPins"]
+            .as_array()
+            .and_then(|pins| {
+                pins.iter()
+                    .find(|pin| pin["contextId"] == original_context["contextId"])
+            })
+            .ok_or_else(|| {
+                AppError::new(
+                    "STALE_CONTEXT",
+                    "Original observation context pin is absent",
+                )
+            })?;
+        if original_context["projectId"] != project.as_str()
+            || original["contextDigest"] != original_context["contextDigest"]
+            || original["contextDigest"] != pin["contextDigest"]
+            || original_context["environment"] != pin["environment"]
+        {
+            return Err(AppError::new(
+                "STALE_CONTEXT",
+                "Successor observation does not identify the original frozen context",
+            ));
+        }
+        check_successor_environment(&original_context["environment"], &context["environment"])?;
+        let current_scope: WriteScope = decode(&context["scope"])?;
+        if !scope_contains(&current_scope, scope) {
+            return Err(AppError::new(
+                "PERMISSION_REQUIRED",
+                "Successor observation context does not cover the original operation scope",
+            ));
+        }
+        Ok(context)
+    }
+
     pub(crate) fn preflight_with_undo(
         &mut self,
         principal: &PrincipalId,
@@ -592,6 +655,63 @@ fn check_prepared_limits(prepared: &PreparedPlan) -> AppResult<()> {
         ));
     }
     Ok(())
+}
+
+fn check_successor_environment(original: &Value, current: &Value) -> AppResult<()> {
+    let original_epoch = original["sessionEpoch"].as_str();
+    let current_epoch = current["sessionEpoch"].as_str();
+    let valid_epochs = original_epoch.is_some_and(|epoch| !epoch.is_empty())
+        && current_epoch.is_some_and(|epoch| !epoch.is_empty())
+        && original_epoch != current_epoch;
+    let actual_game = current["kind"] == "game"
+        && current["worldId"].as_str().is_some_and(|id| !id.is_empty())
+        && current["gameInstanceId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty());
+    let mut original_identity = original
+        .as_object()
+        .cloned()
+        .ok_or_else(|| AppError::new("STALE_CONTEXT", "Original game environment is absent"))?;
+    let mut current_identity = current
+        .as_object()
+        .cloned()
+        .ok_or_else(|| AppError::new("STALE_CONTEXT", "Successor game environment is absent"))?;
+    original_identity.remove("sessionEpoch");
+    current_identity.remove("sessionEpoch");
+    if !valid_epochs || !actual_game || original_identity != current_identity {
+        return Err(AppError::new(
+            "STALE_CONTEXT",
+            "Successor observation requires the same actual game and world with a new session",
+        ));
+    }
+    Ok(())
+}
+
+fn scope_contains(current: &WriteScope, original: &WriteScope) -> bool {
+    current.project_id == original.project_id
+        && original
+            .resource_ids
+            .iter()
+            .all(|id| current.resource_ids.contains(id))
+        && original
+            .object_ids
+            .iter()
+            .all(|id| current.object_ids.contains(id))
+        && original
+            .external_target_ids
+            .iter()
+            .all(|id| current.external_target_ids.contains(id))
+        && original.regions.iter().all(|original_region| {
+            current.regions.iter().any(|current_region| {
+                current_region.world_id == original_region.world_id
+                    && current_region.dimension == original_region.dimension
+                    && (0..3).all(|axis| {
+                        current_region.min[axis] <= original_region.min[axis]
+                            && current_region.max_exclusive[axis]
+                                >= original_region.max_exclusive[axis]
+                    })
+            })
+        })
 }
 
 pub(crate) fn check_context(

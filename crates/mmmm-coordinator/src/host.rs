@@ -10,13 +10,13 @@ use crate::{
     service::RequestContextWitness,
     workspace_bootstrap::NativeOwnerWitness,
 };
-use mmmm_application::{AppError, AppResult, ProviderPort};
+use mmmm_application::{Access, AppError, AppResult, AuthorityPort, ProviderPort};
 use mmmm_contracts::{
     ActionId, BindingId, ContextId, ContractValidator, InvocationId, OperationId, PrincipalId,
     ProjectId, Sha256Digest, StepId, canonical_digest, encode_json, raw_digest,
     verify_projected_digest,
 };
-use mmmm_runtime::storage::DurableStore;
+use mmmm_runtime::storage::{DurableStore, OperationRecord};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1231,7 +1231,7 @@ pub(crate) struct CurrentCompletedPairingOwner<'a> {
     pairing: &'a CompletedPairingWitness,
     store: &'a DurableStore,
     authority: &'a LocalAuthority,
-    owner: NativeOwnerWitness,
+    owner: &'a NativeOwnerWitness,
 }
 impl CurrentCompletedPairingOwner<'_> {
     /// Returns factual local approval under this exact short request borrow.
@@ -1246,7 +1246,7 @@ impl CurrentCompletedPairingOwner<'_> {
         self.check_current()?;
         let record = crate::host_read_policy::read_current_host_policy(
             self.store,
-            &self.owner,
+            self.owner,
             self.pairing,
             self.authority,
         )?;
@@ -1366,7 +1366,7 @@ impl CompletedPairingWitness {
             pairing: self,
             store,
             authority,
-            owner,
+            owner: &owner,
         };
         current.check_current()?;
         let output = inspect(&current);
@@ -1383,6 +1383,37 @@ impl CompletedPairingWitness {
                 },
             )),
         }
+    }
+    /// Keep one captured native owner across a read-only host acquisition and
+    /// retention of its actual reply. Short guard borrows end before the CAS
+    /// write; the same captured owner is checked again after the callback.
+    fn with_current_native_owner_mut<T>(
+        &self,
+        store: &mut DurableStore,
+        authority: &LocalAuthority,
+        inspect: impl FnOnce(&mut DurableStore, &dyn Fn(&DurableStore) -> AppResult<()>) -> AppResult<T>,
+    ) -> AppResult<T> {
+        self.check_current(authority)?;
+        if Path::new(text(self.observation.original_offer(), "dataRoot")?) != store.data_root() {
+            return Err(error(
+                "PERMISSION_REQUIRED",
+                "Completed native pairing belongs to another held Store",
+            ));
+        }
+        let owner = NativeOwnerWitness::capture(store, self.request.budget().deadline())
+            .map_err(|cause| self.native_owner_failure(cause))?;
+        let check = |store: &DurableStore| {
+            CurrentCompletedPairingOwner {
+                pairing: self,
+                store,
+                authority,
+                owner: &owner,
+            }
+            .check_current()
+        };
+        check(store)?;
+        let output = inspect(store, &check);
+        calibration_route_finish(output, check(store))
     }
     pub fn check_current(&self, authority: &LocalAuthority) -> AppResult<()> {
         self.request
@@ -1668,6 +1699,224 @@ impl HostBridge {
         };
         witness.check_current(authority)?;
         Ok(witness)
+    }
+    /// Find one actual newly completed native pairing for the same running
+    /// server/world. A public context locator cannot choose among routes, and
+    /// the original bootstrap approval never becomes a successor capability.
+    pub(crate) fn bootstrap_successor_pairing(
+        &self,
+        store: &DurableStore,
+        request: &RequestContextWitness,
+        authority: &LocalAuthority,
+        original: &Value,
+    ) -> AppResult<CompletedPairingWitness> {
+        let (_, record) = bootstrap_successor_original(store, request, authority, original)?;
+        let selected = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
+            let mut selected = None;
+            for (id, host) in &state.hosts {
+                if !request.authenticated().permits_context(id.as_str())
+                    || &host.principal != request.authenticated().principal()
+                    || Instant::now() >= host.expires
+                    || host.context["projectId"] != original["context"]["projectId"]
+                    || !bootstrap_successor_environment(
+                        &original["context"]["environment"],
+                        &host.context["environment"],
+                    )
+                    || host.completed_pairing.as_ref().is_none_or(|observation| {
+                        !observation.check_delivery()
+                            || host.context != *observation.context()
+                            || host.hello != observation.original_offer()["hostHello"]
+                    })
+                {
+                    continue;
+                }
+                if selected.replace(id.clone()).is_some() {
+                    return Err(error(
+                        "SUCCESSOR_PAIRING_AMBIGUOUS",
+                        "More than one completed native successor pairing is current",
+                    ));
+                }
+            }
+            selected.ok_or_else(|| {
+                error(
+                    "CAPABILITY_UNAVAILABLE",
+                    "No actual completed native successor pairing is current",
+                )
+            })?
+        };
+        let pairing = self.completed_pairing_witness(request, authority, &selected)?;
+        pairing.with_current_native_owner(store, authority, |owner| {
+            self.bootstrap_successor_identity(&pairing, authority, &|| {
+                owner.check_current()?;
+                self.check_bootstrap_successor_pairing(&pairing, authority, original, &record)
+            })
+        })?;
+        Ok(pairing)
+    }
+    /// Read only through a new actual pairing. The registry callback must
+    /// independently check its original source/manifest pins and operation
+    /// admission. Received truth is retained before any post-acquisition
+    /// current check; it is never converted into an original ProviderResult.
+    pub(crate) fn inspect_bootstrap_successor_with_store(
+        &self,
+        store: &mut DurableStore,
+        authority: &LocalAuthority,
+        original: &Value,
+        pairing: &CompletedPairingWitness,
+        selector: Value,
+        current: &dyn Fn(&DurableStore) -> AppResult<()>,
+    ) -> AppResult<Value> {
+        validate_bootstrap_successor_selector(&selector, original)?;
+        let (key, record) =
+            bootstrap_successor_original(store, &pairing.request, authority, original)?;
+        pairing.with_current_native_owner_mut(store, authority, |store, owner_current| {
+            let check = |store: &DurableStore| {
+                owner_current(store)?;
+                current(store)?;
+                self.check_bootstrap_successor_pairing(pairing, authority, original, &record)?;
+                owner_current(store)
+            };
+            check(store)?;
+            let result = (|| {
+                self.bootstrap_successor_identity(pairing, authority, &|| check(store))?;
+                let host = self.bootstrap_successor_host(pairing, authority)?;
+                let expires = bounded_host_deadline(
+                    pairing
+                        .request
+                        .budget()
+                        .deadline()
+                        .min(host.expires)
+                        .min(pairing.lease_expires()),
+                )?;
+                check(store)?;
+                let acquired = exchange_acquired(
+                    &host,
+                    "inspect",
+                    Some(&pairing.context_id),
+                    selector,
+                    &expires,
+                    pairing.request.budget().deadline(),
+                )?;
+                let acquired = retain_acquired_operation_truth(store, &key, acquired)?;
+                response_payload(acquired.into_response()?)
+            })();
+            calibration_route_finish(
+                result,
+                self.bootstrap_successor_identity(pairing, authority, &|| check(store)),
+            )
+        })
+    }
+    fn check_bootstrap_successor_pairing(
+        &self,
+        pairing: &CompletedPairingWitness,
+        authority: &LocalAuthority,
+        original: &Value,
+        record: &OperationRecord,
+    ) -> AppResult<()> {
+        pairing.check_current(authority)?;
+        let scope = serde_json::to_value(&record.scope)
+            .map_err(|_| error("PERMISSION_REQUIRED", "Original operation scope is invalid"))?;
+        if !Arc::ptr_eq(&self.state, &pairing.state)
+            || pairing.request.method() != "operation.reconcile"
+            || pairing.principal() != &record.principal
+            || pairing.project() != &record.project_id
+            || pairing.context()["principalRef"] != original["context"]["principalRef"]
+            || !bootstrap_successor_environment(
+                &original["context"]["environment"],
+                &pairing.context()["environment"],
+            )
+            || !crate::authority::scope_contains(&pairing.context()["scope"], &scope)
+        {
+            return Err(error(
+                "PERMISSION_REQUIRED",
+                "Completed successor pairing does not cover the original operation",
+            ));
+        }
+        authority.clone().authorize_operation(
+            pairing.principal(),
+            record,
+            Access::ObserveOperation,
+        )?;
+        pairing.check_current(authority)
+    }
+    fn bootstrap_successor_host(
+        &self,
+        pairing: &CompletedPairingWitness,
+        authority: &LocalAuthority,
+    ) -> AppResult<PairedHost> {
+        pairing.check_current(authority)?;
+        let host = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| error("HOST_UNAVAILABLE", "Host state is unavailable"))?;
+            let host = checked_host(&state, &pairing.context_id, Some(pairing.principal()))?;
+            if !Arc::ptr_eq(&self.state, &pairing.state)
+                || host.generation != pairing.generation
+                || host.context != *pairing.context()
+                || host
+                    .completed_pairing
+                    .as_ref()
+                    .is_none_or(|observation| !Arc::ptr_eq(observation, &pairing.observation))
+            {
+                return Err(error(
+                    "SESSION_ROUTE_CHANGED",
+                    "Completed successor pairing route was replaced",
+                ));
+            }
+            host.clone()
+        };
+        pairing.check_current(authority)?;
+        Ok(host)
+    }
+    fn bootstrap_successor_identity(
+        &self,
+        pairing: &CompletedPairingWitness,
+        authority: &LocalAuthority,
+        current: &dyn Fn() -> AppResult<()>,
+    ) -> AppResult<()> {
+        for (method, id, selector) in [
+            ("hello", None, json!({})),
+            (
+                "inspect",
+                Some(&pairing.context_id),
+                json!({"kind":"execution_context"}),
+            ),
+        ] {
+            current()?;
+            let host = self.bootstrap_successor_host(pairing, authority)?;
+            let expires = bounded_host_deadline(
+                pairing
+                    .request
+                    .budget()
+                    .deadline()
+                    .min(host.expires)
+                    .min(pairing.lease_expires()),
+            )?;
+            // No BridgeState/route mutex is held during the host call.
+            let observed =
+                exchange(&host.client, method, id, selector, Some(&expires)).and_then(|actual| {
+                    let (definition, expected) = if method == "hello" {
+                        ("HostHello", &host.hello)
+                    } else {
+                        ("ExecutionContext", &host.context)
+                    };
+                    validate(definition, &actual)?;
+                    if &actual != expected {
+                        return Err(error(
+                            "STALE_CONTEXT",
+                            "Actual successor host identity changed",
+                        ));
+                    }
+                    Ok(())
+                });
+            calibration_route_finish(observed, current())?;
+        }
+        Ok(())
     }
     /// Trusted bootstrap only. The host is independently queried before this
     /// exact immutable context becomes routable. An approval may rotate the
@@ -2798,6 +3047,124 @@ fn durable_invocation_key(
         digest: blob.digest,
     })
 }
+fn bootstrap_successor_original(
+    store: &DurableStore,
+    request: &RequestContextWitness,
+    authority: &LocalAuthority,
+    original: &Value,
+) -> AppResult<(OriginalInvocationKey, OperationRecord)> {
+    request
+        .check_local()
+        .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
+    if request.method() != "operation.reconcile"
+        || original["actionId"] != crate::calibration_bootstrap::ACTION
+        || original["context"]["principalRef"] != request.authenticated().principal().as_str()
+        || original["contextDigest"] != original["context"]["contextDigest"]
+        || original["arguments"].as_object().is_none_or(|arguments| {
+            arguments.len() != 1 || !arguments.contains_key("sourceBundleDigest")
+        })
+    {
+        return Err(error(
+            "PERMISSION_REQUIRED",
+            "Successor observation requires the exact original bootstrap reconcile request",
+        ));
+    }
+    verify_projected_digest("ExecutionContext", &original["context"]).map_err(|_| {
+        error(
+            "STALE_CONTEXT",
+            "Original bootstrap context digest is invalid",
+        )
+    })?;
+    let _: Sha256Digest = serde_json::from_value(
+        original["arguments"]["sourceBundleDigest"].clone(),
+    )
+    .map_err(|_| {
+        error(
+            "INVALID_INPUT",
+            "Original bootstrap source bundle is invalid",
+        )
+    })?;
+    let key = durable_invocation_key(store, original, request.budget().deadline())?;
+    let record = store
+        .operation(&key.operation)
+        .map_err(|cause| AppError::storage("STALE_CONTEXT", cause))?;
+    if &record.principal != request.authenticated().principal()
+        || original["context"]["projectId"] != record.project_id.as_str()
+        || original["context"]["contextId"] != record.context_id.as_str()
+    {
+        return Err(error(
+            "PERMISSION_REQUIRED",
+            "Original bootstrap differs from its durable operation owner",
+        ));
+    }
+    authority.clone().authorize_operation(
+        request.authenticated().principal(),
+        &record,
+        Access::ObserveOperation,
+    )?;
+    request
+        .check_local()
+        .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
+    Ok((key, record))
+}
+fn bootstrap_successor_environment(original: &Value, successor: &Value) -> bool {
+    if original["kind"] != "game"
+        || original["side"] != "server"
+        || successor["kind"] != "game"
+        || successor["side"] != "server"
+        || ["worldId", "gameInstanceId"].iter().any(|key| {
+            original[*key].as_str().is_none_or(str::is_empty) || original[*key] != successor[*key]
+        })
+        || original["sessionEpoch"].as_str().is_none_or(str::is_empty)
+        || successor["sessionEpoch"].as_str().is_none_or(str::is_empty)
+        || original["sessionEpoch"] == successor["sessionEpoch"]
+    {
+        return false;
+    }
+    let (Some(mut original), Some(mut successor)) = (
+        original.as_object().cloned(),
+        successor.as_object().cloned(),
+    ) else {
+        return false;
+    };
+    original.remove("sessionEpoch");
+    successor.remove("sessionEpoch");
+    original == successor
+}
+fn validate_bootstrap_successor_selector(selector: &Value, original: &Value) -> AppResult<()> {
+    let fields = [
+        "kind",
+        "invocationId",
+        "invocationDigest",
+        "sourceBundleDigest",
+        "frozenManifestDigest",
+    ];
+    if selector.as_object().is_none_or(|object| {
+        object.len() != fields.len() || fields.iter().any(|key| !object.contains_key(*key))
+    }) || selector["kind"] != "calibration_bootstrap_successor"
+        || selector["invocationId"] != original["invocationId"]
+        || selector["invocationDigest"]
+            != canonical_digest(original)
+                .map_err(|_| error("INVALID_INPUT", "Original bootstrap digest is invalid"))?
+                .as_str()
+        || selector["sourceBundleDigest"] != original["arguments"]["sourceBundleDigest"]
+    {
+        return Err(error(
+            "INVALID_INPUT",
+            "Successor selector differs from the exact original bootstrap invocation",
+        ));
+    }
+    // The source registry owns the actual frozen manifest, and checks this pin
+    // in the mandatory callback. A syntactically valid digest creates no right.
+    let _: Sha256Digest = serde_json::from_value(selector["frozenManifestDigest"].clone())
+        .map_err(|_| {
+            error(
+                "INVALID_INPUT",
+                "Frozen bootstrap manifest digest is invalid",
+            )
+        })?;
+    Ok(())
+}
 fn retain_first_dispatch(
     state: &mut BridgeState,
     key: OriginalInvocationKey,
@@ -3182,6 +3549,70 @@ fn validate_job_observation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bootstrap_successor_environment_requires_one_running_world_and_a_new_epoch() {
+        // Pure identity filtering only; this fixture cannot create a native
+        // completion receipt, owner, pairing or observation capability.
+        let original = json!({"kind":"game","side":"server","worldId":"world-original",
+            "gameInstanceId":"instance-original","sessionEpoch":"epoch-original"});
+        assert!(!bootstrap_successor_environment(&original, &original));
+        let mut successor = original.clone();
+        successor["sessionEpoch"] = json!("epoch-successor");
+        assert!(bootstrap_successor_environment(&original, &successor));
+        for (key, replacement) in [
+            ("worldId", json!("another-world")),
+            ("gameInstanceId", json!("restarted-instance")),
+            ("kind", json!("offline")),
+            ("side", json!("client")),
+            ("sessionEpoch", Value::Null),
+        ] {
+            let mut changed = successor.clone();
+            changed[key] = replacement;
+            assert!(!bootstrap_successor_environment(&original, &changed));
+        }
+        successor["additionalIdentity"] = json!("unmatched");
+        assert!(!bootstrap_successor_environment(&original, &successor));
+    }
+    #[test]
+    fn bootstrap_successor_selector_is_closed_and_pins_the_original_invocation() {
+        // The existing ordinary-selector fixture has no private bootstrap
+        // selector or manifest pin. This checks only the new closed transport
+        // shape; public JSON still cannot issue its required native pairing.
+        let mut original = route_fixture_invocation();
+        original["actionId"] = json!(crate::calibration_bootstrap::ACTION);
+        original["arguments"] = json!({"sourceBundleDigest":raw_digest(b"source-bundle")});
+        let selector = json!({"kind":"calibration_bootstrap_successor",
+            "invocationId":original["invocationId"],
+            "invocationDigest":canonical_digest(&original).unwrap(),
+            "sourceBundleDigest":original["arguments"]["sourceBundleDigest"],
+            "frozenManifestDigest":raw_digest(b"frozen-manifest")});
+        validate_bootstrap_successor_selector(&selector, &original).unwrap();
+        for (key, replacement) in [
+            ("kind", json!("dispatch")),
+            ("invocationId", json!("another-invocation")),
+            ("invocationDigest", json!(raw_digest(b"another-invocation"))),
+            ("sourceBundleDigest", json!(raw_digest(b"another-bundle"))),
+            ("frozenManifestDigest", json!("invalid-digest")),
+        ] {
+            let mut changed = selector.clone();
+            changed[key] = replacement;
+            assert_eq!(
+                validate_bootstrap_successor_selector(&changed, &original)
+                    .unwrap_err()
+                    .code,
+                "INVALID_INPUT"
+            );
+        }
+        let mut changed = selector.clone();
+        changed["originalInvocation"] = original.clone();
+        assert!(validate_bootstrap_successor_selector(&changed, &original).is_err());
+        let mut changed = selector;
+        changed
+            .as_object_mut()
+            .unwrap()
+            .remove("frozenManifestDigest");
+        assert!(validate_bootstrap_successor_selector(&changed, &original).is_err());
+    }
     #[test]
     fn completed_pairing_provenance_keeps_host_bridge_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}

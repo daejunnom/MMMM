@@ -187,6 +187,28 @@ final class HostInspectionControlTest {
         assertSame(closing, assertThrows(IOException.class, () -> AnonymousBridge.closeOutput(output, null)));
     }
 
+    @Test void privateApprovalBridgeAllowsBootstrapAndRejectsOtherPurposesBeforeLaunching() {
+        // Existing stream cleanup fixtures cannot detect this runtime purpose
+        // rejection. Exercise the exact production gate without launching a child.
+        for (String purpose : List.of("numeric_calibration_normative47/1", "numeric_calibration_bootstrap/1")) {
+            ObjectNode offer = ContractJson.newObject().put("purpose", purpose);
+            assertTrue(AnonymousBridge.calibrationApprovalPurpose(AnonymousBridge.Mode.APPLY_APPROVAL, offer));
+            assertThrows(ContractException.class,
+                    () -> AnonymousBridge.calibrationApprovalPurpose(AnonymousBridge.Mode.PAIRING, offer));
+        }
+        for (String purpose : List.of("numeric_calibration_bootstrap/2", "numeric_calibration_other/1", "", " numeric_calibration_bootstrap/1")) {
+            ObjectNode offer = ContractJson.newObject().put("purpose", purpose);
+            assertThrows(ContractException.class,
+                    () -> AnonymousBridge.calibrationApprovalPurpose(AnonymousBridge.Mode.APPLY_APPROVAL, offer));
+        }
+        ObjectNode missing = ContractJson.newObject();
+        assertFalse(AnonymousBridge.calibrationApprovalPurpose(AnonymousBridge.Mode.PAIRING, missing));
+        assertFalse(AnonymousBridge.calibrationApprovalPurpose(AnonymousBridge.Mode.APPLY_APPROVAL, missing));
+        ObjectNode explicitNull = ContractJson.newObject().putNull("purpose");
+        assertThrows(ContractException.class,
+                () -> AnonymousBridge.calibrationApprovalPurpose(AnonymousBridge.Mode.APPLY_APPROVAL, explicitNull));
+    }
+
     private static ObjectNode request(String method, String id) {
         ObjectNode request = ContractJson.newObject().put("protocolVersion", ContractJson.VERSION).put("requestId", id)
                 .put("method", method).put("deadlineAt", NOW.plusSeconds(30).toString());

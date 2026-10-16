@@ -26,6 +26,7 @@ import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -39,6 +40,10 @@ import java.util.function.Supplier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.FileToIdConverter;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.ServerFunctionLibrary;
 import net.minecraft.server.packs.FixedPathPackResources;
 import net.minecraft.server.packs.repository.Pack;
 
@@ -109,7 +114,206 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
         private final String digest;
         private final CompletableFuture<ProviderResult> result = new CompletableFuture<>();
         private volatile CompletionStage<Void> actualReload;
-        private Accepted(Invocation invocation) { original = invocation; digest = ContractJson.digest(invocation.wire()); }
+        private final Attempt attempt;
+        private Accepted(NativeCalibrationBootstrap owner, Invocation invocation) {
+            original = invocation; digest = ContractJson.digest(invocation.wire());
+            attempt = new Attempt(owner, invocation, result);
+        }
+    }
+
+    /** Historical facts from an actual admission. It contains no session, approval, request control or replay entry. */
+    static final class Attempt {
+        private record ResultState(ObjectNode result, Throwable failure) { }
+        private record ReloadState(String outcome, Throwable failure) { }
+        private final MinecraftServer owner;
+        private final Invocation original;
+        private final String invocationDigest, bundleDigest, manifestDigest, gameInstanceId, worldId;
+        private final List<Program> programs;
+        private final Set<String> targetIds;
+        private final List<NativeLoadedCalibrationSources.ExpectedSource<Identifier>> expectedSources;
+        private volatile ResultState result;
+        private volatile ReloadState reload = new ReloadState("not_attempted", null);
+        private volatile String effectPhase = "accepted";
+        private volatile ObjectNode fileFacts;
+        private volatile int initializationAttemptedCount;
+        private volatile List<Integer> initializationReturns = List.of();
+
+        private Attempt(NativeCalibrationBootstrap bootstrap, Invocation invocation, CompletionStage<ProviderResult> actualResult) {
+            owner = bootstrap.server; original = invocation; invocationDigest = ContractJson.digest(invocation.wire());
+            bundleDigest = bootstrap.bundleDigest; manifestDigest = bootstrap.manifestDigest;
+            gameInstanceId = invocation.context().path("environment").path("gameInstanceId").asText();
+            worldId = invocation.context().path("environment").path("worldId").asText();
+            programs = bootstrap.programs;
+            Set<String> ids = new HashSet<>(); ids.add(PACK_TARGET);
+            for (Program program : programs) {
+                ids.add("calibration-objective-" + program.objective());
+                ids.add("calibration-storage-" + ContractJson.sha256(program.storage().getBytes(StandardCharsets.UTF_8)));
+            }
+            targetIds = Set.copyOf(ids);
+            var converter = new FileToIdConverter(Registries.elementsDirPath(ServerFunctionLibrary.TYPE_KEY), ".mcfunction");
+            var expected = new ArrayList<NativeLoadedCalibrationSources.ExpectedSource<Identifier>>(47);
+            for (Program program : programs) {
+                Identifier id = Identifier.parse(program.functionId());
+                String path = "data/mmmm_calibration/function/" + program.functionId().substring("mmmm_calibration:".length()) + ".mcfunction";
+                JsonNode matched = null;
+                for (JsonNode entry : bootstrap.manifest.path("sourceBundle").path("entries")) {
+                    if (path.equals(entry.path("path").asText())) matched = entry;
+                }
+                if (matched == null) throw invalid();
+                expected.add(new NativeLoadedCalibrationSources.ExpectedSource<>(id, converter.idToFile(id),
+                        java.util.HexFormat.of().parseHex(matched.path("rawBytesHex").asText())));
+            }
+            expectedSources = List.copyOf(expected);
+            actualResult.whenComplete((value, failure) -> result = new ResultState(value == null ? null : value.wire().deepCopy(), failure));
+        }
+
+        Invocation original() { return original; }
+        String invocationDigest() { return invocationDigest; }
+        String sourceBundleDigest() { return bundleDigest; }
+        String frozenManifestDigest() { return manifestDigest; }
+        void requireScope(ObjectNode context) {
+            if (!stringSet(context.path("scope").path("externalTargetIds")).containsAll(targetIds)) throw invalid();
+        }
+        void requireActualOwner(MinecraftServer actual, String actualGame, String actualWorld) {
+            if (actual != owner || !gameInstanceId.equals(actualGame) || !worldId.equals(actualWorld)) throw invalid();
+        }
+        private void startReload() { effectPhase = "reload_call_attempted"; reload = new ReloadState("call_attempted_without_future", null); }
+        private void retainReload(CompletionStage<Void> actual) {
+            Objects.requireNonNull(actual); effectPhase = "reload_future_returned";
+            reload = new ReloadState("pending", null);
+            actual.whenComplete((ignored, failure) -> reload = new ReloadState(failure == null ? "completed" : "failed", failure));
+        }
+        private ObjectNode history() {
+            ResultState originalResult = result; ReloadState actual = reload;
+            ObjectNode history = ContractJson.newObject().put("resultTerminal", originalResult != null).put("effectPhase", effectPhase)
+                    .put("initializationAttemptedCount", initializationAttemptedCount).put("reloadOutcome", actual.outcome());
+            if (originalResult == null || originalResult.result() == null) history.putNull("originalResult");
+            else history.set("originalResult", originalResult.result().deepCopy());
+            history.set("originalFailure", originalResult == null ? com.fasterxml.jackson.databind.node.NullNode.instance : throwable(originalResult.failure()));
+            history.set("reloadFailure", throwable(actual.failure()));
+            ObjectNode installed = fileFacts;
+            if (installed == null) history.putNull("fileFacts"); else history.set("fileFacts", installed.deepCopy());
+            ArrayNode returns = history.putArray("initializationReturns"); initializationReturns.forEach(returns::add);
+            return history;
+        }
+
+        ObjectNode observeSuccessor(MinecraftServer actual, ServerLevel level, HostSession currentOwner,
+                                    ObjectNode context, Runnable current) {
+            return checked(() -> {
+                current.run(); long from = Integer.toUnsignedLong(actual.getTickCount());
+                ObjectNode response = ContractJson.newObject().put("format", "mmmm.native.calibration-bootstrap-successor/1")
+                        .put("frozenManifestDigest", manifestDigest).put("sourceBundleDigest", bundleDigest);
+                response.set("originalInvocation", original.wire().deepCopy()); response.set("currentContext", context.deepCopy());
+                response.set("history", history());
+                ObjectNode observation = response.putObject("observation").put("format", "mmmm.native.calibration-bootstrap-observation/1")
+                        .put("observedFromTick", Long.toString(from)).put("observedToTick", Long.toString(from));
+                observation.putObject("pack").put("status", "unknown").put("reason", "readonly_pack_observer_unavailable")
+                        .put("identityContinuity", "unproven");
+                ObjectNode loaded = observation.putObject("loadedSources").put("status", "unknown").put("causalLink", "unproven");
+                ArrayNode functions = loaded.putArray("functions"); loaded.putNull("failure");
+                try {
+                    var sources = NativeLoadedCalibrationSources.observe(actual, expectedSources, current::run);
+                    for (var function : sources.functions()) {
+                        current.run(); functions.addObject().put("functionId", function.functionId().toString())
+                                .put("resourceId", function.resourceId().toString()).put("sourcePackId", function.sourcePackId())
+                                .put("rawSha256", function.sha256()).put("byteLength", function.bytes().length);
+                    }
+                    sources.checkCurrent(current::run); current.run(); loaded.put("status", "known");
+                } catch (RuntimeException failure) {
+                    loaded.set("failure", observedFailure(failure, current));
+                }
+                ObjectNode images = observation.putObject("targetImages").put("status", "unknown");
+                images.putArray("targets"); images.putNull("failure");
+                try {
+                    boolean known = true; int bytes = 0;
+                    for (Program program : programs) {
+                        current.run();
+                        String objectiveId = "calibration-objective-" + program.objective();
+                        String storageId = "calibration-storage-" + ContractJson.sha256(program.storage().getBytes(StandardCharsets.UTF_8));
+                        ArrayNode bindings = ContractJson.newObject().putArray("bindings");
+                        bindings.addObject().put("targetId", objectiveId).put("kind", "objective").put("objective", program.objective());
+                        bindings.addObject().put("targetId", storageId).put("kind", "owned_storage").put("storage", program.storage())
+                                .putArray("ownedSubtrees").add("inputs").add("invocation");
+                        var selected = NativeCalibrationTargetImages.select(program.caseId(), program.functionId(), bindings);
+                        var pair = NativeCalibrationTargetImages.observeSelected(actual, level, currentOwner, context, selected, current::run);
+                        byte[] objective = pair.objectiveBytes(), storage = pair.storageBytes();
+                        // Preserve a bounded completed prefix. No omitted target is represented as absent or known.
+                        if ((long) bytes + objective.length + storage.length > 192L * 1024) throw limit();
+                        if (!appendSuccessorPair(response, objectiveId, objective, pair.objectiveSha256(),
+                                storageId, storage, pair.storageSha256())) throw limit();
+                        bytes += objective.length + storage.length;
+                        known &= pair.objectiveFullTargetKnown() && pair.storageFullTargetKnown(); current.run();
+                    }
+                    images.put("status", known ? "known" : "unknown");
+                } catch (RuntimeException failure) {
+                    images.set("failure", observedFailure(failure, current));
+                }
+                observation.put("observedToTick", Long.toString(Integer.toUnsignedLong(actual.getTickCount())));
+                current.run(); bounded(response); return response;
+            }, current);
+        }
+        private static void addTarget(ArrayNode rows, String id, byte[] raw, String sha) {
+            rows.addObject().put("targetId", id).put("rawBytesHex", java.util.HexFormat.of().formatHex(raw)).put("rawSha256", sha);
+        }
+    }
+
+    /** Wire capacity only. This formatter creates no native observation or permission. */
+    static boolean appendSuccessorPair(ObjectNode response, String objectiveId, byte[] objective, String objectiveSha,
+                                       String storageId, byte[] storage, String storageSha) {
+        ObjectNode observation = ContractJson.object(response.path("observation"));
+        ObjectNode images = ContractJson.object(observation.path("targetImages"));
+        if (!(images.path("targets") instanceof ArrayNode targets)) throw limit();
+        String actualTick = text(observation, "observedToTick");
+        if (!actualTick.matches("[0-9]{1,10}") || Long.parseLong(actualTick) > 0xffff_ffffL) throw limit();
+        int originalSize = targets.size(); boolean retained = false; Throwable primary = null;
+        try {
+            Attempt.addTarget(targets, objectiveId, objective, objectiveSha);
+            Attempt.addTarget(targets, storageId, storage, storageSha);
+            // The actual original/history/loaded/current fields are already in
+            // this response. Reserve the bounded failure wire and the maximum
+            // growth of the actual final unsigned tick before admitting a pair.
+            retained = withinFrame(response, 16 * 1024 + 10 - actualTick.length(), 256);
+            return retained;
+        } catch (RuntimeException | Error failure) { primary = failure; throw failure; }
+        finally {
+            if (!retained) {
+                try { while (targets.size() > originalSize) targets.remove(targets.size() - 1); }
+                catch (RuntimeException | Error cleanup) { if (primary == null) throw cleanup; preserve(primary, cleanup); }
+            }
+        }
+    }
+
+    /** Bounded factual throwable graph. Messages and stacks can contain local paths and are deliberately excluded. */
+    static JsonNode throwable(Throwable actual) {
+        return throwable(actual, new IdentityHashMap<>(), new int[] { 0 }, 0);
+    }
+    private static JsonNode observedFailure(RuntimeException actual, Runnable post) {
+        try { post.run(); }
+        catch (RuntimeException | Error after) { preserve(actual, after); throw actual; }
+        return throwable(actual);
+    }
+    private static JsonNode throwable(Throwable actual, IdentityHashMap<Throwable, Boolean> seen, int[] count, int depth) {
+        if (actual == null) return com.fasterxml.jackson.databind.node.NullNode.instance;
+        // Every emitted diagnostic object consumes the budget, including a
+        // depth/cycle boundary. Callers stop expansion before no slot remains.
+        if (count[0] >= 32) throw limit();
+        count[0]++;
+        ObjectNode node = ContractJson.newObject().put("type", actual.getClass().getName());
+        if (actual instanceof ContractException contract && contract.code().matches("[A-Z][A-Z0-9_]{0,127}")) node.put("code", contract.code());
+        else node.putNull("code");
+        node.putNull("cause"); ArrayNode suppressed = node.putArray("suppressed");
+        if (depth >= 8 || seen.put(actual, Boolean.TRUE) != null) return node.put("truncated", true);
+        boolean truncated = false;
+        if (actual.getCause() != null) {
+            if (count[0] >= 32) truncated = true;
+            else node.set("cause", throwable(actual.getCause(), seen, count, depth + 1));
+        }
+        Throwable[] children = actual.getSuppressed();
+        for (int i = 0; i < children.length && i < 8; i++) {
+            if (count[0] >= 32) { truncated = true; break; }
+            suppressed.add(throwable(children[i], seen, count, depth + 1));
+        }
+        return node.put("truncated", truncated || children.length > 8);
     }
 
     private final ContractJson contracts;
@@ -117,7 +321,7 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
     private final Clock clock;
     private final NativeCalibrationApproval.Tasks tasks;
     private final NativeCalibrationApproval.Current current;
-    private final Consumer<Invocation> retainAccepted;
+    private final Consumer<Attempt> retainAccepted;
     private final MinecraftServer server;
     private final Supplier<ServerPlayer> player;
     private final Function<String, ServerLevel> levels;
@@ -132,7 +336,7 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
 
     NativeCalibrationBootstrap(ContractJson contracts, ObjectNode input, HostSession session, Clock clock,
                                NativeCalibrationApproval.Tasks tasks, NativeCalibrationApproval.Current current,
-                               Consumer<Invocation> retainAccepted, MinecraftServer server, Supplier<ServerPlayer> player,
+                               Consumer<Attempt> retainAccepted, MinecraftServer server, Supplier<ServerPlayer> player,
                                Function<String, ServerLevel> levels) {
         this.contracts = Objects.requireNonNull(contracts); this.session = Objects.requireNonNull(session);
         this.clock = Objects.requireNonNull(clock); this.tasks = Objects.requireNonNull(tasks); this.current = Objects.requireNonNull(current);
@@ -282,10 +486,10 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
                     if (accepted != null) throw invalid();
                     actual.recheck(gate); check(original, gate, true);
                     var candidate = reservations.inspect(original, true); reservations.admit(candidate);
-                    admitted = new Accepted(original); accepted = admitted;
+                    admitted = new Accepted(this, original); accepted = admitted;
                 }
                 // A failed publication retains the exact admitted identity and may not execute or rebind it.
-                try { retainAccepted.accept(original); } catch (RuntimeException | Error failure) { admitted.result.completeExceptionally(failure); throw failure; }
+                try { retainAccepted.accept(admitted.attempt); } catch (RuntimeException | Error failure) { admitted.result.completeExceptionally(failure); throw failure; }
                 copy(admitted.result, response); execute(admitted, actual, gate, request);
             } catch (RuntimeException | Error failure) {
                 Throwable primary = finish(failure, () -> check(original, gate, true));
@@ -302,20 +506,27 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
         Object files = null; List<Integer> returns = new ArrayList<>(); boolean requested = false;
         try {
             check(admitted.original, gate, true); prepared.recheck(gate);
+            admitted.attempt.effectPhase = "pack_attempted";
             var installed = prepared.files.execute(admitted.original, gate); files = installed;
-            check(admitted.original, gate, true); prepared.storage.acquire(gate); prepared.storage.recheck(gate); check(admitted.original, gate, true);
+            admitted.attempt.fileFacts = installed.toWire(); admitted.attempt.effectPhase = "pack_created";
+            check(admitted.original, gate, true); admitted.attempt.effectPhase = "storage_acquire_attempted";
+            prepared.storage.acquire(gate); admitted.attempt.effectPhase = "storage_acquired";
+            prepared.storage.recheck(gate); check(admitted.original, gate, true);
             ServerPlayer actualPlayer = player.get(); ServerLevel level = levels.apply(admitted.original.context().path("dimension").asText());
             if (actualPlayer == null || actualPlayer.level() != level) throw invalid();
             var commandSource = NativeCommands.source(actualPlayer, level, admitted.original.context());
             for (Program program : programs) for (String command : program.initializationCommands()) {
                 check(admitted.original, gate, false); NativeCommandDispatch.requireIdle(server);
                 var parsed = server.getCommands().getDispatcher().parse(new StringReader(command), commandSource);
+                admitted.attempt.effectPhase = "objective_attempted"; admitted.attempt.initializationAttemptedCount++;
                 int returned = NativeCommandDispatch.execute(server, parsed); returns.add(returned);
+                admitted.attempt.initializationReturns = List.copyOf(returns);
                 if (returned <= 0) throw new ContractException("CALIBRATION_BOOTSTRAP_INIT_FAILED", "The actual objective initialization did not report success");
                 prepared.storage.recheck(gate); check(admitted.original, gate, false);
             }
             check(admitted.original, gate, true);
-            var repository = server.getPackRepository(); repository.reload(); check(admitted.original, gate, true);
+            var repository = server.getPackRepository(); admitted.attempt.effectPhase = "repository_reload_attempted";
+            repository.reload(); check(admitted.original, gate, true);
             Pack chosen = null; int available = 0;
             for (Pack pack : repository.getAvailablePacks()) {
                 gate.run(); if (++available > MAX_PACKS) throw limit();
@@ -326,10 +537,11 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
             List<String> selection = new ArrayList<>();
             for (String id : repository.getSelectedIds()) { gate.run(); if (selection.size() == MAX_PACKS || selection.contains(id)) throw limit(); selection.add(id); }
             if (!selection.contains(chosen.getId())) { if (selection.size() == MAX_PACKS) throw limit(); selection.add(chosen.getId()); }
-            check(admitted.original, gate, true); requested = true;
+            check(admitted.original, gate, true); requested = true; admitted.attempt.startReload();
             // Reload is the final effect. Its native START hook retires this route; no next write follows it.
             var reload = server.reloadResources(List.copyOf(selection));
             admitted.actualReload = reload.minimalCompletionStage();
+            admitted.attempt.retainReload(admitted.actualReload);
             Object finalFiles = files; List<Integer> finalReturns = List.copyOf(returns);
             // Bound observation without cancelling/completing the engine's own future or claiming its effects stopped.
             var observed = new CompletableFuture<Void>();
@@ -448,10 +660,14 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
     private static String text(ObjectNode object, String field) { if (!object.path(field).isTextual()) throw invalid(); return object.path(field).textValue(); }
     private static String sha(ObjectNode object, String field) { String value = text(object, field); if (!value.matches("[a-f0-9]{64}")) throw invalid(); return value; }
     private static void bounded(JsonNode value) {
-        if (ContractJson.bytes(value).length > Math.min(AnonymousBridge.MAX_FRAME, HostRuntime.MAX_RESULT_BYTES)) throw limit();
+        if (!withinFrame(value, 0, 0)) throw limit();
+    }
+    private static boolean withinFrame(JsonNode value, int reservedBytes, int reservedNodes) {
+        if (ContractJson.bytes(value).length > Math.min(AnonymousBridge.MAX_FRAME, HostRuntime.MAX_RESULT_BYTES) - reservedBytes) return false;
         record Node(JsonNode value, int depth) { }
         var todo = new ArrayDeque<Node>(); todo.add(new Node(value, 1)); int count = 0;
-        while (!todo.isEmpty()) { Node node = todo.removeLast(); if (++count > 4096 || node.depth() > 64) throw limit(); if (node.value().isContainerNode()) for (JsonNode child : node.value()) todo.add(new Node(child, node.depth() + 1)); }
+        while (!todo.isEmpty()) { Node node = todo.removeLast(); if (++count > 4096 - reservedNodes || node.depth() > 64) return false; if (node.value().isContainerNode()) for (JsonNode child : node.value()) todo.add(new Node(child, node.depth() + 1)); }
+        return true;
     }
     private static <T> T checked(Supplier<T> action, Runnable post) {
         Throwable primary = null;

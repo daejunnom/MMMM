@@ -34,6 +34,9 @@ const MAX_ENTRIES: usize = 8;
 const MAX_BUNDLE_BYTES: u64 = 3 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 1024 * 1024;
 
+#[path = "calibration_bootstrap_successor.rs"]
+mod successor;
+
 /// Empty construction grants nothing. All entries originate in the actual
 /// same-Store setup producer; confirmed entries additionally retain ACK/EOF.
 #[derive(Clone, Default)]
@@ -1365,6 +1368,105 @@ mod tests {
         (bytes.len(), nodes)
     }
 
+    fn capacity_failure_tree() -> Value {
+        let leaf = || {
+            json!({"type":"java.lang.RuntimeException","code":null,
+            "cause":null,"suppressed":[],"truncated":false})
+        };
+        let children = (0..8)
+            .map(|index| {
+                let mut child = leaf();
+                child["suppressed"] = json!(
+                    (0..if index == 7 { 2 } else { 3 })
+                        .map(|_| leaf())
+                        .collect::<Vec<_>>()
+                );
+                child
+            })
+            .collect::<Vec<_>>();
+        let mut root = leaf();
+        root["suppressed"] = json!(children);
+        root
+    }
+
+    fn successor_capacity_payload(
+        context: &Value,
+        programs: &Value,
+        entries: &Value,
+        bundle: &Sha256Digest,
+        native_nbt_bytes: usize,
+    ) -> Value {
+        // Serialization layout only. These bytes do not represent a native
+        // objective, a loaded function, an actual attempt or completed pairing.
+        // The configurable NBT width prevents a small textual placeholder from
+        // hiding its bytesHex -> rawBytesHex double expansion.
+        let native_bytes = vec![0u8; native_nbt_bytes];
+        let native_nbt = json!({"format":"minecraft.nbt.named-compound/uncompressed",
+            "bytesHex":encode_hex(&native_bytes),"sha256":raw_digest(&native_bytes),"rawFloatingBits":[]});
+        let mut functions = Vec::new();
+        let mut images = Vec::new();
+        for program in programs.as_array().unwrap() {
+            let function = program["functionId"].as_str().unwrap();
+            let suffix = function.strip_prefix("mmmm_calibration:").unwrap();
+            let path = format!("data/mmmm_calibration/function/{suffix}.mcfunction");
+            let entry = entries
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["path"] == path)
+                .unwrap();
+            functions.push(json!({"functionId":function,
+                "resourceId":format!("mmmm_calibration:function/{suffix}.mcfunction"),
+                "sourcePackId":"file/mmmm-calibration-normative47",
+                "rawSha256":entry["rawSha256"],"byteLength":entry["byteLength"]}));
+            let objective = program["objective"].as_str().unwrap();
+            let storage = program["storage"].as_str().unwrap();
+            let objective_id = format!("calibration-objective-{objective}");
+            let storage_id = format!("calibration-storage-{}", raw_digest(storage.as_bytes()));
+            let objective_image = json!({"format":"mmmm.native.calibration-target/1",
+                "selector":{"targetId":objective_id,"kind":"objective","objective":objective},
+                "status":"known","presence":"present","membershipScope":"current_native_scoreboard",
+                "captureScope":"native_objective_and_all_scores","coverage":"full_target","reason":null,
+                "payload":{"nativeObjectiveNbt":native_nbt,"scores":[],"displaySlots":[]}});
+            let storage_image = json!({"format":"mmmm.native.calibration-target/1",
+                "selector":{"targetId":storage_id,"kind":"owned_storage","storage":storage,"ownedSubtrees":["inputs","invocation"]},
+                "status":"known","presence":"absent","membershipScope":"current_cached_command_storage",
+                "captureScope":"native_owned_storage_subtrees","coverage":"full_target","reason":null,
+                "payload":{"storagePresent":false,"inputs":{"presence":"absent","nativeValueNbt":null},
+                    "invocation":{"presence":"absent","nativeValueNbt":null}}});
+            for (id, image) in [(objective_id, objective_image), (storage_id, storage_image)] {
+                let bytes = canonical_bytes(&image).unwrap();
+                images.push(json!({"targetId":id,"rawBytesHex":encode_hex(&bytes),"rawSha256":raw_digest(&bytes)}));
+            }
+        }
+        let mut original: Value =
+            serde_json::from_slice(include_bytes!("../../../examples/invocation.json")).unwrap();
+        original["contextId"] = context["contextId"].clone();
+        original["context"] = context.clone();
+        original["contextDigest"] = context["contextDigest"].clone();
+        original["actionId"] = json!(ACTION);
+        original["arguments"] = json!({"sourceBundleDigest":bundle});
+        original["argumentsDigest"] = json!(canonical_digest(&original["arguments"]).unwrap());
+        let mut successor = context.clone();
+        successor["environment"]["sessionEpoch"] = json!("capacity-successor-epoch");
+        successor["contextDigest"] =
+            json!(projected_digest("ExecutionContext", &successor).unwrap());
+        let file_facts = entries.as_array().unwrap().iter().map(|entry| json!({
+            "path":entry["path"],"byteLength":entry["byteLength"],"rawSha256":entry["rawSha256"]
+        })).collect::<Vec<_>>();
+        json!({"format":"mmmm.native.calibration-bootstrap-successor/1",
+            "originalInvocation":original,"frozenManifestDigest":raw_digest(b"capacity manifest label only"),
+            "sourceBundleDigest":bundle,"currentContext":successor,
+            "history":{"originalResult":null,"originalFailure":capacity_failure_tree(),"resultTerminal":true,
+                "effectPhase":"reload_future_returned","fileFacts":{"sourceBundleDigest":bundle,"verifiedFileCount":48,"files":file_facts},
+                "initializationAttemptedCount":47,"initializationReturns":vec![1;47],"reloadOutcome":"failed",
+                "reloadFailure":capacity_failure_tree()},
+            "observation":{"format":"mmmm.native.calibration-bootstrap-observation/1","observedFromTick":"0","observedToTick":"0",
+                "pack":{"status":"unknown","reason":"readonly_pack_observer_unavailable","identityContinuity":"unproven"},
+                "loadedSources":{"status":"known","causalLink":"unproven","functions":functions,"failure":null},
+                "targetImages":{"status":"known","targets":images,"failure":null}}})
+    }
+
     #[test]
     fn normative_bootstrap_full_approval_and_ready_frames_fit_current_control_limits() {
         // Capacity and closed-grammar regression only. The original 48 source
@@ -1540,6 +1642,79 @@ mod tests {
         println!(
             "capacity only: approval={} bytes/{} nodes; ready HostResponse RPC={} bytes/{} nodes",
             approval_capacity.0, approval_capacity.1, ready_capacity.0, ready_capacity.1
+        );
+
+        // The earlier approval/absence-ready frames contain neither successor
+        // history, its two bounded error trees, the current 47 source rows nor
+        // the 94 current target encodings. Cover the whole new wire layout.
+        // 256-byte NBT is a representative capacity width, not an observed
+        // native Objective.Packed size or proof that all real states fit.
+        let successor =
+            successor_capacity_payload(&context, &programs, &entries, &bundle_digest, 256);
+        assert_eq!(
+            successor["observation"]["loadedSources"]["functions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            47
+        );
+        assert_eq!(
+            successor["observation"]["targetImages"]["targets"]
+                .as_array()
+                .unwrap()
+                .len(),
+            94
+        );
+        let successor_capacity = assert_full_control_frame(&successor);
+        assert!(
+            successor_capacity.0 <= 256 * 1024,
+            "Java payload: {}",
+            successor_capacity.0
+        );
+        let mut actual_result_layout: Value =
+            serde_json::from_slice(include_bytes!("../../../examples/provider-result.json"))
+                .unwrap();
+        actual_result_layout["effects"] = json!("unknown");
+        actual_result_layout["data"] = json!({"completionClaim":"bootstrap_reload_observation_only",
+            "sourceBundleDigest":bundle_digest,"installedFileCount":48,"initializedObjectiveCount":47,"reloadOutcome":"completed"});
+        ContractValidator::shared()
+            .unwrap()
+            .validate("ProviderResult", &actual_result_layout)
+            .unwrap();
+        let mut with_result = successor.clone();
+        with_result["history"]["originalResult"] = actual_result_layout;
+        with_result["history"]["originalFailure"] = Value::Null;
+        with_result["history"]["reloadOutcome"] = json!("completed");
+        with_result["history"]["reloadFailure"] = Value::Null;
+        assert!(assert_full_control_frame(&with_result).0 <= 256 * 1024);
+        let successor_response = json!({"protocolVersion":mmmm_contracts::CONTRACT_VERSION,
+            "requestId":"capacity-successor-response","status":"ok","payload":successor,"eventSequence":"0"});
+        ContractValidator::shared()
+            .unwrap()
+            .validate("HostResponse", &successor_response)
+            .unwrap();
+        let successor_rpc =
+            json!({"jsonrpc":"2.0","id":"capacity-successor-response","result":successor_response});
+        let successor_rpc_capacity = assert_full_control_frame(&successor_rpc);
+        // A raw-target budget alone cannot ensure the stricter Java payload
+        // budget: hex doubles the outer bytes, including the inner NBT hex.
+        let wider = successor_capacity_payload(&context, &programs, &entries, &bundle_digest, 1024);
+        let raw_targets = wider["observation"]["targetImages"]["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|image| image["rawBytesHex"].as_str().unwrap().len() / 2)
+            .sum::<usize>();
+        assert!(raw_targets <= 192 * 1024);
+        assert!(encode_json(&wider).unwrap().len() > 256 * 1024);
+        assert_full_control_frame(&wider);
+        println!(
+            "capacity only: successor={} bytes/{} nodes; wrapped={} bytes/{} nodes; wider raw={} bytes exceeds Java payload",
+            successor_capacity.0,
+            successor_capacity.1,
+            successor_rpc_capacity.0,
+            successor_rpc_capacity.1,
+            raw_targets
         );
 
         // One mutation reuses the same fully expanded input. Digest knowledge

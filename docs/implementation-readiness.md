@@ -2122,6 +2122,86 @@ pairing을 통한 readonly reconcile은 unavailable이며 실제 original-result
 원 ProviderResult나 추가 효과 가능성 해소를 합성하지 않고 원 journal의 fence를 유지한다.
 scene/animation 발급자, DataPack calibration 및 실제 target-profile 생산자도 후속 구현이다.
 
+## 실제 JVM 재검증과 bootstrap successor의 부분 관측
+
+고정 `47add35df7ae1f15651a54961a4020f468bbd93e`의 Windows `502`는 7모듈
+412개·원 XML 36개·필수 11 task의 실제 실행이 모두 통과했고 failure/error/skip은 0이다.
+입력 203개의 전후 manifest SHA는
+`b8011efb8a10f774fdeee6bd4e1239240abc7593f37d463377f2de18fdae8698`로 같았다.
+원 XML을 별도로 보존했으며 summary 12,594 bytes의 SHA는
+`761f790651130f8d301c53e5985c4ece4fc3cabc967aa9e56bd9ce73f59b437e`다.
+command 0·79,244 ms·Job commit peak 1,380,569,088 bytes·6 process·최대 gap 145 ms,
+자연 종료·drain·완전한 출력·export·scratch 정리·lease 해제다. 앞선 `497`의 serial
+compile 실패를 수정하거나 이 후속 성공으로 지우지 않았다.
+
+`503`은 같은 head에서 실제 선택 MSVC와 JDK 25 헤더로 C witness를 컴파일·실행했다.
+42 table signature·6 callback·4 entry 검사 및 입력 8개의 전후 재검증이 통과했다.
+fixture/helper/Rust FFI/선택 compiler/JNI·JVMTI·platform header/실제 witness image를
+pin했다. command 0·13,063 ms·Job commit peak 174,862,336 bytes·7 process·최대 gap
+127 ms이며 owned-tail 정리 뒤 drain·완전한 출력·export·scratch 정리·lease 해제다.
+helper의 source SHA는 caller-bound이며 VM/table 호출·게임·whole-toolchain 검증을
+발급하지 않는다. JVM CI 76 (`38859789149`)도 세 OS의 JVM 및 native observer
+ABI/controlled-startup 단계와 집계 성공을 관측했다. 새 원 ZIP 감사는 아직 미실행이다.
+Rust CI 85 (`38859789187`)도 후속 조회에서 세 OS의 실제 테스트·lint 및 집계 성공을
+확인했다. 두 CI의 job/step metadata 성공과 새 원 ZIP 감사를 구분하며, 이 결과는 이후
+successor·용량 수정이나 실제 게임·공개 배포의 근거가 아니다.
+
+후속 successor 구현은 원 operation의 Observe 권한과 실제 새 completed pairing의 읽기
+권한을 연결한다. 원 query/Invocation/context pin은 유지하며 같은 game/world·다른 epoch와
+전체 scope를 검사한다. 실제 원 route가 여전히 유효하면 원 source/intent/권한을 확인한 뒤
+기존 경로를 유지하고, 필요한 새 pairing 부재나 무효인 bootstrap을 None으로 우회하지 않는다.
+host 응답은 후검사보다 먼저 원 operation CAS에 보존한다. 공개 JSON이나 digest만으로
+새 pairing·ADMIN·capsule을 발급하지 않는다.
+
+Java는 실제 Accepted에서만 최대 8개 Attempt를 만들고 원 result/failure·reload future를
+reload route 밖에 보존한다. 실제 completion frame·nonce·ready·EOF·child exit 0·stderr
+drain 이후에만 새 route의 private 완료 사실을 기록한다. 이 경계는 같은 server instance의
+수명에 한정되고 실제 ADMIN·95개 scope·현재 generation을 전후 재검사한다. 현재 loaded
+47개와 cache 상태 94개를 읽지만 pack은 unknown으로 남기고 95번째 가짜 image/SHA는
+만들지 않는다. root identity 연속성과 loaded 함수 source 인과가 미입증이므로 원 effect를
+보존하면서 settled=false·빈 direct_changes를 반환한다. 원 ProviderResult가 없으면 poll도
+이를 합성하지 않아 원 작업의 finished·성공·fence 해제를 만들지 않는다.
+
+독립 추적에서 기존 AnonymousBridge가 bootstrap 승인 purpose를 거절하던 P1을 발견했다.
+실제 exchange의 닫힌 gate를 numeric/bootstrap 두 purpose만 허용하도록 교정하고 기존
+HostInspectionControlTest에 허용·거절 회귀를 추가했다. 원 nonce·ACK/EOF·기한·exit/drain
+검사는 바꾸지 않았다. 이전 `502`의 412개에는 이 회귀가 없었으며 새 JVM 검증은 대기 중이다.
+
+Rust 9개·Java 5개의 독립 source 리뷰는 미해결 P1/P2가 없었다. `504`의 명시 Rust format
+뒤 `505`에서 Application 7개·Coordinator 4개 집중 검사가 통과했다. 입력 306개·
+7,720,034 bytes의 전후 SHA는
+`04e2d845a07240a09fd3b0b7fe8d6b4081d373a637515cc09cde807df783dc29`로 같았다.
+command 0·96,646 ms·Job commit peak 1,592,094,720 bytes·6 process·최대 gap 150 ms이며
+owned-tail 정리 뒤 drain·완전한 출력·export·scratch 정리·lease 해제다. 실제 새 pairing이나
+게임 관측을 만든 fixture는 없다. 후속 `506` strict는 조건식 두 곳의 lint로 exit 101이며
+11,599 ms·정상 drain/export/정리를 보존했다. 동치 조건식/let-chain으로 교정한 뒤
+`507` format과 `508` Application·Coordinator·CLI all-target strict 검사가 통과했다.
+`508`은 command 0·21,498 ms·Job commit peak 967,041,024 bytes·7 process·최대 gap
+118 ms이며 자연 종료·drain·완전한 출력·export·scratch 정리·lease 해제다.
+`505`의 원 입력 목록은 별도 source binding 43,501 bytes·SHA
+`7efe22bbe3e92101b8ccfb761082dab5449c890c457b340a75081ee430d68940`로 보존했다.
+이는 당시 캡처한 입력을 뒤에 보존한 기록이며 원 managed 영수증을 수정하지 않았다.
+
+후속 용량 검토에서 raw target 192 KiB 한도만으로 실제 response 256 KiB 한도를
+보장할 수 없음을 확인했다. 실제 wire 구조를 사용한 순수 fixture를 확장하되 대표 NBT
+크기를 실제 게임 관측으로 해석하지 않는다. Java Throwable emitter의 depth/cycle
+절단 노드도 32개 출력 예산에 포함하도록 고쳤고 기존 테스트에서 실제 emitter를
+검사한다. 실제 target 쌍의 candidate 직렬화에 전체 frame 예산과 오류 16 KiB·256 node 및
+종료 tick 길이 여유를 검사하는 교정을 완료하고 독립 source 검토를 통과했다. 초과한
+이번 쌍만 철회하여 실제 prefix와 unknown/LIMIT를 보존하며, 예상 밖의 오류와 후검사
+실패를 부분 성공으로 바꾸지 않는다. raw 192 KiB와 최종 256 KiB·4,096 node·depth 64
+한도는 유지한다. Java 후속 변경은 `505`/`508`의 성공 범위에 포함하지 않으며 실제 JVM
+검사는 대기 중이다.
+
+Rust capacity fixture는 `509` format 뒤 `510`에서 1개 통과했다. 입력 306개·7,729,705
+bytes의 전후 pin은
+`4beadb83f23adadd4d21434402e220235a03f71fbcc9684dce6558709c357681`로 같았다.
+별도 source binding 43,368 bytes·SHA
+`2d8e42b9db9731a93cf3876853e2eae3bc7bbc014cf9eb60b8fbf392ee525b98`와 원 관리 기록을
+보존했다. command 0·70,670 ms·Job commit peak 1,592,999,936 bytes·6 process·최대 gap
+146 ms이며 owned-tail 정리 뒤 drain·완전한 출력·export·scratch 정리·lease 해제다.
+이 fixture는 실제 Java emitter 실행·NBT 크기·게임 및 ADMIN 관측의 근거가 아니다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

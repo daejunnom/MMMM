@@ -72,6 +72,15 @@ public final class AnonymousBridge {
         catch (NoSuchAlgorithmException exception) { throw new AssertionError(exception); }
     }
 
+    /** Exact private approval purposes share the same installed/completed pin checks. */
+    static boolean calibrationApprovalPurpose(Mode mode, ObjectNode offer) {
+        boolean calibration = mode == Mode.APPLY_APPROVAL && Set.of(
+                "numeric_calibration_normative47/1", "numeric_calibration_bootstrap/1")
+                .contains(offer.path("purpose").asText());
+        if (offer.has("purpose") && !calibration) throw failure();
+        return calibration;
+    }
+
     /** Caller executes off the game thread. The child is a bounded bridge; the daemon has its own owner. */
     public static ObjectNode exchange(Path executable, String expectedSha256, ObjectNode offer,
                                       byte[] rawCapability, Installer installer) {
@@ -99,8 +108,7 @@ public final class AnonymousBridge {
         control.run();
         if (rawCapability.length != 32) throw new IllegalArgumentException("Capability must contain 32 bytes");
         envelope(offer, mode.offerKind, offer.path("nonce").asText());
-        boolean calibration = mode == Mode.APPLY_APPROVAL && "numeric_calibration_normative47/1".equals(offer.path("purpose").asText());
-        if (offer.has("purpose") && !calibration) throw failure();
+        boolean calibration = calibrationApprovalPurpose(mode, offer);
         if (!offer.path("nonce").isTextual() || !offer.path("nonce").asText().matches("[a-z0-9][a-z0-9._:-]{0,127}")) throw failure();
         ObjectNode immutableOffer = offer.deepCopy();
         verifyExecutable(executable, expectedSha256, control);

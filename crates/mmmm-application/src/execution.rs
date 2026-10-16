@@ -515,8 +515,8 @@ impl Application<'_> {
                 .store
                 .stored_invocation(&record.operation_id, &stored.step_id)
                 .map_err(|e| AppError::storage("STALE_CONTEXT", e))?;
-            let id: ContextId = decode(&invocation["context"]["contextId"])?;
-            let context = self.observation_context(principal, &plan, &id)?;
+            let context =
+                self.reconciliation_context(principal, &plan, &invocation, &record.scope)?;
             self.authority.authorize(
                 principal,
                 &record.project_id,

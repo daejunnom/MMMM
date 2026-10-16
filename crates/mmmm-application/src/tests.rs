@@ -199,6 +199,7 @@ struct TargetState {
     precondition_batch_mode: Option<PreconditionBatchMode>,
     precondition_batch_calls: usize,
     single_precondition_calls: usize,
+    poll_response_missing: bool,
 }
 impl TargetState {
     fn new() -> Self {
@@ -248,6 +249,7 @@ impl TargetState {
             precondition_batch_mode: None,
             precondition_batch_calls: 0,
             single_precondition_calls: 0,
+            poll_response_missing: false,
         }
     }
 }
@@ -398,6 +400,7 @@ struct Provider {
     descriptor: Value,
     extra_descriptors: BTreeMap<String, Value>,
     codec: Option<RegisteredResultCodec>,
+    successor_context: Option<Value>,
 }
 impl ProviderPort for Provider {
     fn result_codec(
@@ -476,6 +479,16 @@ impl ProviderPort for Provider {
     }
     fn context(&mut self, _principal: &PrincipalId, _context: &ContextId) -> AppResult<Value> {
         Ok(self.live_context.clone())
+    }
+    fn successor_observation_context_with_store(
+        &mut self,
+        _store: &mut DurableStore,
+        _principal: &PrincipalId,
+        _original: &Value,
+    ) -> AppResult<Option<Value>> {
+        // Unit-only trusted-port fixture; this issues no native pairing or
+        // retained host-attempt capability.
+        Ok(self.successor_context.clone())
     }
     fn action_descriptor(&mut self, step: &Value, _context: &Value) -> AppResult<Value> {
         Ok(self
@@ -700,6 +713,9 @@ impl ProviderPort for Provider {
         );
         // The original invocation is queried; it is never dispatched again.
         // A retained valid complete response is distinct from target readback.
+        if target.poll_response_missing {
+            return Ok(None);
+        }
         Ok(Some(json!({
             "contractVersion":"0.2.0", "status":"complete", "data":invocation["arguments"],
             "effects":"recorded", "diagnostics":[], "artifacts":[]
@@ -1262,6 +1278,7 @@ impl Fixture {
                 descriptor,
                 extra_descriptors: BTreeMap::new(),
                 codec: None,
+                successor_context: None,
             },
             observer: Observer {
                 target: target.clone(),
@@ -2016,6 +2033,229 @@ fn current_observe_grant_can_reconcile_original_job_after_apply_policy_revocatio
     assert_eq!(fixture.target.borrow().dispatches, 1);
 }
 
+// These trusted-port fixtures exercise common journal admission only. They do
+// not establish actual bootstrap, successor pairing or game acceptance.
+fn successor_context_fixture(context: &Value) -> Value {
+    let mut current = context.clone();
+    current["contextId"] = json!("context-fixture-successor");
+    current["environment"]["sessionEpoch"] = json!("epoch-fixture-successor");
+    current["contextDigest"] = json!(projected_digest("ExecutionContext", &current).unwrap());
+    current
+}
+
+#[test]
+fn successor_observation_default_none_keeps_the_exact_session_guard() {
+    let mut fixture = Fixture::new(1);
+    let plan = fixture.plan();
+    fixture.target.borrow_mut().lose_response = true;
+    fixture.target.borrow_mut().observer_available = false;
+    let unknown = fixture.apply(&plan, "successor-none-key").unwrap();
+    let mut current = successor_context_fixture(&fixture.provider.live_context);
+    // Ordinary lookup keeps the original context ID; only its session changes.
+    current["contextId"] = plan["contextId"].clone();
+    current["contextDigest"] = json!(projected_digest("ExecutionContext", &current).unwrap());
+    let mut provider = DefaultRegisteredReadProvider(Provider {
+        target: fixture.target.clone(),
+        live_context: current.clone(),
+        descriptor: fixture.provider.descriptor.clone(),
+        extra_descriptors: BTreeMap::new(),
+        codec: None,
+        // The wrapper intentionally inherits the trait's None method, even
+        // when its wrapped fixture would offer a successor context.
+        successor_context: Some(current),
+    });
+    let principal = fixture.principal.clone();
+    let error = {
+        let mut app = fixture.app();
+        app.provider = &mut provider;
+        app.operation_reconcile(&principal, &Fixture::query(&unknown))
+            .unwrap_err()
+    };
+    assert_eq!(error.code, "STALE_CONTEXT");
+    assert_eq!(fixture.target.borrow().dispatches, 1);
+    assert_eq!(fixture.target.borrow().polls, 0);
+}
+
+#[test]
+fn admitted_successor_observes_the_original_invocation_and_never_dispatches_successors() {
+    let mut fixture = Fixture::new(2);
+    let plan = fixture.plan();
+    fixture.target.borrow_mut().lose_response = true;
+    fixture.target.borrow_mut().observer_available = false;
+    let unknown = fixture.apply(&plan, "successor-observe-key").unwrap();
+    let operation: OperationId = decode(&unknown["operationId"]).unwrap();
+    let step: StepId = decode(&plan["steps"][0]["stepId"]).unwrap();
+    let original = fixture.store.stored_invocation(&operation, &step).unwrap();
+    fixture.provider.successor_context =
+        Some(successor_context_fixture(&fixture.provider.live_context));
+    fixture.target.borrow_mut().observer_available = true;
+    fixture.target.borrow_mut().apply_grant = false;
+    let reconciled = fixture.reconcile(&unknown);
+    assert_eq!(reconciled["completedStepIds"], json!(["write-first"]));
+    assert_eq!(reconciled["pendingStepIds"], json!(["write-second"]));
+    let record = fixture.store.operation(&operation).unwrap();
+    assert!(record.steps[0].finished);
+    assert_eq!(record.steps[1].dispatch, DispatchEvidence::NotSent);
+    assert_eq!(
+        fixture.store.stored_invocation(&operation, &step).unwrap(),
+        original
+    );
+    assert_eq!(fixture.target.borrow().dispatches, 1);
+    assert_eq!(fixture.target.borrow().polls, 1);
+}
+
+#[test]
+fn successor_observation_rejects_invalid_current_identity_scope_and_action_before_poll() {
+    for case in [
+        "principal",
+        "project",
+        "world",
+        "game_instance",
+        "kind",
+        "side",
+        "same_epoch",
+        "missing_world",
+        "scope",
+        "digest",
+        "descriptor",
+        "revoked",
+    ] {
+        let mut fixture = Fixture::new(1);
+        let plan = fixture.plan();
+        fixture.target.borrow_mut().lose_response = true;
+        fixture.target.borrow_mut().observer_available = false;
+        let unknown = fixture.apply(&plan, "successor-invalid-key").unwrap();
+        let mut current = successor_context_fixture(&fixture.provider.live_context);
+        match case {
+            "principal" => current["principalRef"] = json!("principal-other"),
+            "project" => current["projectId"] = json!("project-other"),
+            "world" => current["environment"]["worldId"] = json!("world-other"),
+            "game_instance" => current["environment"]["gameInstanceId"] = json!("game-other"),
+            "kind" => current["environment"]["kind"] = json!("daemon"),
+            "side" => current["environment"]["side"] = json!("client"),
+            "same_epoch" => {
+                current["environment"]["sessionEpoch"] =
+                    fixture.provider.live_context["environment"]["sessionEpoch"].clone()
+            }
+            "missing_world" => current["environment"]["worldId"] = Value::Null,
+            "scope" => current["scope"]["resourceIds"] = json!([]),
+            "descriptor" => {
+                fixture.provider.descriptor["implementationDigest"] =
+                    json!(raw_digest(b"successor-different-implementation"))
+            }
+            "revoked" => fixture.target.borrow_mut().observe_grant = false,
+            "digest" => {
+                current["contextDigest"] = json!(raw_digest(b"invalid-successor-context-digest"))
+            }
+            _ => unreachable!(),
+        }
+        if case != "digest" {
+            current["contextDigest"] =
+                json!(projected_digest("ExecutionContext", &current).unwrap());
+        }
+        fixture.provider.successor_context = Some(current);
+        let principal = fixture.principal.clone();
+        assert!(
+            fixture
+                .app()
+                .operation_reconcile(&principal, &Fixture::query(&unknown))
+                .is_err(),
+            "{case}"
+        );
+        assert_eq!(fixture.target.borrow().dispatches, 1, "{case}");
+        assert_eq!(fixture.target.borrow().polls, 0, "{case}");
+        assert!(
+            !fixture
+                .store
+                .operation(&decode(&unknown["operationId"]).unwrap())
+                .unwrap()
+                .steps[0]
+                .finished,
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn successor_fresh_readback_without_original_provider_result_keeps_the_step_unfinished() {
+    let mut fixture = Fixture::new(1);
+    let plan = fixture.plan();
+    fixture.target.borrow_mut().lose_response = true;
+    fixture.target.borrow_mut().observer_available = false;
+    let unknown = fixture.apply(&plan, "successor-no-result-key").unwrap();
+    fixture.provider.successor_context =
+        Some(successor_context_fixture(&fixture.provider.live_context));
+    fixture.target.borrow_mut().observer_available = true;
+    fixture.target.borrow_mut().poll_response_missing = true;
+    let reconciled = fixture.reconcile(&unknown);
+    let operation: OperationId = decode(&unknown["operationId"]).unwrap();
+    let record = fixture.store.operation(&operation).unwrap();
+    assert_ne!(reconciled["state"], "succeeded");
+    assert_eq!(reconciled["completedStepIds"], json!([]));
+    assert_eq!(record.steps[0].effect, EffectEvidence::CompleteConfirmed);
+    assert!(!record.steps[0].finished);
+    assert_eq!(fixture.target.borrow().dispatches, 1);
+    assert_eq!(fixture.target.borrow().polls, 1);
+}
+
+#[test]
+fn successor_observation_keeps_original_query_and_context_pin_checks() {
+    let mut fixture = Fixture::new(1);
+    let plan = fixture.plan();
+    fixture.target.borrow_mut().lose_response = true;
+    fixture.target.borrow_mut().observer_available = false;
+    let unknown = fixture.apply(&plan, "successor-original-pin-key").unwrap();
+    let operation: OperationId = decode(&unknown["operationId"]).unwrap();
+    let step: StepId = decode(&plan["steps"][0]["stepId"]).unwrap();
+    let original = fixture.store.stored_invocation(&operation, &step).unwrap();
+    let scope = fixture.store.operation(&operation).unwrap().scope;
+    fixture.provider.successor_context =
+        Some(successor_context_fixture(&fixture.provider.live_context));
+    let principal = fixture.principal.clone();
+    let mut query = Fixture::query(&unknown);
+    query["contextId"] = json!("context-fixture-successor");
+    assert_eq!(
+        fixture
+            .app()
+            .operation_reconcile(&principal, &query)
+            .unwrap_err()
+            .code,
+        "STALE_CONTEXT"
+    );
+    for case in ["pin_digest", "pin_environment", "original_digest"] {
+        let mut frozen = plan.clone();
+        let mut invocation = original.clone();
+        match case {
+            "pin_digest" => {
+                frozen["contextPins"][0]["contextDigest"] =
+                    json!(raw_digest(b"different-original-pin"))
+            }
+            "pin_environment" => {
+                frozen["contextPins"][0]["environment"]["worldId"] = json!("world-other")
+            }
+            "original_digest" => {
+                invocation["contextDigest"] = json!(raw_digest(b"different-original-context"))
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            fixture
+                .app()
+                .reconciliation_context(&principal, &frozen, &invocation, &scope)
+                .unwrap_err()
+                .code,
+            "STALE_CONTEXT",
+            "{case}"
+        );
+    }
+    assert_eq!(
+        fixture.store.stored_invocation(&operation, &step).unwrap(),
+        original
+    );
+    assert_eq!(fixture.target.borrow().dispatches, 1);
+    assert_eq!(fixture.target.borrow().polls, 0);
+}
+
 #[test]
 fn retained_readback_envelope_pins_exact_recovery_bytes_across_orphan_collection() {
     let mut fixture = Fixture::new(1);
@@ -2462,6 +2702,7 @@ fn precondition_batches_are_fresh_after_capture_and_keep_common_drift_checks() {
         descriptor: fallback.provider.descriptor.clone(),
         extra_descriptors: BTreeMap::new(),
         codec: None,
+        successor_context: None,
     });
     let principal = fallback.principal.clone();
     let report =
@@ -2752,6 +2993,7 @@ fn registered_read_uses_actual_read_boundary_and_default_unavailable_never_dispa
         descriptor: fixture.provider.descriptor.clone(),
         extra_descriptors: BTreeMap::new(),
         codec: None,
+        successor_context: None,
     });
     let error = {
         let mut app = fixture.app();

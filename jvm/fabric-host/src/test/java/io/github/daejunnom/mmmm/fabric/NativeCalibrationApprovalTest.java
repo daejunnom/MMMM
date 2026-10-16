@@ -1,5 +1,6 @@
 package io.github.daejunnom.mmmm.fabric;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.daejunnom.mmmm.host.GameThread;
 import io.github.daejunnom.mmmm.host.HostAuthority;
@@ -282,6 +283,166 @@ final class NativeCalibrationApprovalTest {
             assertUnclaimed(harness.grant);
             assertFalse(harness.session.verifiedWriteProfile());
         }
+    }
+
+    @Test void bootstrapFailureDiagnosticChargesTruncatedLeavesToItsActualObjectBudget() {
+        // Existing approval fixtures do not exercise the new actual Throwable
+        // formatter. This is a pure 97-object failure graph, with no attempt,
+        // native owner, ADMIN receipt or successful provider result.
+        Throwable root = branchingFailureGraph();
+        JsonNode wire = NativeCalibrationBootstrap.throwable(root);
+        List<JsonNode> emitted = diagnosticObjects(wire);
+        assertEquals(32, emitted.size(), "Depth-boundary diagnostic objects must consume the same budget");
+        assertTrue(emitted.stream().anyMatch(node -> node.path("truncated").asBoolean() && !node.path("suppressed").isEmpty()),
+                "An exhausted parent must mark its omitted children");
+        for (JsonNode node : emitted) {
+            var fields = new java.util.HashSet<String>(); node.fieldNames().forEachRemaining(fields::add);
+            assertEquals(Set.of("type", "code", "cause", "suppressed", "truncated"), fields);
+        }
+        assertEquals("FIXTURE_FAILURE", wire.path("code").asText());
+        assertFalse(wire.toString().contains("fixture-message-is-not-public"));
+    }
+
+    @Test void bootstrapFailureDiagnosticKeepsCycleAndDepthBoundariesFactualAndFinite() {
+        Throwable first = new IllegalStateException("fixture-cycle"), second = new IllegalArgumentException("fixture-cycle");
+        first.initCause(second); second.initCause(first);
+        JsonNode cyclic = NativeCalibrationBootstrap.throwable(first);
+        assertEquals(3, diagnosticObjects(cyclic).size());
+        assertEquals(first.getClass().getName(), cyclic.path("cause").path("cause").path("type").asText());
+        assertTrue(cyclic.path("cause").path("cause").path("truncated").booleanValue());
+        assertTrue(cyclic.path("cause").path("cause").path("cause").isNull());
+
+        Throwable deep = new IllegalStateException("fixture-depth"), tail = deep;
+        for (int depth = 1; depth < 20; depth++) {
+            Throwable next = new IllegalStateException("fixture-depth"); tail.initCause(next); tail = next;
+        }
+        JsonNode bounded = NativeCalibrationBootstrap.throwable(deep);
+        assertEquals(9, diagnosticObjects(bounded).size());
+        JsonNode boundary = bounded;
+        for (int depth = 0; depth < 8; depth++) boundary = boundary.path("cause");
+        assertTrue(boundary.path("truncated").booleanValue()); assertTrue(boundary.path("cause").isNull());
+        assertTrue(NativeCalibrationBootstrap.throwable(null).isNull());
+    }
+
+    @Test void successorPairCapacityKeepsThePreviousPrefixWhenHexExceedsTheWholePayloadBudget() throws Exception {
+        // The approval fixtures omit successor history and double hex expansion.
+        // This is wire capacity only: no native read, attempt, pairing or result
+        // is issued by constructing these synthetic JSON/byte bodies.
+        ObjectNode response = successorWireFixture();
+        byte[] first = new byte[48 * 1024], next = new byte[32 * 1024];
+        assertTrue(2L * first.length + 2L * next.length < 192L * 1024);
+        assertTrue(NativeCalibrationBootstrap.appendSuccessorPair(response, "capacity-first-objective", first, ContractJson.sha256(first),
+                "capacity-first-storage", first, ContractJson.sha256(first)));
+        byte[] retained = ContractJson.bytes(response);
+        assertFalse(NativeCalibrationBootstrap.appendSuccessorPair(response, "capacity-next-objective", next, ContractJson.sha256(next),
+                "capacity-next-storage", next, ContractJson.sha256(next)));
+        assertArrayEquals(retained, ContractJson.bytes(response));
+        ObjectNode images = ContractJson.object(response.path("observation").path("targetImages"));
+        assertEquals(2, images.path("targets").size()); assertEquals("unknown", images.path("status").asText());
+
+        var factory = NativeCalibrationBootstrap.class.getDeclaredMethod("limit"); factory.setAccessible(true);
+        Throwable actualLimit = (Throwable) factory.invoke(null);
+        JsonNode failure = NativeCalibrationBootstrap.throwable(actualLimit);
+        assertEquals("CALIBRATION_BOOTSTRAP_LIMIT", failure.path("code").asText());
+        assertTrue(ContractJson.bytes(failure).length <= 16 * 1024); assertTrue(jsonNodes(failure) <= 256);
+        images.set("failure", failure);
+        ContractJson.object(response.path("observation")).put("observedToTick", "4294967295");
+        assertSuccessorFinalWireFits(response);
+
+        ObjectNode excessiveHeader = successorWireFixture();
+        ContractJson.object(excessiveHeader.path("originalInvocation").path("arguments"))
+                .put("capacityOnlyOversize", "x".repeat(HostRuntime.MAX_RESULT_BYTES));
+        assertFalse(NativeCalibrationBootstrap.appendSuccessorPair(excessiveHeader, "capacity-objective", new byte[1], "0".repeat(64),
+                "capacity-storage", new byte[1], "0".repeat(64)));
+        var bounded = NativeCalibrationBootstrap.class.getDeclaredMethod("bounded", JsonNode.class); bounded.setAccessible(true);
+        assertInstanceOf(ContractException.class, assertThrows(java.lang.reflect.InvocationTargetException.class,
+                () -> bounded.invoke(null, excessiveHeader)).getCause(), "An oversized original header must still fail closed");
+    }
+
+    @Test void successorPairCapacityReservesActualDiagnosticNodesAndTheFinalTickWidth() throws Exception {
+        ObjectNode response = successorWireFixture();
+        var resources = ContractJson.object(response.path("currentContext").path("scope")).withArray("resourceIds");
+        int addedPairNodes = 8, targetNodes = 4096 - 256 - addedPairNodes;
+        int remaining = targetNodes - jsonNodes(response);
+        assertTrue(remaining > 0);
+        for (int i = 0; i < remaining; i++) resources.add("capacity-resource-" + i);
+        byte[] raw = "{}".getBytes(StandardCharsets.US_ASCII);
+        assertTrue(NativeCalibrationBootstrap.appendSuccessorPair(response, "capacity-objective", raw, ContractJson.sha256(raw),
+                "capacity-storage", raw, ContractJson.sha256(raw)));
+        assertEquals(4096 - 256, jsonNodes(response));
+        byte[] retained = ContractJson.bytes(response);
+        assertFalse(NativeCalibrationBootstrap.appendSuccessorPair(response, "capacity-extra-objective", raw, ContractJson.sha256(raw),
+                "capacity-extra-storage", raw, ContractJson.sha256(raw)));
+        assertArrayEquals(retained, ContractJson.bytes(response));
+        JsonNode failure = NativeCalibrationBootstrap.throwable(branchingFailureGraph());
+        // A maximum 32-object diagnostic is at most 192 JSON value nodes.
+        // The 256-node reserve also leaves room for the eight RPC wrapper nodes.
+        assertTrue(jsonNodes(failure) <= 192); assertTrue(ContractJson.bytes(failure).length <= 16 * 1024);
+        ContractJson.object(response.path("observation").path("targetImages")).set("failure", failure);
+        ContractJson.object(response.path("observation")).put("observedToTick", "4294967295");
+        assertSuccessorFinalWireFits(response);
+    }
+
+    private static ObjectNode successorWireFixture() throws IOException {
+        String digest = "0".repeat(64);
+        ObjectNode response = ContractJson.newObject().put("format", "mmmm.native.calibration-bootstrap-successor/1")
+                .put("frozenManifestDigest", digest).put("sourceBundleDigest", digest);
+        response.set("originalInvocation", fixture("invocation.json")); response.set("currentContext", fixture("execution-context.json"));
+        ObjectNode history = response.putObject("history").put("resultTerminal", true).put("effectPhase", "reload_future_returned")
+                .put("initializationAttemptedCount", 47).put("reloadOutcome", "completed");
+        history.putNull("originalResult"); history.set("originalFailure", NativeCalibrationBootstrap.throwable(new IllegalStateException("capacity-only")));
+        history.putNull("reloadFailure"); var returns = history.putArray("initializationReturns"); for (int i = 0; i < 47; i++) returns.add(1);
+        ObjectNode files = history.putObject("fileFacts").put("sourceBundleDigest", digest).put("verifiedFileCount", 48);
+        var paths = files.putArray("files");
+        for (int i = 0; i < 48; i++) paths.addObject().put("path", "capacity-only/source-" + i + ".mcfunction").put("byteLength", 65536).put("rawSha256", digest);
+        ObjectNode observation = response.putObject("observation").put("format", "mmmm.native.calibration-bootstrap-observation/1")
+                .put("observedFromTick", "0").put("observedToTick", "0");
+        observation.putObject("pack").put("status", "unknown").put("reason", "readonly_pack_observer_unavailable").put("identityContinuity", "unproven");
+        ObjectNode loaded = observation.putObject("loadedSources").put("status", "unknown").put("causalLink", "unproven"); loaded.putNull("failure");
+        var functions = loaded.putArray("functions");
+        for (int i = 0; i < 47; i++) functions.addObject().put("functionId", "mmmm_calibration:capacity_only_" + i + "/" + "0".repeat(24))
+                .put("resourceId", "mmmm_calibration:function/capacity_only_" + i + "/" + "0".repeat(24) + ".mcfunction")
+                .put("sourcePackId", "file/mmmm-calibration-normative47").put("rawSha256", digest).put("byteLength", 65536);
+        ObjectNode images = observation.putObject("targetImages").put("status", "unknown"); images.putArray("targets"); images.putNull("failure");
+        return response;
+    }
+
+    private static void assertSuccessorFinalWireFits(ObjectNode response) throws Exception {
+        var bounded = NativeCalibrationBootstrap.class.getDeclaredMethod("bounded", JsonNode.class); bounded.setAccessible(true);
+        assertDoesNotThrow(() -> bounded.invoke(null, response));
+        assertTrue(ContractJson.bytes(response).length <= HostRuntime.MAX_RESULT_BYTES);
+        ObjectNode host = ContractJson.newObject().put("protocolVersion", ContractJson.VERSION).put("requestId", "capacity-successor")
+                .put("status", "ok").put("eventSequence", "0"); host.set("payload", response);
+        ObjectNode rpc = ContractJson.newObject().put("jsonrpc", "2.0").put("id", "capacity-successor"); rpc.set("result", host);
+        assertTrue(ContractJson.bytes(rpc).length <= 1024 * 1024); assertTrue(jsonNodes(rpc) <= 4096);
+    }
+
+    private static int jsonNodes(JsonNode value) {
+        int result = 1; if (value.isContainerNode()) for (JsonNode child : value) result += jsonNodes(child); return result;
+    }
+
+    private static Throwable branchingFailureGraph() {
+        Throwable root = new ContractException("FIXTURE_FAILURE", "fixture-message-is-not-public"), depthSix = root;
+        for (int depth = 1; depth <= 6; depth++) {
+            Throwable next = new IllegalStateException("fixture-message-is-not-public"); depthSix.initCause(next); depthSix = next;
+        }
+        for (int branch = 0; branch < 9; branch++) {
+            Throwable depthSeven = new IllegalStateException("fixture-message-is-not-public");
+            if (branch == 0) depthSix.initCause(depthSeven); else depthSix.addSuppressed(depthSeven);
+            depthSeven.initCause(new IllegalArgumentException("fixture-message-is-not-public"));
+            for (int leaf = 0; leaf < 8; leaf++) depthSeven.addSuppressed(new IllegalArgumentException("fixture-message-is-not-public"));
+        }
+        return root;
+    }
+
+    private static List<JsonNode> diagnosticObjects(JsonNode root) {
+        var result = new ArrayList<JsonNode>(); var pending = new ArrayList<JsonNode>(); pending.add(root);
+        for (int index = 0; index < pending.size(); index++) {
+            JsonNode node = pending.get(index); if (node.isNull()) continue; result.add(node);
+            if (!node.path("cause").isNull()) pending.add(node.path("cause"));
+            node.path("suppressed").forEach(pending::add);
+        }
+        return result;
     }
 
     private static class RejectingRunner implements NativeCalibrationApproval.Runner {

@@ -1135,6 +1135,30 @@ impl ProviderPort for CompositeProvider {
             .authority
             .current_context_with_deadline(principal, id, budget.deadline())
     }
+    fn successor_observation_context_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        principal: &PrincipalId,
+        original: &Value,
+    ) -> AppResult<Option<Value>> {
+        if original["actionId"] != crate::calibration_bootstrap::ACTION {
+            return Ok(None);
+        }
+        let request = self.shared.calibration_request()?;
+        if request.authenticated().principal() != principal {
+            return Err(forbidden());
+        }
+        self.shared
+            .bootstrap
+            .observe_successor(
+                store,
+                &request,
+                &self.shared.authority,
+                &self.shared.hosts,
+                original,
+            )
+            .map(|observed| observed.map(|observed| observed.context().clone()))
+    }
     fn action_descriptor(&mut self, step: &Value, context: &Value) -> AppResult<Value> {
         let call = self.shared.call(context)?;
         call.check()?;
@@ -1571,6 +1595,18 @@ impl ProviderPort for CompositeProvider {
         receipt: Option<&str>,
     ) -> AppResult<Option<Value>> {
         let request = self.shared.calibration_request()?;
+        if invocation["actionId"] == crate::calibration_bootstrap::ACTION
+            && request.method() == "operation.reconcile"
+            && let Some(observed) = self.shared.bootstrap.observe_successor(
+                store,
+                &request,
+                &self.shared.authority,
+                &self.shared.hosts,
+                invocation,
+            )?
+        {
+            return Ok(observed.original_result());
+        }
         if let Some(entered) =
             self.shared
                 .enter_bootstrap(store, &request, invocation, BootstrapAccess::Observe)?
@@ -2103,6 +2139,23 @@ impl IndependentObserverPort for CompositeObserver {
         scope: &WriteScope,
     ) -> AppResult<ReadbackEvidence> {
         let request = self.shared.calibration_request()?;
+        if invocation["actionId"] == crate::calibration_bootstrap::ACTION
+            && request.method() == "operation.reconcile"
+        {
+            let operation: OperationId = decode(&invocation["operationId"])?;
+            if &store.operation(&operation).map_err(storage)?.scope != scope {
+                return Err(forbidden());
+            }
+            if let Some(observed) = self.shared.bootstrap.observe_successor(
+                store,
+                &request,
+                &self.shared.authority,
+                &self.shared.hosts,
+                invocation,
+            )? {
+                return observed.readback(invocation);
+            }
+        }
         if self
             .shared
             .enter_bootstrap(store, &request, invocation, BootstrapAccess::Observe)?

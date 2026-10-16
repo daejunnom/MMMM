@@ -922,6 +922,18 @@ impl ProviderPort for GuardedProvider<'_> {
         self.admission()?;
         self.inner.action_descriptor(step, context)
     }
+    fn successor_observation_context_with_store(
+        &mut self,
+        store: &mut DurableStore,
+        principal: &mmmm_contracts::PrincipalId,
+        original: &Value,
+    ) -> mmmm_application::AppResult<Option<Value>> {
+        self.admission()?;
+        let observed = self
+            .inner
+            .successor_observation_context_with_store(store, principal, original);
+        crate::observer::finish_native_observation(observed, self.admission())
+    }
     fn observe_precondition(
         &mut self,
         precondition: &Value,
