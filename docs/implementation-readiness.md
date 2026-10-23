@@ -2639,7 +2639,7 @@ NotFound·ENOENT 2 관측 오류로 중단됐다. binding attempt 44·최대 ret
 FD 15·query failure 1·retirement 0이고 signal 9·drain·출력 완료·export·scratch 정리·
 lease 해제를 기록했다. 현재 증거에는 compiler 오류가 없고 compile 완료도 없다.
 이 열거 후보 실패를 held member의 identity 변경이나 D078 Z2→X0로 재분류하지 않는다.
-현재 source는 retained PID 확인 전에 candidate의 initial stat을 열므로 이 role 라벨만으로
+해당 실행 당시 source는 retained PID 확인 전에 candidate의 initial stat을 열므로 이 role 라벨만으로
 당시 unbound 여부를 확정할 수 없다. ENOENT를 실제 종료·RSS 0·완전 sample로 승격하지 않는다.
 기존 원 identity·기한·자원·정리 조건을 유지할 후속 관측 처리 검토가 남았다.
 
@@ -2694,14 +2694,33 @@ lease 해제와 감독/정리 오류 0이다. snapshot과 원시 로그는 저�
 PowerShell ordered map의 크기 집계에서 실패했다. 두 실행 모두 Cargo 호출 전이며 원
 실패·완전한 출력·정상 정리 기록을 보존했다. 575의 유한한 경로 진단으로 전자를 확인하고
 명시적인 동일 drive 표기 처리와 합계 반복문으로 수정했다. 실패를 검사 성공으로 바꾸지 않는다.
-이번 변경의 실제 Linux native/strict 결과는 후속 CI에서 확인해야 한다. WSL은 사용하지 않았다.
+이 Windows 검증만으로 Linux native/strict 성공을 판정하지 않았으며, 후속 CI 관측은 아래와
+같이 구분한다. WSL은 사용하지 않았다.
 
 별도로 위 변경 전 `d47204a`의
 [Rust96](https://github.com/daejunnom/MMMM/actions/runs/39960679636)과
 [JVM87](https://github.com/daejunnom/MMMM/actions/runs/39960679978)은 최종 success이며,
 각 3개 OS의 tests/lint 또는 JVM/native/startup 및 집계 step 성공을 metadata로 확인했다.
 이 성공은 앞선 간헐적인 CI85 실패를 지우지 않으며, 이번 두 소스 수정의 실행 증거도 아니다.
-해당 두 새 CI의 원 artifact 감사와 실제 게임·클라이언트·공개 배포는 별도로 남아 있다.
+해당 두 CI 전체 artifact의 감사와 실제 게임·클라이언트·공개 배포는 별도로 남아 있다.
+
+후속 `73a903833abf13a1d7ff86b149c1b9065d1c9245`의
+[Rust97](https://github.com/daejunnom/MMMM/actions/runs/39965360390)은 3OS 실제 Rust
+tests/lint 및 집계 job success를 metadata로 확인했다.
+[JVM88](https://github.com/daejunnom/MMMM/actions/runs/39965360393)도 3OS JVM/native/
+controlled startup 및 최종 집계 success다. 원 Linux ZIP 10,647,287 bytes·SHA
+`0e326df9f34425d2b42a9ebdf04f32d5b0a39f938ce04a60bcf769a53874f105`를 API와 실제
+bytes로 대조하고 결과 문서가 결합한 native/header/startup의 process·finish·finalization
+9개 원 byte digest를 모두 확인했다. 각각 31,922/1,698/235 ms·exit 0·drain·출력 완료·
+정상 export/scratch 정리/lease 해제다. 새 incomplete_enumeration은 세 단계 모두
+count/recovered_samples 0·first/last/following_failure null이다. retirement_count 0과
+JVM pending leader/member null도 유지되어 이번 실행을 실제 two-pass recovery나
+pidfd retirement 분기의 재현 성공으로 해석하지 않는다. 이전 `d47204a`의 JVM87 Linux
+ZIP도 10,647,441 bytes·SHA
+`568a1153b5c2e40d65884066df633db4e5095d38e1fb086ee98bba6a7a0735b2`를 대조했으며
+같은 세 단계의 원 binding 9개와 exit 0·정상 종료/정리를 확인했다. 두 원 ZIP은 외부에
+보존했고 binary나 source manifest 내용을 추가 검사하지 않았다. 이는 development
+fixture 검증이며 실제 source admission·pack/JNI 게임 경로·전체 toolchain 인증과 별도다.
 
 ### 실제 함수 로더의 읽기 전용 ABI 관측
 
