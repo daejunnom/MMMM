@@ -2815,6 +2815,52 @@ owned tail 정리 뒤 drain했다. strict는 command 0·33,263 ms·peak 773,947,
 감독/정리 오류 0이다. 실제 새 resource의 native 인증·CAS·게임 또는 공개 배포 성공으로
 확대하지 않는다. 관측 JNI와 bootstrap 연결의 미공유 작업은 이 검사 입력에서 제외했다.
 
+후속 loaded-source WIP는 실제 JNI export, 원 loader의 Supplier/Future/continuation,
+selected Entry·Resource·원 stream·reader·lines·compiled Function 및 게시 Map의 관계를
+기록 코어에 연결한다. phase46은 Rust numeric47 정본으로 관측 대상만 선택하며 unrelated
+함수를 보관하지 않는다. phase35는 원 Consumer·NewHolder·server와 실제 setter receiver,
+원 Map 저장 피연산자를 결합한다. 현재 원 reload future의 binding 전에는 terminal을
+합성하지 않는다. Java bootstrap은 같은 selection 참조로 한 번 arm하고 원 reload를
+실행하며, 관측 오류와 원 실행 오류를 분리한다.
+
+successor의 nested observation은 `/2`이며 단일 opaque native receipt 최대 64 KiB와
+첫 source 실패·이번 current 실패를 기존 전체 payload CAS에 보존한다. 전체 응답
+256 KiB·실패 예약 32 KiB 안에서 target prefix를 수집한다. Rust의 해당 transport 두
+소스는 Windows592의 clean7738364+정확 overlay에서 8 tests PASS·386 filtered이며
+534개·12,286,744 bytes의 전후 manifest
+`92c1db69046e975ad6d476a3c795644df1eadc91277e9ac5667464848958b565`가 같았다.
+command 0·94,169 ms·peak 1,653,198,848 bytes·7 processes·gap 148 ms이며 owned tail
+정리 뒤 drain·output/export·scratch 정리·lease 해제와 감독/정리 오류 0이다.
+
+새 observer의 Windows598 snapshot 검사는 build script의 SAC/WDAC4551로 compile 전에
+멈췄다. 실제 checkout 경로의 599는 compile을 완료했지만 검사 EXE가 4551로 실행되지
+않았다. 600에서 확인한 Clippy14건은 같은 판정의 let-chain·contains 및 설치 관측값과
+JNI 입력의 named record로 교정했다. 603의 정확한 소스 포맷 뒤 604 strict lib/tests
+Clippy PASS, 605 observer80 tests PASS·0 filtered다. 이전 차단의 원인을 확정하거나
+해결했다고 주장하지 않으며, 원 598/599/600 실패 기록을 보존한다.
+
+604/605는 checkout의 선택된 source closure와 소유 코호트 137개·2,327,677 bytes를
+전후 대조했고 manifest SHA
+`67c1639d7c26a65de44f68640f513faf30a78f36b351401725ff310fc6e43b0f`가 같았다.
+이는 원자적인 source snapshot이나 전체 dependency/toolchain image 증명이 아니다.
+strict는 command 0·7,990 ms·peak 392,019,968 bytes·8 processes·gap 115 ms·자연 종료,
+tests는 command 0·12,723 ms·peak 583,180,288 bytes·7 processes·gap 145 ms·owned tail
+정리 뒤 drain이다. 두 실행 모두 output/export·scratch 정리·lease 해제와 감독/정리 오류
+0이다. C witness의 선언 검사는 47 table signature로 갱신했으며 새 C/JVM 실행은 별도다.
+
+registry는 8 captures·각 512 strong refs이며 현재 정상 관계의 보수적 상한 496개와
+첫 historical Throwable 전용 slot을 구분한다. fresh current 조회는 scoped root guard
+안에서 원 요청의 기한·취소를 확인한다. 초기 cached identity 추출에는 call-entry 기한과
+class stamp만 적용한다. current 원인이 일반 ref 한도를 넘으면 실제 Throwable 참조와
+재전파는 보장하지 않고 opaque 실패만 남긴다. 미지원 Guava 형태·미관측 class/loader는
+unavailable이며 Active 동시 JNI frame의 별도 상한과 실제 호스트 상한의 합성은 후속
+검증이다. 역사/현재 실패를 섞거나 SourceAdmission·target·settled로 승격하지 않는다.
+
+599의 실제 차단 뒤 Ubuntu의 읽기 전용 준비를 시도했다. 601은 기본 계정/인수 전달
+오류로 실패했고 602는 명시한 기존 일반 계정의 UID만 확인했다. 이후 605가 Windows에서
+실행되어 Ubuntu 제품 빌드·검사로 전환하지 않았다. 배포판 설정·전역 종료를 변경하지
+않았으며 두 초기 점검을 Linux 제품 검사나 Windows Job의 Linux 자원 보장으로 보지 않는다.
+
 사용자 계정 인증 문제로 Minecraft 클라이언트 로그인·실제 ADMIN pairing·시각 검증은
 not_run이다. 클라이언트 인증을 우회하거나 필수 인수를 줄이지 않고, 독립 구현과 서버 측
 관측을 계속한다. 필수 게임 인수와 공개 v0.1.0 배포 완료 조건은 아래와 같다.

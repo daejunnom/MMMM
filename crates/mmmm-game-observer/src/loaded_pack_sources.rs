@@ -103,6 +103,16 @@ pub(crate) struct Checkpoint {
     pub now_ms: u64,
 }
 
+/// Actual identities and selected entries read from the installed server view.
+pub(crate) struct InstalledSourceView<'a> {
+    pub server: ObjectId,
+    pub manager: ObjectId,
+    pub resources: ObjectId,
+    pub library: ObjectId,
+    pub published_map: ObjectId,
+    pub entries: &'a [(String, ObjectId)],
+}
+
 #[derive(Clone, Debug)]
 struct ExpectedFunction {
     resource: String,
@@ -880,14 +890,17 @@ impl RecordingCore {
     pub(crate) fn server_installed(
         &mut self,
         id: CaptureId,
-        server: ObjectId,
-        manager: ObjectId,
-        resources: ObjectId,
-        library: ObjectId,
-        actual_map: ObjectId,
-        entries: &[(String, ObjectId)],
+        view: InstalledSourceView<'_>,
         check: Checkpoint,
     ) -> Result<(), Failure> {
+        let InstalledSourceView {
+            server,
+            manager,
+            resources,
+            library,
+            published_map: actual_map,
+            entries,
+        } = view;
         self.with_fact(id, check, |capture| {
             if capture.binding.server != server
                 || capture.manager != Some(manager)
@@ -1255,12 +1268,14 @@ mod tests {
             .unwrap();
         core.server_installed(
             id,
-            object(1),
-            object(16),
-            object(17),
-            object(18),
-            object(25),
-            &entries(),
+            InstalledSourceView {
+                server: object(1),
+                manager: object(16),
+                resources: object(17),
+                library: object(18),
+                published_map: object(25),
+                entries: &entries(),
+            },
             check(),
         )
         .unwrap();
@@ -1359,12 +1374,14 @@ mod tests {
             .unwrap();
         core.server_installed(
             id,
-            object(1),
-            object(16),
-            object(17),
-            object(18),
-            object(25),
-            &entries(),
+            InstalledSourceView {
+                server: object(1),
+                manager: object(16),
+                resources: object(17),
+                library: object(18),
+                published_map: object(25),
+                entries: &entries(),
+            },
             check(),
         )
         .unwrap();
@@ -1523,12 +1540,14 @@ mod tests {
             .unwrap();
         core.server_installed(
             id,
-            object(1),
-            object(16),
-            object(17),
-            object(18),
-            object(25),
-            &entries(),
+            InstalledSourceView {
+                server: object(1),
+                manager: object(16),
+                resources: object(17),
+                library: object(18),
+                published_map: object(25),
+                entries: &entries(),
+            },
             check(),
         )
         .unwrap();

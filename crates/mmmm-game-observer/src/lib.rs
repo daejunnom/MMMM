@@ -19,6 +19,8 @@ mod classfile;
 mod definitions;
 mod ffi;
 mod library_lifetime;
+mod loaded_pack_sources;
+mod loaded_pack_sources_jni;
 mod native_producer;
 mod owned_pack_files;
 
@@ -123,4 +125,23 @@ pub unsafe extern "C" fn Java_io_github_daejunnom_mmmm_observer_DefinitionOwnedP
 ) -> *mut c_void {
     // SAFETY: the foreign entry arguments belong to this calling JNI frame.
     unsafe { owned_pack_files::call(env.cast(), bridge, port, frame, operation) }
+}
+
+/// Actual loader events and a separate fresh, read-only current-root observation.
+/// Historical receipts contain no source admission or execution permission.
+///
+/// # Safety
+/// All references must belong to this attached thread's live pinned JNI frame.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_io_github_daejunnom_mmmm_observer_DefinitionPackLoadBridge_nativeObserve(
+    env: *mut c_void,
+    bridge: *mut c_void,
+    port: *mut c_void,
+    bytes: *mut c_void,
+    offset: i32,
+    length: i32,
+    phase: i32,
+) -> *mut c_void {
+    // SAFETY: only the actual VM invocation supplies this attached frame.
+    unsafe { loaded_pack_sources_jni::call(env.cast(), bridge, port, bytes, offset, length, phase) }
 }

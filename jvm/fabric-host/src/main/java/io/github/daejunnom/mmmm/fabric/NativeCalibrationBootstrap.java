@@ -26,6 +26,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -57,6 +58,7 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
             "registryGeneration", "runtimeSourceFactsDigest", "suiteDigest", "recipeSha256", "plan", "sourceBundle", "programs");
     private static final Set<String> PROGRAM_FIELDS = Set.of("caseId", "functionId", "objective", "storage", "initializationCommands");
     private static final int MAX_TARGETS = 95, MAX_PACKS = 256;
+    private static final int MAX_SOURCE_RECEIPT_BYTES = 64 * 1024;
 
     /** Only the closed, protected bootstrap manifest constructs a program. */
     static final class Program {
@@ -143,6 +145,9 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
         private volatile DefinitionOwnedPackFilesBridge.RootAnchor heldRootAnchor;
         private volatile DefinitionOwnedPackFilesBridge.HeldRootReceipt rootRetirement;
         private volatile Throwable rootRetirementFailure;
+        private volatile boolean sourceArmAttempted;
+        private volatile NativeFunctionLoadObservation sourceObservation;
+        private volatile Throwable sourceObservationFailure;
 
         private Attempt(NativeCalibrationBootstrap bootstrap, Invocation invocation, CompletionStage<ProviderResult> actualResult) {
             owner = bootstrap.server; original = invocation; invocationDigest = ContractJson.digest(invocation.wire());
@@ -205,6 +210,47 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
                 throw failure;
             }
         }
+        void retireForServerStop(MinecraftServer actual, Runnable cleanup) {
+            requireActualServer(actual);
+            Throwable primary = null;
+            try {
+                cleanup.run();
+                NativeFunctionLoadObservation observed = sourceObservation;
+                if (observed != null) observed.retire();
+            } catch (RuntimeException | Error failure) { retainSourceFailure(failure); primary = failure; }
+            // One failed retirement must not skip the other retained owner.
+            try { retireRoot(actual, cleanup); }
+            catch (RuntimeException | Error failure) {
+                if (primary == null) primary = failure; else preserve(primary, failure);
+            }
+            if (primary instanceof RuntimeException failure) throw failure;
+            if (primary instanceof Error failure) throw failure;
+        }
+        private synchronized void retainSourceFailure(Throwable actual) {
+            if (sourceObservationFailure == null) sourceObservationFailure = actual;
+        }
+        private void refreshSourceFailure() {
+            NativeFunctionLoadObservation observed = sourceObservation;
+            if (observed == null) return;
+            try {
+                var first = observed.firstFailure();
+                // The port also retains fresh-call failures. Those belong only
+                // to currentFailure, never the historical loader's first cause.
+                if (first != null && first.phase() != NativeFunctionLoadObservation.Phase.OBSERVE_CURRENT)
+                    retainSourceFailure(first.actualThrowable());
+            } catch (RuntimeException | Error failure) { retainSourceFailure(failure); }
+        }
+        private void armSourceObservation(Collection<String> actualSelection) {
+            // Observation is a one-shot diagnostic of the approved original call.
+            // Its failure cannot cancel, replace or retry the engine's reload.
+            if (sourceArmAttempted) return;
+            sourceArmAttempted = true;
+            try {
+                sourceObservation = NativeFunctionLoadObservation.begin(owner, this, original,
+                        sourceFiles, heldRootAnchor, actualSelection);
+                refreshSourceFailure();
+            } catch (RuntimeException | Error failure) { retainSourceFailure(failure); }
+        }
         private static boolean retirementConsumed(DefinitionOwnedPackFilesBridge.HeldRootReceipt actual) {
             return actual != null && Set.of("reference_released", "close_uncertain", "vm_owned").contains(actual.state());
         }
@@ -245,14 +291,33 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
                         .put("frozenManifestDigest", manifestDigest).put("sourceBundleDigest", bundleDigest);
                 response.set("originalInvocation", original.wire().deepCopy()); response.set("currentContext", context.deepCopy());
                 response.set("history", history());
-                ObjectNode observation = response.putObject("observation").put("format", "mmmm.native.calibration-bootstrap-observation/1")
+                ObjectNode observation = response.putObject("observation").put("format", "mmmm.native.calibration-bootstrap-observation/2")
                         .put("observedFromTick", Long.toString(from)).put("observedToTick", Long.toString(from));
+                SourceTrace trace = new SourceTrace(sourceArmAttempted);
+                refreshSourceFailure();
+                NativeFunctionLoadObservation sourceCapture = sourceObservation;
+                if (sourceCapture != null) {
+                    try { trace.historical(sourceCapture.opaqueReceipt()); }
+                    catch (RuntimeException | Error failure) { retainSourceFailure(failure); }
+                }
                 ObjectNode pack = observation.putObject("pack").put("status", "unknown").put("reason", "retained_root_not_published")
                         .put("identityContinuity", "unproven").put("currentBytes", "not_observed").put("fullPackMembership", "unproven");
                 pack.putNull("retainedRoot"); pack.putNull("failure");
                 if (heldRootAnchor != null) {
                     try {
-                        var retained = observeRetainedPack(actual, this, current);
+                        var retained = withRetainedPackRoot(actual, current, root -> {
+                            var facts = NativeCalibrationPackFiles.observeRetainedRoot(actual, this, root, current);
+                            if (sourceCapture != null) {
+                                try {
+                                    var port = NativeCalibrationPackFiles.freshCurrentRootPort(actual, this, root, current);
+                                    trace.current(sourceCapture.observeCurrent(port));
+                                } catch (RuntimeException | Error failure) {
+                                    // This call's failure never overwrites the original first source cause.
+                                    trace.currentFailure = failure;
+                                }
+                            }
+                            return facts;
+                        });
                         pack.set("retainedRoot", heldRootFacts(retained));
                         pack.put("status", "observed").put("reason", "native_retained_root_identity_only");
                         pack.put("identityContinuity", retained.identity());
@@ -263,6 +328,11 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
                         pack.set("failure", observedFailure(failure, current));
                     }
                 }
+                refreshSourceFailure();
+                // Attach before targets: their existing whole-response budget
+                // includes the opaque receipt and both bounded failure graphs.
+                observation.set("loadedSourceTrace", sourceTraceWire(trace.attempted, trace.origin,
+                        trace.receipt, sourceObservationFailure, trace.currentFailure));
                 ObjectNode loaded = observation.putObject("loadedSources").put("status", "unknown").put("causalLink", "unproven");
                 ArrayNode functions = loaded.putArray("functions"); loaded.putNull("failure");
                 try {
@@ -317,8 +387,7 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
                 .put("closed", actual.closed()).put("shared", actual.shared()).put("uncertain", actual.uncertain());
     }
 
-    private static DefinitionOwnedPackFilesBridge.HeldRootReceipt observeRetainedPack(MinecraftServer server,
-            Attempt attempt, Runnable current) {
+    private static <T> T withRetainedPackRoot(MinecraftServer server, Runnable current, Function<Path, T> observe) {
         return checked(() -> {
             current.run(); Pack selected = null; int count = 0;
             for (Pack pack : server.getPackRepository().getAvailablePacks()) {
@@ -328,8 +397,41 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
                 }
             }
             if (selected == null) throw new ContractException("CALIBRATION_BOOTSTRAP_PACK_UNAVAILABLE", "The actual repository did not expose the original pack");
-            return withPackRoot(selected, current, root -> NativeCalibrationPackFiles.observeRetainedRoot(server, attempt, root, current));
+            return withPackRoot(selected, current, observe);
         }, current);
+    }
+
+    private static final class SourceTrace {
+        private final boolean attempted;
+        private String origin = "none";
+        private byte[] receipt;
+        private Throwable currentFailure;
+        private SourceTrace(boolean attempted) { this.attempted = attempted; }
+        private void historical(byte[] raw) {
+            if (raw.length == 0) return;
+            requireSourceReceipt(raw); receipt = raw; origin = "historical_only";
+        }
+        private void current(byte[] raw) {
+            requireSourceReceipt(raw); receipt = raw; origin = "current_call_return";
+        }
+    }
+
+    /** Descriptive transport only. Java never decodes native facts or issues source authority. */
+    static ObjectNode sourceTraceWire(boolean attempted, String origin, byte[] receipt,
+                                      Throwable firstFailure, Throwable currentFailure) {
+        if (!Set.of("none", "historical_only", "current_call_return").contains(origin)
+                || (receipt == null) != "none".equals(origin)
+                || ("current_call_return".equals(origin) && currentFailure != null)
+                || (!attempted && (receipt != null || firstFailure != null || currentFailure != null))) throw limit();
+        ObjectNode wire = ContractJson.newObject().put("format", "mmmm.native.calibration-loaded-source-trace/1")
+                .put("armAttempted", attempted).put("receiptOrigin", origin);
+        if (receipt == null) wire.putNull("receiptBytesHex");
+        else { requireSourceReceipt(receipt); wire.put("receiptBytesHex", java.util.HexFormat.of().formatHex(receipt)); }
+        wire.set("failure", throwable(firstFailure)); wire.set("currentFailure", throwable(currentFailure));
+        return wire;
+    }
+    private static void requireSourceReceipt(byte[] raw) {
+        if (raw == null || raw.length == 0 || raw.length > MAX_SOURCE_RECEIPT_BYTES) throw limit();
     }
 
     /** Wire capacity only. This formatter creates no native observation or permission. */
@@ -628,9 +730,13 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
             List<String> selection = new ArrayList<>();
             for (String id : repository.getSelectedIds()) { gate.run(); if (selection.size() == MAX_PACKS || selection.contains(id)) throw limit(); selection.add(id); }
             if (!selection.contains(chosen.getId())) { if (selection.size() == MAX_PACKS) throw limit(); selection.add(chosen.getId()); }
+            var actualSelection = List.copyOf(selection);
+            check(admitted.original, gate, true);
+            admitted.attempt.armSourceObservation(actualSelection);
+            // The original gate still owns deadline/cancellation after observer work.
             check(admitted.original, gate, true); requested = true; admitted.attempt.startReload();
             // Reload is the final effect. Its native START hook retires this route; no next write follows it.
-            var reload = server.reloadResources(List.copyOf(selection));
+            var reload = server.reloadResources(actualSelection);
             admitted.actualReload = reload.minimalCompletionStage();
             admitted.attempt.retainReload(admitted.actualReload);
             Object finalFiles = files; List<Integer> finalReturns = List.copyOf(returns);

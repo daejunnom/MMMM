@@ -134,6 +134,24 @@ final class NativeCalibrationPackFiles {
         }
     }
 
+    /** One fresh read-only JNI frame; the caller must not retain this callback carrier. */
+    static Object freshCurrentRootPort(MinecraftServer server, NativeCalibrationBootstrap.Attempt attempt,
+                                      Path actualSelectedRoot, Runnable current) {
+        Objects.requireNonNull(server); Objects.requireNonNull(attempt); Objects.requireNonNull(current);
+        current.run(); attempt.requireActualServer(server);
+        var anchor = attempt.heldRootAnchor();
+        if (anchor == null) throw failure("CALIBRATION_PACK_ROOT_NOT_HELD");
+        Path selected = actualAbsolute(actualSelectedRoot);
+        Runnable fresh = () -> {
+            current.run(); attempt.requireActualServer(server);
+            if (attempt.heldRootAnchor() != anchor) throw failure("CALIBRATION_PACK_ROOT_CHANGED");
+            current.run();
+        };
+        fresh.run();
+        // An empty relative path cannot enter the create-new pack operation.
+        return new NativeCall(server, attempt, anchor, selected, "", fresh);
+    }
+
     static DefinitionOwnedPackFilesBridge.HeldRootReceipt observeRetainedRoot(MinecraftServer server,
             NativeCalibrationBootstrap.Attempt attempt, Path actualSelectedRoot, Runnable current) {
         Objects.requireNonNull(current); attempt.requireActualServer(server);

@@ -5,6 +5,7 @@
 
 #[path = "owned_pack_roots.rs"]
 mod roots;
+pub(crate) use roots::RetainedCloseCause;
 
 use crate::{
     ffi::{self, JNIEnv, jmethodID, jobject},
@@ -19,18 +20,23 @@ use std::{
     collections::BTreeMap,
     ffi::OsStr,
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     ptr,
     sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
 };
 
 const PACK: &str = "mmmm-calibration-normative47";
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_FRAME: usize = MAX_BYTES + 48 * 280 + 42;
 const REQUIRED_STATUS: i32 = 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128;
+const CURRENT_OBSERVATION_LIMIT: Duration = Duration::from_secs(120);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
-enum Failure {
+/// A Post owns both failures in primary/post order. Each Checkpoint leaf owns
+/// one actual Throwable local ref from this JNI frame; its consumer must retain
+/// the actual cause before closing that local ref once. Other refs are borrowed.
+pub(crate) enum Failure {
     Invalid,
     Unavailable,
     Busy,
@@ -40,13 +46,67 @@ enum Failure {
     Lifetime(&'static crate::library_lifetime::LibraryLifetimeError),
     Checkpoint(jobject),
     Post(Box<Failure>, Box<Failure>),
+    ObservationDeadline,
     Panic,
 }
-type Result<T> = std::result::Result<T, Failure>;
+pub(crate) type Result<T> = std::result::Result<T, Failure>;
+
+/// Borrowed actual objects from one attached source-observation JNI frame.
+#[derive(Clone, Copy)]
+pub(crate) struct SourceRootObjects {
+    pub server: jobject,
+    pub attempt: jobject,
+    pub invocation: jobject,
+    pub bundle: jobject,
+    pub anchor: jobject,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct SourceRootFacts {
+    pub bundle_digest: [u8; 32],
+}
+
+/// A borrowed check for one current read frame; it exposes no root, port or env.
+pub(crate) trait CurrentObservationCheck {
+    fn check(&self) -> Result<()>;
+}
+
+/// Preserve a caller's actual error together with a later root/check failure.
+pub(crate) trait CurrentRootError: Sized {
+    fn root(failure: Failure) -> Self;
+    fn post(primary: Self, post: Failure) -> Self;
+}
+
+fn check_observation_deadline(deadline: Instant) -> Result<()> {
+    if Instant::now() >= deadline {
+        Err(Failure::ObservationDeadline)
+    } else {
+        Ok(())
+    }
+}
+
+trait SourceRootControl: Control<Error = Failure> {
+    fn env(&self) -> *mut JNIEnv;
+    fn ffi(&self, error: ffi::FfiError) -> Failure;
+    fn bind_anchor(&self, class: (u64, u64)) -> Result<()>;
+}
+
 struct Active;
 impl Drop for Active {
     fn drop(&mut self) {
         ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+enum ChecksToken {
+    Owned(native_producer::OwnedFilePortToken),
+    Current(native_producer::CurrentSourceRootToken),
+}
+impl ChecksToken {
+    fn is_current(&self) -> bool {
+        match self {
+            Self::Owned(token) => token.is_current(),
+            Self::Current(token) => token.is_current(),
+        }
     }
 }
 
@@ -55,11 +115,23 @@ struct Checks {
     port: jobject,
     method: jmethodID,
     status: i32,
-    token: native_producer::OwnedFilePortToken,
+    token: ChecksToken,
+    observation_deadline: Option<Instant>,
     anchor_class: Cell<Option<(u64, u64)>>,
     effects: Cell<bool>,
 }
 impl Checks {
+    fn deadline_check(&self) -> Result<()> {
+        self.observation_deadline
+            .map_or(Ok(()), check_observation_deadline)
+    }
+    fn scoped_check(&self) -> Result<()> {
+        if self.observation_deadline.is_some() {
+            Control::check(self)
+        } else {
+            Ok(())
+        }
+    }
     fn anchor_current(&self) -> bool {
         self.anchor_class
             .get()
@@ -88,21 +160,130 @@ impl Checks {
         }
     }
     fn text(&self, method: jmethodID) -> Result<Vec<u16>> {
-        // SAFETY: exact private zero-argument String method on this live port.
-        let string = unsafe { ffi::call_object_zero(self.env, self.port, method) }
-            .map_err(|e| self.ffi(e))?;
-        // SAFETY: returned String local reference belongs to this frame.
-        let result = unsafe { ffi::string_utf16(self.env, string, 4096) }.map_err(|e| self.ffi(e));
-        // SAFETY: releases only this local reference, after the original result.
-        let close = unsafe { ffi::delete_local(self.env, string) }.map_err(|e| self.ffi(e));
-        finish(result, close)
+        self.scoped_check()?;
+        let result = (|| {
+            // SAFETY: exact private zero-argument String method on this live port.
+            let string = unsafe { ffi::call_object_zero(self.env, self.port, method) }
+                .map_err(|e| self.ffi(e))?;
+            // SAFETY: returned String local reference belongs to this frame.
+            let result =
+                unsafe { ffi::string_utf16(self.env, string, 4096) }.map_err(|e| self.ffi(e));
+            // SAFETY: releases only this local reference, after the original result.
+            let close = unsafe { ffi::delete_local(self.env, string) }.map_err(|e| self.ffi(e));
+            finish(result, close)
+        })();
+        finish(result, self.scoped_check())
     }
 }
 impl Control for Checks {
     type Error = Failure;
     fn check(&self) -> Result<()> {
-        if !self.token.is_current()
-            || !self.anchor_current()
+        self.deadline_check()?;
+        let result = (|| {
+            if !self.token.is_current()
+                || !self.anchor_current()
+                || native_producer::status() != self.status
+                || self.status < 0
+                || self.status & REQUIRED_STATUS != REQUIRED_STATUS
+                || native_producer::owned_files_vm().is_null()
+            {
+                return Err(Failure::Unavailable);
+            }
+            // SAFETY: the original private Fabric port and method remain local and
+            // live. No Rust mutex is held while the original Java check executes.
+            unsafe { ffi::call_void_zero(self.env, self.port, self.method) }
+                .map_err(|e| self.ffi(e))?;
+            if !self.token.is_current()
+                || !self.anchor_current()
+                || native_producer::status() != self.status
+            {
+                return Err(Failure::Unavailable);
+            }
+            Ok(())
+        })();
+        finish(result, self.deadline_check())
+    }
+    fn io_error(&self, error: io::Error) -> Failure {
+        Failure::Io(error)
+    }
+    fn unsafe_selection(&self) -> Failure {
+        Failure::Invalid
+    }
+    fn changed(&self) -> Failure {
+        Failure::Changed
+    }
+    fn with_post_failure(&self, primary: Failure, post: Failure) -> Failure {
+        Failure::Post(Box::new(primary), Box::new(post))
+    }
+}
+
+struct CurrentCheckGuard<'a> {
+    checks: &'a Checks,
+}
+impl CurrentObservationCheck for CurrentCheckGuard<'_> {
+    fn check(&self) -> Result<()> {
+        Control::check(self.checks)
+    }
+}
+
+impl SourceRootControl for Checks {
+    fn env(&self) -> *mut JNIEnv {
+        self.env
+    }
+    fn ffi(&self, error: ffi::FfiError) -> Failure {
+        Checks::ffi(self, error)
+    }
+    fn bind_anchor(&self, class: (u64, u64)) -> Result<()> {
+        Checks::bind_anchor(self, class)
+    }
+}
+
+fn source_ffi(env: *mut JNIEnv, error: ffi::FfiError) -> Failure {
+    // Keep only the actual pending Throwable from this current attached frame.
+    let actual = unsafe { ffi::take_exception(env) }.unwrap_or(ptr::null_mut());
+    if !actual.is_null() {
+        Failure::Checkpoint(actual)
+    } else {
+        let _ = error;
+        Failure::Unavailable
+    }
+}
+
+struct SourceChecks<'a> {
+    env: *mut JNIEnv,
+    token: &'a native_producer::SourceCaptureToken,
+    status: i32,
+    deadline: Instant,
+    anchor_class: Cell<Option<(u64, u64)>>,
+}
+impl SourceRootControl for SourceChecks<'_> {
+    fn env(&self) -> *mut JNIEnv {
+        self.env
+    }
+    fn ffi(&self, error: ffi::FfiError) -> Failure {
+        source_ffi(self.env, error)
+    }
+    fn bind_anchor(&self, class: (u64, u64)) -> Result<()> {
+        if self.anchor_class.get().is_some_and(|prior| prior != class) {
+            return Err(Failure::Changed);
+        }
+        self.anchor_class.set(Some(class));
+        if native_producer::owned_root_anchor_current(class) {
+            Ok(())
+        } else {
+            Err(Failure::Changed)
+        }
+    }
+}
+impl Control for SourceChecks<'_> {
+    type Error = Failure;
+    fn check(&self) -> Result<()> {
+        if self.env.is_null()
+            || !self.token.is_current()
+            || !self
+                .anchor_class
+                .get()
+                .is_none_or(native_producer::owned_root_anchor_current)
             || native_producer::status() != self.status
             || self.status < 0
             || self.status & REQUIRED_STATUS != REQUIRED_STATUS
@@ -110,15 +291,8 @@ impl Control for Checks {
         {
             return Err(Failure::Unavailable);
         }
-        // SAFETY: the original private Fabric port and method remain local and
-        // live. No Rust mutex is held while the original Java check executes.
-        unsafe { ffi::call_void_zero(self.env, self.port, self.method) }
-            .map_err(|e| self.ffi(e))?;
-        if !self.token.is_current()
-            || !self.anchor_current()
-            || native_producer::status() != self.status
-        {
-            return Err(Failure::Unavailable);
+        if Instant::now() >= self.deadline {
+            return Err(Failure::ObservationDeadline);
         }
         Ok(())
     }
@@ -135,6 +309,7 @@ impl Control for Checks {
         Failure::Post(Box::new(primary), Box::new(post))
     }
 }
+
 fn finish<T>(primary: Result<T>, after: Result<()>) -> Result<T> {
     match (primary, after) {
         (Err(primary), Err(after)) => Err(Failure::Post(Box::new(primary), Box::new(after))),
@@ -392,13 +567,174 @@ fn setup(
             port,
             method,
             status,
-            token,
+            token: ChecksToken::Owned(token),
+            observation_deadline: None,
             anchor_class: Cell::new(None),
             effects: Cell::new(false),
         },
         root,
         relative,
     ))
+}
+
+/// The token was issued from object_class of this same fresh NativeCall in the
+/// current frame. This path never reacquires the old owned-file bridge port.
+fn setup_admitted_current(
+    env: *mut JNIEnv,
+    token: native_producer::CurrentSourceRootToken,
+    port: jobject,
+    deadline: Instant,
+) -> Result<(Checks, jmethodID)> {
+    let status = native_producer::status();
+    let vm = native_producer::owned_files_vm();
+    if env.is_null()
+        || port.is_null()
+        || !token.is_current()
+        || status < 0
+        || status & REQUIRED_STATUS != REQUIRED_STATUS
+        || vm.is_null()
+    {
+        return Err(Failure::Unavailable);
+    }
+    let class = unsafe { ffi::object_class(env, port) }.map_err(|e| source_ffi(env, e))?;
+    let setup = (|| {
+        if unsafe { ffi::class_signature(vm, class) }.map_err(|e| source_ffi(env, e))?
+            != b"Lio/github/daejunnom/mmmm/fabric/NativeCalibrationPackFiles$NativeCall;"
+        {
+            return Err(Failure::Invalid);
+        }
+        let method = unsafe { ffi::method_id(env, class, c"checkpoint", c"()V") }
+            .map_err(|e| source_ffi(env, e))?;
+        let root = unsafe { ffi::method_id(env, class, c"nativeRoot", c"()Ljava/lang/String;") }
+            .map_err(|e| source_ffi(env, e))?;
+        Ok((method, root))
+    })();
+    let (method, root) = finish(
+        setup,
+        unsafe { ffi::delete_local(env, class) }.map_err(|e| source_ffi(env, e)),
+    )?;
+    let checks = Checks {
+        env,
+        port,
+        method,
+        status,
+        token: ChecksToken::Current(token),
+        observation_deadline: Some(deadline),
+        anchor_class: Cell::new(None),
+        effects: Cell::new(false),
+    };
+    Control::check(&checks)?;
+    Ok((checks, root))
+}
+
+/// Independent bounded source facts, without reusing an old request callback.
+/// selected is relayed only after JNI joins the actual source PackResources and
+/// its fixed root/data paths; caller-supplied path metadata cannot select a root.
+pub(crate) fn observe_source_root(
+    env: *mut JNIEnv,
+    token: &native_producer::SourceCaptureToken,
+    objects: SourceRootObjects,
+    selected: Option<&Path>,
+    deadline: Instant,
+) -> Result<SourceRootFacts> {
+    if ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(Failure::Busy);
+    }
+    let _active = Active;
+    let _root_call = roots::enter()?;
+    let checks = SourceChecks {
+        env,
+        token,
+        status: native_producer::status(),
+        deadline,
+        anchor_class: Cell::new(None),
+    };
+    checks.check()?;
+    let result = roots::observe_source_root(&checks, objects, selected);
+    finish(result, checks.check())
+}
+
+fn finish_current<T, E: CurrentRootError>(
+    primary: std::result::Result<T, E>,
+    after: Result<()>,
+) -> std::result::Result<T, E> {
+    match (primary, after) {
+        (Err(primary), Err(post)) => Err(E::post(primary, post)),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(post)) => Err(E::root(post)),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
+
+/// Keep the fresh current check and its original frame lease until all reads,
+/// repeated root joins, local cleanup and the final checkpoint have finished.
+/// The independent deadline is capped once at 120 seconds and never renewed.
+pub(crate) fn with_current_source_root<R, E: CurrentRootError>(
+    env: *mut JNIEnv,
+    token: native_producer::CurrentSourceRootToken,
+    fresh_port: jobject,
+    objects: SourceRootObjects,
+    new_deadline: Instant,
+    body: impl for<'scope> FnOnce(
+        &'scope (dyn CurrentObservationCheck + 'scope),
+        SourceRootFacts,
+    ) -> std::result::Result<R, E>,
+) -> std::result::Result<R, E> {
+    let now = Instant::now();
+    let limit = now
+        .checked_add(CURRENT_OBSERVATION_LIMIT)
+        .ok_or_else(|| E::root(Failure::Unavailable))?;
+    let deadline = new_deadline.min(limit);
+    if now >= deadline {
+        return Err(E::root(Failure::ObservationDeadline));
+    }
+    if ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(E::root(Failure::Busy));
+    }
+    let _active = Active;
+    let _root_call = roots::enter().map_err(E::root)?;
+    let setup = setup_admitted_current(env, token, fresh_port, deadline).map_err(E::root);
+    let (checks, root_method) = finish_current(setup, check_observation_deadline(deadline))?;
+    let bindings = match roots::Bindings::load(&checks) {
+        Ok(bindings) => bindings,
+        Err(error) => return finish_current(Err(E::root(error)), Control::check(&checks)),
+    };
+    let prepared = (|| {
+        Control::check(&checks)?;
+        bindings.matches_source_objects(&checks, objects)?;
+        let selected = path(checks.text(root_method)?)?;
+        let facts = roots::observe_source_root(&checks, objects, Some(&selected))?;
+        Ok((selected, facts))
+    })();
+    let result = match prepared {
+        Err(error) => Err(E::root(error)),
+        Ok((selected, facts)) => {
+            let guard = CurrentCheckGuard { checks: &checks };
+            let result = body(&guard, facts);
+            let post = (|| {
+                Control::check(&checks)?;
+                bindings.matches_source_objects(&checks, objects)?;
+                let actual_selected = path(checks.text(root_method)?)?;
+                if actual_selected != selected {
+                    return Err(Failure::Changed);
+                }
+                let actual = roots::observe_source_root(&checks, objects, Some(&selected))?;
+                if actual.bundle_digest != facts.bundle_digest {
+                    return Err(Failure::Changed);
+                }
+                Ok(())
+            })();
+            finish_current(result, post)
+        }
+    };
+    let result = finish_current(result, bindings.close(&checks));
+    finish_current(result, Control::check(&checks))
 }
 
 fn run(
@@ -599,6 +935,7 @@ fn encode_failure(error: Failure, bytes: &mut Vec<u8>, refs: &mut Vec<jobject>) 
         Failure::Unavailable => bytes.push(2),
         Failure::Busy => bytes.push(3),
         Failure::Changed => bytes.push(4),
+        Failure::ObservationDeadline => bytes.push(11),
         Failure::Panic => bytes.push(8),
     }
 }

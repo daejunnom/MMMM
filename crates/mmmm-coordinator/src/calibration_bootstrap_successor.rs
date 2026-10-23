@@ -7,6 +7,8 @@ use mmmm_application::ReadbackEvidence;
 use mmmm_contracts::{ContractValidator, encode_json};
 use mmmm_runtime::storage::{DispatchEvidence, EffectEvidence};
 
+const MAX_SUCCESSOR_PAYLOAD_BYTES: usize = 256 * 1024;
+
 struct EnteredSuccessor<'a> {
     registry: &'a BootstrapRegistry,
     entry: Rc<PreparedBootstrap>,
@@ -139,7 +141,7 @@ impl BootstrapRegistry {
         let payload = finish_native_observation(observed, entered.check(store))?;
         validate_payload(&payload, &entered, &manifest_digest)?;
         let bytes = encode_json(&payload).map_err(|_| unavailable())?;
-        if bytes.len() > crate::rpc::MAX_CONTROL_BYTES {
+        if bytes.len() > crate::rpc::MAX_CONTROL_BYTES.min(MAX_SUCCESSOR_PAYLOAD_BYTES) {
             return Err(unavailable());
         }
         let evidence = store.put_blob(&bytes).map_err(storage)?;
@@ -718,11 +720,14 @@ fn validate_observation(value: &Value, source: &BootstrapSource) -> AppResult<()
             "observedFromTick",
             "observedToTick",
             "pack",
+            "loadedSourceTrace",
             "loadedSources",
             "targetImages",
         ],
     )?;
-    if value["format"] != "mmmm.native.calibration-bootstrap-observation/1" {
+    // This validates only the fresh private host reply. Previously stored /1
+    // evidence remains untouched; it is not replayed through this decoder.
+    if value["format"] != "mmmm.native.calibration-bootstrap-observation/2" {
         return Err(unavailable());
     }
     let tick = |field: &str| {
@@ -742,6 +747,7 @@ fn validate_observation(value: &Value, source: &BootstrapSource) -> AppResult<()
         return Err(unavailable());
     }
     validate_pack(&value["pack"])?;
+    validate_loaded_source_trace(&value["loadedSourceTrace"])?;
     let loaded = &value["loadedSources"];
     exact(loaded, &["status", "causalLink", "functions", "failure"])?;
     if loaded["causalLink"] != "unproven" {
@@ -833,6 +839,56 @@ fn validate_observation(value: &Value, source: &BootstrapSource) -> AppResult<()
     Ok(())
 }
 
+/// Opaque evidence transport only. Neither this envelope nor decoded JSON
+/// constructs the actual native object joins or a SourceAdmission witness.
+fn validate_loaded_source_trace(value: &Value) -> AppResult<()> {
+    exact(
+        value,
+        &[
+            "format",
+            "armAttempted",
+            "receiptOrigin",
+            "receiptBytesHex",
+            "failure",
+            "currentFailure",
+        ],
+    )?;
+    if value["format"] != "mmmm.native.calibration-loaded-source-trace/1"
+        || !value["armAttempted"].is_boolean()
+    {
+        return Err(unavailable());
+    }
+    validate_failure(&value["failure"])?;
+    validate_failure(&value["currentFailure"])?;
+    let attempted = value["armAttempted"].as_bool().ok_or_else(unavailable)?;
+    match value["receiptOrigin"].as_str() {
+        Some("none") if value["receiptBytesHex"].is_null() => {}
+        Some("historical_only" | "current_call_return") if attempted => {
+            let raw = value["receiptBytesHex"].as_str().ok_or_else(unavailable)?;
+            if raw.is_empty()
+                || raw.len() > 2 * 64 * 1024
+                || raw.len() % 2 != 0
+                || !raw
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                || (value["receiptOrigin"] == "current_call_return"
+                    && !value["currentFailure"].is_null())
+            {
+                return Err(unavailable());
+            }
+        }
+        _ => return Err(unavailable()),
+    }
+    if !attempted
+        && (value["receiptOrigin"] != "none"
+            || !value["failure"].is_null()
+            || !value["currentFailure"].is_null())
+    {
+        return Err(unavailable());
+    }
+    Ok(())
+}
+
 fn validate_status(status: &Value, count: usize, maximum: usize) -> AppResult<()> {
     match status.as_str() {
         Some("known") if count == maximum => Ok(()),
@@ -844,6 +900,37 @@ fn validate_status(status: &Value, count: usize, maximum: usize) -> AppResult<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loaded_source_trace_is_bounded_opaque_transport_without_admission() {
+        // No prior fixture includes this bridge envelope. Its arbitrary bytes
+        // are deliberately not native facts or an actual capture witness.
+        let mut trace = json!({"format":"mmmm.native.calibration-loaded-source-trace/1",
+            "armAttempted":false,"receiptOrigin":"none","receiptBytesHex":null,
+            "failure":null,"currentFailure":null});
+        assert!(validate_loaded_source_trace(&trace).is_ok());
+        trace["armAttempted"] = json!(true);
+        trace["receiptOrigin"] = json!("current_call_return");
+        trace["receiptBytesHex"] = json!("ff".repeat(64 * 1024));
+        assert!(validate_loaded_source_trace(&trace).is_ok());
+        trace["receiptBytesHex"] = json!("ff".repeat(64 * 1024 + 1));
+        assert!(validate_loaded_source_trace(&trace).is_err());
+        for raw in ["", "0", "GG", "Ff", "00 1", "é"] {
+            trace["receiptBytesHex"] = json!(raw);
+            assert!(validate_loaded_source_trace(&trace).is_err());
+        }
+        trace["receiptBytesHex"] = json!("00");
+        trace["armAttempted"] = json!(false);
+        assert!(validate_loaded_source_trace(&trace).is_err());
+        trace["armAttempted"] = json!(true);
+        trace["currentFailure"] = json!({"type":"syntax-only","code":null,
+            "cause":null,"suppressed":[],"truncated":false});
+        assert!(validate_loaded_source_trace(&trace).is_err());
+        trace["receiptOrigin"] = json!("historical_only");
+        assert!(validate_loaded_source_trace(&trace).is_ok());
+        trace["known"] = json!(true);
+        assert!(validate_loaded_source_trace(&trace).is_err());
+    }
 
     #[test]
     fn current_prefix_cannot_claim_complete_membership() {

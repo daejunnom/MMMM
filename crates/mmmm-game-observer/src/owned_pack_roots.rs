@@ -4,7 +4,9 @@
 //! actual server/Attempt/Invocation/bundle; all joins use IsSameObject. A Java
 //! constructor, numeric key, path or SHA cannot register a filesystem identity.
 
-use super::{Checks, Failure, Result, finish};
+use super::{
+    Checks, Failure, Result, SourceRootControl, SourceRootFacts, SourceRootObjects, finish,
+};
 use crate::ffi::{self, JNIEnv, jobject};
 use mmmm_owned_files::{Control, DirectoryIdentityEvidence, HeldDirectory, RetainedCloseStage};
 use std::{
@@ -56,7 +58,7 @@ struct Record {
     global_release_error: Option<ffi::FfiError>,
 }
 
-pub(super) struct RetainedCloseCause {
+pub(crate) struct RetainedCloseCause {
     pub pin: Option<usize>,
     pub stage: RetainedCloseStage,
     pub error: io::Error,
@@ -117,6 +119,9 @@ pub(super) struct Bindings {
     correlation: [[u8; 32]; 3],
 }
 fn object(checks: &Checks, owner: jobject, name: &CStr) -> Result<jobject> {
+    if checks.observation_deadline.is_some() {
+        return source_object(checks, owner, name);
+    }
     // SAFETY: all owners and returned refs belong to this original attached
     // JNI frame. No mutex is held while resolving or invoking Java methods.
     let class = unsafe { ffi::object_class(checks.env, owner) }.map_err(|e| checks.ffi(e))?;
@@ -129,6 +134,68 @@ fn object(checks: &Checks, owner: jobject, name: &CStr) -> Result<jobject> {
         call,
         unsafe { ffi::delete_local(checks.env, class) }.map_err(|e| checks.ffi(e)),
     )
+}
+/// Factual anchor getters share only the independent source observation control.
+/// They neither resolve a path nor reconstruct an owned-file permission.
+fn source_object(checks: &impl SourceRootControl, owner: jobject, name: &CStr) -> Result<jobject> {
+    checks.check()?;
+    let env = checks.env();
+    let result = (|| {
+        let class = unsafe { ffi::object_class(env, owner) }.map_err(|e| checks.ffi(e))?;
+        let call = (|| {
+            let method = unsafe { ffi::method_id(env, class, name, c"()Ljava/lang/Object;") }
+                .map_err(|e| checks.ffi(e))?;
+            unsafe { ffi::call_object_zero(env, owner, method) }.map_err(|e| checks.ffi(e))
+        })();
+        let closed = unsafe { ffi::delete_local(env, class) }.map_err(|e| checks.ffi(e));
+        match (call, closed) {
+            (Ok(local), Ok(())) => Ok(local),
+            (Ok(local), Err(error)) => finish(
+                Err(error),
+                unsafe { ffi::delete_local(env, local) }.map_err(|e| checks.ffi(e)),
+            ),
+            (Err(error), closed) => finish(Err(error), closed),
+        }
+    })();
+    let post = checks.check();
+    match (result, post) {
+        (Ok(local), Ok(())) => Ok(local),
+        (Ok(local), Err(error)) => finish(
+            Err(error),
+            unsafe { ffi::delete_local(env, local) }.map_err(|e| checks.ffi(e)),
+        ),
+        (Err(error), post) => finish(Err(error), post),
+    }
+}
+
+fn source_anchor_objects(
+    checks: &impl SourceRootControl,
+    anchor: jobject,
+    objects: SourceRootObjects,
+) -> Result<()> {
+    for (method, expected) in [
+        (c"nativeServer", objects.server),
+        (c"nativeAttempt", objects.attempt),
+        (c"nativeInvocation", objects.invocation),
+        (c"nativeBundle", objects.bundle),
+    ] {
+        checks.check()?;
+        let actual = source_object(checks, anchor, method)?;
+        let same = if actual.is_null() || expected.is_null() {
+            Err(Failure::Invalid)
+        } else {
+            unsafe { ffi::same_object(checks.env(), actual, expected) }.map_err(|e| checks.ffi(e))
+        };
+        let same = finish(
+            same,
+            unsafe { ffi::delete_local(checks.env(), actual) }.map_err(|e| checks.ffi(e)),
+        )?;
+        if !same {
+            return Err(Failure::Changed);
+        }
+        checks.check()?;
+    }
+    Ok(())
 }
 fn text(checks: &Checks, name: &CStr) -> Result<[u8; 32]> {
     let class = unsafe { ffi::object_class(checks.env, checks.port) }.map_err(|e| checks.ffi(e))?;
@@ -156,6 +223,36 @@ fn text(checks: &Checks, name: &CStr) -> Result<[u8; 32]> {
     )
 }
 impl Bindings {
+    /// The fresh port must expose the very same five objects supplied by the
+    /// actual source callback. Strings, path names and digests are not joins.
+    pub fn matches_source_objects(
+        &self,
+        checks: &Checks,
+        objects: SourceRootObjects,
+    ) -> Result<()> {
+        checks.check()?;
+        let result = (|| {
+            for (held, actual) in self.objects.into_iter().chain([self.anchor]).zip([
+                objects.server,
+                objects.attempt,
+                objects.invocation,
+                objects.bundle,
+                objects.anchor,
+            ]) {
+                if held.is_null() || actual.is_null() {
+                    return Err(Failure::Invalid);
+                }
+                if !unsafe { ffi::same_object(checks.env, held, actual) }
+                    .map_err(|e| checks.ffi(e))?
+                {
+                    return Err(Failure::Changed);
+                }
+            }
+            Ok(())
+        })();
+        finish(result, checks.check())
+    }
+
     pub fn load(checks: &Checks) -> Result<Self> {
         let anchor = object(checks, checks.port, c"nativeAnchor")?;
         let mut objects = [ptr::null_mut(); 4];
@@ -255,6 +352,140 @@ impl Bindings {
         }
         selected.ok_or(Failure::Unavailable)
     }
+}
+
+/// Join one already completed native root to actual source callback objects.
+/// The caller holds ACTIVE and enter(); the retained directory never leaves
+/// this helper and its native correlation is the only returned digest source.
+pub(super) fn observe_source_root(
+    checks: &impl SourceRootControl,
+    objects: SourceRootObjects,
+    selected: Option<&Path>,
+) -> Result<SourceRootFacts> {
+    checks.check()?;
+    let result = (|| {
+        if checks.env().is_null()
+            || [
+                objects.server,
+                objects.attempt,
+                objects.invocation,
+                objects.bundle,
+                objects.anchor,
+            ]
+            .into_iter()
+            .any(|object| object.is_null())
+        {
+            return Err(Failure::Invalid);
+        }
+        let candidates = {
+            let state = ROOTS.lock().map_err(|_| Failure::Unavailable)?;
+            if state.closed || state.active != 1 {
+                return Err(Failure::Unavailable);
+            }
+            state
+                .entries
+                .iter()
+                .filter(|entry| entry.anchor != 0)
+                .map(|entry| (entry.serial, entry.anchor, entry.class, entry.correlation))
+                .collect::<Vec<_>>()
+        };
+        let mut matched = None;
+        for candidate in candidates {
+            if unsafe { ffi::same_object(checks.env(), objects.anchor, candidate.1 as jobject) }
+                .map_err(|e| checks.ffi(e))?
+            {
+                if matched.is_some() {
+                    return Err(Failure::Changed);
+                }
+                matched = Some(candidate);
+            }
+        }
+        let (serial, anchor, class, correlation) = matched.ok_or(Failure::Unavailable)?;
+        let root = {
+            let state = ROOTS.lock().map_err(|_| Failure::Unavailable)?;
+            if state.closed || state.active != 1 {
+                return Err(Failure::Unavailable);
+            }
+            let record = state
+                .entries
+                .iter()
+                .find(|entry| entry.serial == serial)
+                .ok_or(Failure::Unavailable)?;
+            if record.anchor != anchor
+                || record.class != class
+                || record.correlation != correlation
+                || record.facts.state != 4
+            {
+                return Err(Failure::Changed);
+            }
+            record.root.clone().ok_or(Failure::Unavailable)?
+        };
+        let actual_class = unsafe { ffi::object_class(checks.env(), objects.anchor) }
+            .map_err(|e| checks.ffi(e))?;
+        let stamp =
+            unsafe { crate::native_producer::owned_root_anchor_class(checks.env(), actual_class) }
+                .map_err(|error| match error {
+                    crate::native_producer::ProducerError::Ffi(error) => checks.ffi(error),
+                    _ => Failure::Unavailable,
+                })
+                .and_then(|stamp| stamp.ok_or(Failure::Unavailable));
+        let stamp = finish(
+            stamp,
+            unsafe { ffi::delete_local(checks.env(), actual_class) }.map_err(|e| checks.ffi(e)),
+        )?;
+        if stamp != class {
+            return Err(Failure::Changed);
+        }
+        checks.bind_anchor(stamp)?;
+        if let Some(selected) = selected {
+            checks.check()?;
+            if !root.matches_selected_root(selected, checks)? {
+                return Err(Failure::Changed);
+            }
+            checks.check()?;
+        }
+        let joined = source_anchor_objects(checks, anchor as jobject, objects);
+        let post = if let Some(selected) = selected {
+            (|| {
+                checks.check()?;
+                if !root.matches_selected_root(selected, checks)? {
+                    return Err(Failure::Changed);
+                }
+                checks.check()
+            })()
+        } else {
+            Ok(())
+        };
+        let joined = finish(joined, post);
+        let stable = (|| {
+            let state = ROOTS.lock().map_err(|_| Failure::Unavailable)?;
+            if state.closed || state.active != 1 {
+                return Err(Failure::Unavailable);
+            }
+            let record = state
+                .entries
+                .iter()
+                .find(|entry| entry.serial == serial)
+                .ok_or(Failure::Unavailable)?;
+            if record.anchor != anchor
+                || record.class != class
+                || record.correlation != correlation
+                || record.facts.state != 4
+                || !record
+                    .root
+                    .as_ref()
+                    .is_some_and(|held| Arc::ptr_eq(held, &root))
+            {
+                return Err(Failure::Changed);
+            }
+            Ok(())
+        })();
+        finish(joined, stable)?;
+        Ok(SourceRootFacts {
+            bundle_digest: correlation[1],
+        })
+    })();
+    finish(result, checks.check())
 }
 
 /// Slot reservation precedes even creation of the pack directory. The actual

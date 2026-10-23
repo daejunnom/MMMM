@@ -120,6 +120,7 @@ MMMM_SIZE_ALIGN(jthread, 8, 8);
 MMMM_SIZE_ALIGN(jstring, 8, 8);
 MMMM_SIZE_ALIGN(jbyteArray, 8, 8);
 MMMM_SIZE_ALIGN(jmethodID, 8, 8);
+MMMM_SIZE_ALIGN(jfieldID, 8, 8);
 MMMM_SIZE_ALIGN(JNIEnv, 8, 8);
 MMMM_SIZE_ALIGN(JavaVM, 8, 8);
 MMMM_SIZE_ALIGN(jvmtiEnv, 8, 8);
@@ -223,14 +224,19 @@ typedef jobject (*MmmmNewGlobalRef)(JNIEnv *, jobject);
 typedef void (*MmmmDeleteRef)(JNIEnv *, jobject);
 typedef jboolean (*MmmmIsSameObject)(JNIEnv *, jobject, jobject);
 typedef jclass (*MmmmGetObjectClass)(JNIEnv *, jobject);
+typedef jboolean (*MmmmIsInstanceOf)(JNIEnv *, jobject, jclass);
 typedef jmethodID (*MmmmGetMethodID)(JNIEnv *, jclass, const char *, const char *);
 typedef jobject (*MmmmCallObjectMethodA)(JNIEnv *, jobject, jmethodID, const jvalue *);
+typedef jint (*MmmmCallIntMethodA)(JNIEnv *, jobject, jmethodID, const jvalue *);
 typedef void (*MmmmCallVoidMethodA)(JNIEnv *, jobject, jmethodID, const jvalue *);
+typedef jfieldID (*MmmmGetFieldID)(JNIEnv *, jclass, const char *, const char *);
+typedef jobject (*MmmmGetObjectField)(JNIEnv *, jobject, jfieldID);
 typedef jsize (*MmmmGetStringLength)(JNIEnv *, jstring);
 typedef const char *(*MmmmGetStringUTFChars)(JNIEnv *, jstring, jboolean *);
 typedef void (*MmmmReleaseStringUTFChars)(JNIEnv *, jstring, const char *);
 typedef jsize (*MmmmGetArrayLength)(JNIEnv *, jarray);
 typedef jobjectArray (*MmmmNewObjectArray)(JNIEnv *, jsize, jclass, jobject);
+typedef jobject (*MmmmGetObjectArrayElement)(JNIEnv *, jobjectArray, jsize);
 typedef void (*MmmmSetObjectArrayElement)(JNIEnv *, jobjectArray, jsize, jobject);
 typedef jbyteArray (*MmmmNewByteArray)(JNIEnv *, jsize);
 typedef void (*MmmmGetByteArrayRegion)(JNIEnv *, jbyteArray, jsize, jsize, jbyte *);
@@ -246,14 +252,19 @@ MMMM_JNI(DeleteGlobalRef, 22, MmmmDeleteRef);
 MMMM_JNI(DeleteLocalRef, 23, MmmmDeleteRef);
 MMMM_JNI(IsSameObject, 24, MmmmIsSameObject);
 MMMM_JNI(GetObjectClass, 31, MmmmGetObjectClass);
+MMMM_JNI(IsInstanceOf, 32, MmmmIsInstanceOf);
 MMMM_JNI(GetMethodID, 33, MmmmGetMethodID);
 MMMM_JNI(CallObjectMethodA, 36, MmmmCallObjectMethodA);
+MMMM_JNI(CallIntMethodA, 51, MmmmCallIntMethodA);
 MMMM_JNI(CallVoidMethodA, 63, MmmmCallVoidMethodA);
+MMMM_JNI(GetFieldID, 94, MmmmGetFieldID);
+MMMM_JNI(GetObjectField, 95, MmmmGetObjectField);
 MMMM_JNI(GetStringLength, 164, MmmmGetStringLength);
 MMMM_JNI(GetStringUTFChars, 169, MmmmGetStringUTFChars);
 MMMM_JNI(ReleaseStringUTFChars, 170, MmmmReleaseStringUTFChars);
 MMMM_JNI(GetArrayLength, 171, MmmmGetArrayLength);
 MMMM_JNI(NewObjectArray, 172, MmmmNewObjectArray);
+MMMM_JNI(GetObjectArrayElement, 173, MmmmGetObjectArrayElement);
 MMMM_JNI(SetObjectArrayElement, 174, MmmmSetObjectArrayElement);
 MMMM_JNI(NewByteArray, 176, MmmmNewByteArray);
 MMMM_JNI(GetByteArrayRegion, 200, MmmmGetByteArrayRegion);
@@ -399,9 +410,9 @@ int main(int argc, char **argv)
         "\"individual_capability_checks\":6,\"combined_capability_checks\":1,"
         "\"callbacks_bytes\":312,\"callbacks_alignment\":8,\"callback_slots\":[0,1,4,5,6,17],"
         "\"native_method_bytes\":24,\"native_method_alignment\":8,\"native_method_offsets\":[0,8,16],"
-        "\"jni_slots\":[6,15,17,21,22,23,24,31,33,36,63,164,169,170,171,172,174,176,200,208,215,220,228],"
+        "\"jni_slots\":[6,15,17,21,22,23,24,31,32,33,36,51,63,94,95,164,169,170,171,172,173,174,176,200,208,215,220,228],"
         "\"jvmti_positions\":[2,18,47,48,49,52,57,64,65,66,75,88,89,122,133,140,142,146],"
-        "\"java_vm_get_env_slot\":6,\"table_signature_checks\":42,\"callback_signature_checks\":6,"
+        "\"java_vm_get_env_slot\":6,\"table_signature_checks\":47,\"callback_signature_checks\":6,"
         "\"entry_signature_checks\":4,\"set_event_variadic\":true,"
         "\"vm_invoked\":false,\"table_entries_called\":false,\"target_policy_granted\":false}\n";
     _Static_assert(sizeof(report) <= 4096, "MMMM_ABI_REPORT_BOUND");

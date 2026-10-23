@@ -362,6 +362,58 @@ final class NativeCalibrationApprovalTest {
                 () -> bounded.invoke(null, excessiveHeader)).getCause(), "An oversized original header must still fail closed");
     }
 
+    @Test void loadedSourceTraceCarriesOneOpaqueReceiptAndKeepsFirstAndCurrentCausesSeparate() {
+        // Arbitrary bytes test transport only. They issue no native capture,
+        // source admission, reload observation or ADMIN/current owner proof.
+        Throwable first = new ContractException("SOURCE_FIRST", "private-first-message");
+        Throwable current = new ContractException("SOURCE_CURRENT", "private-current-message");
+        ObjectNode trace = NativeCalibrationBootstrap.sourceTraceWire(true, "historical_only",
+                new byte[64 * 1024], first, current);
+        assertEquals(128 * 1024, trace.path("receiptBytesHex").textValue().length());
+        assertEquals("SOURCE_FIRST", trace.path("failure").path("code").textValue());
+        assertEquals("SOURCE_CURRENT", trace.path("currentFailure").path("code").textValue());
+        assertEquals(0, first.getSuppressed().length); assertNull(first.getCause());
+        assertEquals(0, current.getSuppressed().length); assertNull(current.getCause());
+        assertFalse(trace.toString().contains("private-first-message"));
+        assertFalse(trace.toString().contains("private-current-message"));
+        assertThrows(ContractException.class, () -> NativeCalibrationBootstrap.sourceTraceWire(true,
+                "historical_only", new byte[64 * 1024 + 1], first, current));
+        assertThrows(ContractException.class, () -> NativeCalibrationBootstrap.sourceTraceWire(true,
+                "current_call_return", new byte[1], first, current));
+        assertThrows(ContractException.class, () -> NativeCalibrationBootstrap.sourceTraceWire(true,
+                "historical_only", new byte[0], first, current));
+        assertThrows(ContractException.class, () -> NativeCalibrationBootstrap.sourceTraceWire(false,
+                "none", null, first, null));
+        ObjectNode unarmed = NativeCalibrationBootstrap.sourceTraceWire(false, "none", null, null, null);
+        assertTrue(unarmed.path("receiptBytesHex").isNull());
+        assertTrue(unarmed.path("failure").isNull()); assertTrue(unarmed.path("currentFailure").isNull());
+    }
+
+    @Test void opaqueSourceReceiptAndBothCausesConsumeTheWholeTargetPrefixBudget() throws Exception {
+        // Existing capacity fixtures omit the new opaque trace. Charge its
+        // doubled hex and both existing bounded diagnostic graphs before targets.
+        ObjectNode response = successorWireFixture();
+        ObjectNode observation = ContractJson.object(response.path("observation"));
+        assertEquals("mmmm.native.calibration-bootstrap-observation/2", observation.path("format").textValue());
+        ObjectNode trace = NativeCalibrationBootstrap.sourceTraceWire(true, "historical_only",
+                new byte[64 * 1024], branchingFailureGraph(), branchingFailureGraph());
+        assertTrue(ContractJson.bytes(trace.path("failure")).length
+                + ContractJson.bytes(trace.path("currentFailure")).length <= 32 * 1024);
+        observation.set("loadedSourceTrace", trace);
+        byte[] first = new byte[4 * 1024], next = new byte[32 * 1024];
+        assertTrue(NativeCalibrationBootstrap.appendSuccessorPair(response, "capacity-source-objective", first, ContractJson.sha256(first),
+                "capacity-source-storage", first, ContractJson.sha256(first)));
+        byte[] retained = ContractJson.bytes(response);
+        assertFalse(NativeCalibrationBootstrap.appendSuccessorPair(response, "capacity-source-extra-objective", next, ContractJson.sha256(next),
+                "capacity-source-extra-storage", next, ContractJson.sha256(next)));
+        assertArrayEquals(retained, ContractJson.bytes(response));
+        ObjectNode images = ContractJson.object(observation.path("targetImages"));
+        assertEquals(2, images.path("targets").size()); assertEquals("unknown", images.path("status").textValue());
+        images.set("failure", NativeCalibrationBootstrap.throwable(branchingFailureGraph()));
+        observation.put("observedToTick", "4294967295");
+        assertSuccessorFinalWireFits(response);
+    }
+
     @Test void successorNativeDiagnosticsKeepLifetimeCloseStageAndNumericFactsWithoutMessages() throws Exception {
         // Existing throwable fixtures contain only ContractException and Java
         // graphs. This is a private-frame codec fixture, never native evidence.
@@ -433,8 +485,9 @@ final class NativeCalibrationApprovalTest {
         ObjectNode files = history.putObject("fileFacts").put("sourceBundleDigest", digest).put("verifiedFileCount", 48);
         var paths = files.putArray("files");
         for (int i = 0; i < 48; i++) paths.addObject().put("path", "capacity-only/source-" + i + ".mcfunction").put("byteLength", 65536).put("rawSha256", digest);
-        ObjectNode observation = response.putObject("observation").put("format", "mmmm.native.calibration-bootstrap-observation/1")
+        ObjectNode observation = response.putObject("observation").put("format", "mmmm.native.calibration-bootstrap-observation/2")
                 .put("observedFromTick", "0").put("observedToTick", "0");
+        observation.set("loadedSourceTrace", NativeCalibrationBootstrap.sourceTraceWire(false, "none", null, null, null));
         ObjectNode pack = observation.putObject("pack").put("status", "unknown").put("reason", "retained_root_not_published").put("identityContinuity", "unproven")
                 .put("currentBytes", "not_observed").put("fullPackMembership", "unproven"); pack.putNull("retainedRoot"); pack.putNull("failure");
         ObjectNode loaded = observation.putObject("loadedSources").put("status", "unknown").put("causalLink", "unproven"); loaded.putNull("failure");

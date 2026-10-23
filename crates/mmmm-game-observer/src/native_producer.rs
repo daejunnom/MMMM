@@ -75,6 +75,39 @@ const ROSTER: &[&[u8]] = &[
     b"io/github/daejunnom/mmmm/observer/",
     b"io/github/daejunnom/mmmm/fabric/",
 ];
+// Exact source-observation receivers only. This is not a Minecraft namespace
+// prefix, and it does not admit unspecified JDK collection implementations.
+const SOURCE_CLASS_ROSTER: &[&[u8]] = &[
+    b"net/minecraft/server/packs/resources/Resource",
+    b"net/minecraft/server/packs/FixedPathPackResources",
+    b"net/minecraft/server/packs/resources/MultiPackResourceManager",
+    b"net/minecraft/server/packs/resources/ResourceManager",
+    b"net/minecraft/server/packs/resources/CloseableResourceManager",
+    b"net/minecraft/server/ServerFunctionLibrary",
+    b"net/minecraft/server/ServerFunctionManager",
+    b"net/minecraft/server/ReloadableServerResources",
+    b"net/minecraft/server/MinecraftServer$ReloadableResources",
+    b"net/minecraft/resources/Identifier",
+    b"net/minecraft/server/MinecraftServer",
+    b"net/minecraft/server/dedicated/DedicatedServer",
+    b"io/github/daejunnom/mmmm/fabric/NativeFunctionLoadObservation",
+    b"io/github/daejunnom/mmmm/fabric/NativeFunctionLoadObservation$NativeCall",
+    b"io/github/daejunnom/mmmm/fabric/NativeFunctionLoadObservation$TrackedSupplier",
+    b"io/github/daejunnom/mmmm/fabric/NativeFunctionLoadObservation$TrackedFunction",
+    b"io/github/daejunnom/mmmm/fabric/NativeFunctionLoadObservation$Read",
+    b"io/github/daejunnom/mmmm/fabric/mixin/ServerFunctionManagerLibraryReadAccess",
+    b"io/github/daejunnom/mmmm/fabric/mixin/FixedPathPackReadAccess",
+];
+// Exact actual read receivers and their inherited-method owners. Their existing
+// defining loader must be nonzero; it is not inferred to be the game loader.
+const READ_RECEIVER_ROSTER: &[&[u8]] = &[
+    b"com/google/common/collect/RegularImmutableList",
+    b"com/google/common/collect/SingletonImmutableList",
+    b"com/google/common/collect/RegularImmutableMap",
+    b"com/google/common/collect/ImmutableCollection",
+    b"com/google/common/collect/ImmutableList",
+    b"com/google/common/collect/ImmutableMap",
+];
 
 static STATUS: AtomicI32 = AtomicI32::new(UNSUPPORTED_ABI);
 static JVMTI: AtomicPtr<JvmtiEnv> = AtomicPtr::new(ptr::null_mut());
@@ -383,6 +416,497 @@ pub(crate) unsafe fn owned_file_port(
     Ok(token.is_current().then_some(token))
 }
 
+/// Actual source-callback Classes pinned by one issuer operation lease.
+/// This token cannot authorize access to a fresh owned-file NativeCall.
+pub(crate) struct SourceCaptureToken {
+    _operation: Operation,
+    status: jint,
+    classes: [(u64, u64); 4],
+}
+impl SourceCaptureToken {
+    pub(crate) fn is_current(&self) -> bool {
+        source_port_current(self.status, &self.classes)
+    }
+    pub(crate) fn stamp(&self) -> [(u64, u64); 4] {
+        self.classes
+    }
+    pub(crate) fn snapshot(&self) -> SourceCaptureStamp {
+        SourceCaptureStamp {
+            status: self.status,
+            classes: self.classes,
+        }
+    }
+    /// Native issuer epoch; callers must also check the current token/stamp.
+    pub(crate) fn generation(&self) -> u64 {
+        1
+    }
+}
+
+/// Pure metadata, never a frame lease or renewed observation authority.
+/// The current JNI frame must separately keep its SourceCaptureToken alive.
+#[derive(Clone, Copy)]
+pub(crate) struct SourceCaptureStamp {
+    status: jint,
+    classes: [(u64, u64); 4],
+}
+impl SourceCaptureStamp {
+    pub(crate) fn is_current(&self) -> bool {
+        source_port_current(self.status, &self.classes)
+    }
+}
+
+/// Retainable metadata only: no operation/TLS lease, JNI env or local ref.
+/// The issuer owns held_class; accessing it requires a current frame token.
+#[derive(Clone, Copy)]
+pub(crate) struct ObservedClassStamp {
+    class_id: u64,
+    definition_generation: u64,
+    loader: u64,
+    held_class: usize,
+    signature: &'static [u8],
+}
+impl ObservedClassStamp {
+    pub(crate) fn is_current(&self) -> bool {
+        self.held_class != 0
+            && status() >= 0
+            && status() & VM_LIVE != 0
+            && core(|core| {
+                Ok(core.ordinary_generation(self.class_id) == Some(self.definition_generation))
+            })
+            .unwrap_or(false)
+    }
+    pub(crate) fn stamp(&self) -> (u64, u64) {
+        (self.class_id, self.definition_generation)
+    }
+    pub(crate) fn signature(&self) -> &'static [u8] {
+        self.signature
+    }
+    pub(crate) fn loader(&self) -> u64 {
+        self.loader
+    }
+    /// This borrowed Class must not escape token's current attached JNI frame.
+    pub(crate) fn actual_class(&self, token: &SourceCaptureToken) -> Option<jclass> {
+        (token.is_current() && self.is_current()).then_some(self.held_class as jclass)
+    }
+}
+
+/// Pure issuer-held read-class metadata; no JNI frame or operation lease.
+/// A current SourceCaptureToken must separately pin every actual Class use.
+#[derive(Clone, Copy)]
+pub(crate) struct ReadReceiverStamp {
+    class: ObservedClassStamp,
+}
+impl ReadReceiverStamp {
+    pub(crate) fn is_current(&self) -> bool {
+        self.class.is_current()
+    }
+    pub(crate) fn stamp(&self) -> (u64, u64) {
+        self.class.stamp()
+    }
+    pub(crate) fn signature(&self) -> &'static [u8] {
+        self.class.signature()
+    }
+    pub(crate) fn loader(&self) -> u64 {
+        self.class.loader()
+    }
+    pub(crate) fn actual_class(&self, token: &SourceCaptureToken) -> Option<jclass> {
+        self.class.actual_class(token)
+    }
+}
+
+/// Join object_class's actual Class to one exact issuer-held definition.
+pub(crate) unsafe fn actual_source_class(
+    env: *mut JNIEnv,
+    token: &SourceCaptureToken,
+    actual_class: jclass,
+    expected: &'static [u8],
+) -> Result<Option<ObservedClassStamp>> {
+    if actual_class.is_null() {
+        return Ok(None);
+    }
+    unsafe { source_class_stamp(env, token, Some(actual_class), expected) }
+}
+
+/// Resolve a fixed issuer-held base Class, without FindClass/Class.forName or
+/// using the actual server's subclass to select inherited-field metadata.
+pub(crate) unsafe fn source_class_by_name(
+    env: *mut JNIEnv,
+    token: &SourceCaptureToken,
+    expected: &'static [u8],
+) -> Result<Option<ObservedClassStamp>> {
+    unsafe { source_class_stamp(env, token, None, expected) }
+}
+
+unsafe fn source_class_stamp(
+    env: *mut JNIEnv,
+    token: &SourceCaptureToken,
+    actual_class: Option<jclass>,
+    expected: &'static [u8],
+) -> Result<Option<ObservedClassStamp>> {
+    unsafe { retained_class_stamp(env, token, actual_class, expected, ClassStampPolicy::Source) }
+}
+
+/// Join an actual read receiver or declaring Class to its exact held definition.
+pub(crate) unsafe fn actual_read_receiver_class(
+    env: *mut JNIEnv,
+    token: &SourceCaptureToken,
+    actual_class: jclass,
+    expected: &'static [u8],
+) -> Result<Option<ReadReceiverStamp>> {
+    if actual_class.is_null() {
+        return Ok(None);
+    }
+    unsafe {
+        retained_class_stamp(
+            env,
+            token,
+            Some(actual_class),
+            expected,
+            ClassStampPolicy::ReadReceiver,
+        )
+    }
+    .map(|stamp| stamp.map(|class| ReadReceiverStamp { class }))
+}
+
+#[derive(Clone, Copy)]
+enum ClassStampPolicy {
+    Source,
+    ReadReceiver,
+}
+
+unsafe fn retained_class_stamp(
+    env: *mut JNIEnv,
+    token: &SourceCaptureToken,
+    actual_class: Option<jclass>,
+    expected: &'static [u8],
+    policy: ClassStampPolicy,
+) -> Result<Option<ObservedClassStamp>> {
+    let Some(name) = class_internal(expected) else {
+        return Ok(None);
+    };
+    let roster = match policy {
+        ClassStampPolicy::Source => SOURCE_CLASS_ROSTER,
+        ClassStampPolicy::ReadReceiver => READ_RECEIVER_ROSTER,
+    };
+    if !roster.contains(&name) || env.is_null() || !token.is_current() {
+        return Ok(None);
+    }
+    if unsafe { ffi::exception(env)? } {
+        return Err(FfiError::PendingException.into());
+    }
+    let ti = owned_files_vm();
+    if ti.is_null() {
+        return Ok(None);
+    }
+    let references = {
+        let state = STATE
+            .get()
+            .ok_or(ProducerError::StateUnavailable)?
+            .lock()
+            .map_err(|_| ProducerError::StateUnavailable)?;
+        if state.closed {
+            return Ok(None);
+        }
+        state
+            .references
+            .iter()
+            .filter(|reference| reference.kind == ReferenceKind::Class)
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    let references = match policy {
+        ClassStampPolicy::Source => references,
+        ClassStampPolicy::ReadReceiver => {
+            let Some(actual) = actual_class else {
+                return Ok(None);
+            };
+            // Select the actual held Class before inspecting its name or loader.
+            // An unrelated same-named Class in another loader is no candidate.
+            let mut matched = None;
+            for reference in references {
+                if !token.is_current() {
+                    return Ok(None);
+                }
+                if unsafe { ffi::same_object(env, actual, reference.handle as jclass)? } {
+                    if matched.is_some() {
+                        return Ok(None);
+                    }
+                    matched = Some(reference);
+                }
+            }
+            let Some(reference) = matched else {
+                return Ok(None);
+            };
+            vec![reference]
+        }
+    };
+    let game_loader = match policy {
+        ClassStampPolicy::Source => {
+            // The token's fourth exact Class is the held MinecraftServer base.
+            let Some(game_class) = references
+                .iter()
+                .find(|reference| reference.id == token.classes[3].0)
+            else {
+                return Ok(None);
+            };
+            if !token.is_current() {
+                return Ok(None);
+            }
+            let Some(loader) =
+                (unsafe { existing_source_loader(env, ti, game_class.handle as jclass)? })
+            else {
+                return Ok(None);
+            };
+            if loader == 0 {
+                return Ok(None);
+            }
+            Some(loader)
+        }
+        ClassStampPolicy::ReadReceiver => None,
+    };
+    let mut found = None;
+    for reference in references {
+        if !token.is_current() {
+            return Ok(None);
+        }
+        let class = reference.handle as jclass;
+        if unsafe { ffi::class_signature(ti, class)? } != expected {
+            continue;
+        }
+        if found.is_some() {
+            return Ok(None);
+        }
+        if let Some(actual) = actual_class
+            && !unsafe { ffi::same_object(env, actual, class)? }
+        {
+            return Ok(None);
+        }
+        let Some(generation) = core(|core| Ok(core.ordinary_generation(reference.id)))? else {
+            return Ok(None);
+        };
+        if !token.is_current() || !unsafe { ffi::class_prepared(ti, class)? } {
+            return Ok(None);
+        }
+        let Some(loader) = (unsafe { existing_source_loader(env, ti, class)? }) else {
+            return Ok(None);
+        };
+        if loader == 0 || game_loader.is_some_and(|expected| expected != loader) {
+            return Ok(None);
+        }
+        found = Some(ObservedClassStamp {
+            class_id: reference.id,
+            definition_generation: generation,
+            loader,
+            held_class: reference.handle,
+            signature: expected,
+        });
+    }
+    Ok(found.filter(|stamp| token.is_current() && stamp.is_current()))
+}
+
+/// A separately joined actual fresh owned-file port, never a capture conversion.
+pub(crate) struct CurrentSourceRootToken {
+    _operation: Operation,
+    status: jint,
+    classes: [(u64, u64); 5],
+}
+impl CurrentSourceRootToken {
+    pub(crate) fn is_current(&self) -> bool {
+        source_port_current(self.status, &self.classes)
+    }
+    pub(crate) fn stamp(&self) -> [(u64, u64); 5] {
+        self.classes
+    }
+    /// Native issuer epoch; callers must also check the current token/stamp.
+    pub(crate) fn generation(&self) -> u64 {
+        1
+    }
+}
+
+fn source_port_current<const N: usize>(initial: jint, classes: &[(u64, u64); N]) -> bool {
+    status() == initial
+        && initial >= 0
+        && initial & VM_LIVE != 0
+        && core(|core| {
+            Ok(classes
+                .iter()
+                .all(|(id, generation)| core.ordinary_generation(*id) == Some(*generation)))
+        })
+        .unwrap_or(false)
+}
+
+/// Resolve an already issuer-held loader; this metadata port creates no globals.
+unsafe fn existing_source_loader(
+    env: *mut JNIEnv,
+    ti: *mut JvmtiEnv,
+    class: jclass,
+) -> Result<Option<u64>> {
+    let loader = unsafe { ffi::class_loader(ti, class)? };
+    if loader.is_null() {
+        return Ok(Some(0));
+    }
+    let result = unsafe { existing_identity(env, loader, ReferenceKind::Loader) };
+    let closed = unsafe { ffi::delete_local(env, loader) };
+    match (result, closed) {
+        (Ok(loader), Ok(())) => Ok(loader),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+    }
+}
+
+/// Names are fixed by the private callers below. Actual Classes come from JNI
+/// object_class, never from a Java name/id/Class getter or a caller's receipt.
+unsafe fn source_port_classes<const N: usize>(
+    env: *mut JNIEnv,
+    initial: jint,
+    names: [&[u8]; N],
+    supplied: &[jclass],
+) -> Result<Option<[(u64, u64); N]>> {
+    let ti = owned_files_vm();
+    if env.is_null()
+        || initial < 0
+        || initial & VM_LIVE == 0
+        || ti.is_null()
+        || supplied.len() + 2 != N
+        || supplied.iter().any(|class| class.is_null())
+        || unsafe { ffi::exception(env)? }
+    {
+        return Ok(None);
+    }
+    let references = {
+        let state = STATE
+            .get()
+            .ok_or(ProducerError::StateUnavailable)?
+            .lock()
+            .map_err(|_| ProducerError::StateUnavailable)?;
+        if state.closed {
+            return Ok(None);
+        }
+        state
+            .references
+            .iter()
+            .filter(|reference| reference.kind == ReferenceKind::Class)
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    let mut actual = [ptr::null_mut(); N];
+    actual[..supplied.len()].copy_from_slice(supplied);
+    let mut joined = [(0, 0); N];
+    let mut counts = [0usize; N];
+    for reference in references {
+        let class = reference.handle as jclass;
+        let signature = unsafe { ffi::class_signature(ti, class)? };
+        for index in 0..N {
+            if signature != names[index] {
+                continue;
+            }
+            counts[index] += 1;
+            if index < supplied.len() && !unsafe { ffi::same_object(env, class, actual[index])? } {
+                return Ok(None);
+            }
+            if index >= supplied.len() {
+                actual[index] = class;
+            }
+            let Some(generation) = core(|core| Ok(core.ordinary_generation(reference.id)))? else {
+                return Ok(None);
+            };
+            if !unsafe { ffi::class_prepared(ti, class)? } {
+                return Ok(None);
+            }
+            joined[index] = (reference.id, generation);
+        }
+    }
+    if counts != [1; N] {
+        return Ok(None);
+    }
+    let mut game_loader = None;
+    for (index, class) in actual.into_iter().enumerate() {
+        let Some(loader) = (unsafe { existing_source_loader(env, ti, class)? }) else {
+            return Ok(None);
+        };
+        if index == 0 {
+            if loader != 0 {
+                return Ok(None);
+            }
+        } else if loader == 0 || game_loader.is_some_and(|expected| expected != loader) {
+            return Ok(None);
+        } else {
+            game_loader = Some(loader);
+        }
+    }
+    Ok(source_port_current(initial, &joined).then_some(joined))
+}
+
+pub(crate) unsafe fn source_capture_port(
+    env: *mut JNIEnv,
+    implicit_bridge: jclass,
+    actual_load_port_class: jclass,
+) -> Result<Option<SourceCaptureToken>> {
+    let operation =
+        Operation::acquire(METADATA_RESERVATION).ok_or(ProducerError::StateUnavailable)?;
+    let initial = status();
+    let names: [&[u8]; 4] = [
+        b"Lio/github/daejunnom/mmmm/observer/DefinitionPackLoadBridge;",
+        b"Lio/github/daejunnom/mmmm/fabric/NativeFunctionLoadObservation$NativeCall;",
+        b"Lio/github/daejunnom/mmmm/fabric/MmmmFabricHost;",
+        b"Lnet/minecraft/server/MinecraftServer;",
+    ];
+    let Some(classes) = (unsafe {
+        source_port_classes(
+            env,
+            initial,
+            names,
+            &[implicit_bridge, actual_load_port_class],
+        )?
+    }) else {
+        return Ok(None);
+    };
+    let token = SourceCaptureToken {
+        _operation: operation,
+        status: initial,
+        classes,
+    };
+    Ok(token.is_current().then_some(token))
+}
+
+pub(crate) unsafe fn current_source_root_port(
+    env: *mut JNIEnv,
+    implicit_bridge: jclass,
+    actual_load_port_class: jclass,
+    actual_fresh_native_call_class: jclass,
+) -> Result<Option<CurrentSourceRootToken>> {
+    let operation =
+        Operation::acquire(METADATA_RESERVATION).ok_or(ProducerError::StateUnavailable)?;
+    let initial = status();
+    let names: [&[u8]; 5] = [
+        b"Lio/github/daejunnom/mmmm/observer/DefinitionPackLoadBridge;",
+        b"Lio/github/daejunnom/mmmm/fabric/NativeFunctionLoadObservation$NativeCall;",
+        b"Lio/github/daejunnom/mmmm/fabric/NativeCalibrationPackFiles$NativeCall;",
+        b"Lio/github/daejunnom/mmmm/fabric/MmmmFabricHost;",
+        b"Lnet/minecraft/server/MinecraftServer;",
+    ];
+    let Some(classes) = (unsafe {
+        source_port_classes(
+            env,
+            initial,
+            names,
+            &[
+                implicit_bridge,
+                actual_load_port_class,
+                actual_fresh_native_call_class,
+            ],
+        )?
+    }) else {
+        return Ok(None);
+    };
+    let token = CurrentSourceRootToken {
+        _operation: operation,
+        status: initial,
+        classes,
+    };
+    Ok(token.is_current().then_some(token))
+}
+
 /// Actual observed bootstrap anchor Class generation. An anchor's name or
 /// Java constructor is not registration; this joins the exact prepared Class
 /// object to the installed initial-definition producer for each current call.
@@ -513,6 +1037,10 @@ fn callback(action: impl FnOnce() -> Result<()>) {
 }
 fn selected(name: &[u8]) -> bool {
     ROSTER.iter().any(|prefix| name.starts_with(prefix))
+        || SOURCE_CLASS_ROSTER
+            .iter()
+            .chain(READ_RECEIVER_ROSTER.iter())
+            .any(|expected| *expected == name)
 }
 fn selected_prefix(prefix: &[u16]) -> bool {
     ROSTER.iter().any(|expected| {
@@ -525,7 +1053,23 @@ fn selected_prefix(prefix: &[u16]) -> bool {
                 };
                 actual == u16::from(*expected)
             })
-    })
+    }) || (prefix.len() < 64
+        && SOURCE_CLASS_ROSTER
+            .iter()
+            .chain(READ_RECEIVER_ROSTER.iter())
+            .any(|expected| {
+                // string_prefix returns min(full length, 64); exactly 64 is not a
+                // complete-name witness. Existing MMMM prefix selection stays above.
+                expected.len() == prefix.len()
+                    && expected.iter().zip(prefix).all(|(expected, actual)| {
+                        let actual = if *actual == u16::from(b'.') {
+                            u16::from(b'/')
+                        } else {
+                            *actual
+                        };
+                        actual == u16::from(*expected)
+                    })
+            }))
 }
 fn normalize(name: &[u8]) -> Vec<u8> {
     name.iter()
@@ -743,6 +1287,7 @@ pub(crate) fn on_load(vm: *mut JavaVM, options: *mut c_char) -> jint {
 pub(crate) fn on_unload() {
     STATUS.store(VM_DEAD, Ordering::Release);
     crate::owned_pack_files::on_unload();
+    crate::loaded_pack_sources_jni::on_unload();
     JVMTI.store(ptr::null_mut(), Ordering::Release);
     // Agent_OnUnload may occur after VM destruction. No JNI calls are permitted.
 }
@@ -818,6 +1363,7 @@ unsafe extern "C" fn vm_death(_ti: *mut JvmtiEnv, env: *mut JNIEnv) {
     // This actual VMDeath callback supplies the still-valid event environment.
     // Registry drains no active file lease and invokes no Java callback here.
     unsafe { crate::owned_pack_files::vm_death(env) };
+    unsafe { crate::loaded_pack_sources_jni::vm_death(env) };
     let references = match STATE.get().and_then(|state| state.lock().ok()) {
         Some(mut state) => {
             state.closed = true;

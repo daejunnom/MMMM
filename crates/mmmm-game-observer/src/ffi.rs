@@ -34,6 +34,16 @@ pub(crate) type jthread = jobject;
 pub(crate) type jstring = jobject;
 pub(crate) type jbyteArray = jobject;
 pub(crate) type jmethodID = *mut c_void;
+pub(crate) type jfieldID = *mut c_void;
+
+// Only the object member is needed for the admitted CallObjectMethodA calls.
+// The selected native-header witness independently checks the full C jvalue.
+#[repr(C, align(8))]
+union jvalue {
+    l: jobject,
+}
+const _: [(); 8] = [(); std::mem::size_of::<jvalue>()];
+const _: [(); 8] = [(); std::mem::align_of::<jvalue>()];
 
 #[repr(C)]
 pub(crate) struct JNIEnv {
@@ -965,6 +975,93 @@ pub(crate) unsafe fn object_class(env: *mut JNIEnv, object: jobject) -> Result<j
         Ok(value)
     }
 }
+pub(crate) unsafe fn is_instance_of(
+    env: *mut JNIEnv,
+    object: jobject,
+    class: jclass,
+) -> Result<bool> {
+    let function = unsafe {
+        jni_fn!(
+            env,
+            32,
+            unsafe extern "C" fn(*mut JNIEnv, jobject, jclass) -> jboolean
+        )
+    };
+    let pending = unsafe { jni_fn!(env, 228, unsafe extern "C" fn(*mut JNIEnv) -> jboolean) };
+    if unsafe { pending(env) } != 0 {
+        return Err(FfiError::PendingException);
+    }
+    if object.is_null() || class.is_null() {
+        return Err(FfiError::InvalidResult);
+    }
+    let value = unsafe { function(env, object, class) };
+    if unsafe { pending(env) } != 0 {
+        Err(FfiError::PendingException)
+    } else {
+        Ok(value != 0)
+    }
+}
+pub(crate) unsafe fn field_id(
+    env: *mut JNIEnv,
+    class: jclass,
+    name: &std::ffi::CStr,
+    signature: &std::ffi::CStr,
+) -> Result<jfieldID> {
+    let function = unsafe {
+        jni_fn!(
+            env,
+            94,
+            unsafe extern "C" fn(*mut JNIEnv, jclass, *const c_char, *const c_char) -> jfieldID
+        )
+    };
+    let pending = unsafe { jni_fn!(env, 228, unsafe extern "C" fn(*mut JNIEnv) -> jboolean) };
+    if unsafe { pending(env) } != 0 {
+        return Err(FfiError::PendingException);
+    }
+    if class.is_null() {
+        return Err(FfiError::InvalidResult);
+    }
+    let value = unsafe { function(env, class, name.as_ptr(), signature.as_ptr()) };
+    if unsafe { pending(env) } != 0 {
+        Err(FfiError::PendingException)
+    } else if value.is_null() {
+        Err(FfiError::InvalidResult)
+    } else {
+        Ok(value)
+    }
+}
+pub(crate) unsafe fn object_field(
+    env: *mut JNIEnv,
+    object: jobject,
+    field: jfieldID,
+) -> Result<Option<jobject>> {
+    // Resolve cleanup before the field read can produce a local reference.
+    let function = unsafe {
+        jni_fn!(
+            env,
+            95,
+            unsafe extern "C" fn(*mut JNIEnv, jobject, jfieldID) -> jobject
+        )
+    };
+    let pending = unsafe { jni_fn!(env, 228, unsafe extern "C" fn(*mut JNIEnv) -> jboolean) };
+    let delete = unsafe { jni_fn!(env, 23, unsafe extern "C" fn(*mut JNIEnv, jobject)) };
+    if unsafe { pending(env) } != 0 {
+        return Err(FfiError::PendingException);
+    }
+    if object.is_null() || field.is_null() {
+        return Err(FfiError::InvalidResult);
+    }
+    let value = unsafe { function(env, object, field) };
+    if unsafe { pending(env) } != 0 {
+        if !value.is_null() {
+            // DeleteLocalRef preserves the pending exception.
+            unsafe { delete(env, value) };
+        }
+        Err(FfiError::PendingException)
+    } else {
+        Ok((!value.is_null()).then_some(value))
+    }
+}
 pub(crate) unsafe fn method_id(
     env: *mut JNIEnv,
     class: jclass,
@@ -1002,6 +1099,81 @@ pub(crate) unsafe fn call_object_zero(
         Err(FfiError::PendingException)
     } else if value.is_null() {
         Err(FfiError::InvalidResult)
+    } else {
+        Ok(value)
+    }
+}
+pub(crate) unsafe fn call_object_zero_optional(
+    env: *mut JNIEnv,
+    object: jobject,
+    method: jmethodID,
+) -> Result<Option<jobject>> {
+    unsafe { call_object_optional(env, object, method, ptr::null()) }
+}
+pub(crate) unsafe fn call_object_one_optional(
+    env: *mut JNIEnv,
+    object: jobject,
+    method: jmethodID,
+    argument: jobject,
+) -> Result<Option<jobject>> {
+    let argument = jvalue { l: argument };
+    unsafe { call_object_optional(env, object, method, &argument) }
+}
+unsafe fn call_object_optional(
+    env: *mut JNIEnv,
+    object: jobject,
+    method: jmethodID,
+    arguments: *const jvalue,
+) -> Result<Option<jobject>> {
+    // Resolve cleanup and exception functions before producing any local ref.
+    let function = unsafe {
+        jni_fn!(
+            env,
+            36,
+            unsafe extern "C" fn(*mut JNIEnv, jobject, jmethodID, *const jvalue) -> jobject
+        )
+    };
+    let pending = unsafe { jni_fn!(env, 228, unsafe extern "C" fn(*mut JNIEnv) -> jboolean) };
+    let delete = unsafe { jni_fn!(env, 23, unsafe extern "C" fn(*mut JNIEnv, jobject)) };
+    if unsafe { pending(env) } != 0 {
+        return Err(FfiError::PendingException);
+    }
+    if object.is_null() || method.is_null() {
+        return Err(FfiError::InvalidResult);
+    }
+    let value = unsafe { function(env, object, method, arguments) };
+    if unsafe { pending(env) } != 0 {
+        if !value.is_null() {
+            // DeleteLocalRef is allowed with a pending exception; never clear it.
+            unsafe { delete(env, value) };
+        }
+        Err(FfiError::PendingException)
+    } else {
+        Ok((!value.is_null()).then_some(value))
+    }
+}
+pub(crate) unsafe fn call_int_zero(
+    env: *mut JNIEnv,
+    object: jobject,
+    method: jmethodID,
+) -> Result<jint> {
+    let function = unsafe {
+        jni_fn!(
+            env,
+            51,
+            unsafe extern "C" fn(*mut JNIEnv, jobject, jmethodID, *const jvalue) -> jint
+        )
+    };
+    let pending = unsafe { jni_fn!(env, 228, unsafe extern "C" fn(*mut JNIEnv) -> jboolean) };
+    if unsafe { pending(env) } != 0 {
+        return Err(FfiError::PendingException);
+    }
+    if object.is_null() || method.is_null() {
+        return Err(FfiError::InvalidResult);
+    }
+    let value = unsafe { function(env, object, method, ptr::null()) };
+    if unsafe { pending(env) } != 0 {
+        Err(FfiError::PendingException)
     } else {
         Ok(value)
     }
@@ -1070,6 +1242,68 @@ pub(crate) unsafe fn whole_byte_array(
         return Err(FfiError::PendingException);
     }
     unsafe { selected_array(env, value, 0, size, cap) }
+}
+/// Returns caller-owned, non-null local refs; the input array stays caller-owned.
+/// On failure every acquired element ref is deleted without clearing exceptions.
+pub(crate) unsafe fn object_array_values(
+    env: *mut JNIEnv,
+    array: jobject,
+    cap: usize,
+) -> Result<Vec<jobject>> {
+    let cap = jint::try_from(cap).map_err(|_| FfiError::BoundExceeded)?;
+    // All fallible table lookups precede calls that can produce element refs.
+    let length = unsafe { jni_fn!(env, 171, unsafe extern "C" fn(*mut JNIEnv, jobject) -> jint) };
+    let get = unsafe {
+        jni_fn!(
+            env,
+            173,
+            unsafe extern "C" fn(*mut JNIEnv, jobject, jint) -> jobject
+        )
+    };
+    let pending = unsafe { jni_fn!(env, 228, unsafe extern "C" fn(*mut JNIEnv) -> jboolean) };
+    let delete = unsafe { jni_fn!(env, 23, unsafe extern "C" fn(*mut JNIEnv, jobject)) };
+    if unsafe { pending(env) } != 0 {
+        return Err(FfiError::PendingException);
+    }
+    if array.is_null() {
+        return Err(FfiError::InvalidResult);
+    }
+    let count = unsafe { length(env, array) };
+    if unsafe { pending(env) } != 0 {
+        return Err(FfiError::PendingException);
+    }
+    if count < 0 {
+        return Err(FfiError::InvalidResult);
+    }
+    if count > cap {
+        return Err(FfiError::BoundExceeded);
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count as usize)
+        .map_err(|_| FfiError::BoundExceeded)?;
+    for index in 0..count {
+        let value = unsafe { get(env, array, index) };
+        let error = if unsafe { pending(env) } != 0 {
+            Some(FfiError::PendingException)
+        } else if value.is_null() {
+            Some(FfiError::InvalidResult)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            if !value.is_null() {
+                unsafe { delete(env, value) };
+            }
+            for retained in values {
+                unsafe { delete(env, retained) };
+            }
+            return Err(error);
+        }
+        // Capacity was reserved before the first JNI element access.
+        values.push(value);
+    }
+    Ok(values)
 }
 pub(crate) unsafe fn object_array(env: *mut JNIEnv, values: &[jobject]) -> Result<jobject> {
     let find = unsafe {

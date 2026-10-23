@@ -127,7 +127,7 @@ public final class MmmmFabricHost implements ModInitializer {
         // write session or original request callback participates in cleanup.
         for (NativeCalibrationBootstrap.Attempt attempt : List.copyOf(bootstrapAttempts.values())) {
             try {
-                attempt.retireRoot(actual, () -> {
+                attempt.retireForServerStop(actual, () -> {
                     if (server != actual || !actual.isSameThread()) throw new ContractException("CALIBRATION_ROOT_CLEANUP_OWNER_CHANGED", "The actual server lifecycle cleanup owner changed");
                 });
             } catch (RuntimeException | Error failure) {

@@ -1462,9 +1462,11 @@ mod tests {
                 "initializationAttemptedCount":47,"initializationReturns":vec![1;47],"reloadOutcome":"failed",
                 "reloadFailure":capacity_failure_tree(),"rootAnchorReserved":false,"rootAnchorRecorded":false,
                 "rootRetirement":null,"rootRetirementFailure":null},
-            "observation":{"format":"mmmm.native.calibration-bootstrap-observation/1","observedFromTick":"0","observedToTick":"0",
+            "observation":{"format":"mmmm.native.calibration-bootstrap-observation/2","observedFromTick":"0","observedToTick":"0",
                 "pack":{"status":"unknown","reason":"retained_root_not_published","identityContinuity":"unproven",
                     "currentBytes":"not_observed","fullPackMembership":"unproven","retainedRoot":null,"failure":null},
+                "loadedSourceTrace":{"format":"mmmm.native.calibration-loaded-source-trace/1","armAttempted":false,
+                    "receiptOrigin":"none","receiptBytesHex":null,"failure":null,"currentFailure":null},
                 "loadedSources":{"status":"known","causalLink":"unproven","functions":functions,"failure":null},
                 "targetImages":{"status":"known","targets":images,"failure":null}}})
     }
