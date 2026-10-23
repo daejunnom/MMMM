@@ -26,6 +26,18 @@ pub enum StorageError {
         primary: Box<StorageError>,
         checkpoint: Box<StorageError>,
     },
+    /// A read-only journal snapshot and its original request checkpoint both
+    /// failed. Neither failure is converted into a complete or empty snapshot.
+    JournalSnapshotCheckpointFailure {
+        primary: Box<StorageError>,
+        checkpoint: Box<StorageError>,
+    },
+    /// Preserve failed read-transaction finalization alongside the original
+    /// snapshot error. No rollback completion is inferred from dropping a value.
+    JournalSnapshotRollbackFailure {
+        primary: Box<StorageError>,
+        rollback: Box<StorageError>,
+    },
 }
 
 impl fmt::Display for StorageError {
@@ -54,6 +66,12 @@ impl fmt::Display for StorageError {
             Self::CalibrationCheckpointFailure { .. } => {
                 f.write_str("Calibration approval work and its original checkpoint both failed")
             }
+            Self::JournalSnapshotCheckpointFailure { .. } => {
+                f.write_str("Journal snapshot and its original checkpoint both failed")
+            }
+            Self::JournalSnapshotRollbackFailure { .. } => {
+                f.write_str("Journal snapshot and its read transaction rollback both failed")
+            }
         }
     }
 }
@@ -62,14 +80,27 @@ impl StorageError {
     /// failure as a generic I/O error or replacing the original failure.
     pub fn primary_failure(&self) -> &Self {
         let mut current = self;
-        while let Self::CalibrationCheckpointFailure { primary, .. } = current {
+        while let Self::CalibrationCheckpointFailure { primary, .. }
+        | Self::JournalSnapshotCheckpointFailure { primary, .. }
+        | Self::JournalSnapshotRollbackFailure { primary, .. } = current
+        {
             current = primary;
         }
         current
     }
     pub fn checkpoint_failure(&self) -> Option<&Self> {
         match self {
-            Self::CalibrationCheckpointFailure { checkpoint, .. } => Some(checkpoint),
+            Self::CalibrationCheckpointFailure { checkpoint, .. }
+            | Self::JournalSnapshotCheckpointFailure { checkpoint, .. } => Some(checkpoint),
+            Self::JournalSnapshotRollbackFailure { primary, .. } => primary.checkpoint_failure(),
+            _ => None,
+        }
+    }
+    pub fn rollback_failure(&self) -> Option<&Self> {
+        match self {
+            Self::JournalSnapshotRollbackFailure { rollback, .. } => Some(rollback),
+            Self::CalibrationCheckpointFailure { primary, .. }
+            | Self::JournalSnapshotCheckpointFailure { primary, .. } => primary.rollback_failure(),
             _ => None,
         }
     }
@@ -77,7 +108,9 @@ impl StorageError {
 impl std::error::Error for StorageError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::CalibrationCheckpointFailure { primary, .. } => Some(primary.as_ref()),
+            Self::CalibrationCheckpointFailure { primary, .. }
+            | Self::JournalSnapshotCheckpointFailure { primary, .. }
+            | Self::JournalSnapshotRollbackFailure { primary, .. } => Some(primary.as_ref()),
             _ => None,
         }
     }
@@ -305,6 +338,48 @@ pub struct OperationRecord {
     pub scope: WriteScope,
     pub whole_project_fence: bool,
     pub steps: Vec<StepRecord>,
+}
+
+/// Trusted local observations of one complete, bounded journal read transaction.
+/// This Rust-only value is neither an access grant nor a release attestation.
+/// Its facts describe the read transaction, not writes submitted afterwards.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournalSnapshot {
+    pub(crate) operations: Vec<OperationRecord>,
+    pub(crate) write_fences: Vec<WriteFenceSnapshot>,
+}
+impl JournalSnapshot {
+    pub fn operations(&self) -> &[OperationRecord] {
+        &self.operations
+    }
+    pub fn write_fences(&self) -> &[WriteFenceSnapshot] {
+        &self.write_fences
+    }
+    /// Include queued/unsent and already-observed nonterminal writes. The
+    /// restart-only unresolved_dispatches helper has different semantics.
+    pub fn unresolved_writes(&self) -> impl Iterator<Item = &OperationRecord> {
+        self.operations.iter().filter(|record| {
+            !record.state.terminal() && record.steps.iter().any(|s| s.write_effect)
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriteFenceSnapshot {
+    pub(crate) operation_id: OperationId,
+    pub(crate) scope: WriteScope,
+    pub(crate) whole_project: bool,
+}
+impl WriteFenceSnapshot {
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+    pub fn scope(&self) -> &WriteScope {
+        &self.scope
+    }
+    pub fn whole_project(&self) -> bool {
+        self.whole_project
+    }
 }
 
 #[derive(Clone, Debug)]

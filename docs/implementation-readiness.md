@@ -2438,6 +2438,42 @@ Linux 조건식을 동치로 정리한 뒤 `542` format·`543` Windows all-targe
 Linux 전용 조건식의 실제 strict 통과와 새 후보 archive 생성은 후속이며 WSL은 사용하지
 않았다. 원 ZIP 보존과 로컬 검사 자료를 제품 인수나 공개 배포 근거로 대체하지 않는다.
 
+## 전체 작업 원장과 실제 fence의 제한된 조회
+
+Runtime의 `journal_snapshot_checked`는 현재 소유한 동일 Store의 Deferred 읽기
+트랜잭션 하나에서 전체 operation과 실제 write fence를 수집한다. SQL index와 record
+identity, 동결 ExecutionPlan의 실제 CAS 바이트·digest·context·scope·step roster 및
+operation retention을 대조한다. queued/unsent 쓰기와 step 관측이 끝난 nonterminal
+쓰기도 `unresolved_writes()`에 포함한다. 합법적인 Partial 이후 fence 부재는 기존
+operation 상태와 별도 사실로 보존한다.
+
+상한은 operation/fence 각각 4,096행, record/scope 각각 1 MiB, plan 8 MiB, 누적
+32 MiB 및 총 65,536 step이다. 초과하면 불완전 조회 오류를 반환한다. 원 요청의
+checkpoint를 DB/CAS 처리 전후와 chunk 사이에 적용하고, BEGIN 이후 정상·실패
+경로 모두 명시적 rollback으로 종료한다. 본문·checkpoint·rollback의 동시 오류는
+typed 원인으로 함께 남긴다. 호출자가 현재 권한을 먼저 확립해야 하는 Rust 내부
+관측이며, 공개 wire 계약이나 release proof를 발급하지 않는다. 실제 FN36 수집기와의
+연결 및 현재 권한·출시 자료의 최종 판정은 후속 구현 범위다.
+
+Windows `547`의 format 뒤 `548`에서 기존 fixture를 재사용한 집중 검사 6개가
+통과했다. 실제 4,096/4,097행 경계, false write flag, SQL/CAS/fence/retention 불일치와
+원 checkpoint 실패를 포함한다. 입력 324개·8,964,238 bytes의 전후 pin은
+`29def1a360f049c75d272912c1e8c0b29016b8899bca7263b0b69134d925e347`로 같았다.
+`549`의 Runtime 전체 library 검사도 137개 통과했다. 두 실행은 command 0·drain·
+출력 완료·export·scratch 정리·lease 해제 및 감독/정리 오류 0이며, 각각 57,742 ms와
+30,676 ms다. `549` 완료 기록을 다시 읽고 현재 변경 소스 세 파일의 digest가 기존
+검토본과 같음을 확인했다. `548`의 전후 입력 확인을 `549`의 별도 전후 capture로
+표현하지 않는다. 현재 변경은 독립 소스 검토를 통과했으며 게임·3OS·공개 배포 인수를
+완료한 근거로 사용하지 않는다.
+
+현재 소스의 Windows `550`에서 Runtime·Application·Coordinator·CLI의 all-target
+strict 검사를 통과했다. command 0·77,525 ms·Job peak 968,577,024 bytes·7 process·
+gap 143 ms·자연 종료이며 drain·출력 완료·export·scratch 정리·lease 해제 및 감독/정리
+오류 0이다. 이는 새 StorageError의 실제 소비자 컴파일을 포함한다. 이전 고정
+`79448ab`의 Rust CI 90 집계 성공과 JVM CI 81 집계 실패도 metadata로 확인했으며,
+이후 Runtime 변경의 CI 성공으로 대신하지 않는다. 현재 서버는 중지 상태이고 계정
+인증 문제로 클라이언트·ADMIN pairing·시각 검증은 계속 미실행이다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

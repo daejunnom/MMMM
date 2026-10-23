@@ -284,6 +284,459 @@ fn reservations_bind_exactly_one_operation_across_reopen() {
     assert!(store.unresolved_dispatches().unwrap().is_empty());
 }
 
+// The echo and derived write fixtures above cover normal dispatch/restart, but
+// do not establish a complete read-only journal observation. These regressions
+// reuse those exact fixtures and real transitions; no game/release evidence or
+// new source fixture is fabricated.
+#[test]
+fn journal_snapshot_includes_unsent_and_settled_nonterminal_writes_without_repair() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let plan = frozen_write("plan-snapshot", "resource-snapshot");
+    let read = example("execution-plan.json");
+    store.save_plan(&plan).unwrap();
+    store.save_plan(&read).unwrap();
+    reserve(&mut store, &plan, "operation-snapshot", "snapshot-key");
+    reserve(&mut store, &read, "operation-read", "read-key");
+    let snapshot = store.journal_snapshot_checked(|| Ok(())).unwrap();
+    assert_eq!(snapshot.operations().len(), 2);
+    assert_eq!(snapshot.unresolved_writes().count(), 1);
+    assert_eq!(
+        snapshot.unresolved_writes().next().unwrap().state,
+        OperationState::Queued
+    );
+    assert!(snapshot.write_fences().is_empty());
+    assert!(store.unresolved_dispatches().unwrap().is_empty());
+    let operation = op("operation-snapshot");
+    store
+        .dispatch_intent(
+            &operation,
+            &step(),
+            &invocation("operation-snapshot", "invocation-snapshot"),
+        )
+        .unwrap();
+    let snapshot = store.journal_snapshot_checked(|| Ok(())).unwrap();
+    assert_eq!(snapshot.write_fences().len(), 1);
+    assert_eq!(snapshot.write_fences()[0].operation_id(), &operation);
+    assert_eq!(
+        snapshot.write_fences()[0].scope(),
+        &store.operation(&operation).unwrap().scope
+    );
+    assert!(!snapshot.write_fences()[0].whole_project());
+    store.request_cancel(&operation).unwrap();
+    assert_eq!(
+        store
+            .journal_snapshot_checked(|| Ok(()))
+            .unwrap()
+            .unresolved_writes()
+            .next()
+            .unwrap()
+            .state,
+        OperationState::CancelRequested
+    );
+    store.mark_outcome_unknown(&operation, &step()).unwrap();
+    assert_eq!(
+        store
+            .journal_snapshot_checked(|| Ok(()))
+            .unwrap()
+            .unresolved_writes()
+            .next()
+            .unwrap()
+            .state,
+        OperationState::OutcomeUnknown
+    );
+    let evidence = store
+        .put_blob(b"snapshot regression observed partial target")
+        .unwrap();
+    store
+        .record_observation(
+            &operation,
+            &step(),
+            StepObservation {
+                dispatch: DispatchEvidence::Observed,
+                effect: EffectEvidence::SomeConfirmed,
+                further_effects_possible: false,
+                provider_receipt: Some("receipt-snapshot".into()),
+                observation_refs: vec![evidence.clone()],
+                finished: false,
+            },
+        )
+        .unwrap();
+    store
+        .finish_operation(&operation, OperationState::Partial)
+        .unwrap();
+    let snapshot = store.journal_snapshot_checked(|| Ok(())).unwrap();
+    assert_eq!(
+        snapshot.unresolved_writes().next().unwrap().state,
+        OperationState::Partial
+    );
+    assert!(snapshot.write_fences().is_empty());
+    // Existing transitions allow renewed uncertainty after Partial removed its
+    // fence. Preserve the actual absent fence and unresolved write separately.
+    store.mark_outcome_unknown(&operation, &step()).unwrap();
+    let changes: i64 = store
+        .connection
+        .query_row("SELECT total_changes()", [], |row| row.get(0))
+        .unwrap();
+    let snapshot = store.journal_snapshot_checked(|| Ok(())).unwrap();
+    let unresolved = snapshot.unresolved_writes().next().unwrap();
+    assert!(unresolved.steps[0].further_effects_possible);
+    assert!(snapshot.write_fences().is_empty());
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        changes
+    );
+    assert!(store.connection.is_autocommit());
+    store
+        .record_observation(
+            &operation,
+            &step(),
+            StepObservation {
+                dispatch: DispatchEvidence::Observed,
+                effect: EffectEvidence::CompleteConfirmed,
+                further_effects_possible: false,
+                provider_receipt: Some("receipt-snapshot".into()),
+                observation_refs: vec![evidence],
+                finished: true,
+            },
+        )
+        .unwrap();
+    assert!(store.unresolved_dispatches().unwrap().is_empty());
+    assert_eq!(
+        store
+            .journal_snapshot_checked(|| Ok(()))
+            .unwrap()
+            .unresolved_writes()
+            .count(),
+        1
+    );
+    store
+        .finish_operation(&operation, OperationState::Succeeded)
+        .unwrap();
+    assert_eq!(
+        store
+            .journal_snapshot_checked(|| Ok(()))
+            .unwrap()
+            .unresolved_writes()
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn journal_snapshot_preserves_terminal_unfinished_read_evidence() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let plan = example("execution-plan.json");
+    store.save_plan(&plan).unwrap();
+    let operation = op("operation-terminal-read");
+    reserve(&mut store, &plan, operation.as_str(), "terminal-read-key");
+    store
+        .dispatch_intent(
+            &operation,
+            &step(),
+            &invocation(operation.as_str(), "invocation-terminal-read"),
+        )
+        .unwrap();
+    store.mark_outcome_unknown(&operation, &step()).unwrap();
+    let record = store
+        .finish_operation(&operation, OperationState::FailedBeforeEffects)
+        .unwrap();
+    assert!(!record.steps[0].finished);
+    assert!(record.reconciliation_required);
+    let snapshot = store.journal_snapshot_checked(|| Ok(())).unwrap();
+    assert_eq!(snapshot.operations(), &[record]);
+    assert_eq!(snapshot.unresolved_writes().count(), 0);
+    assert!(snapshot.write_fences().is_empty());
+}
+
+#[test]
+fn journal_snapshot_rejects_false_write_flags_fence_mismatch_and_lost_plan_retention() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let plan = frozen_write("plan-snapshot-integrity", "resource-snapshot-integrity");
+    let blob = store.save_plan(&plan).unwrap();
+    let operation = op("operation-snapshot-integrity");
+    let record = reserve(&mut store, &plan, operation.as_str(), "integrity-key")
+        .record()
+        .clone();
+    let mut altered = record.clone();
+    altered.steps[0].write_effect = false;
+    store
+        .connection
+        .execute(
+            "UPDATE operations SET record_json=?2 WHERE operation_id=?1",
+            rusqlite::params![
+                operation.as_str(),
+                super::journal::encode(&altered).unwrap()
+            ],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.journal_snapshot_checked(|| Ok(())),
+        Err(StorageError::Corrupt(_))
+    ));
+    store
+        .connection
+        .execute(
+            "UPDATE operations SET record_json=?2 WHERE operation_id=?1",
+            rusqlite::params![operation.as_str(), super::journal::encode(&record).unwrap()],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "DELETE FROM blob_refs WHERE owner_kind='operation' AND owner_id=?1 AND digest=?2",
+            rusqlite::params![operation.as_str(), blob.digest.as_str()],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.journal_snapshot_checked(|| Ok(())),
+        Err(StorageError::Corrupt(_))
+    ));
+    store
+        .connection
+        .execute(
+            "INSERT INTO blob_refs(owner_kind,owner_id,digest) VALUES('operation',?1,?2)",
+            rusqlite::params![operation.as_str(), blob.digest.as_str()],
+        )
+        .unwrap();
+    store
+        .dispatch_intent(
+            &operation,
+            &step(),
+            &invocation(operation.as_str(), "invocation-snapshot-integrity"),
+        )
+        .unwrap();
+    let mut scope = store.operation(&operation).unwrap().scope;
+    scope.resource_ids = vec![mmmm_contracts::ResourceId::new("resource-foreign").unwrap()];
+    let altered_scope = super::journal::encode(&scope).unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE write_fences SET scope_json=?2 WHERE operation_id=?1",
+            rusqlite::params![operation.as_str(), altered_scope],
+        )
+        .unwrap();
+    let changes: i64 = store
+        .connection
+        .query_row("SELECT total_changes()", [], |row| row.get(0))
+        .unwrap();
+    assert!(matches!(
+        store.journal_snapshot_checked(|| Ok(())),
+        Err(StorageError::Corrupt(_))
+    ));
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT scope_json FROM write_fences WHERE operation_id=?1",
+                [operation.as_str()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        altered_scope
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        changes
+    );
+}
+
+#[test]
+fn journal_snapshot_limits_and_original_checkpoints_never_return_partial_success() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let plan = frozen_write("plan-snapshot-bounds", "resource-snapshot-bounds");
+    store.save_plan(&plan).unwrap();
+    let operation = op("operation-snapshot-bounds");
+    let record = reserve(&mut store, &plan, operation.as_str(), "bounds-key")
+        .record()
+        .clone();
+    store.connection.execute("UPDATE operations SET record_json=CAST(zeroblob(1048577) AS TEXT) WHERE operation_id=?1", [operation.as_str()]).unwrap();
+    assert!(matches!(
+        store.journal_snapshot_checked(|| Ok(())),
+        Err(StorageError::InvalidInput(_))
+    ));
+    store
+        .connection
+        .execute(
+            "UPDATE operations SET record_json='{' WHERE operation_id=?1",
+            [operation.as_str()],
+        )
+        .unwrap();
+    let admitted = std::cell::Cell::new(false);
+    let error = store
+        .journal_snapshot_checked(|| {
+            if store.connection.is_autocommit() && admitted.get() {
+                Err(StorageError::Conflict("Original snapshot checkpoint"))
+            } else {
+                if !store.connection.is_autocommit() {
+                    admitted.set(true);
+                }
+                Ok(())
+            }
+        })
+        .unwrap_err();
+    assert!(matches!(error.primary_failure(), StorageError::Corrupt(_)));
+    assert!(matches!(
+        error.checkpoint_failure(),
+        Some(StorageError::Conflict("Original snapshot checkpoint"))
+    ));
+    assert!(store.connection.is_autocommit());
+    store
+        .connection
+        .execute(
+            "UPDATE operations SET record_json=?2 WHERE operation_id=?1",
+            rusqlite::params![operation.as_str(), super::journal::encode(&record).unwrap()],
+        )
+        .unwrap();
+    let cancelled = store
+        .journal_snapshot_checked(|| Err(StorageError::Conflict("Original cancellation")))
+        .unwrap_err();
+    assert!(matches!(
+        cancelled,
+        StorageError::Conflict("Original cancellation")
+    ));
+    assert!(store.connection.is_autocommit());
+    let cancelled_after_begin = store
+        .journal_snapshot_checked(|| {
+            if store.connection.is_autocommit() {
+                Ok(())
+            } else {
+                Err(StorageError::Conflict("Post-BEGIN cancellation"))
+            }
+        })
+        .unwrap_err();
+    assert!(matches!(
+        cancelled_after_begin.primary_failure(),
+        StorageError::Conflict("Post-BEGIN cancellation")
+    ));
+    assert!(store.connection.is_autocommit());
+    assert_eq!(
+        store
+            .journal_snapshot_checked(|| Ok(()))
+            .unwrap()
+            .operations()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn journal_snapshot_row_ceiling_rejects_a_complete_prefix() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let plan = frozen_write("plan-snapshot-rows", "resource-snapshot-rows");
+    let blob = store.save_plan(&plan).unwrap();
+    let record = reserve(&mut store, &plan, "operation-snapshot-0", "rows-key-0")
+        .record()
+        .clone();
+    // One actual reservation supplies the exact plan-derived record. Repeating
+    // it with distinct durable identities is needed to reach the global row
+    // ceiling; the normal one-operation fixtures cannot exercise a lost tail.
+    let transaction = store.connection.transaction().unwrap();
+    for index in 1..4096 {
+        let mut next = record.clone();
+        next.operation_id = op(&format!("operation-snapshot-{index}"));
+        next.idempotency_key = format!("rows-key-{index}");
+        transaction.execute("INSERT INTO operations(operation_id,principal,project_id,idempotency_key,plan_id,plan_hash,record_json) VALUES(?1,?2,?3,?4,?5,?6,?7)", rusqlite::params![next.operation_id.as_str(), next.principal.as_str(), next.project_id.as_str(), &next.idempotency_key, next.plan_id.as_str(), next.plan_hash.as_str(), super::journal::encode(&next).unwrap()]).unwrap();
+        transaction
+            .execute(
+                "INSERT INTO blob_refs(owner_kind,owner_id,digest) VALUES('operation',?1,?2)",
+                rusqlite::params![next.operation_id.as_str(), blob.digest.as_str()],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+    let boundary = store.journal_snapshot_checked(|| Ok(())).unwrap();
+    assert_eq!(boundary.operations().len(), 4096);
+    assert_eq!(boundary.unresolved_writes().count(), 4096);
+    reserve(
+        &mut store,
+        &plan,
+        "operation-snapshot-4096",
+        "rows-key-4096",
+    );
+    let changes: i64 = store
+        .connection
+        .query_row("SELECT total_changes()", [], |row| row.get(0))
+        .unwrap();
+    assert!(matches!(
+        store.journal_snapshot_checked(|| Ok(())),
+        Err(StorageError::InvalidInput(_))
+    ));
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT count(*) FROM operations", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        4097
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        changes
+    );
+    assert!(store.connection.is_autocommit());
+}
+
+#[test]
+fn journal_snapshot_checks_actual_plan_bytes_and_sql_operation_identity() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let plan = frozen_write("plan-snapshot-bytes", "resource-snapshot-bytes");
+    let blob = store.save_plan(&plan).unwrap();
+    let operation = op("operation-snapshot-bytes");
+    reserve(&mut store, &plan, operation.as_str(), "bytes-key");
+    store
+        .connection
+        .execute(
+            "UPDATE operations SET principal='foreign-principal' WHERE operation_id=?1",
+            [operation.as_str()],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.journal_snapshot_checked(|| Ok(())),
+        Err(StorageError::Corrupt(_))
+    ));
+    store
+        .connection
+        .execute(
+            "UPDATE operations SET principal='principal-fixture' WHERE operation_id=?1",
+            [operation.as_str()],
+        )
+        .unwrap();
+    let path = store.cas.path(&blob.digest);
+    let original = fs::read(&path).unwrap();
+    let mut changed = original.clone();
+    changed[0] ^= 1;
+    fs::write(&path, &changed).unwrap();
+    assert!(matches!(
+        store.journal_snapshot_checked(|| Ok(())),
+        Err(StorageError::Corrupt(_))
+    ));
+    assert_eq!(fs::read(&path).unwrap(), changed);
+    fs::write(path, original).unwrap();
+    assert_eq!(
+        store
+            .journal_snapshot_checked(|| Ok(()))
+            .unwrap()
+            .unresolved_writes()
+            .count(),
+        1
+    );
+}
+
 #[test]
 fn restart_after_intent_never_resends_and_keeps_scoped_fence() {
     let root = TestRoot::new();

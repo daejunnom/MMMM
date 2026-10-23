@@ -187,7 +187,398 @@ fn check_fences(
     }
 }
 
+// These ceilings bound one complete local observation. Crossing any ceiling
+// returns an error; a prefix is never represented as a complete journal.
+const SNAPSHOT_MAX_ROWS: usize = 4096;
+const SNAPSHOT_MAX_TEXT_BYTES: usize = 4096;
+const SNAPSHOT_MAX_RECORD_BYTES: u64 = 1024 * 1024;
+const SNAPSHOT_MAX_PLAN_BYTES: u64 = 8 * 1024 * 1024;
+const SNAPSHOT_MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+const SNAPSHOT_MAX_STEPS: usize = 65_536;
+
+#[derive(Default)]
+struct SnapshotBudget {
+    bytes: u64,
+    steps: usize,
+}
+impl SnapshotBudget {
+    fn bytes(&mut self, bytes: u64) -> StorageResult<()> {
+        self.bytes = self.bytes.checked_add(bytes).ok_or_else(snapshot_limit)?;
+        if self.bytes > SNAPSHOT_MAX_TOTAL_BYTES {
+            return Err(snapshot_limit());
+        }
+        Ok(())
+    }
+    fn steps(&mut self, steps: usize) -> StorageResult<()> {
+        self.steps = self.steps.checked_add(steps).ok_or_else(snapshot_limit)?;
+        if self.steps > SNAPSHOT_MAX_STEPS {
+            return Err(snapshot_limit());
+        }
+        Ok(())
+    }
+}
+fn snapshot_limit() -> StorageError {
+    StorageError::InvalidInput("Complete journal snapshot exceeds its fixed limits".into())
+}
+fn snapshot_corrupt(message: &str) -> StorageError {
+    StorageError::Corrupt(message.into())
+}
+fn snapshot_checked_after<T>(
+    result: StorageResult<T>,
+    check: &mut impl FnMut() -> StorageResult<()>,
+) -> StorageResult<T> {
+    match (result, check()) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(checkpoint)) => Err(checkpoint),
+        (Err(primary), Err(checkpoint)) => Err(StorageError::JournalSnapshotCheckpointFailure {
+            primary: Box::new(primary),
+            checkpoint: Box::new(checkpoint),
+        }),
+    }
+}
+fn snapshot_text(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    budget: &mut SnapshotBudget,
+) -> StorageResult<String> {
+    // Every caller selects a BLOB substr capped at this ceiling plus one byte.
+    // The sentinel distinguishes an oversized value from a valid prefix.
+    let bytes: Vec<u8> = row.get(index)?;
+    if bytes.len() > SNAPSHOT_MAX_TEXT_BYTES {
+        return Err(snapshot_limit());
+    }
+    budget.bytes(bytes.len() as u64)?;
+    String::from_utf8(bytes).map_err(|_| snapshot_corrupt("Journal metadata is not UTF-8"))
+}
+fn snapshot_json(
+    row: &rusqlite::Row<'_>,
+    length_index: usize,
+    text_index: usize,
+    budget: &mut SnapshotBudget,
+) -> StorageResult<String> {
+    let length: i64 = row.get(length_index)?;
+    let length = u64::try_from(length)
+        .map_err(|_| snapshot_corrupt("Negative journal metadata byte length"))?;
+    if length > SNAPSHOT_MAX_RECORD_BYTES {
+        return Err(snapshot_limit());
+    }
+    budget.bytes(length)?;
+    let text: Option<String> = row.get(text_index)?;
+    let text = text.ok_or_else(|| snapshot_corrupt("Journal metadata text is missing"))?;
+    if text.len() as u64 != length {
+        return Err(snapshot_corrupt("Journal metadata byte length differs"));
+    }
+    Ok(text)
+}
+fn snapshot_operation(
+    row: &rusqlite::Row<'_>,
+    budget: &mut SnapshotBudget,
+) -> StorageResult<OperationRecord> {
+    let identity = (0..6)
+        .map(|index| snapshot_text(row, index, budget))
+        .collect::<StorageResult<Vec<_>>>()?;
+    let text = snapshot_json(row, 6, 7, budget)?;
+    let record: OperationRecord = decode(&text)?;
+    if identity[0] != record.operation_id.as_str()
+        || identity[1] != record.principal.as_str()
+        || identity[2] != record.project_id.as_str()
+        || identity[3] != record.idempotency_key
+        || identity[4] != record.plan_id.as_str()
+        || identity[5] != record.plan_hash.as_str()
+        || record.idempotency_key.is_empty()
+        || record.scope.project_id != record.project_id
+        || record.whole_project_fence
+            != (record.scope.is_empty() && record.steps.iter().any(|step| step.write_effect))
+    {
+        return Err(snapshot_corrupt(
+            "Operation index, scope or identity differs",
+        ));
+    }
+    record.scope.validate()?;
+    budget.steps(record.steps.len())?;
+    let mut ids = std::collections::BTreeSet::new();
+    for step in &record.steps {
+        if !ids.insert(&step.step_id)
+            || (step.finished
+                && (step.further_effects_possible || step.effect == EffectEvidence::Unknown))
+            || (step.dispatch == DispatchEvidence::Observed && step.observation_refs.is_empty())
+            || (step.dispatch == DispatchEvidence::NotSent
+                && (step.finished
+                    || step.effect != EffectEvidence::NoneConfirmed
+                    || step.further_effects_possible
+                    || step.provider_receipt.is_some()
+                    || step.invocation_id.is_some()
+                    || step.invocation_digest.is_some()
+                    || !step.observation_refs.is_empty()))
+            || (step.dispatch != DispatchEvidence::NotSent
+                && (step.invocation_id.is_none() || step.invocation_digest.is_none()))
+        {
+            return Err(snapshot_corrupt("Operation step evidence is inconsistent"));
+        }
+    }
+    let valid_terminal = match record.state {
+        OperationState::Succeeded => record.steps.iter().all(step_verified),
+        OperationState::FailedBeforeEffects => no_effect_proven(&record),
+        OperationState::Cancelled => no_effect_proven(&record) && record.cancellation_requested,
+        _ => true,
+    };
+    if !valid_terminal {
+        return Err(snapshot_corrupt(
+            "Terminal operation exceeds its retained evidence",
+        ));
+    }
+    Ok(record)
+}
+fn snapshot_plan(
+    store: &DurableStore,
+    transaction: &Transaction<'_>,
+    record: &OperationRecord,
+    budget: &mut SnapshotBudget,
+    check: &mut impl FnMut() -> StorageResult<()>,
+) -> StorageResult<()> {
+    check()?;
+    let result = (|| {
+        let mut statement = snapshot_checked_after(transaction.prepare(
+            "SELECT substr(CAST(d.content_hash AS BLOB),1,65),substr(CAST(d.blob_digest AS BLOB),1,65),b.byte_length FROM documents d LEFT JOIN blobs b ON b.digest=d.blob_digest WHERE d.definition='ExecutionPlan' AND d.document_id=?1 ORDER BY d.content_hash LIMIT 2",
+        ).map_err(StorageError::from), check)?;
+        check()?;
+        let mut rows = snapshot_checked_after(
+            statement
+                .query([record.plan_id.as_str()])
+                .map_err(StorageError::from),
+            check,
+        )?;
+        check()?;
+        let row = snapshot_checked_after(rows.next().map_err(StorageError::from), check)?
+            .ok_or(StorageError::NotFound("Execution plan"))?;
+        let hash = snapshot_text(row, 0, budget)?;
+        let digest = snapshot_text(row, 1, budget)?;
+        let length: Option<i64> = row.get(2)?;
+        check()?;
+        let additional =
+            snapshot_checked_after(rows.next().map_err(StorageError::from), check)?.is_some();
+        if hash != record.plan_hash.as_str() || additional {
+            return Err(snapshot_corrupt("Frozen plan index identity differs"));
+        }
+        let length =
+            length.ok_or_else(|| snapshot_corrupt("Frozen plan CAS metadata is missing"))?;
+        let blob = BlobRef {
+            digest: mmmm_contracts::Sha256Digest::new(digest)
+                .map_err(|error| snapshot_corrupt(&error.to_string()))?,
+            byte_length: u64::try_from(length)
+                .map_err(|_| snapshot_corrupt("Negative frozen plan byte length"))?,
+        };
+        if blob.byte_length > SNAPSHOT_MAX_PLAN_BYTES {
+            return Err(snapshot_limit());
+        }
+        budget.bytes(blob.byte_length)?;
+        check()?;
+        let retained: i64 = snapshot_checked_after(transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM blob_refs WHERE owner_kind='operation' AND owner_id=?1 AND digest=?2)",
+            params![record.operation_id.as_str(), blob.digest.as_str()],
+            |row| row.get(0),
+        ).map_err(StorageError::from), check)?;
+        if retained != 1 {
+            return Err(snapshot_corrupt(
+                "Operation frozen plan retention is missing",
+            ));
+        }
+        Ok(blob)
+    })();
+    let blob = snapshot_checked_after(result, check)?;
+    check()?;
+    let bytes = snapshot_checked_after(
+        store.read_blob_checked(&blob, SNAPSHOT_MAX_PLAN_BYTES, &mut *check),
+        check,
+    )?;
+    check()?;
+    let result = (|| {
+        let plan = mmmm_contracts::parse_json(&bytes)
+            .map_err(|error| snapshot_corrupt(&error.to_string()))?;
+        let steps = plan["steps"]
+            .as_array()
+            .ok_or_else(|| snapshot_corrupt("Frozen plan steps are missing"))?;
+        if steps.len() != record.steps.len() {
+            return Err(snapshot_corrupt(
+                "Operation and frozen plan step rosters differ",
+            ));
+        }
+        store
+            .validator
+            .validate("ExecutionPlan", &plan)
+            .map_err(|error| snapshot_corrupt(&error.to_string()))?;
+        let actual = mmmm_contracts::verify_projected_digest("ExecutionPlan", &plan)
+            .map_err(|error| snapshot_corrupt(&error.to_string()))?;
+        let scope: WriteScope = serde_json::from_value(plan["scope"].clone())
+            .map_err(|error| snapshot_corrupt(&error.to_string()))?;
+        if actual != record.plan_hash
+            || plan["planId"] != record.plan_id.as_str()
+            || plan["projectId"] != record.project_id.as_str()
+            || plan["contextId"] != record.context_id.as_str()
+            || scope != record.scope
+        {
+            return Err(snapshot_corrupt(
+                "Operation and frozen plan identity or scope differs",
+            ));
+        }
+        for (stored, frozen) in record.steps.iter().zip(steps) {
+            let requirement: VerificationRequirement =
+                serde_json::from_value(frozen["verificationRequirement"].clone())
+                    .map_err(|error| snapshot_corrupt(&error.to_string()))?;
+            if frozen["stepId"] != stored.step_id.as_str()
+                || (frozen["effect"] != "read") != stored.write_effect
+                || requirement != stored.verification_requirement
+            {
+                return Err(snapshot_corrupt(
+                    "Operation and frozen plan step metadata differs",
+                ));
+            }
+        }
+        Ok(())
+    })();
+    snapshot_checked_after(result, check)
+}
+
+fn no_effect_proven(record: &OperationRecord) -> bool {
+    record.steps.iter().all(|step| {
+        step.dispatch == DispatchEvidence::NotSent
+            || ((step.finished || !step.write_effect)
+                && step.effect == EffectEvidence::NoneConfirmed
+                && !step.further_effects_possible)
+    })
+}
+
 impl DurableStore {
+    /// Observe the complete journal and actual write fences in one read
+    /// transaction on this already-owned Store. The trusted caller establishes
+    /// authority before calling and supplies its original cancellation/deadline
+    /// checkpoint. No Project filter, repair, replay, CAS write or release proof
+    /// is created. Limits are errors, never partial/empty success.
+    pub fn journal_snapshot_checked(
+        &self,
+        mut check: impl FnMut() -> StorageResult<()>,
+    ) -> StorageResult<JournalSnapshot> {
+        check()?;
+        let transaction =
+            match Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred) {
+                Ok(transaction) => transaction,
+                Err(error) => return snapshot_checked_after(Err(error.into()), &mut check),
+            };
+        // Once BEGIN succeeds, every checkpoint failure follows the same
+        // explicit rollback path, including this first post-BEGIN checkpoint.
+        let admitted = check();
+        let result = (|| {
+            admitted?;
+            let mut budget = SnapshotBudget::default();
+            let mut operations = Vec::new();
+            check()?;
+            let mut statement = snapshot_checked_after(
+                transaction.prepare(
+                    "SELECT substr(CAST(operation_id AS BLOB),1,4097),substr(CAST(principal AS BLOB),1,4097),substr(CAST(project_id AS BLOB),1,4097),substr(CAST(idempotency_key AS BLOB),1,4097),substr(CAST(plan_id AS BLOB),1,4097),substr(CAST(plan_hash AS BLOB),1,4097),length(CAST(record_json AS BLOB)),CASE WHEN length(CAST(record_json AS BLOB))<=1048576 THEN record_json ELSE NULL END FROM operations ORDER BY operation_id LIMIT 4097",
+                ).map_err(StorageError::from),
+                &mut check,
+            )?;
+            check()?;
+            let mut rows = snapshot_checked_after(
+                statement.query([]).map_err(StorageError::from),
+                &mut check,
+            )?;
+            loop {
+                check()?;
+                let Some(row) =
+                    snapshot_checked_after(rows.next().map_err(StorageError::from), &mut check)?
+                else {
+                    break;
+                };
+                if operations.len() >= SNAPSHOT_MAX_ROWS {
+                    return Err(snapshot_limit());
+                }
+                let record = snapshot_operation(row, &mut budget)?;
+                check()?;
+                snapshot_plan(self, &transaction, &record, &mut budget, &mut check)?;
+                operations.push(record);
+            }
+            drop(rows);
+            drop(statement);
+            let by_id: std::collections::BTreeMap<_, _> = operations
+                .iter()
+                .map(|record| (&record.operation_id, record))
+                .collect();
+            let mut write_fences = Vec::new();
+            check()?;
+            let mut statement = snapshot_checked_after(
+                transaction.prepare(
+                    "SELECT substr(CAST(operation_id AS BLOB),1,4097),length(CAST(scope_json AS BLOB)),CASE WHEN length(CAST(scope_json AS BLOB))<=1048576 THEN scope_json ELSE NULL END,whole_project FROM write_fences ORDER BY operation_id LIMIT 4097",
+                ).map_err(StorageError::from),
+                &mut check,
+            )?;
+            check()?;
+            let mut rows = snapshot_checked_after(
+                statement.query([]).map_err(StorageError::from),
+                &mut check,
+            )?;
+            loop {
+                check()?;
+                let Some(row) =
+                    snapshot_checked_after(rows.next().map_err(StorageError::from), &mut check)?
+                else {
+                    break;
+                };
+                if write_fences.len() >= SNAPSHOT_MAX_ROWS {
+                    return Err(snapshot_limit());
+                }
+                let id = snapshot_text(row, 0, &mut budget)?;
+                let operation_id =
+                    OperationId::new(id).map_err(|error| snapshot_corrupt(&error.to_string()))?;
+                let scope: WriteScope = decode(&snapshot_json(row, 1, 2, &mut budget)?)?;
+                scope.validate()?;
+                let whole: i64 = row.get(3)?;
+                let record = by_id
+                    .get(&operation_id)
+                    .ok_or_else(|| snapshot_corrupt("Write fence owner is missing"))?;
+                if !matches!(whole, 0 | 1)
+                    || record.state.terminal()
+                    || !record
+                        .steps
+                        .iter()
+                        .any(|step| step.write_effect && step.dispatch != DispatchEvidence::NotSent)
+                    || record.scope != scope
+                    || record.whole_project_fence != (whole == 1)
+                {
+                    return Err(snapshot_corrupt("Write fence differs from its operation"));
+                }
+                write_fences.push(WriteFenceSnapshot {
+                    operation_id,
+                    scope,
+                    whole_project: whole == 1,
+                });
+                check()?;
+            }
+            drop(rows);
+            drop(statement);
+            drop(by_id);
+            check()?;
+            Ok(JournalSnapshot {
+                operations,
+                write_fences,
+            })
+        })();
+        let result = snapshot_checked_after(result, &mut check);
+        // Finalize the read transaction explicitly on both paths. A rollback
+        // failure remains a typed cause even when snapshot collection failed.
+        let result = match (result, transaction.rollback().map_err(StorageError::from)) {
+            (Ok(snapshot), Ok(())) => Ok(snapshot),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(_), Err(rollback)) => Err(rollback),
+            (Err(primary), Err(rollback)) => Err(StorageError::JournalSnapshotRollbackFailure {
+                primary: Box::new(primary),
+                rollback: Box::new(rollback),
+            }),
+        };
+        snapshot_checked_after(result, &mut check)
+    }
+
     pub fn operation(&self, operation: &OperationId) -> StorageResult<OperationRecord> {
         read_record(&self.connection, operation)
     }
@@ -781,12 +1172,7 @@ impl DurableStore {
             .iter()
             .any(|s| s.further_effects_possible || s.effect == EffectEvidence::Unknown);
         let all_verified = record.steps.iter().all(step_verified);
-        let no_effect_proven = record.steps.iter().all(|s| {
-            s.dispatch == DispatchEvidence::NotSent
-                || ((s.finished || !s.write_effect)
-                    && s.effect == EffectEvidence::NoneConfirmed
-                    && !s.further_effects_possible)
-        });
+        let no_effect_proven = no_effect_proven(&record);
         let valid = match state {
             OperationState::Succeeded => all_verified,
             OperationState::FailedBeforeEffects => no_effect_proven,
