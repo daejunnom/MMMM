@@ -2595,7 +2595,52 @@ JVM result와 toolchain receipt의 source·null/SHA generation을 observer consu
 header 경로는 해당 세대 하나만 사용하며 기존 flat으로 fallback하지 않는다. 원 archive
 digest·extraction·기한·자원·입력 pin 검사는 유지한다. 같은 세대가 실패 후 남아 있으면
 자동 재사용·삭제·재시도하지 않고 별도 수명 판단이 필요하다. 독립 소스 검토와 세 helper의
-AST 구문 검사에서 결함·구문 오류 0이며 실제 새 JVM 실행 성공은 아직 확인하지 않았다.
+AST 구문 검사에서 결함·구문 오류 0이며 실제 실행 결과는 아래에 별도로 기록한다.
+
+## 고정 source의 Windows JVM 검증
+
+f266a1a61c1116ba48cedc920c1d861ca3bcd60c의 Windows 568은 새 SHA toolchain generation을
+선택한 실제 jvm-ci 실행이다. Temurin 25.0.4.1+1·Gradle 9.6.0의 기존 archive digest와
+extraction 검사를 통과하고, JVM result와 toolchain receipt가 같은 source/generation을
+기록했다. 이전 flat 자료는 보존했다. 필수 11 task가 모두 executed이고 실제 Gradle의
+33 actionable task도 모두 실행됐다. Fabric compile을 포함해 build exit 0·status=passed다.
+
+7개 모듈에서 426개 검사가 failure/error/skip 0으로 통과했다. 원 JUnit XML 37개·
+82,018 bytes를 정확한 report roster와 digest로 다시 대조하고 각 실제 testcase 수와
+실패·오류·skip node를 검사했다. 이 XML은 cache 수명과 분리해 외부 568 증거 디렉터리에
+CreateNew·flush·readback hash로 보존했다. 새 codec 8개와 approval 진단 1개도 포함되며
+실제 JNI registry·global reference·image pin·VMDeath 실행을 뜻하지 않는다.
+
+선택 소스 209개·2,411,526 bytes는 실행 전후 길이·digest가 같았다. source manifest
+35,913 bytes·SHA는
+`b54bc938c4bd6fad105b5b5019d8485a38293a7e0134aed69eadd0d9790035bc`, JVM result
+12,567 bytes·SHA는
+`ee543d02ab22dd78e7e80beaf8bcbd57f6cff16db06774923a8cee7912483fa9`다.
+실제 build VM은 heap 1 GiB·고정 numeric 인자 shape 일치·UTF-8이며 인자 20개는
+고정 19개와 launcher agent 하나다. 선택 agent 1,610 bytes·SHA
+`49c3db09e32704300079a6707447519a0a779a952eee9c2c062b5af57d380d0b`의 전후 대조도
+통과했다. 별도 upstream digest나 전체 JDK/Gradle image 인증으로 확대하지 않는다.
+
+관리 실행은 command 0·73,645 ms·Job peak 1,260,654,592 bytes·5 process·gap 224 ms·
+자연 종료다. drain·완전한 출력·export·scratch 정리·lease 해제와 감독/정리 오류 0이며,
+종료 시 JVM slot 2,783,647,818 bytes·catalog 11,534,248,765 bytes로 기존 상한을
+유지했다. observer의 새 generation 소비·새 C witness 실행·실제 게임 검증은 이 JVM
+성공과 별도다. 실제 서버/클라이언트·ADMIN pairing·시각 인수·release는 not_run이고
+이번 검증에 WSL은 사용하지 않았다.
+
+같은 source의 [JVM CI 85](https://github.com/daejunnom/MMMM/actions/runs/39958414500)는
+3개 OS의 JVM 단계 성공, Windows/macOS native 단계 성공과 Linux native 단계 실패 및
+최종 집계 실패를 metadata로 확인했다. 이 관측을 3OS 전체 인수 성공으로 바꾸지 않는다.
+Linux 원 ZIP 78,801 bytes·SHA
+`42dfbdc310a26a320fb7abde7d4b5a990649f9efa71f1e5524c23c39656d8994`를 API digest와
+대조하고 40개 entry 중 원 native-build process·finish·stderr와 observer result를
+제한해 읽었다. 실제 native build는 6,658 ms에 enumerated_candidate/stat/open의
+NotFound·ENOENT 2 관측 오류로 중단됐다. binding attempt 44·최대 retained member 5/
+FD 15·query failure 1·retirement 0이고 signal 9·drain·출력 완료·export·scratch 정리·
+lease 해제를 기록했다. 현재 증거에는 compiler 오류가 없고 compile 완료도 없다.
+이 unbound 열거 후보 실패를 held member의 identity 변경이나 D078 Z2→X0로
+재분류하지 않으며, ENOENT를 실제 종료·RSS 0·완전 sample로 승격하지 않는다.
+기존 원 identity·기한·자원·정리 조건을 유지할 후속 관측 처리 검토가 남았다.
 
 ## 첫 공개 배포 인수
 
