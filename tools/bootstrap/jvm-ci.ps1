@@ -312,9 +312,9 @@ try {
     $operation = 'source_input_identity'
     $sourceSha = @(& git -C $checkoutRoot rev-parse HEAD)
     if ($LASTEXITCODE -ne 0 -or $sourceSha.Count -ne 1 -or $sourceSha[0] -cne $ExpectedSourceSha) { throw 'SOURCE_SHA_MISMATCH' }
-    & git -C $checkoutRoot diff --quiet HEAD -- jvm contracts examples tools/bootstrap/jvm-ci.ps1 tools/bootstrap/jvm-runtime-probe.ps1 tools/bootstrap/jvm-archive.py .github/workflows/jvm.yml tools/bootstrap/WindowsBootstrap.cs
+    & git -C $checkoutRoot diff --quiet HEAD -- jvm contracts examples tests/example-index.json tests/digest-fixtures.json tools/bootstrap/jvm-ci.ps1 tools/bootstrap/jvm-runtime-probe.ps1 tools/bootstrap/jvm-archive.py .github/workflows/jvm.yml tools/bootstrap/WindowsBootstrap.cs
     if ($LASTEXITCODE -ne 0) { throw 'DIRTY_JVM_SOURCE_INPUTS' }
-    $inputs = @(& git -C $checkoutRoot ls-files -- jvm contracts examples tools/bootstrap/jvm-ci.ps1 tools/bootstrap/jvm-runtime-probe.ps1 tools/bootstrap/jvm-archive.py .github/workflows/jvm.yml tools/bootstrap/WindowsBootstrap.cs)
+    $inputs = @(& git -C $checkoutRoot ls-files -- jvm contracts examples tests/example-index.json tests/digest-fixtures.json tools/bootstrap/jvm-ci.ps1 tools/bootstrap/jvm-runtime-probe.ps1 tools/bootstrap/jvm-archive.py .github/workflows/jvm.yml tools/bootstrap/WindowsBootstrap.cs)
     if ($LASTEXITCODE -ne 0 -or $inputs.Count -lt 8 -or $inputs.Count -gt 10000) { throw 'SOURCE_INPUT_INVENTORY_INVALID' }
     $inputRecords = [System.Collections.Generic.List[object]]::new(); $inputBytes = 0L
     foreach ($relative in ($inputs | Sort-Object -CaseSensitive)) {
@@ -501,7 +501,7 @@ gradle.taskGraph.afterTask { task, state ->
     $record.build_vm_probe_sha256 = Get-RegularHash $buildVmPath 2048
     $finalSourceSha = @(& git -C $checkoutRoot rev-parse HEAD)
     if ($LASTEXITCODE -ne 0 -or $finalSourceSha.Count -ne 1 -or $finalSourceSha[0] -cne $ExpectedSourceSha) { throw 'SOURCE_SHA_CHANGED_DURING_BUILD' }
-    & git -C $checkoutRoot diff --quiet HEAD -- jvm contracts examples tools/bootstrap/jvm-ci.ps1 tools/bootstrap/jvm-runtime-probe.ps1 tools/bootstrap/jvm-archive.py .github/workflows/jvm.yml tools/bootstrap/WindowsBootstrap.cs
+    & git -C $checkoutRoot diff --quiet HEAD -- jvm contracts examples tests/example-index.json tests/digest-fixtures.json tools/bootstrap/jvm-ci.ps1 tools/bootstrap/jvm-runtime-probe.ps1 tools/bootstrap/jvm-archive.py .github/workflows/jvm.yml tools/bootstrap/WindowsBootstrap.cs
     if ($LASTEXITCODE -ne 0) { throw 'SOURCE_CHANGED_DURING_BUILD' }
     foreach ($inputRecord in $inputRecords) {
         $finalFile = Assert-PhysicalPath (Join-Path $checkoutRoot $inputRecord.path) $false

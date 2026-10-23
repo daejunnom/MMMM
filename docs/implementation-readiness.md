@@ -2926,6 +2926,22 @@ owned tail 정리 뒤 drain·완전한 출력·export·scratch 정리·lease 해
 strict Clippy도 PASS이며 command 0·자연 종료·전후 source pin·drain·완전한 출력·export·
 scratch 정리·lease 해제와 감독/정리 오류 0을 확인했다.
 
+607의 컴파일 실패에는 Guava 33.6.0의 classfile annotation 정의를 `compileOnly`
+`error_prone_annotations:2.47.0`으로 공급하도록 수정했다. 버전은
+[Guava 원 parent POM](https://github.com/google/guava/blob/v33.6.0/pom.xml)과
+[module POM](https://github.com/google/guava/blob/v33.6.0/guava/pom.xml)에 맞췄다.
+실제 ImmutableList ABI와 `-Xlint:all`·`-Werror`는 유지하며 processor·runtime include는
+추가하지 않았다. 네 fixture 실패는 기존 두 테스트가 실제 읽는 원
+`tests/example-index.json`·`tests/digest-fixtures.json` 입력 누락과 연결된다. 정본 JVM
+helper의 pre-diff·inventory·post-diff 세 scope에 정확한 두 경로만 추가했다.
+
+새 외부 local-source-snapshot helper v2는 이 metadata 변경의 새 정본 SHA를 고정하고,
+세 삽입만 역변환하면 f266의 원 helper SHA가 정확히 복원되는지 candidate blob에서
+검사한다. 나머지 호환 입력 6개의 동일성, 고정 JVM 인수 19개·11 task·7 모듈·init과
+XML 및 성공 조건을 유지했다. 알 수 없는 source inventory의 첫 경로는 안전한 제한된
+metadata만 별도 보존한 뒤 계속 실패한다. unknown 내용 읽기·재귀 탐색·추정 허용은
+추가하지 않았다. 원 v1과 607 실패는 그대로 보존하며 실제 재검사 결과는 별도로 기록한다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

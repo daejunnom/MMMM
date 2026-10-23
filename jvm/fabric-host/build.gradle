@@ -6,6 +6,7 @@ dependencies {
     implementation 'net.fabricmc.fabric-api:fabric-api:0.162.0+26.3'
     implementation project(':host-core')
     implementation project(':public-java-adapter')
+    compileOnly 'com.google.errorprone:error_prone_annotations:2.47.0'
     compileOnly project(':definition-observer')
     testImplementation project(':definition-observer')
     include project(':host-core')
