@@ -89,6 +89,7 @@ pub struct NativeDisplayState {
     uuid: [u8; 16],
     kind: NativeDisplayKind,
     position_bits: [u64; 3],
+    rotation: Option<[NativeDisplayFloat; 2]>,
     owner_tag: String,
     tags: Vec<NativeDisplayTag>,
     persisted_entity_type: Option<String>,
@@ -108,6 +109,12 @@ impl NativeDisplayState {
     }
     pub fn position_bits(&self) -> &[u64; 3] {
         &self.position_bits
+    }
+    /// The two original root Rotation elements, in persisted order and native
+    /// floating representation. Absence is not a zero/effective rotation, and
+    /// preserving a representation does not admit it as a target pose codec.
+    pub fn rotation(&self) -> Option<[NativeDisplayFloat; 2]> {
+        self.rotation
     }
     pub fn owner_tag(&self) -> &str {
         &self.owner_tag
@@ -332,6 +339,7 @@ pub(crate) fn parse_display(
     let transformation = optional(root, "transformation")
         .map(transform)
         .transpose()?;
+    let rotation = optional(root, "Rotation").map(vector::<2>).transpose()?;
     let billboard = optional(root, "billboard")
         .map(|value| match value {
             Tag::String(units) => match String::from_utf16(units).ok().as_deref() {
@@ -356,6 +364,7 @@ pub(crate) fn parse_display(
         uuid,
         kind,
         position_bits,
+        rotation,
         owner_tag: owner_tag.to_owned(),
         tags: native_tags.into_iter().map(NativeDisplayTag).collect(),
         persisted_entity_type,

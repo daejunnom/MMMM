@@ -2942,6 +2942,44 @@ XML 및 성공 조건을 유지했다. 알 수 없는 source inventory의 첫 �
 metadata만 별도 보존한 뒤 계속 실패한다. unknown 내용 읽기·재귀 탐색·추정 허용은
 추가하지 않았다. 원 v1과 607 실패는 그대로 보존하며 실제 재검사 결과는 별도로 기록한다.
 
+고정 `c5ced0616a176b7ac509539d3c94b7b455e00a1f`의 Windows617은 v2 helper로
+Gradle exit 0·`BUILD SUCCESSFUL`·33 actionable tasks의 실행 보고와 Fabric compile
+통과를 관측했다. 607의 annotation 및 fixture 실패는 재발하지 않았다. 선택 파일 8개와
+agent의 전후 pin 및 정확한 profile metadata 역변환도 통과했다. 그러나 사후 source
+inventory는 새 일반 디렉터리 `jvm/fabric-host/logs`를 검출했고 helper/command는 1로
+실패했다. 원 v2·617 기록과 최초 metadata를 보존한다. task/XML 집계 전 거절이므로
+전체 JVM 검증 통과가 아니며 이 경로를 무시하거나 결과를 성공으로 재분류하지 않는다.
+외부 test 작업 경로로 실제 생성물을 보내는 수정이 후속이다.
+
+617의 원 source manifest SHA는
+`f810962c7a86a01aac8922e62c9e6913425aa4298c6481c9f5556570c70207b7`이다. source
+사후 검사는 완료되지 않았다. command 1·62,771 ms·Job peak 1,327,407,104 bytes·
+5 processes·gap 137 ms이며 자연 종료·drain·완전한 출력·export·scratch 정리·lease 해제와
+감독/정리 오류 0을 확인했다. Gradle 성공과 evidence 완결 실패를 구분한다.
+
+persisted display projection은 paired read가 보존한 원 NBT의 root `Rotation` 두 원소를
+optional 값으로 전달한다. 원소 순서와 Float32/Float64 bits·signed zero를 유지하고,
+없으면 `None`이며 transformation·소문자 키·authoring 값으로 보충하지 않는다. 잘못된
+길이·태그·비유한 값은 거절한다. yaw/pitch 의미·실제 게임 형식·identity 판정·binding과
+pose-writer 승인은 이 관측값만으로 발급하지 않는다.
+
+Windows619의 격리 snapshot은 compile을 마쳤지만 실제 test EXE가 SAC/WDAC4551로
+실행되지 못했다. Windows620은 가능한 현재 checkout 경로에서 다시 compile을 마쳤고
+같은 정책 차단으로 test가 미실행이다. 두 원 실패와 각각 전후 입력을 보존한다. 619는
+547개·12,683,952 bytes·manifest
+`695f0aa19b30559326265180510f3f3ea327f597aa331d0a07c9ffec71a0ce13`,
+620은 선택 source closure 305개·7,567,221 bytes·manifest
+`b44680865fe97fbdb1cbcc88a45c9276b76b21968f0caf06ddc19eea06d11b59`로 전후 같았다.
+620은 before/after bytes 검사이며 원자적인 snapshot·전체 dependency/toolchain 증명은
+아니다. 각각 command 1/Cargo101·93,499/86,725 ms·peak
+1,675,169,792/1,670,258,688 bytes·7 processes·gap 144/143 ms이다. 두 실행 모두
+owned tail 정리 뒤 drain·완전한 출력·export·scratch 정리·lease 해제와 감독/정리 오류
+0을 확인했다. compiler 성공을 새 projection 검사나 실제 게임 통과로 올리지 않는다.
+같은 현재 checkout의 source closure에 대한 Windows621 Coordinator lib/tests strict
+Clippy는 PASS다. 전후 source manifest는 620과 같고 command 0·자연 종료·drain·완전한
+출력·export·scratch 정리·lease 해제와 감독/정리 오류 0을 확인했다. 새 projection의
+실행 검사는 여전히 미실행이며 이후 동일 source CI 또는 허용된 대체 실행으로 확인한다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

@@ -77,6 +77,7 @@ fn fields() -> Fields {
                     .collect::<Vec<_>>(),
             ),
         ),
+        (9, "Rotation", floats(&[720.5, -0.0])),
         (9, "Tags", list(8, &[text("other"), text(OWNER_TAG)])),
         (
             9,
@@ -121,6 +122,13 @@ fn persisted_display_types_signed_uuid_words_and_missing_fields_remain_factual()
         parsed.position_bits(),
         &[(-0.0f64).to_bits(), 64.5f64.to_bits(), (-0.25f64).to_bits()]
     );
+    assert_eq!(
+        parsed.rotation(),
+        Some([
+            NativeDisplayFloat::Float32(720.5f32.to_bits()),
+            NativeDisplayFloat::Float32((-0.0f32).to_bits()),
+        ])
+    );
     assert_eq!(parsed.owner_tag(), OWNER_TAG);
     assert_eq!(
         parsed.persisted_entity_type(),
@@ -142,11 +150,42 @@ fn persisted_display_types_signed_uuid_words_and_missing_fields_remain_factual()
     minimal.retain(|(_, name, _)| matches!(*name, "UUID" | "Pos" | "Tags" | "opaque"));
     let parsed = parse_display(&raw(&minimal), &selector(), OWNER_TAG, &|| Ok(())).unwrap();
     assert_eq!(parsed.persisted_entity_type(), None);
+    assert_eq!(parsed.rotation(), None);
     assert_eq!(parsed.transformation(), None);
     assert_eq!(parsed.billboard(), None);
     assert_eq!(parsed.interpolation().start(), None);
     assert_eq!(parsed.interpolation().duration(), None);
     assert_eq!(parsed.interpolation().teleport_duration(), None);
+    let mut without_rotation = fields();
+    without_rotation.retain(|(_, name, _)| *name != "Rotation");
+    without_rotation.push((9, "rotation", floats(&[12.0, 34.0])));
+    let parsed =
+        parse_display(&raw(&without_rotation), &selector(), OWNER_TAG, &|| Ok(())).unwrap();
+    assert!(parsed.transformation().is_some());
+    assert_eq!(parsed.rotation(), None);
+    let mut double_rotation = fields();
+    *double_rotation
+        .iter_mut()
+        .find(|(_, name, _)| *name == "Rotation")
+        .unwrap() = (
+        9,
+        "Rotation",
+        list(
+            6,
+            &[
+                (-0.0f64).to_bits().to_be_bytes().to_vec(),
+                123.25f64.to_bits().to_be_bytes().to_vec(),
+            ],
+        ),
+    );
+    let parsed = parse_display(&raw(&double_rotation), &selector(), OWNER_TAG, &|| Ok(())).unwrap();
+    assert_eq!(
+        parsed.rotation(),
+        Some([
+            NativeDisplayFloat::Float64((-0.0f64).to_bits()),
+            NativeDisplayFloat::Float64(123.25f64.to_bits()),
+        ])
+    );
     let mut decomposed = fields();
     let replacement = compound(&[
         (9, "translation", floats(&[0.0, 1.0, 2.0])),
@@ -196,6 +235,43 @@ fn persisted_display_rejects_hash_only_identity_mismatch_nonfinite_and_wrong_nat
             ),
         ),
         ("Pos", 9, floats(&[0.0, 64.5, -0.25])),
+        ("Rotation", 9, floats(&[])),
+        ("Rotation", 9, floats(&[0.0])),
+        ("Rotation", 9, floats(&[0.0, 1.0, 2.0])),
+        ("Rotation", 5, 1.0f32.to_bits().to_be_bytes().to_vec()),
+        (
+            "Rotation",
+            9,
+            list(
+                3,
+                &[0i32.to_be_bytes().to_vec(), 1i32.to_be_bytes().to_vec()],
+            ),
+        ),
+        ("Rotation", 9, list(8, &[text("0"), text("1")])),
+        ("Rotation", 9, floats(&[f32::NAN, 0.0])),
+        ("Rotation", 9, floats(&[0.0, f32::INFINITY])),
+        (
+            "Rotation",
+            9,
+            list(
+                6,
+                &[
+                    f64::NAN.to_bits().to_be_bytes().to_vec(),
+                    0.0f64.to_bits().to_be_bytes().to_vec(),
+                ],
+            ),
+        ),
+        (
+            "Rotation",
+            9,
+            list(
+                6,
+                &[
+                    0.0f64.to_bits().to_be_bytes().to_vec(),
+                    f64::NEG_INFINITY.to_bits().to_be_bytes().to_vec(),
+                ],
+            ),
+        ),
         ("id", 8, text("minecraft:pig")),
         ("Tags", 9, list(8, &[text("other")])),
         ("transformation", 9, floats(&[0.0; 15])),
