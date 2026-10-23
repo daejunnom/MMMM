@@ -2776,6 +2776,45 @@ Java hook 등록과 전체 통합 검증은 별도 작업이다.
 관측 코어 성공을 원 source 소비·실제 function 설치·SourceAdmission·target profile 또는
 게임 인수 성공으로 바꾸지 않는다.
 
+Windows590은 원 server bundle에서 선택한 game JAR와 Guava 33.6.0-jre JAR를 임시
+scratch로 추출하고 유한한 javap로 DedicatedServer와 immutable collection 7개 클래스의
+선언·bytecode를 읽었다. 원 bundle·선택 JDK 파일 및 archive·추출한 두 JAR, 총 7개
+입력의 전후 digest가 같았다. Guava JAR는 3,064,793 bytes·SHA
+`dc573e1fca4fd5454f4a5fd3d7da2df03002876a4175bafc14a95980dd7713b3`이다.
+command 0·9,961 ms·Job peak 208,941,056 bytes·3 processes·gap 111 ms이며 자연
+종료·drain·완전한 출력·export·scratch 정리·lease 해제와 감독/정리 오류 0이다.
+stdout 254,141 bytes·SHA
+`7ae8426934361312f8e76dcc6f44ed1ab2ced71e2add490c876e9f8c2359d92a`를 외부에 보존했다.
+앞선 589는 감독 도구가 상대 실행 파일 이름을 거절해 실행 등록 전에 실패했다.
+590은 선택한 PowerShell의 절대 경로를 사용했다. WSL은 사용하지 않았다.
+
+이 bytecode에서 실제 열린 pack 목록의 ImmutableList collector, ImmutableCollection의
+상속된 final toArray, Regular/SingletonImmutableList의 size와 RegularImmutableMap의
+get을 구분했다. Map builder에는 JdkBackedImmutableMap fallback도 있어 모든 게시 Map이
+같은 구체 클래스라고 가정하지 않는다. 후속 JNI는 필요한 실제 receiver와 method owner의
+현재 정의 세대를 따로 검사하고 미지원 형태를 unavailable로 남기는 범위로 구현 중이다.
+이는 실제 runtime 객체·ClassLoader·JNI 호출·source admission 또는 게임 검증이 아니다.
+
+MCP artifact resource 읽기를 기존 FN31 `artifact.read`의 인증된 Coordinator 호출에
+연결했다. locator는 정본 ContextId·ResourceId·digest·offset·limit를 지정하며 권한을
+발급하지 않는다. 도구와 resource는 같은 worker·semaphore·취소·기한·drain 경로를 쓴다.
+실제 반환 resource의 ID·digest·범위·byte 길이와 base64를 검사한 뒤 원 MIME의 text/blob와
+slice metadata를 전달한다. resource index는 실제 빈 목록이며 공개 locator template
+하나만 제공한다. snapshot catalog resource는 후속 구현이다.
+
+Windows593에서 정확한 MCP 소스만 포맷한 뒤 594의 격리 snapshot에서 기존 tool 회귀를
+포함한 MCP 21 tests PASS·4 filtered out, 595에서 해당 CLI all-targets strict Clippy PASS다.
+입력은 clean `7738364f048a7e52b02e1d3151662997b18a6fe3`에 정확한 MCP 소스 하나를
+반영한 534개·12,312,997 bytes다. 두 실행의 전후 manifest SHA
+`83b2152670577f51502c54434efba10f0c08e81c8ba2616aac01d6610d001f32`가 같았다.
+공유 MCP 소스는 91,879 bytes·SHA
+`c66c216908d2e979d74c77a650ada5bd0372fb66fa0ebab02298ca376822f5e6`다.
+tests는 command 0·87,983 ms·Job peak 1,171,533,824 bytes·7 processes·gap 146 ms이며
+owned tail 정리 뒤 drain했다. strict는 command 0·33,263 ms·peak 773,947,392 bytes·
+8 processes·gap 126 ms·자연 종료다. 두 실행 모두 출력/export·scratch 정리·lease 해제와
+감독/정리 오류 0이다. 실제 새 resource의 native 인증·CAS·게임 또는 공개 배포 성공으로
+확대하지 않는다. 관측 JNI와 bootstrap 연결의 미공유 작업은 이 검사 입력에서 제외했다.
+
 사용자 계정 인증 문제로 Minecraft 클라이언트 로그인·실제 ADMIN pairing·시각 검증은
 not_run이다. 클라이언트 인증을 우회하거나 필수 인수를 줄이지 않고, 독립 구현과 서버 측
 관측을 계속한다. 필수 게임 인수와 공개 v0.1.0 배포 완료 조건은 아래와 같다.

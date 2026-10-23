@@ -3,20 +3,23 @@
 //! This module never opens the application store or creates a second journal.
 //!
 //! Profile references: modelcontextprotocol.io/specification/2025-11-25/
-//! {basic/lifecycle,basic/transports,server/tools,server/utilities/pagination}.
+//! {basic/lifecycle,basic/transports,server/tools,server/resources,server/utilities/pagination}.
 //! SDK API is pinned to modelcontextprotocol/rust-sdk tag rmcp-v3.5.1.
 
 use mmmm_contracts::{
-    CANONICAL_SCHEMA, ContractValidator, FUNCTION_INDEX, FunctionContract, JsonLimits, encode_json,
-    parse_json, parse_json_with_limits, raw_digest,
+    CANONICAL_SCHEMA, ContextId, ContractValidator, FUNCTION_INDEX, FunctionContract, JsonLimits,
+    ResourceId, Sha256Digest, UnsignedDecimal, encode_json, parse_json, parse_json_with_limits,
+    raw_digest,
 };
 use mmmm_coordinator::{CoordinatorClient, client::ClientError};
 use rmcp::{
     ErrorData, ServerHandler, ServiceExt,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorCode,
-        Implementation, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
-        ServerCapabilities, ServerConfig, Tool,
+        Implementation, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+        PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
+        ReadResourceResult, ResourceContents, ResourceTemplate, ServerCapabilities, ServerConfig,
+        Tool,
     },
     service::{RequestContext, RoleServer, RxJsonRpcMessage, TxJsonRpcMessage},
     transport::Transport,
@@ -42,6 +45,10 @@ const MAX_FRAME_NODES: usize = 4096;
 const MAX_REQUESTS: usize = 4;
 const MAX_SESSION_FRAMES: usize = 4096;
 const MAX_PAGE_TOOLS: usize = 4;
+const MAX_ARTIFACT_SLICE: u64 = 65_536;
+const ARTIFACT_URI_PREFIX: &str = "mmmm://artifact/";
+const ARTIFACT_URI_TEMPLATE: &str =
+    "mmmm://artifact/{+contextId}/{+resourceId}/{sha256}/{offset}/{limitBytes}";
 const SESSION_LIFETIME: Duration = Duration::from_secs(30 * 60);
 const READ_IDLE: Duration = Duration::from_secs(300);
 const WRITE_DEADLINE: Duration = Duration::from_secs(5);
@@ -412,7 +419,33 @@ fn tool_error(code: &str, message: &str, uncertain: bool) -> CallToolResult {
     result.result_type = None;
     result
 }
-fn client_error(error: ClientError) -> CallToolResult {
+/// Static public diagnostics shared by the tool and resource envelopes. The
+/// original remote message, request URI and authentication material stay out.
+struct CallFailure {
+    code: String,
+    message: &'static str,
+    uncertain: bool,
+}
+impl CallFailure {
+    fn new(code: &str, message: &'static str, uncertain: bool) -> Self {
+        Self {
+            code: code.into(),
+            message,
+            uncertain,
+        }
+    }
+    fn tool(self) -> CallToolResult {
+        tool_error(&self.code, self.message, self.uncertain)
+    }
+    fn resource(self) -> ErrorData {
+        ErrorData::new(
+            ErrorCode::INTERNAL_ERROR,
+            "The artifact resource could not be read through the Coordinator",
+            Some(json!({"code":self.code,"automaticRetry":false})),
+        )
+    }
+}
+fn client_failure(error: ClientError) -> CallFailure {
     let (code, message, uncertain) = match error {
         ClientError::Discovery => (
             "COORDINATOR_DISCOVERY",
@@ -466,7 +499,7 @@ fn client_error(error: ClientError) -> CallToolResult {
                     code.as_deref(),
                     Some("OUTCOME_UNKNOWN" | "OUTPUT_SCHEMA_INVALID" | "BUDGET_EXCEEDED")
                 );
-            return tool_error(
+            return CallFailure::new(
                 code.as_deref().unwrap_or("SERVICE_ERROR"),
                 if uncertain {
                     "The Coordinator could not return a verified result; inspect the durable operation before retrying a write"
@@ -477,7 +510,11 @@ fn client_error(error: ClientError) -> CallToolResult {
             );
         }
     };
-    tool_error(code, message, uncertain)
+    CallFailure::new(code, message, uncertain)
+}
+#[cfg(test)]
+fn client_error(error: ClientError) -> CallToolResult {
+    client_failure(error).tool()
 }
 fn success_result(output: Value) -> Result<CallToolResult, FacadeError> {
     let text = String::from_utf8(encode_json(&output).map_err(|_| FacadeError::OutputFrame)?)
@@ -487,6 +524,207 @@ fn success_result(output: Value) -> Result<CallToolResult, FacadeError> {
     result.content = vec![ContentBlock::text(text)];
     bounded_result(&serde_json::to_value(&result).map_err(|_| FacadeError::OutputFrame)?)?;
     Ok(result)
+}
+
+/// A public locator, never an authority or a registration. Its lexical forms
+/// are the same nominal IDs, lowercase SHA-256 and decimals used by FN31.
+struct ArtifactLocator {
+    context: ContextId,
+    resource: ResourceId,
+    digest: Sha256Digest,
+    offset: u64,
+    limit: u64,
+}
+impl ArtifactLocator {
+    fn parse(uri: &str) -> Result<Self, ErrorData> {
+        if uri.len() > 512 {
+            return Err(invalid_artifact_uri());
+        }
+        let mut parts = uri
+            .strip_prefix(ARTIFACT_URI_PREFIX)
+            .ok_or_else(invalid_artifact_uri)?
+            .split('/');
+        let context = ContextId::new(parts.next().ok_or_else(invalid_artifact_uri)?)
+            .map_err(|_| invalid_artifact_uri())?;
+        let resource = ResourceId::new(parts.next().ok_or_else(invalid_artifact_uri)?)
+            .map_err(|_| invalid_artifact_uri())?;
+        let digest = Sha256Digest::new(parts.next().ok_or_else(invalid_artifact_uri)?)
+            .map_err(|_| invalid_artifact_uri())?;
+        let offset = artifact_decimal(parts.next().ok_or_else(invalid_artifact_uri)?)
+            .ok_or_else(invalid_artifact_uri)?;
+        let limit = artifact_decimal(parts.next().ok_or_else(invalid_artifact_uri)?)
+            .filter(|limit| (1..=MAX_ARTIFACT_SLICE).contains(limit))
+            .ok_or_else(invalid_artifact_uri)?;
+        if parts.next().is_some() || offset.checked_add(limit).is_none() {
+            return Err(invalid_artifact_uri());
+        }
+        let locator = Self {
+            context,
+            resource,
+            digest,
+            offset,
+            limit,
+        };
+        if locator.uri() != uri {
+            return Err(invalid_artifact_uri());
+        }
+        Ok(locator)
+    }
+    fn uri(&self) -> String {
+        format!(
+            "{ARTIFACT_URI_PREFIX}{}/{}/{}/{}/{}",
+            self.context, self.resource, self.digest, self.offset, self.limit
+        )
+    }
+    fn request(&self) -> Value {
+        // Only original FN31 input fields cross the authenticated transport.
+        // The expected digest is checked against its actual verified response.
+        json!({"contextId":self.context,"resourceId":self.resource,
+            "offset":self.offset.to_string(),"limitBytes":self.limit})
+    }
+}
+fn artifact_decimal(value: &str) -> Option<u64> {
+    UnsignedDecimal::new(value).ok()?.as_str().parse().ok()
+}
+fn invalid_artifact_uri() -> ErrorData {
+    ErrorData::invalid_params("Invalid canonical artifact resource locator", None)
+}
+fn invalid_artifact_response() -> ErrorData {
+    ErrorData::internal_error(
+        "Artifact slice does not match its verified resource locator",
+        None,
+    )
+}
+
+/// Validate STANDARD canonical base64 without decoding or allocating another
+/// copy of the artifact. Only the actual Coordinator/CAS issues source bytes.
+fn artifact_base64_length(value: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
+    if !bytes.len().is_multiple_of(4) || bytes.len() > 87_384 {
+        return None;
+    }
+    if bytes.is_empty() {
+        return Some(0);
+    }
+    let padding = if bytes.ends_with(b"==") {
+        2
+    } else {
+        usize::from(bytes.ends_with(b"="))
+    };
+    let payload = &bytes[..bytes.len() - padding];
+    fn sextet(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    if !payload.iter().all(|byte| sextet(*byte).is_some()) {
+        return None;
+    }
+    let last = sextet(*payload.last()?)?;
+    if (padding == 2 && last & 15 != 0) || (padding == 1 && last & 3 != 0) {
+        return None;
+    }
+    (bytes.len() / 4).checked_mul(3)?.checked_sub(padding)
+}
+
+fn artifact_resource_result(
+    locator: &ArtifactLocator,
+    output: Value,
+) -> Result<ReadResourceResult, ErrorData> {
+    let invalid = invalid_artifact_response;
+    let validator = ContractValidator::shared().map_err(|_| invalid())?;
+    if bounded_json(&output).is_err() || validator.validate("ArtifactSlice", &output).is_err() {
+        return Err(invalid());
+    }
+    let resource = &output["resource"];
+    let size = resource["sizeBytes"].as_u64().ok_or_else(invalid)?;
+    if resource["resourceId"].as_str() != Some(locator.resource.as_str())
+        || resource["sha256"].as_str() != Some(locator.digest.as_str())
+        || output["offset"].as_str().and_then(artifact_decimal) != Some(locator.offset)
+        || locator.offset > size
+    {
+        return Err(invalid());
+    }
+    let data = output["data"].as_str().ok_or_else(invalid)?;
+    let bytes = match output["encoding"].as_str() {
+        Some("utf8") => data.len(),
+        Some("base64") => artifact_base64_length(data).ok_or_else(invalid)?,
+        _ => return Err(invalid()),
+    };
+    let expected_length = locator.limit.min(size - locator.offset);
+    if u64::try_from(bytes).ok() != Some(expected_length) {
+        return Err(invalid());
+    }
+    let end = locator
+        .offset
+        .checked_add(expected_length)
+        .ok_or_else(invalid)?;
+    let next_offset = if end < size {
+        json!(end.to_string())
+    } else {
+        Value::Null
+    };
+    if output["nextOffset"] != next_offset {
+        return Err(invalid());
+    }
+    let mime = resource["mediaType"].as_str().ok_or_else(invalid)?;
+    let uri = locator.uri();
+    let content = match output["encoding"].as_str() {
+        Some("utf8") => ResourceContents::text(data, uri),
+        Some("base64") => ResourceContents::blob(data, uri),
+        _ => return Err(invalid()),
+    }
+    .with_mime_type(mime)
+    .with_meta(
+        Map::from_iter([(
+            "io.github.daejunnom.mmmm/artifactSlice".into(),
+            json!({"contextId":locator.context,"resource":resource,
+            "offset":output["offset"],"nextOffset":next_offset,"sliceBytes":bytes}),
+        )])
+        .into(),
+    );
+    let mut result = ReadResourceResult::new(vec![content]);
+    result.result_type = None;
+    bounded_result(&serde_json::to_value(&result).map_err(|_| invalid())?)
+        .map_err(|_| invalid())?;
+    Ok(result)
+}
+
+fn artifact_resource_list(cursor: Option<&str>) -> Result<ListResourcesResult, ErrorData> {
+    if cursor.is_some() {
+        return Err(ErrorData::invalid_params(
+            "No artifact resource index or cursor is available",
+            None,
+        ));
+    }
+    // The tool catalog is not a resource ACL index. Do not retain an inventory
+    // from past tool calls or invent access to all resources in a Project.
+    Ok(ListResourcesResult {
+        result_type: None,
+        ..ListResourcesResult::default()
+    })
+}
+fn artifact_resource_templates(
+    cursor: Option<&str>,
+) -> Result<ListResourceTemplatesResult, ErrorData> {
+    if cursor.is_some() {
+        return Err(ErrorData::invalid_params(
+            "Invalid artifact resource template cursor",
+            None,
+        ));
+    }
+    let template = ResourceTemplate::new(ARTIFACT_URI_TEMPLATE, "mmmm-artifact-slice")
+        .with_description("A bounded slice of an existing registered artifact. Context and resource IDs are locators; each read requires current Coordinator authorization. SHA-256 pins the full resource; offset is a canonical decimal and limitBytes is 1..65536. This template is not a resource inventory or permission grant.");
+    Ok(ListResourceTemplatesResult {
+        result_type: None,
+        resource_templates: vec![template],
+        ..ListResourceTemplatesResult::default()
+    })
 }
 
 struct McpFacade {
@@ -524,34 +762,52 @@ impl McpFacade {
         input: Value,
         cancel: impl Future<Output = ()> + Send,
     ) -> CallToolResult {
+        match self.execute_canonical(function, input, cancel).await {
+            Ok(output) => success_result(output).unwrap_or_else(|_| tool_error("OUTPUT_LIMIT", "Result exceeded the MCP wire limit; inspect the durable operation before retrying a write", true)),
+            Err(error) => error.tool(),
+        }
+    }
+    /// Every facade operation uses the same authenticated Coordinator client,
+    /// sole owned worker and drain permit. Resource reads enter FN31 normally;
+    /// they cannot create an in-process request witness from their locator.
+    async fn execute_canonical(
+        &self,
+        function: FunctionContract,
+        input: Value,
+        cancel: impl Future<Output = ()> + Send,
+    ) -> Result<Value, CallFailure> {
         if self.stopping.load(Ordering::Acquire) {
-            return tool_error(
+            return Err(CallFailure::new(
                 "FACADE_STOPPING",
                 "The facade is closing; no request was dispatched",
                 false,
-            );
+            ));
         }
         let validator = match ContractValidator::shared() {
             Ok(value) => value,
             Err(_) => {
-                return tool_error("INTERNAL_ERROR", "Canonical validator unavailable", false);
+                return Err(CallFailure::new(
+                    "INTERNAL_ERROR",
+                    "Canonical validator unavailable",
+                    false,
+                ));
             }
         };
         if bounded_json(&input).is_err() || validator.validate(&function.input, &input).is_err() {
-            return tool_error(
+            return Err(CallFailure::new(
                 "INVALID_INPUT",
                 "Arguments violate the canonical function contract",
                 false,
-            );
+            ));
         }
         let permit = match self.calls.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                return tool_error(
+                return Err(CallFailure::new(
                     "SERVER_BUSY",
                     "One Coordinator call is already running; no request was dispatched",
                     false,
-                );
+                ));
             }
         };
         let coordinator = self.coordinator.clone();
@@ -573,26 +829,47 @@ impl McpFacade {
             biased;
             _ = &mut cancel => {
                 dispatch_cancel.store(true, Ordering::Release);
-                return tool_error("DELIVERY_UNKNOWN", "Call canceled locally; application effects are not proven stopped. Inspect the durable operation", true);
+                return Err(CallFailure::new("DELIVERY_UNKNOWN", "Call canceled locally; application effects are not proven stopped. Inspect the durable operation", true));
             }
             result = tokio::time::timeout(CALL_DEADLINE, worker) => match result {
                 Ok(Ok(Ok(output))) => output,
-                Ok(Ok(Err(error))) => return client_error(error),
-                _ => return tool_error("DELIVERY_UNKNOWN", "Coordinator call did not return a verified result; inspect the durable operation", true),
+                Ok(Ok(Err(error))) => return Err(client_failure(error)),
+                _ => return Err(CallFailure::new("DELIVERY_UNKNOWN", "Coordinator call did not return a verified result; inspect the durable operation", true)),
             }
         };
         if validator.validate(&function.output, &output).is_err() {
-            return client_error(ClientError::InvalidResponse);
+            return Err(client_failure(ClientError::InvalidResponse));
         }
-        success_result(output).unwrap_or_else(|_| tool_error("OUTPUT_LIMIT", "Result exceeded the MCP wire limit; inspect the durable operation before retrying a write", true))
+        Ok(output)
+    }
+    async fn read_artifact(
+        &self,
+        request: ReadResourceRequestParams,
+        cancel: impl Future<Output = ()> + Send,
+    ) -> Result<ReadResourceResult, ErrorData> {
+        // Multi-round input negotiation is outside the negotiated 2025 profile.
+        if request.input_responses.is_some() || request.request_state.is_some() {
+            return Err(ErrorData::invalid_params(
+                "Only the MCP 2025-11-25 resources/read profile is supported",
+                None,
+            ));
+        }
+        let locator = ArtifactLocator::parse(&request.uri)?;
+        let (function, input) =
+            self.prepare_call("artifact.read", locator.request().as_object().cloned())?;
+        let output = self
+            .execute_canonical(function, input, cancel)
+            .await
+            .map_err(CallFailure::resource)?;
+        artifact_resource_result(&locator, output)
     }
 }
 impl ServerHandler for McpFacade {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_resources().build())
             .with_protocol_version(ProtocolVersion::V_2025_11_25)
             .with_server_info(Implementation::new("MMMM", env!("CARGO_PKG_VERSION")))
-            .with_instructions("MMMM uses canonical contract 0.2.0 through the shared local Coordinator. This facade supports MCP 2025-11-25 only. Use the canonical function name and DTO. Transport success preserves reported operation status; unknown write delivery requires durable operation inspection before retry.")
+            .with_instructions("MMMM uses canonical contract 0.2.0 through the shared local Coordinator. This facade supports MCP 2025-11-25 only. Use the canonical function name and DTO. Artifact resources expose bounded text/blob slices through the same authenticated artifact.read function; their URI template is a locator, not an access grant. No resource inventory, catalog resources or subscriptions are provided. Transport success preserves reported operation status; unknown write delivery requires durable operation inspection before retry.")
     }
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Owned(vec![ProtocolVersion::V_2025_11_25])
@@ -636,6 +913,36 @@ impl ServerHandler for McpFacade {
         Ok(self
             .execute(function, input, context.ct.cancelled())
             .await
+            .into())
+    }
+    async fn list_resources(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        artifact_resource_list(request.as_ref().and_then(|params| params.cursor.as_deref()))
+    }
+    async fn list_resource_templates(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        artifact_resource_templates(request.as_ref().and_then(|params| params.cursor.as_deref()))
+    }
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        if context.ct.is_cancelled() {
+            return Err(ErrorData::internal_error(
+                "Artifact resource read was canceled before dispatch",
+                None,
+            ));
+        }
+        Ok(self
+            .read_artifact(request, context.ct.cancelled())
+            .await?
             .into())
     }
     async fn on_initialized(&self, _context: rmcp::service::NotificationContext<RoleServer>) {
@@ -1165,6 +1472,7 @@ mod tests {
         }
         let info = serde_json::to_value(server.get_info()).unwrap();
         assert!(info["capabilities"]["tools"].is_object());
+        assert_eq!(info["capabilities"]["resources"], json!({}));
         assert!(info["capabilities"].get("tasks").is_none());
     }
 
@@ -1348,6 +1656,369 @@ mod tests {
         assert!(bounded_json(&json!(vec![0; MAX_FRAME_NODES])).is_err());
     }
 
+    // Existing artifact reader tests own actual CAS/ACL behavior. These spies
+    // exercise only the new URI/protocol projection and shared worker boundary;
+    // a returned fixture is not a native authorization or game observation.
+    fn artifact_uri(offset: u64, limit: u64) -> String {
+        format!(
+            "{ARTIFACT_URI_PREFIX}context-artifact-test/resource-artifact-test/{}/{offset}/{limit}",
+            raw_digest(b"actual artifact")
+        )
+    }
+    fn artifact_output() -> Value {
+        json!({"resource":{"resourceId":"resource-artifact-test","sha256":raw_digest(b"actual artifact"),"mediaType":"text/plain","sizeBytes":15},
+            "offset":"0","encoding":"utf8","data":"actual artifact","nextOffset":null})
+    }
+    struct ArtifactSpy {
+        calls: Mutex<Vec<(String, Value)>>,
+        output: Value,
+        denied: bool,
+        gate: Option<Arc<ArtifactWorkerGate>>,
+    }
+    struct ArtifactWorkerGate {
+        entered: AtomicBool,
+        released: Mutex<bool>,
+        changed: std::sync::Condvar,
+    }
+    impl CoordinatorPort for ArtifactSpy {
+        fn call(&self, method: &str, input: &Value) -> Result<Value, ClientError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((method.into(), input.clone()));
+            if let Some(gate) = &self.gate {
+                gate.entered.store(true, Ordering::Release);
+                let released = gate.released.lock().unwrap();
+                let (released, _) = gate
+                    .changed
+                    .wait_timeout_while(released, Duration::from_secs(5), |value| !*value)
+                    .unwrap();
+                if !*released {
+                    return Err(ClientError::Unavailable);
+                }
+            }
+            if self.denied {
+                Err(ClientError::Remote {
+                    code: -32000,
+                    application_code: Some("RESOURCE_FORBIDDEN".into()),
+                    message: "private untrusted authentication detail".into(),
+                })
+            } else {
+                Ok(self.output.clone())
+            }
+        }
+    }
+    fn artifact_spy(output: Value) -> Arc<ArtifactSpy> {
+        Arc::new(ArtifactSpy {
+            calls: Mutex::new(Vec::new()),
+            output,
+            denied: false,
+            gate: None,
+        })
+    }
+    fn artifact_facade(spy: Arc<ArtifactSpy>) -> McpFacade {
+        McpFacade {
+            catalog: Arc::new(Catalog::new().unwrap()),
+            coordinator: spy,
+            calls: Arc::new(Semaphore::new(1)),
+            stopping: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    #[test]
+    fn artifact_locator_uses_canonical_contract_id_digest_and_decimal_forms() {
+        let uri = artifact_uri(0, 65_536);
+        let locator = ArtifactLocator::parse(&uri).unwrap();
+        assert_eq!(locator.uri(), uri);
+        assert_eq!(
+            locator.request(),
+            json!({"contextId":"context-artifact-test","resourceId":"resource-artifact-test","offset":"0","limitBytes":65_536})
+        );
+        ContractValidator::shared()
+            .unwrap()
+            .validate("ArtifactReadRequest", &locator.request())
+            .unwrap();
+        let digest = raw_digest(b"actual artifact").to_string();
+        // Stable IDs admit ':'. RFC 6570 reserved expansion preserves that
+        // exact character; simple expansion would introduce rejected aliases.
+        let namespaced = format!("{ARTIFACT_URI_PREFIX}context:local/resource:local/{digest}/0/1");
+        let namespaced = ArtifactLocator::parse(&namespaced).unwrap();
+        assert_eq!(namespaced.context.as_str(), "context:local");
+        assert_eq!(namespaced.resource.as_str(), "resource:local");
+        assert!(ARTIFACT_URI_TEMPLATE.contains("{+contextId}/{+resourceId}"));
+        let invalid = [
+            "file:///private/local-artifact".into(),
+            uri.replace("mmmm://", "https://"),
+            uri.replace("artifact/", "catalog/"),
+            uri.replace("context-artifact-test", "Context-artifact-test"),
+            uri.replace("context-artifact-test", "context%2fartifact"),
+            uri.replace(&digest, &digest.to_ascii_uppercase()),
+            format!("{uri}/extra"),
+            format!("{uri}?authorization=never-echo"),
+            format!("{ARTIFACT_URI_PREFIX}context/resource/{digest}/00/1"),
+            format!("{ARTIFACT_URI_PREFIX}context/resource/{digest}/+1/1"),
+            format!("{ARTIFACT_URI_PREFIX}context/resource/{digest}/0/0"),
+            format!("{ARTIFACT_URI_PREFIX}context/resource/{digest}/0/65537"),
+            format!("{ARTIFACT_URI_PREFIX}context/resource/{digest}/18446744073709551616/1"),
+            artifact_uri(u64::MAX, 1),
+            "x".repeat(513),
+        ];
+        for uri in invalid {
+            let error = match ArtifactLocator::parse(&uri) {
+                Err(error) => error,
+                Ok(_) => panic!("Invalid locator admitted"),
+            };
+            assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+            assert_eq!(error.message, "Invalid canonical artifact resource locator");
+            assert!(error.data.is_none());
+        }
+    }
+    #[test]
+    fn artifact_slice_becomes_actual_mime_text_or_blob_with_exact_range_metadata() {
+        let locator = ArtifactLocator::parse(&artifact_uri(0, 65_536)).unwrap();
+        let text =
+            serde_json::to_value(artifact_resource_result(&locator, artifact_output()).unwrap())
+                .unwrap();
+        assert_eq!(text["contents"][0]["text"], "actual artifact");
+        assert_eq!(text["contents"][0]["mimeType"], "text/plain");
+        assert!(text.get("resultType").is_none());
+        assert!(text["contents"][0].get("blob").is_none());
+        let metadata = &text["contents"][0]["_meta"]["io.github.daejunnom.mmmm/artifactSlice"];
+        assert_eq!(metadata["sliceBytes"], 15);
+        assert_eq!(metadata["offset"], "0");
+        assert!(metadata["nextOffset"].is_null());
+        let mut partial = artifact_output();
+        partial["data"] = json!("act");
+        partial["nextOffset"] = json!("3");
+        let locator = ArtifactLocator::parse(&artifact_uri(0, 3)).unwrap();
+        let partial =
+            serde_json::to_value(artifact_resource_result(&locator, partial).unwrap()).unwrap();
+        assert_eq!(
+            partial["contents"][0]["_meta"]["io.github.daejunnom.mmmm/artifactSlice"]["nextOffset"],
+            "3"
+        );
+        let mut binary = artifact_output();
+        binary["resource"]["mediaType"] = json!("application/octet-stream");
+        binary["resource"]["sizeBytes"] = json!(2);
+        binary["resource"]["sha256"] = json!(raw_digest(&[255, 0]));
+        binary["encoding"] = json!("base64");
+        binary["data"] = json!("/wA=");
+        let uri = format!(
+            "{ARTIFACT_URI_PREFIX}context-artifact-test/resource-artifact-test/{}/0/65536",
+            raw_digest(&[255, 0])
+        );
+        let locator = ArtifactLocator::parse(&uri).unwrap();
+        let blob =
+            serde_json::to_value(artifact_resource_result(&locator, binary).unwrap()).unwrap();
+        assert_eq!(blob["contents"][0]["blob"], "/wA=");
+        assert_eq!(blob["contents"][0]["mimeType"], "application/octet-stream");
+        assert!(blob["contents"][0].get("text").is_none());
+        let mut empty = artifact_output();
+        empty["offset"] = json!("15");
+        empty["data"] = json!("");
+        let locator = ArtifactLocator::parse(&artifact_uri(15, 1)).unwrap();
+        assert!(artifact_resource_result(&locator, empty).is_ok());
+    }
+    #[test]
+    fn artifact_slice_withholds_wrong_identity_digest_offset_length_or_next_offset() {
+        let locator = ArtifactLocator::parse(&artifact_uri(0, 65_536)).unwrap();
+        for field in 0..8 {
+            let mut output = artifact_output();
+            match field {
+                0 => output["resource"]["resourceId"] = json!("another-resource"),
+                1 => output["resource"]["sha256"] = json!("a".repeat(64)),
+                2 => output["offset"] = json!("1"),
+                3 => output["data"] = json!("short"),
+                4 => output["data"] = json!("too long for the actual resource"),
+                5 => output["nextOffset"] = json!("15"),
+                6 => output["resource"]["mediaType"] = json!(""),
+                _ => output["resource"]["sizeBytes"] = json!(14),
+            }
+            assert!(artifact_resource_result(&locator, output).is_err());
+        }
+        let mut oversized = artifact_output();
+        oversized["resource"]["mediaType"] = json!("x".repeat(MAX_FRAME_BYTES));
+        assert!(artifact_resource_result(&locator, oversized).is_err());
+        let locator = ArtifactLocator::parse(&artifact_uri(16, 1)).unwrap();
+        assert!(artifact_resource_result(&locator, artifact_output()).is_err());
+    }
+    #[test]
+    fn artifact_base64_is_standard_canonical_and_bounded() {
+        for (value, bytes) in [("", 0), ("/w==", 1), ("/wA=", 2), ("YWJj", 3)] {
+            assert_eq!(artifact_base64_length(value), Some(bytes));
+        }
+        for value in [
+            "/x==", "/wB=", "YW=J", "====", "YWJj\n", "_w==", "YQ", "YQ===",
+        ] {
+            assert_eq!(artifact_base64_length(value), None);
+        }
+        assert!(artifact_base64_length(&"A".repeat(87_388)).is_none());
+        let locator = ArtifactLocator::parse(&artifact_uri(0, 65_536)).unwrap();
+        let mut invalid = artifact_output();
+        invalid["resource"]["sizeBytes"] = json!(1);
+        invalid["encoding"] = json!("base64");
+        for data in ["/x==", "/wA=", "YQ", "\n/w=="] {
+            invalid["data"] = json!(data);
+            assert!(artifact_resource_result(&locator, invalid.clone()).is_err());
+        }
+    }
+    #[test]
+    fn artifact_resource_inventory_is_empty_and_template_is_only_a_locator() {
+        let list = serde_json::to_value(artifact_resource_list(None).unwrap()).unwrap();
+        assert_eq!(list["resources"], json!([]));
+        assert!(list.get("nextCursor").is_none());
+        assert!(list.get("resultType").is_none());
+        let templates = serde_json::to_value(artifact_resource_templates(None).unwrap()).unwrap();
+        assert_eq!(templates["resourceTemplates"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            templates["resourceTemplates"][0]["uriTemplate"],
+            ARTIFACT_URI_TEMPLATE
+        );
+        assert!(templates.get("resultType").is_none());
+        for cursor in ["", "invented-cursor"] {
+            assert!(artifact_resource_list(Some(cursor)).is_err());
+            assert!(artifact_resource_templates(Some(cursor)).is_err());
+        }
+    }
+    #[tokio::test]
+    async fn artifact_read_calls_original_fn31_once_and_preserves_coordinator_denial() {
+        let spy = artifact_spy(artifact_output());
+        let server = artifact_facade(spy.clone());
+        server
+            .read_artifact(
+                ReadResourceRequestParams::new(artifact_uri(0, 65_536)),
+                std::future::pending(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *spy.calls.lock().unwrap(),
+            vec![(
+                "artifact.read".into(),
+                json!({"contextId":"context-artifact-test","resourceId":"resource-artifact-test","offset":"0","limitBytes":65_536})
+            )]
+        );
+        let denied = Arc::new(ArtifactSpy {
+            calls: Mutex::new(Vec::new()),
+            output: artifact_output(),
+            denied: true,
+            gate: None,
+        });
+        let server = artifact_facade(denied.clone());
+        let error = server
+            .read_artifact(
+                ReadResourceRequestParams::new(artifact_uri(0, 65_536)),
+                std::future::pending(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.data.as_ref().unwrap()["code"], "RESOURCE_FORBIDDEN");
+        assert!(
+            !serde_json::to_string(&error)
+                .unwrap()
+                .contains("private untrusted")
+        );
+        assert_eq!(denied.calls.lock().unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn artifact_invalid_locator_mrtr_and_busy_state_do_not_dispatch() {
+        let spy = artifact_spy(artifact_output());
+        let server = artifact_facade(spy.clone());
+        assert!(
+            server
+                .read_artifact(
+                    ReadResourceRequestParams::new("file:///never-echo"),
+                    std::future::pending()
+                )
+                .await
+                .is_err()
+        );
+        for field in ["requestState", "inputResponses"] {
+            let mut request = json!({"uri":artifact_uri(0,65_536)});
+            request[field] = if field == "requestState" {
+                json!("unsupported")
+            } else {
+                json!({})
+            };
+            let request = serde_json::from_value(request).unwrap();
+            assert!(
+                server
+                    .read_artifact(request, std::future::pending())
+                    .await
+                    .is_err()
+            );
+        }
+        let permit = server.calls.acquire().await.unwrap();
+        let error = server
+            .read_artifact(
+                ReadResourceRequestParams::new(artifact_uri(0, 65_536)),
+                std::future::pending(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.data.as_ref().unwrap()["code"], "SERVER_BUSY");
+        assert!(spy.calls.lock().unwrap().is_empty());
+        drop(permit);
+    }
+    #[tokio::test]
+    async fn canceled_artifact_worker_keeps_shared_tool_and_drain_permit_until_actual_return() {
+        let gate = Arc::new(ArtifactWorkerGate {
+            entered: AtomicBool::new(false),
+            released: Mutex::new(false),
+            changed: std::sync::Condvar::new(),
+        });
+        let spy = Arc::new(ArtifactSpy {
+            calls: Mutex::new(Vec::new()),
+            output: artifact_output(),
+            denied: false,
+            gate: Some(gate.clone()),
+        });
+        let server = Arc::new(artifact_facade(spy.clone()));
+        let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let reader = server.clone();
+        let running = tokio::spawn(async move {
+            reader
+                .read_artifact(
+                    ReadResourceRequestParams::new(artifact_uri(0, 65_536)),
+                    async {
+                        let _ = cancelled.await;
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !gate.entered.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), running)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(server.calls.available_permits(), 0);
+        let tool = server
+            .execute(
+                function("prefab.validate"),
+                prefab(),
+                std::future::pending(),
+            )
+            .await;
+        assert_eq!(error_text(&tool)["code"], "SERVER_BUSY");
+        *gate.released.lock().unwrap() = true;
+        gate.changed.notify_all();
+        let permit = tokio::time::timeout(Duration::from_secs(3), server.calls.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(spy.calls.lock().unwrap().len(), 1);
+        drop(permit);
+    }
+
     #[derive(Default)]
     struct RamIo {
         incoming: Mutex<VecDeque<Vec<u8>>>,
@@ -1453,6 +2124,68 @@ mod tests {
         assert!(list["result"].get("resultType").is_none());
         assert!(io.drained.load(Ordering::SeqCst) >= 1);
         assert_eq!(spy.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn rmcp_artifact_resources_roundtrip_uses_empty_index_template_and_real_slice_shape() {
+        let uri = artifact_uri(0, 65_536);
+        let frames = [
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"RAM artifact protocol fixture","version":"1"}}}),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            json!({"jsonrpc":"2.0","id":2,"method":"resources/list"}),
+            json!({"jsonrpc":"2.0","id":3,"method":"resources/templates/list"}),
+            json!({"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":uri}}),
+        ];
+        let io = Arc::new(RamIo {
+            incoming: Mutex::new(
+                frames
+                    .iter()
+                    .map(|frame| encode_json(frame).unwrap())
+                    .collect(),
+            ),
+            eof_after_writes: 4,
+            ..RamIo::default()
+        });
+        let spy = artifact_spy(artifact_output());
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            serve_facade(artifact_facade(spy.clone()), io.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let written = io.written.lock().unwrap();
+        assert_eq!(written.len(), 4);
+        let frames: BTreeMap<_, _> = written
+            .iter()
+            .map(|frame| {
+                let value = parse_json_with_limits(frame, limits()).unwrap();
+                (value["id"].as_i64().unwrap(), value)
+            })
+            .collect();
+        assert_eq!(frames[&1]["result"]["capabilities"]["resources"], json!({}));
+        assert_eq!(frames[&2]["result"]["resources"], json!([]));
+        assert_eq!(
+            frames[&3]["result"]["resourceTemplates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            frames[&4]["result"]["contents"][0]["text"],
+            "actual artifact"
+        );
+        assert_eq!(
+            frames[&4]["result"]["contents"][0]["mimeType"],
+            "text/plain"
+        );
+        assert_eq!(frames[&4]["result"]["contents"][0]["uri"], uri);
+        for frame in frames.values() {
+            assert!(frame["result"].get("resultType").is_none());
+        }
+        assert_eq!(spy.calls.lock().unwrap().len(), 1);
+        assert!(io.drained.load(Ordering::SeqCst) >= 1);
     }
 
     #[tokio::test]
