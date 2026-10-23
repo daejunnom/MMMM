@@ -2452,8 +2452,9 @@ operation 상태와 별도 사실로 보존한다.
 checkpoint를 DB/CAS 처리 전후와 chunk 사이에 적용하고, BEGIN 이후 정상·실패
 경로 모두 명시적 rollback으로 종료한다. 본문·checkpoint·rollback의 동시 오류는
 typed 원인으로 함께 남긴다. 호출자가 현재 권한을 먼저 확립해야 하는 Rust 내부
-관측이며, 공개 wire 계약이나 release proof를 발급하지 않는다. 실제 FN36 수집기와의
-연결 및 현재 권한·출시 자료의 최종 판정은 후속 구현 범위다.
+관측이며, 공개 wire 계약이나 release proof를 발급하지 않는다. 실제 FN36의 native
+요청 경로에는 아래의 읽기 전용 publication guard를 연결했다. 동결 배포 자료와
+검증된 proof 수집기 및 현재 권한·출시 자료의 최종 판정은 후속 구현 범위다.
 
 Windows `547`의 format 뒤 `548`에서 기존 fixture를 재사용한 집중 검사 6개가
 통과했다. 실제 4,096/4,097행 경계, false write flag, SQL/CAS/fence/retention 불일치와
@@ -2473,6 +2474,37 @@ gap 143 ms·자연 종료이며 drain·출력 완료·export·scratch 정리·le
 `79448ab`의 Rust CI 90 집계 성공과 JVM CI 81 집계 실패도 metadata로 확인했으며,
 이후 Runtime 변경의 CI 성공으로 대신하지 않는다. 현재 서버는 중지 상태이고 계정
 인증 문제로 클라이언트·ADMIN pairing·시각 검증은 계속 미실행이다.
+
+## 실제 FN36 요청의 미해결 쓰기 차단
+
+LocalFeatureSources의 실제 release_evidence 경로는 원 request witness의 session·
+method·generation, authenticated principal 및 동일 deadline/cancellation 객체를
+확인한다. 기존 native owner의 읽기 전용·유한 OS 관측을 사용하고 요청자가 그 실제
+owner일 때만 동일 Store의 전체 journal을 읽는다. owner 관측 불가나 nonowner는
+전체 원장을 열지 않고 기존 None 경로를 유지한다. 공개 ReadProject 요건을 새로운
+Owner 요건으로 바꾸지 않으며 원 요청의 취소·기한 오류는 None으로 숨기지 않는다.
+
+실제 owner의 fresh snapshot에 미해결 쓰기나 실제 fence가 있으면 고정
+UNRESOLVED_OPERATIONS로 publication을 차단한다. 다른 Project의 ID·count를 공개하지
+않고 operation·fence·CAS를 수정하지 않는다. snapshot 실패는 전체 typed StorageError를
+원인으로 보존하며 callback의 내부 표식과 별도로 원 ServiceError도 함께 보유한다.
+빈 원장도 None이므로 기존 82개 missing과 VERIFIED_EVIDENCE_MISSING을 유지한다.
+이 guard는 필요한 차단을 추가하며 release proof·index·Passed를 발급하지 않는다.
+
+기존 production factory fixture에 네 검사를 추가했다. 실제 FN36을 통해 빈 원장의
+미인수 유지, 다른 Project의 queued/unsent write 차단과 취소 뒤 fresh 재평가, 실제
+ReadProject viewer의 기존 동작, 테스트용 frozen-plan CAS 변조의 원 typed 원인과
+원래 취소 보존을 검사한다. 기존 journal 단위 검사만으로는 native 요청의 인증·
+production composition·공개 결과를 확인하지 못하므로 이 경로 검사를 유지한다.
+
+Windows 562 format 뒤 563의 새 native_fn36_ 검사 4개가 통과했다. command 0·42,552 ms·
+Job peak 1,607,258,112 bytes·6 process·gap 141 ms이며 owned-tail 정리 뒤 drain이다.
+564의 Coordinator·Application·CLI all-target strict도 command 0·19,278 ms·Job peak
+975,470,592 bytes·7 process·gap 143 ms·자연 종료로 통과했다. 두 변경 파일 197,708
+bytes의 전후 manifest digest는
+`cb2b3a7f8302e547250aa70e90cc2f90041da863f93e173fec9d8d36efbd5785`로 같다.
+두 관리 실행은 완전한 출력·export·scratch 정리·lease 해제 및 감독/정리 오류 0이다.
+이 결과는 전체 Coordinator 393개 재실행이나 실제 배포 자료 인증을 뜻하지 않는다.
 
 ## Pack root와 JNI 참조의 실제 소유 수명
 
@@ -2528,6 +2560,16 @@ Control 오류 4551로 차단됐다. 생성 전 실패·원 진단·export·scra
 보존했다. Windows에서 기존 고정 bootstrap image를 사용한 561의 저장소 검사는
 533개 index metadata·정책 blob 하나·위반 0으로 통과했다. command 0·922 ms·drain·
 출력 완료·export·정리·lease 해제이며 새 도구가 실행됐다고 표현하지 않는다.
+
+고정 2f44502의 Windows C header 실행 565에서는 실제 선택 JDK 헤더와 MSVC의
+`/std:c17 /W4 /WX` 컴파일이 exit 0이었다. 새 C 소스·Rust ffi·두 helper 및 bootstrap
+소스 5개의 전후 manifest digest는
+`094995f60316643eb6a559c2319c208fb70dbe2633c84e372ed5fc9603574ed0`으로 같았다.
+그러나 생성 witness EXE의 실행은 native 오류 4551로 차단됐다. helper status=failed,
+phase=witness·witness=null 및 input pin revalidated=false를 유지한다. C 컴파일 성공을
+완료된 ABI witness나 실제 JNI 실행으로 대신하지 않는다. 외부 관리 실행은 command 1·
+9,633 ms·owned-tail 정리 뒤 drain·출력 완료·export·scratch 정리·lease 해제와 감독/
+정리 오류 0이다. 원 compiled image·입력 pin·원 실패는 보존했고 WSL은 사용하지 않았다.
 
 ## 첫 공개 배포 인수
 

@@ -1109,7 +1109,124 @@ impl LocalFeatureSources {
     }
 }
 
+/// Preserve the actual request failure as well as the complete Storage error
+/// tree. The Storage-only callback marker is never the request's sole cause.
+#[derive(Debug)]
+struct NativeReleaseJournalCheckpointFailure {
+    snapshot: StorageError,
+    checkpoint: ServiceError,
+}
+impl std::fmt::Display for NativeReleaseJournalCheckpointFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Local release journal observation and its original {} checkpoint failed",
+            self.checkpoint.code
+        )
+    }
+}
+impl std::error::Error for NativeReleaseJournalCheckpointFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.snapshot)
+    }
+}
+
+fn check_native_release_journal(
+    slot: &RequestContextSlot,
+    access: &FeatureAccess,
+    store: &DurableStore,
+    budget: &RequestBudget,
+) -> Result<(), ServiceError> {
+    let (authenticated, original_budget) = slot.current()?;
+    let request = slot.current_witness("release.evaluate")?;
+    if authenticated.principal() != &access.read_principal.principal_id
+        || !request.authenticated().same_session(&authenticated)
+        || original_budget.deadline() != budget.deadline()
+        || !std::ptr::eq(original_budget.cancellation(), budget.cancellation())
+        || request.budget().deadline() != budget.deadline()
+        || !std::ptr::eq(request.budget().cancellation(), budget.cancellation())
+    {
+        return Err(ServiceError::new(
+            "PERMISSION_REQUIRED",
+            "The original authenticated release request is not current",
+        ));
+    }
+    request.check_local()?;
+    // Capturing this existing witness only observes the current OS owner and
+    // already-owned Store root. Unsupported owner observation preserves the
+    // pre-existing unavailable evidence path; it creates no new public grant.
+    let owner =
+        match crate::workspace_bootstrap::NativeOwnerWitness::capture(store, budget.deadline()) {
+            Ok(owner) => owner,
+            Err(_) => {
+                request.check_local()?;
+                return Ok(());
+            }
+        };
+    if request.authenticated().principal() != owner.principal() {
+        request.check_local()?;
+        return Ok(());
+    }
+
+    let mut checkpoint_failure = None;
+    let snapshot = store.journal_snapshot_checked(|| {
+        if let Err(checkpoint) = request.check_local() {
+            // This fixed marker satisfies the Storage callback's error type.
+            // Keep the first original typed ServiceError and its cause above.
+            checkpoint_failure.get_or_insert(checkpoint);
+            return Err(StorageError::InvalidTransition(
+                "Original release request checkpoint failed".into(),
+            ));
+        }
+        owner.check_store(store)
+    });
+    let snapshot = match (snapshot, checkpoint_failure) {
+        (Ok(snapshot), None) => snapshot,
+        (Ok(_), Some(checkpoint)) => return Err(checkpoint),
+        (Err(snapshot), Some(checkpoint)) => {
+            return Err(ServiceError::caused_by(
+                checkpoint.code,
+                "The actual local release journal observation failed",
+                NativeReleaseJournalCheckpointFailure {
+                    snapshot,
+                    checkpoint,
+                },
+            ));
+        }
+        (Err(snapshot), None) => {
+            let cause = storage_app(snapshot);
+            return Err(ServiceError::caused_by(
+                cause.code,
+                "The actual local release journal observation failed",
+                cause,
+            ));
+        }
+    };
+    // The actual complete snapshot is read only. Do not repair missing fences,
+    // expose another Project's IDs/counts, or turn an empty result into a proof.
+    if snapshot.unresolved_writes().next().is_some() || !snapshot.write_fences().is_empty() {
+        return Err(ServiceError::new(
+            "UNRESOLVED_OPERATIONS",
+            "Actual local writes or write fences remain unresolved; publication is blocked",
+        ));
+    }
+    Ok(())
+}
+
 impl FeatureSources for LocalFeatureSources {
+    fn release_evidence(
+        &mut self,
+        access: &FeatureAccess,
+        _input: &Value,
+        store: &DurableStore,
+        budget: &RequestBudget,
+    ) -> Result<Option<mmmm_policy::VerifiedEvidenceIndex>, ServiceError> {
+        check_native_release_journal(&self.composition.request, access, store, budget)?;
+        // A fresh local journal read is only a publication blocker. It neither
+        // supplies the absent frozen release producer nor authenticates proofs.
+        Ok(None)
+    }
+
     fn import_manual_scene(
         &mut self,
         selection: &crate::native_manual_exchange::NativeManualSelection,

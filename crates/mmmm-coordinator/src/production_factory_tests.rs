@@ -368,6 +368,319 @@ fn authenticated_feature_fixture(
     }
 }
 
+fn release_claim() -> Value {
+    let mut input = parse_json(include_bytes!("../../../examples/release-spec-only.json")).unwrap();
+    input["productVersion"] = json!("0.1.0");
+    input["claim"] = json!("release_candidate");
+    input["passedTestIds"] = input["requiredTestIds"].clone();
+    input["notRunTestIds"] = json!([]);
+    input
+}
+
+fn release_fixture(root: &TestRoot) -> (DaemonHandles, FactorySourceFixture, ProductionRegistries) {
+    let mut store = root.open();
+    let handles = handles(&mut store);
+    let mut factory = ProductionFactory::offline_owned(binary_digest());
+    let parts = factory.compose(&handles, &store).unwrap();
+    let registries = factory.registries().unwrap().clone();
+    let budget =
+        RequestBudget::new(Duration::from_secs(10), Arc::new(AtomicBool::new(false))).unwrap();
+    let fixture =
+        authenticated_feature_fixture(store, &handles, parts, budget, None, &["release.evaluate"]);
+    (handles, fixture, registries)
+}
+
+fn queue_other_project_release_write(
+    store: &mut DurableStore,
+) -> (
+    mmmm_runtime::storage::OperationRecord,
+    mmmm_runtime::storage::BlobRef,
+) {
+    // The existing ExecutionPlan/Invocation examples already supply a matching
+    // frozen identity. Its Project is deliberately distinct from the native
+    // configured workspace so this test detects a Project-filtered journal.
+    let mut plan = parse_json(include_bytes!("../../../examples/execution-plan.json")).unwrap();
+    plan["planId"] = json!("plan-private-release-write");
+    plan["scope"]["resourceIds"] = json!(["resource-private-release-write"]);
+    plan["steps"][0]["effect"] = json!("write");
+    plan["steps"][0]["resourcesWritten"] = json!(["resource-private-release-write"]);
+    plan["steps"][0]["verificationRequirement"] = json!("independent_readback");
+    plan["planHash"] = json!(projected_digest("ExecutionPlan", &plan).unwrap());
+    let blob = store.save_plan(&plan).unwrap();
+    let record = store
+        .reserve_operation(mmmm_runtime::storage::ReserveOperation {
+            operation_id: mmmm_contracts::OperationId::new("operation-private-release-write")
+                .unwrap(),
+            principal: PrincipalId::new("principal-fixture").unwrap(),
+            project_id: serde_json::from_value(plan["projectId"].clone()).unwrap(),
+            idempotency_key: "private-release-write-key".into(),
+            plan_id: serde_json::from_value(plan["planId"].clone()).unwrap(),
+            plan_hash: serde_json::from_value(plan["planHash"].clone()).unwrap(),
+            context_id: serde_json::from_value(plan["contextId"].clone()).unwrap(),
+        })
+        .unwrap()
+        .record()
+        .clone();
+    (record, blob)
+}
+
+#[test]
+fn native_fn36_empty_journal_still_has_no_verified_release_evidence() {
+    let root = TestRoot::new();
+    let (handles, mut fixture, _) = release_fixture(&root);
+    let before = fixture
+        .service
+        .management_store()
+        .journal_snapshot_checked(|| Ok(()))
+        .unwrap();
+    assert!(before.operations().is_empty());
+    assert!(before.write_fences().is_empty());
+    let result = fixture
+        .service
+        .call(
+            &fixture.authenticated,
+            "release.evaluate",
+            &release_claim(),
+            &fixture.budget,
+        )
+        .unwrap();
+    assert_eq!(result["eligible"], false);
+    assert_eq!(result["missingTestIds"].as_array().unwrap().len(), 82);
+    assert!(
+        result["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "VERIFIED_EVIDENCE_MISSING")
+    );
+    assert_eq!(
+        fixture
+            .service
+            .management_store()
+            .journal_snapshot_checked(|| Ok(()))
+            .unwrap(),
+        before
+    );
+    assert!(handles.request.occupied_witness().is_err());
+}
+
+#[test]
+fn native_fn36_reads_fresh_other_project_unsent_writes_without_repair_or_disclosure() {
+    let root = TestRoot::new();
+    let (handles, mut fixture, _) = release_fixture(&root);
+    let (record, _) = queue_other_project_release_write(fixture.service.management_store());
+    assert_ne!(
+        &record.project_id,
+        handles.configured_project.as_ref().unwrap()
+    );
+    assert!(
+        fixture
+            .service
+            .management_store()
+            .unresolved_dispatches()
+            .unwrap()
+            .is_empty()
+    );
+    let before = fixture
+        .service
+        .management_store()
+        .journal_snapshot_checked(|| Ok(()))
+        .unwrap();
+    assert!(before.write_fences().is_empty());
+    let error = fixture
+        .service
+        .call(
+            &fixture.authenticated,
+            "release.evaluate",
+            &release_claim(),
+            &fixture.budget,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "UNRESOLVED_OPERATIONS");
+    for private in [
+        record.operation_id.as_str(),
+        record.project_id.as_str(),
+        record.principal.as_str(),
+        record.idempotency_key.as_str(),
+    ] {
+        assert!(!error.to_string().contains(private));
+    }
+    assert_eq!(
+        fixture
+            .service
+            .management_store()
+            .journal_snapshot_checked(|| Ok(()))
+            .unwrap(),
+        before
+    );
+    fixture
+        .service
+        .management_store()
+        .request_cancel(&record.operation_id)
+        .unwrap();
+    let result = fixture
+        .service
+        .call(
+            &fixture.authenticated,
+            "release.evaluate",
+            &release_claim(),
+            &fixture.budget,
+        )
+        .unwrap();
+    assert_eq!(result["eligible"], false);
+    assert!(
+        result["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "VERIFIED_EVIDENCE_MISSING")
+    );
+    assert!(handles.request.occupied_witness().is_err());
+}
+
+#[test]
+fn native_fn36_nonowner_keeps_read_project_evaluation_without_whole_journal_access() {
+    let root = TestRoot::new();
+    let (handles, mut fixture, registries) = release_fixture(&root);
+    let (record, _) = queue_other_project_release_write(fixture.service.management_store());
+    let workspace = handles.workspace.as_ref().unwrap();
+    let context_id = ContextId::new(workspace.context["contextId"].as_str().unwrap()).unwrap();
+    let viewer = PrincipalId::new("principal-release-project-viewer").unwrap();
+    assert_ne!(&viewer, workspace.witness.principal());
+    let project = handles.configured_project.as_ref().unwrap();
+    let revision = handles
+        .authority
+        .stage_project_access(
+            viewer.clone(),
+            project.clone(),
+            workspace.context["scope"].clone(),
+            [context_id.clone()].into(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+    handles
+        .authority
+        .activate_staged_project(&viewer, project, &revision)
+        .unwrap();
+    let mut sessions = SessionAuthority::new(1).unwrap();
+    let token = sessions
+        .install(SessionPolicy {
+            principal: viewer,
+            allowed_methods: ["release.evaluate".into()].into(),
+            allowed_contexts: [context_id].into(),
+            lifetime: Duration::from_secs(30),
+        })
+        .unwrap();
+    let authenticated = sessions.authenticate_token(&token).unwrap();
+    let mut context = workspace.context.clone();
+    context["principalRef"] = json!(authenticated.principal());
+    context["policyRevision"] = json!(revision);
+    context["contextDigest"] = json!(projected_digest("ExecutionContext", &context).unwrap());
+    registries
+        .contexts
+        .borrow_mut()
+        .register_workspace(&authenticated, &handles.authority, context, &fixture.budget)
+        .unwrap();
+    let before = fixture
+        .service
+        .management_store()
+        .journal_snapshot_checked(|| Ok(()))
+        .unwrap();
+    let result = fixture
+        .service
+        .call(
+            &authenticated,
+            "release.evaluate",
+            &release_claim(),
+            &fixture.budget,
+        )
+        .unwrap();
+    assert_eq!(result["eligible"], false);
+    assert_eq!(result["missingTestIds"].as_array().unwrap().len(), 82);
+    assert!(
+        result["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "VERIFIED_EVIDENCE_MISSING")
+    );
+    let public = String::from_utf8(encode_json(&result).unwrap()).unwrap();
+    assert!(!public.contains(record.operation_id.as_str()));
+    assert!(!public.contains(record.project_id.as_str()));
+    assert_eq!(
+        fixture
+            .service
+            .management_store()
+            .journal_snapshot_checked(|| Ok(()))
+            .unwrap(),
+        before
+    );
+    assert!(handles.request.occupied_witness().is_err());
+}
+
+#[test]
+fn native_fn36_preserves_actual_journal_source_error_and_original_cancellation() {
+    let root = TestRoot::new();
+    let (handles, mut fixture, _) = release_fixture(&root);
+    let (record, blob) = queue_other_project_release_write(fixture.service.management_store());
+    let path = fixture
+        .service
+        .management_store()
+        .data_root()
+        .join("blobs")
+        .join(&blob.digest.as_str()[..2])
+        .join(&blob.digest.as_str()[2..]);
+    assert!(path.starts_with(&root.0));
+    let mut changed = fs::read(&path).unwrap();
+    changed[0] ^= 1;
+    fs::write(&path, &changed).unwrap();
+    let error = fixture
+        .service
+        .call(
+            &fixture.authenticated,
+            "release.evaluate",
+            &release_claim(),
+            &fixture.budget,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "SOURCE_CORRUPT");
+    let mut cause = std::error::Error::source(&error);
+    let mut original = None;
+    while let Some(current) = cause {
+        if let Some(storage) = current.downcast_ref::<mmmm_runtime::storage::StorageError>() {
+            original = Some(storage);
+            break;
+        }
+        cause = current.source();
+    }
+    assert!(matches!(
+        original,
+        Some(mmmm_runtime::storage::StorageError::Corrupt(_))
+    ));
+    assert_eq!(fs::read(&path).unwrap(), changed);
+    assert_eq!(
+        fixture
+            .service
+            .management_store()
+            .operation(&record.operation_id)
+            .unwrap(),
+        record
+    );
+    fixture.budget.cancellation().store(true, Ordering::Release);
+    let cancelled = fixture
+        .service
+        .call(
+            &fixture.authenticated,
+            "release.evaluate",
+            &release_claim(),
+            &fixture.budget,
+        )
+        .unwrap_err();
+    assert_eq!(cancelled.code, "CANCELLED");
+    assert_eq!(fs::read(&path).unwrap(), changed);
+    assert!(handles.request.occupied_witness().is_err());
+}
+
 struct NativeOwnedScene {
     catalog: ProjectCatalog,
     prefab: Value,
