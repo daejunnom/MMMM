@@ -11,7 +11,8 @@ param(
     [Parameter(Mandatory)][string]$CompilerPath,
     [Parameter(Mandatory)][string]$EvidenceRoot,
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedSourceSha,
-    [Parameter(Mandatory)][ValidateSet('windows-x64','linux-x64','macos-arm64')][string]$Target
+    [Parameter(Mandatory)][ValidateSet('windows-x64','linux-x64','macos-arm64')][string]$Target,
+    [ValidatePattern('(?-i)^[0-9a-f]{40}$')][string]$ToolchainGeneration
 )
 
 $ErrorActionPreference = 'Stop'
@@ -273,6 +274,11 @@ function Invoke-BoundedStep([string]$Name, [string]$Program, [string[]]$Argument
 
 try {
     if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'ABI_POWERSHELL_7_REQUIRED' }
+    $useGeneration = $PSBoundParameters.ContainsKey('ToolchainGeneration')
+    if ($useGeneration -and ($ToolchainGeneration -cnotmatch '^[0-9a-f]{40}$' -or $ToolchainGeneration -cne $ExpectedSourceSha)) {
+        throw 'ABI_TOOLCHAIN_GENERATION_SOURCE_MISMATCH'
+    }
+    $result.toolchain_generation = if ($useGeneration) { $ToolchainGeneration } else { $null }
     $actual = if ($IsWindows -and [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq 'X64') { 'windows-x64' }
         elseif ($IsLinux -and [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq 'X64') { 'linux-x64' }
         elseif ($IsMacOS -and [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq 'Arm64') { 'macos-arm64' }
@@ -303,10 +309,13 @@ try {
     if (-not $actualHelper.Equals($expectedHelper, $comparison)) { throw 'ABI_EXECUTED_HELPER_PATH_MISMATCH' }
     $jvmSlot = Join-Path $slots "$hostPrefix-$checkoutKey-jvm"
     $macHome = if ($Target -eq 'macos-arm64') { '/Contents/Home' } else { '' }
-    $jdkCandidates = @(
-        (Join-Path $jvmSlot "cache/gradle-build/toolchains/temurin-25.0.4.1-1-$Target/jdk-25.0.4.1+1$macHome"),
-        (Join-Path $jvmSlot "cache/gradle-build/ci-toolchains/temurin/jdk-25.0.4.1+1$macHome")
-    )
+    $jdkCandidates = if ($useGeneration) {
+        # Explicit generation has exactly one candidate: no old flat fallback.
+        @((Join-Path $jvmSlot "cache/gradle-build/ci-toolchains/$ToolchainGeneration/temurin/jdk-25.0.4.1+1$macHome"))
+    } else {
+        @((Join-Path $jvmSlot "cache/gradle-build/toolchains/temurin-25.0.4.1-1-$Target/jdk-25.0.4.1+1$macHome"),
+            (Join-Path $jvmSlot "cache/gradle-build/ci-toolchains/temurin/jdk-25.0.4.1+1$macHome"))
+    }
     $jdk = Assert-Physical $JdkRoot $true
     if (-not @($jdkCandidates | Where-Object { [System.IO.Path]::GetFullPath($_).Equals($jdk, $comparison) }).Count) {
         throw 'ABI_SELECTED_JDK_PATH_INVALID'

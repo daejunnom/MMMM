@@ -5,7 +5,8 @@ param(
     [Parameter(Mandatory)][string]$EvidenceRoot,
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedSourceSha,
     [Parameter(Mandatory)][ValidateSet('windows-x64','linux-x64','macos-arm64')][string]$Target,
-    [Parameter(Mandatory)][string]$Python
+    [Parameter(Mandatory)][string]$Python,
+    [ValidatePattern('(?-i)^[0-9a-f]{40}$')][string]$ToolchainGeneration
 )
 
 $ErrorActionPreference = 'Stop'
@@ -67,6 +68,31 @@ function Is-Inside([string]$Path, [string]$Root) {
 function New-PhysicalDirectory([string]$Path) {
     [System.IO.Directory]::CreateDirectory($Path) | Out-Null
     return Assert-PhysicalPath $Path $true
+}
+
+function New-ToolchainOutput([string]$Base, [string]$JdkArchive, [bool]$UseGeneration, [string]$Generation) {
+    $baseRoot = New-PhysicalDirectory $Base
+    $selected = if ($UseGeneration) { Join-Path $baseRoot $Generation } else { $baseRoot }
+    if ($UseGeneration -and (Test-Path -LiteralPath $selected)) { throw 'JVM_TOOLCHAIN_GENERATION_ALREADY_EXISTS' }
+    # Inspect only immediate names and metadata in this fixed owned directory.
+    # Flat output counts as one generation; never delete or reuse an old one.
+    $flat = $false; $generations = 0; $entries = 0
+    foreach ($childPath in [System.IO.Directory]::EnumerateFileSystemEntries($baseRoot)) {
+        $entries++
+        if ($entries -gt 6) { throw 'JVM_TOOLCHAIN_GENERATION_ENTRY_BUDGET' }
+        $child = Get-Item -LiteralPath $childPath -Force
+        if ($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw 'JVM_TOOLCHAIN_GENERATION_PHYSICAL_REQUIRED' }
+        if ($child.PSIsContainer) {
+            if ($child.Name -cmatch '^[0-9a-f]{40}$') { $generations++ }
+            elseif ($child.Name -cin @('temurin','gradle')) { $flat = $true }
+            else { throw 'JVM_TOOLCHAIN_GENERATION_LAYOUT_INVALID' }
+        } elseif ($child.Name -cin @($JdkArchive,'gradle-9.6.0-bin.zip')) { $flat = $true }
+        else { throw 'JVM_TOOLCHAIN_GENERATION_LAYOUT_INVALID' }
+    }
+    if (-not $UseGeneration -and $flat) { throw 'JVM_TOOLCHAIN_FLAT_OUTPUT_ALREADY_EXISTS' }
+    if ($generations + [int]$flat -ge 2) { throw 'JVM_TOOLCHAIN_GENERATION_LIMIT' }
+    if ($UseGeneration) { return New-PhysicalDirectory $selected }
+    return $baseRoot
 }
 
 function Write-NewJson([string]$Path, $Value, [int]$Limit = 65536) {
@@ -235,6 +261,13 @@ function Export-TestSummary([string]$Module, [string]$ResultRoot) {
 
 try {
     if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'POWERSHELL_7_REQUIRED' }
+    $useGeneration = $PSBoundParameters.ContainsKey('ToolchainGeneration')
+    $generation = $null
+    if ($useGeneration) {
+        if ($ToolchainGeneration -cnotmatch '^[0-9a-f]{40}$' -or $ToolchainGeneration -cne $ExpectedSourceSha) { throw 'JVM_TOOLCHAIN_GENERATION_SOURCE_MISMATCH' }
+        $generation = $ToolchainGeneration
+    }
+    $record.toolchain_generation = $generation
     $checkoutRoot = Assert-PhysicalPath $Checkout $true
     $evidence = Assert-PhysicalPath $EvidenceRoot $true
     $operation = 'runtime_preflight'
@@ -304,7 +337,7 @@ try {
         'macos-arm64' = @{ file='OpenJDK25U-jdk_aarch64_mac_hotspot_25.0.4.1_1.tar.gz'; sha='61979887f7506a24a57439ff99adb8b3a7fc89977d9cfe3b8984f58a981b7b9d'; java='jdk-25.0.4.1+1/Contents/Home/bin/java' }
     }
     $jdk = $jdkProfiles[$Target]
-    $toolchains = New-PhysicalDirectory (Join-Path $gradleBuild 'ci-toolchains')
+    $toolchains = New-ToolchainOutput (Join-Path $gradleBuild 'ci-toolchains') $jdk.file $useGeneration $generation
     $archiveTool = Get-NativePath (Join-Path $checkoutRoot 'tools/bootstrap/jvm-archive.py') $false
     $profiles = @(
         @{ name='temurin'; file=$jdk.file; sha=$jdk.sha; root='jdk-25.0.4.1+1'; url="https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.4.1%2B1/$($jdk.file)" },
@@ -322,7 +355,8 @@ try {
         $toolchainRecords.Add([ordered]@{ name=$profile.name; archive=$profile.file; source_url=$profile.url; sha256=$profile.sha;
             archive_bytes=$archiveBytes; extraction=$extraction })
     }
-    Write-NewJson (Join-Path $evidence 'jvm-toolchains.json') ([ordered]@{ schema='mmmm-jvm-toolchains/1'; target=$Target; toolchains=$toolchainRecords.ToArray() })
+    Write-NewJson (Join-Path $evidence 'jvm-toolchains.json') ([ordered]@{ schema='mmmm-jvm-toolchains/1'; target=$Target;
+        source_sha=$ExpectedSourceSha; toolchain_generation=$generation; toolchains=$toolchainRecords.ToArray() })
     $java = Get-NativePath (Join-Path (Join-Path $toolchains 'temurin') $jdk.java) $false
     $javaHome = Get-NativePath ([System.IO.Path]::GetDirectoryName([System.IO.Path]::GetDirectoryName($java))) $true
     $releaseFile = Get-NativePath (Join-Path $javaHome 'release') $false

@@ -2569,7 +2569,33 @@ Control 오류 4551로 차단됐다. 생성 전 실패·원 진단·export·scra
 phase=witness·witness=null 및 input pin revalidated=false를 유지한다. C 컴파일 성공을
 완료된 ABI witness나 실제 JNI 실행으로 대신하지 않는다. 외부 관리 실행은 command 1·
 9,633 ms·owned-tail 정리 뒤 drain·출력 완료·export·scratch 정리·lease 해제와 감독/
-정리 오류 0이다. 원 compiled image·입력 pin·원 실패는 보존했고 WSL은 사용하지 않았다.
+정리 오류 0이다. 생성 image의 digest·입력 pin·원 실패를 보존했고 image 자체는 소유
+scratch의 수명에 따라 정리됐다. WSL은 사용하지 않았다.
+
+2f44502의 JVM CI 83은 3개 OS 모두 JVM 단계 실패·native 단계 skipped였다.
+Windows 원 ZIP 56,897 bytes·SHA
+`dfddf098b2ae1b8f1b6436767f57a992b1739dd0a4d24c57f20d483ac9de71ce`를 API digest와
+대조하고 30개 entry 중 원 JVM result·process·finish·stderr만 제한해 읽었다.
+실제 실패는 NativeCalibrationBootstrap.withPackRoot의 IOException을 던지지 않는
+try body에 대한 checked catch 한 곳이었다. 그 도달 불가능한 catch만 제거하고,
+requireRoot의 실제 Files.isSameFile IOException 보존은 유지했다. 원 CI는 command 1·
+77,223 ms·drain·완전한 출력·scratch 정리·lease 해제이며 수정 뒤 성공으로 바꾸지 않는다.
+Linux/macOS의 내부 실패 원인까지 Windows 기록에서 추정하지 않는다.
+
+로컬 JVM 재검증에는 기존 fixed ci-toolchains 출력이 이미 존재했다. 기존 자료를
+덮어쓰거나 지우지 않고 opt-in ToolchainGeneration을 도입했다. 값은 현재 source SHA와
+동일한 40자리 소문자 hex여야 하며 같은 fixed slot의 ci-toolchains/<SHA>에 새 archive와
+extraction을 생성한다. 기존 선택 directory·알 수 없는 즉시 자손·link는 거절하고,
+즉시 자손 최대 6개·flat과 SHA 세대 합계 최대 2개 및 기존 slot/catalog 예산을 유지한다.
+기본 CI의 flat 출력도 기존 archive/extraction CreateNew 검사로 계속 보호한다.
+
+JVM result와 toolchain receipt의 source·null/SHA generation을 observer consumer까지
+연결했다. 양쪽 정상 null은 flat이고, 세 새 metadata가 전부 없는 구형 receipt만
+구형 flat으로 소비한다. 일부 부재·혼합·빈 값·형식/소스 불일치는 거절한다. 명시 SHA의
+header 경로는 해당 세대 하나만 사용하며 기존 flat으로 fallback하지 않는다. 원 archive
+digest·extraction·기한·자원·입력 pin 검사는 유지한다. 같은 세대가 실패 후 남아 있으면
+자동 재사용·삭제·재시도하지 않고 별도 수명 판단이 필요하다. 독립 소스 검토와 세 helper의
+AST 구문 검사에서 결함·구문 오류 0이며 실제 새 JVM 실행 성공은 아직 확인하지 않았다.
 
 ## 첫 공개 배포 인수
 

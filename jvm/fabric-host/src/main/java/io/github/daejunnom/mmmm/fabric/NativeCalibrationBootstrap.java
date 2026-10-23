@@ -706,8 +706,6 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
                         gate.run(); observed = observe.apply(roots.getFirst()); gate.run();
                     }
                 }
-            } catch (IOException failure) {
-                throw rootUnavailable(failure);
             }
             if (count != 1) throw invalid(); return observed;
         }, gate);

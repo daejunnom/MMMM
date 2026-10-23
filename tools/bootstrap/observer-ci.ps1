@@ -16,6 +16,7 @@ param(
     [string]$RustTarget,
     [string]$ManagedSlotRoot,
     [string]$JdkRoot,
+    [ValidatePattern('(?-i)^[0-9a-f]{40}$')][string]$ToolchainGeneration,
     # The image README and the actual runner image can differ. An explicit
     # root is validated as given; otherwise query the installed VC component.
     [string]$WindowsVsRoot
@@ -448,6 +449,10 @@ function Revalidate-Source {
 
 try {
     if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'OBSERVER_POWERSHELL_7_REQUIRED' }
+    $explicitGeneration = $PSBoundParameters.ContainsKey('ToolchainGeneration')
+    if ($explicitGeneration -and ($ToolchainGeneration -cnotmatch '^[0-9a-f]{40}$' -or $ToolchainGeneration -cne $ExpectedSourceSha)) {
+        throw 'OBSERVER_TOOLCHAIN_GENERATION_SOURCE_MISMATCH'
+    }
     $actualTarget = if ($IsWindows -and [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq 'X64') { 'windows-x64' }
         elseif ($IsLinux -and [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq 'X64') { 'linux-x64' }
         elseif ($IsMacOS -and [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq 'Arm64') { 'macos-arm64' }
@@ -511,7 +516,11 @@ try {
         # process, while this launcher and all descendants retain the same
         # outer Rust-managed JVM-purpose owner and deadline.
         $headerPwsh = Assert-Physical ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) $false
-        & $headerPwsh -NoProfile -File (Join-Path $checkoutRoot 'tools/bootstrap/observer-abi-witness.ps1') -Checkout $checkoutRoot -ManagedSlotRoot $headerSlot -JdkRoot $selectedJdk -CompilerPath $compiler -EvidenceRoot $evidence -ExpectedSourceSha $ExpectedSourceSha -Target $Target
+        $headerHelperArgs = @('-NoProfile','-File',(Join-Path $checkoutRoot 'tools/bootstrap/observer-abi-witness.ps1'),
+            '-Checkout',$checkoutRoot,'-ManagedSlotRoot',$headerSlot,'-JdkRoot',$selectedJdk,'-CompilerPath',$compiler,
+            '-EvidenceRoot',$evidence,'-ExpectedSourceSha',$ExpectedSourceSha,'-Target',$Target)
+        if ($explicitGeneration) { $headerHelperArgs += @('-ToolchainGeneration',$ToolchainGeneration) }
+        & $headerPwsh @headerHelperArgs
         $headerHelperExit = $LASTEXITCODE
         if ($headerHelperExit -ne 0) { throw 'OBSERVER_HEADER_HELPER_FAILED' }
         $result.status = 'passed'
@@ -589,11 +598,35 @@ try {
     $toolchains = Read-Json (Join-Path $priorEvidence 'verification/jvm-toolchains.json')
     $priorManaged = Get-ManagedRecords (Join-Path $priorEvidence 'managed') 'jvm'
     Assert-ManagedSuccess $priorManaged $true
-    if ($jvmResult.schema -cne 'mmmm-jvm-ci-result/1' -or $jvmResult.source_sha -cne $ExpectedSourceSha -or $jvmResult.target -cne $Target -or
+    if ($jvmResult.schema -cne 'mmmm-jvm-ci-result/1' -or $jvmResult.source_sha -isnot [string] -or
+        $jvmResult.source_sha -cne $ExpectedSourceSha -or $jvmResult.target -isnot [string] -or $jvmResult.target -cne $Target -or
         $jvmResult.status -cne 'passed' -or $jvmResult.gradle_exit -ne 0 -or @($jvmResult.required_tasks).Count -ne 11 -or
         @($jvmResult.tasks).Count -ne 11 -or @($jvmResult.tasks | Where-Object status -CNE 'executed').Count -ne 0 -or
         @($jvmResult.tests).Count -ne 7 -or @($jvmResult.tests | Where-Object passed -NE $true).Count -ne 0 -or
-        $toolchains.schema -cne 'mmmm-jvm-toolchains/1' -or $toolchains.target -cne $Target) { throw 'OBSERVER_PRIOR_JVM_SUCCESS_REQUIRED' }
+        $toolchains.schema -cne 'mmmm-jvm-toolchains/1' -or $toolchains.target -isnot [string] -or
+        $toolchains.target -cne $Target) { throw 'OBSERVER_PRIOR_JVM_SUCCESS_REQUIRED' }
+    # Old flat receipts predate all three selection fields. New flat receipts
+    # have two explicit null generations and the same source SHA. Partial or
+    # malformed metadata never falls back to another generation or flat output.
+    $resultHasGeneration = $jvmResult.ContainsKey('toolchain_generation')
+    $chainsHaveGeneration = $toolchains.ContainsKey('toolchain_generation')
+    $chainsHaveSource = $toolchains.ContainsKey('source_sha')
+    $generation = $null
+    if ($resultHasGeneration -or $chainsHaveGeneration -or $chainsHaveSource) {
+        if (-not ($resultHasGeneration -and $chainsHaveGeneration -and $chainsHaveSource)) { throw 'OBSERVER_PRIOR_JVM_GENERATION_FIELDS' }
+        if ($toolchains.source_sha -isnot [string] -or $toolchains.source_sha -cne $ExpectedSourceSha) { throw 'OBSERVER_PRIOR_JVM_GENERATION_SOURCE' }
+        $resultGeneration = $jvmResult.toolchain_generation
+        $chainsGeneration = $toolchains.toolchain_generation
+        if ($null -eq $resultGeneration -and $null -eq $chainsGeneration) {
+            $generation = $null
+        } elseif ($null -eq $resultGeneration -or $null -eq $chainsGeneration -or
+            $resultGeneration -isnot [string] -or $chainsGeneration -isnot [string] -or
+            $resultGeneration -cnotmatch '^[0-9a-f]{40}$' -or $resultGeneration -cne $ExpectedSourceSha -or
+            $chainsGeneration -cne $resultGeneration) { throw 'OBSERVER_PRIOR_JVM_GENERATION_INVALID' }
+        else { $generation = $resultGeneration }
+    }
+    if ($explicitGeneration -and $generation -cne $ToolchainGeneration) { throw 'OBSERVER_PRIOR_JVM_GENERATION_MISMATCH' }
+    $result.toolchain_generation = $generation
     $result.jvm_verification = 'passed_prior_record'
     $result.prior_jvm_record = [ordered]@{ slot_id=$priorManaged.slot_id; token=$priorManaged.token; owner_sha256=$priorManaged.owner_sha256;
         process_sha256=(Get-Hash (Join-Path $priorManaged.root 'process.json') 262144);
@@ -604,6 +637,7 @@ try {
     $jvmSlot = Assert-Physical (Join-Path $slotsRoot $priorManaged.slot_id) $true
     $gradleBuild = Assert-Physical (Join-Path $jvmSlot 'cache/gradle-build') $true
     $toolchainRoot = Assert-Physical (Join-Path $gradleBuild 'ci-toolchains') $true
+    if ($null -ne $generation) { $toolchainRoot = Assert-Physical (Join-Path $toolchainRoot $generation) $true }
     $jdkProfiles = @{
         'windows-x64' = @{ file='OpenJDK25U-jdk_x64_windows_hotspot_25.0.4.1_1.zip'; sha='00c847d804f4a78e9f04f2683faf14fed898535b177b7fc704486cb0284e9283'; suffix=''; java='bin/java.exe'; library='mmmm_game_observer.dll'; libraries=@('bin/server/jvm.dll','bin/java.dll','bin/jimage.dll','bin/zip.dll','bin/verify.dll','bin/instrument.dll') }
         'linux-x64' = @{ file='OpenJDK25U-jdk_x64_linux_hotspot_25.0.4.1_1.tar.gz'; sha='dbb698396d478e7fa2b1e50f4103324b2a99b90569ee27c33f2261f9215cf41e'; suffix=''; java='bin/java'; library='libmmmm_game_observer.so'; libraries=@('lib/server/libjvm.so','lib/libjava.so','lib/libjimage.so','lib/libzip.so','lib/libverify.so','lib/libinstrument.so') }
@@ -665,6 +699,7 @@ try {
     $headerArgs = @('run','--checkout',$checkoutRoot,'--output-root',$output,'--evidence-root',$headerManaged,'--purpose','jvm','--timeout-seconds','180','--owned-tail-policy','terminate-build','--',
         $pwsh,'-NoProfile','-File',(Join-Path $checkoutRoot 'tools/bootstrap/observer-ci.ps1'),'-Action','header','-Checkout',$checkoutRoot,'-EvidenceRoot',$headerEvidence,
         '-ExpectedSourceSha',$ExpectedSourceSha,'-Target',$Target,'-ManagedSlotRoot',$jvmSlot,'-JdkRoot',$jdk)
+    if ($null -ne $generation) { $headerArgs += @('-ToolchainGeneration',$generation) }
     if ($PSBoundParameters.ContainsKey('WindowsVsRoot')) { $headerArgs += @('-WindowsVsRoot',$WindowsVsRoot) }
     & $xtaskProgram @headerArgs | Out-Null
     $headerExit = $LASTEXITCODE
@@ -674,6 +709,9 @@ try {
     Assert-ManagedSuccess $headerRecords $true
     $headerResult = Read-Json (Join-Path $headerEvidence 'observer-abi-result.json')
     if ($headerResult.schema -cne 'mmmm-observer-abi-result/1' -or $headerResult.source_sha -cne $ExpectedSourceSha -or $headerResult.target -cne $Target -or
+        -not $headerResult.ContainsKey('toolchain_generation') -or
+        (($null -eq $generation) -ne ($null -eq $headerResult.toolchain_generation)) -or
+        ($null -ne $generation -and ($headerResult.toolchain_generation -isnot [string] -or $headerResult.toolchain_generation -cne $generation)) -or
         $headerResult.status -cne 'passed' -or @($headerResult.input_pins).Count -ne 8 -or @($headerResult.input_pins | Where-Object revalidated -NE $true).Count -ne 0) { throw 'OBSERVER_HEADER_RESULT_INVALID' }
     $result.header_witness = 'passed'
     Revalidate-Source

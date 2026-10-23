@@ -148,6 +148,14 @@ fact record를 검사한다. Windows Job의 2 GiB·32 process 및 기존 출력�
 상한은 유지한다. 이 launcher 변경은 과거 Linux 감독 실패의 원인이나 해결을 입증한
 것이 아니며 현재 실행의 결과는 구현 착수 조건에 별도로 기록한다.
 
+동일 JVM slot에서 기존 CI toolchain 자료를 보존하며 새 실행이 필요할 때만
+`jvm-ci.ps1 -ToolchainGeneration <현재 source SHA>`를 선택할 수 있다. 정확한 40자리
+source SHA의 하위 directory에 새 출력을 생성하며 기존 경로를 재사용하거나 삭제하지
+않는다. flat과 SHA 세대 합계는 최대 2개이며 고정 slot·catalog 예산을 늘리지 않는다.
+실패한 세대도 보존되므로 다음 시도 전에 소유·비활성·참조·정리 조건을 별도로 판단한다.
+이 선택은 JVM result·toolchain receipt·observer의 archive/JDK/header 경로까지 같아야
+한다. source·generation 불일치나 일부 metadata 부재를 기존 flat으로 바꾸지 않는다.
+
 [MMMM-D025](DECISIONS.md)의 소유 JVM helper에는 Rust 관리 route가 native spawn 전에
 `DOTNET_EnableDiagnostics=0`을 고정 child environment override로 넣는다. 부모의
 설정을 조회해 선택하거나 전역 환경을 변경하지 않는다. helper 안에서 시작 후 이 값을
