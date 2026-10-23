@@ -2638,9 +2638,22 @@ Linux 원 ZIP 78,801 bytes·SHA
 NotFound·ENOENT 2 관측 오류로 중단됐다. binding attempt 44·최대 retained member 5/
 FD 15·query failure 1·retirement 0이고 signal 9·drain·출력 완료·export·scratch 정리·
 lease 해제를 기록했다. 현재 증거에는 compiler 오류가 없고 compile 완료도 없다.
-이 unbound 열거 후보 실패를 held member의 identity 변경이나 D078 Z2→X0로
-재분류하지 않으며, ENOENT를 실제 종료·RSS 0·완전 sample로 승격하지 않는다.
+이 열거 후보 실패를 held member의 identity 변경이나 D078 Z2→X0로 재분류하지 않는다.
+현재 source는 retained PID 확인 전에 candidate의 initial stat을 열므로 이 role 라벨만으로
+당시 unbound 여부를 확정할 수 없다. ENOENT를 실제 종료·RSS 0·완전 sample로 승격하지 않는다.
 기존 원 identity·기한·자원·정리 조건을 유지할 후속 관측 처리 검토가 남았다.
+
+Windows 원 ZIP 819,178 bytes·SHA
+`79abdcf247a7019053d9451f0626dc0a9a283da90c99b61484a81328876a3e42`도 API digest와
+대조해 보존했다. 60개 entry 중 observer result·header result 및 세 단계의 원
+process·finish·finalization을 확인하고 result에 결합된 각각의 원 byte digest를
+대조했다. native build/header/controlled startup은 각각 52,759/11,470/307 ms·exit 0·
+drain·출력 완료·export·scratch 정리·lease 해제와 감독/정리 오류 0이다.
+실제 C witness는 table signature 42개·callback 6개·entry 4개 및 input pin 8개 전후
+대조를 통과했다. controlled startup은 실제 started=true·12개 pin 전후 대조와 ABI2
+decode를 관측했다. 이는 해당 CI의 새 helper/default-flat 소비 성공이며 로컬 565의
+Application Control 실패를 바꾸지 않는다. generation 경로의 observer 소비·실제 pack
+root/JNI 참조 수명·게임 인수·source admission·전체 JDK 인증은 별도 미입증이다.
 
 ## 첫 공개 배포 인수
 
