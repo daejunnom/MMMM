@@ -2901,6 +2901,31 @@ init/play/tick dispatch, 실제 client renderer 검증은 별도 미완료다.
 608과 같다. command 0·51,520 ms·peak 1,024,258,048 bytes·8 processes·gap 147 ms,
 자연 종료·drain·output/export·scratch 정리·lease 해제와 감독/정리 오류 0을 확인했다.
 
+MCP catalog resource는 원 FN21 `catalog.describe`를 기존 인증·worker·permit·기한과
+취소·drain 경로로 호출한다. 정본 locator는
+`mmmm://catalog/{+snapshotId}/{kind}/{resourceId}?contextId={+contextId}`이며 현재 context는
+명시해야 한다. kind/resource의 namespaced ID는 각 독립 segment 안에서 정본 percent
+encoding으로 전달한다. 원 DataRecord의 snapshot/kind/resource와 schema를 검사한 뒤
+known/unknown의 value·reason·unit·sources·coverage 전체를 application/json으로 보존한다.
+실제 UTF-8 bytes와 전체 MCP envelope 상한을 검사하며 새 capture·복원·권한이나 CAS
+staging을 수행하지 않는다. resource 목록은 실제 빈 목록이고 template은 두 개다.
+
+Windows612는 정확한 MCP 소스 하나만 포맷했고, Windows613은 clean `42171f6`에 그
+소스만 반영한 격리 snapshot에서 전체 MCP 28 PASS·실패 0·기존 CLI 4 filtered를 확인했다.
+새 7개 검사와 기존 resource 취소 회귀 확장은 URI·원 FN21 한 번 호출·known/unknown
+원 record·schema/identity/output 상한·busy·실제 SDK roundtrip을 다룬다. 새 fixture 없이
+원 known/unknown 예제를 재사용했다. 547개·12,677,282 bytes의 전후 manifest SHA는
+`f8a6b0a5ce0984d77b30834717ef30a869c85fff5425ce1649ff3a18dbdb36fa`로 같았다.
+공유할 포맷 후 MCP 소스는 112,611 bytes·SHA
+`25bf383ecc8c7d4768e7a5e2c08dd11ddf6ac9562fc71285e792f0786b95323c`다.
+613은 command 0·91,955 ms·peak 1,183,383,552 bytes·7 processes·gap 140 ms이며
+owned tail 정리 뒤 drain·완전한 출력·export·scratch 정리·lease 해제와 감독/정리 오류
+0이다. helper의 재사용된 artifact scope label은 observer 실행 근거가 아니며, 실제 검사
+대상은 위 source manifest와 MCP 결과다. 실제 게임 snapshot·native 인증/ACL 및 공개
+배포의 성공으로 확대하지 않는다. Windows614의 같은 snapshot에 대한 CLI all-targets
+strict Clippy도 PASS이며 command 0·자연 종료·전후 source pin·drain·완전한 출력·export·
+scratch 정리·lease 해제와 감독/정리 오류 0을 확인했다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

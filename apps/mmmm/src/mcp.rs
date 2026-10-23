@@ -8,8 +8,8 @@
 
 use mmmm_contracts::{
     CANONICAL_SCHEMA, ContextId, ContractValidator, FUNCTION_INDEX, FunctionContract, JsonLimits,
-    ResourceId, Sha256Digest, UnsignedDecimal, encode_json, parse_json, parse_json_with_limits,
-    raw_digest,
+    ResourceId, ResourceLocation, Sha256Digest, SnapshotId, UnsignedDecimal, encode_json,
+    parse_json, parse_json_with_limits, raw_digest,
 };
 use mmmm_coordinator::{CoordinatorClient, client::ClientError};
 use rmcp::{
@@ -49,6 +49,9 @@ const MAX_ARTIFACT_SLICE: u64 = 65_536;
 const ARTIFACT_URI_PREFIX: &str = "mmmm://artifact/";
 const ARTIFACT_URI_TEMPLATE: &str =
     "mmmm://artifact/{+contextId}/{+resourceId}/{sha256}/{offset}/{limitBytes}";
+const CATALOG_URI_PREFIX: &str = "mmmm://catalog/";
+const CATALOG_URI_TEMPLATE: &str =
+    "mmmm://catalog/{+snapshotId}/{kind}/{resourceId}?contextId={+contextId}";
 const SESSION_LIFETIME: Duration = Duration::from_secs(30 * 60);
 const READ_IDLE: Duration = Duration::from_secs(300);
 const WRITE_DEADLINE: Duration = Duration::from_secs(5);
@@ -440,7 +443,7 @@ impl CallFailure {
     fn resource(self) -> ErrorData {
         ErrorData::new(
             ErrorCode::INTERNAL_ERROR,
-            "The artifact resource could not be read through the Coordinator",
+            "The registered resource could not be read through the Coordinator",
             Some(json!({"code":self.code,"automaticRetry":false})),
         )
     }
@@ -596,6 +599,163 @@ fn invalid_artifact_response() -> ErrorData {
     )
 }
 
+/// FN21 identifies a catalog record by snapshot, namespaced kind and resource,
+/// and an explicit current context. The context query is a locator only; no
+/// preceding tool call or facade session can supply or authorize a missing one.
+struct CatalogLocator {
+    snapshot: SnapshotId,
+    kind: ResourceLocation,
+    resource: ResourceLocation,
+    context: ContextId,
+}
+impl CatalogLocator {
+    fn parse(uri: &str) -> Result<Self, ErrorData> {
+        if uri.len() > MAX_FRAME_BYTES || !uri.is_ascii() {
+            return Err(invalid_catalog_uri());
+        }
+        let (path, context) = uri
+            .strip_prefix(CATALOG_URI_PREFIX)
+            .and_then(|value| value.split_once("?contextId="))
+            .ok_or_else(invalid_catalog_uri)?;
+        let context = ContextId::new(context).map_err(|_| invalid_catalog_uri())?;
+        let mut parts = path.split('/');
+        let snapshot = SnapshotId::new(parts.next().ok_or_else(invalid_catalog_uri)?)
+            .map_err(|_| invalid_catalog_uri())?;
+        let kind = parts
+            .next()
+            .and_then(catalog_component_decode)
+            .and_then(|value| ResourceLocation::new(value).ok())
+            .ok_or_else(invalid_catalog_uri)?;
+        let resource = parts
+            .next()
+            .and_then(catalog_component_decode)
+            .and_then(|value| ResourceLocation::new(value).ok())
+            .ok_or_else(invalid_catalog_uri)?;
+        if parts.next().is_some() {
+            return Err(invalid_catalog_uri());
+        }
+        let locator = Self {
+            snapshot,
+            kind,
+            resource,
+            context,
+        };
+        if locator.uri() != uri {
+            return Err(invalid_catalog_uri());
+        }
+        Ok(locator)
+    }
+    fn uri(&self) -> String {
+        format!(
+            "{CATALOG_URI_PREFIX}{}/{}/{}?contextId={}",
+            self.snapshot,
+            catalog_component_encode(self.kind.as_str()),
+            catalog_component_encode(self.resource.as_str()),
+            self.context
+        )
+    }
+    fn request(&self) -> Value {
+        // Namespaced catalog ResourceLocation differs from FN31 ResourceId.
+        // No range, digest or context approval fields are added to RecordQuery.
+        json!({"snapshotId":self.snapshot,"kind":self.kind,
+            "resourceId":self.resource,"contextId":self.context})
+    }
+}
+fn invalid_catalog_uri() -> ErrorData {
+    ErrorData::invalid_params(
+        "Invalid canonical catalog record locator with explicit context",
+        None,
+    )
+}
+fn invalid_catalog_response() -> ErrorData {
+    ErrorData::internal_error(
+        "Catalog record does not match its snapshot resource locator or output budget",
+        None,
+    )
+}
+fn catalog_unreserved(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+}
+/// RFC 6570 simple expansion for the two ASCII ResourceLocation path values.
+/// Reserved ':' and '/' are encoded independently, preserving segment identity.
+fn catalog_component_encode(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if catalog_unreserved(byte) {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+    }
+    encoded
+}
+fn catalog_component_decode(value: &str) -> Option<String> {
+    fn hex(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let mut bytes = value.bytes();
+    let mut decoded = String::new();
+    while let Some(byte) = bytes.next() {
+        if catalog_unreserved(byte) {
+            decoded.push(char::from(byte));
+        } else if byte == b'%' {
+            let byte = hex(bytes.next()?)?
+                .checked_mul(16)?
+                .checked_add(hex(bytes.next()?)?)?;
+            if !byte.is_ascii() || catalog_unreserved(byte) {
+                return None;
+            }
+            decoded.push(char::from(byte));
+        } else {
+            return None;
+        }
+    }
+    Some(decoded)
+}
+fn catalog_resource_result(
+    locator: &CatalogLocator,
+    output: Value,
+) -> Result<ReadResourceResult, ErrorData> {
+    let invalid = invalid_catalog_response;
+    let validator = ContractValidator::shared().map_err(|_| invalid())?;
+    if validator.validate("DataRecord", &output).is_err()
+        || output["snapshotId"].as_str() != Some(locator.snapshot.as_str())
+        || output["kind"].as_str() != Some(locator.kind.as_str())
+        || output["resourceId"].as_str() != Some(locator.resource.as_str())
+    {
+        return Err(invalid());
+    }
+    // The whole DataRecord is the resource: preserve status, absent value,
+    // reason, units, provenance, sources and coverage. It is not a tool result,
+    // a CAS artifact slice, or a source of new claims about runtime state.
+    let bytes = bounded_json(&output).map_err(|_| invalid())?;
+    let byte_length = bytes.len();
+    let text = String::from_utf8(bytes).map_err(|_| invalid())?;
+    let content = ResourceContents::text(text, locator.uri())
+        .with_mime_type("application/json")
+        .with_meta(
+            Map::from_iter([(
+                "io.github.daejunnom.mmmm/catalogRecord".into(),
+                json!({"contextId":locator.context,"recordBytes":byte_length}),
+            )])
+            .into(),
+        );
+    let mut result = ReadResourceResult::new(vec![content]);
+    result.result_type = None;
+    // JSON text escaping, URI and metadata share the real MCP frame bound.
+    // No truncation, hidden staging or FN31 fallback repairs an oversized read.
+    bounded_result(&serde_json::to_value(&result).map_err(|_| invalid())?)
+        .map_err(|_| invalid())?;
+    Ok(result)
+}
+
 /// Validate STANDARD canonical base64 without decoding or allocating another
 /// copy of the artifact. Only the actual Coordinator/CAS issues source bytes.
 fn artifact_base64_length(value: &str) -> Option<usize> {
@@ -709,20 +869,21 @@ fn artifact_resource_list(cursor: Option<&str>) -> Result<ListResourcesResult, E
         ..ListResourcesResult::default()
     })
 }
-fn artifact_resource_templates(
-    cursor: Option<&str>,
-) -> Result<ListResourceTemplatesResult, ErrorData> {
+fn resource_templates(cursor: Option<&str>) -> Result<ListResourceTemplatesResult, ErrorData> {
     if cursor.is_some() {
         return Err(ErrorData::invalid_params(
-            "Invalid artifact resource template cursor",
+            "Invalid registered resource template cursor",
             None,
         ));
     }
     let template = ResourceTemplate::new(ARTIFACT_URI_TEMPLATE, "mmmm-artifact-slice")
         .with_description("A bounded slice of an existing registered artifact. Context and resource IDs are locators; each read requires current Coordinator authorization. SHA-256 pins the full resource; offset is a canonical decimal and limitBytes is 1..65536. This template is not a resource inventory or permission grant.");
+    let catalog = ResourceTemplate::new(CATALOG_URI_TEMPLATE, "mmmm-catalog-record")
+        .with_mime_type("application/json")
+        .with_description("One complete DataRecord from an existing immutable snapshot through catalog.describe. Snapshot and current context IDs are explicit locators; kind and resourceId are separately percent-encoded namespaced IDs. Each read requires current snapshot, record and source authorization. This template does not capture or restore snapshots and grants no access.");
     Ok(ListResourceTemplatesResult {
         result_type: None,
-        resource_templates: vec![template],
+        resource_templates: vec![template, catalog],
         ..ListResourceTemplatesResult::default()
     })
 }
@@ -768,7 +929,7 @@ impl McpFacade {
         }
     }
     /// Every facade operation uses the same authenticated Coordinator client,
-    /// sole owned worker and drain permit. Resource reads enter FN31 normally;
+    /// sole owned worker and drain permit. Resource reads enter FN21 or FN31;
     /// they cannot create an in-process request witness from their locator.
     async fn execute_canonical(
         &self,
@@ -863,13 +1024,49 @@ impl McpFacade {
             .map_err(CallFailure::resource)?;
         artifact_resource_result(&locator, output)
     }
+    async fn read_catalog(
+        &self,
+        request: ReadResourceRequestParams,
+        cancel: impl Future<Output = ()> + Send,
+    ) -> Result<ReadResourceResult, ErrorData> {
+        if request.input_responses.is_some() || request.request_state.is_some() {
+            return Err(ErrorData::invalid_params(
+                "Only the MCP 2025-11-25 resources/read profile is supported",
+                None,
+            ));
+        }
+        let locator = CatalogLocator::parse(&request.uri)?;
+        let (function, input) =
+            self.prepare_call("catalog.describe", locator.request().as_object().cloned())?;
+        let output = self
+            .execute_canonical(function, input, cancel)
+            .await
+            .map_err(CallFailure::resource)?;
+        catalog_resource_result(&locator, output)
+    }
+    async fn read_registered_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        cancel: impl Future<Output = ()> + Send,
+    ) -> Result<ReadResourceResult, ErrorData> {
+        if request.uri.starts_with(ARTIFACT_URI_PREFIX) {
+            self.read_artifact(request, cancel).await
+        } else if request.uri.starts_with(CATALOG_URI_PREFIX) {
+            self.read_catalog(request, cancel).await
+        } else {
+            Err(ErrorData::invalid_params(
+                "Unsupported registered resource locator",
+                None,
+            ))
+        }
+    }
 }
 impl ServerHandler for McpFacade {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_resources().build())
             .with_protocol_version(ProtocolVersion::V_2025_11_25)
             .with_server_info(Implementation::new("MMMM", env!("CARGO_PKG_VERSION")))
-            .with_instructions("MMMM uses canonical contract 0.2.0 through the shared local Coordinator. This facade supports MCP 2025-11-25 only. Use the canonical function name and DTO. Artifact resources expose bounded text/blob slices through the same authenticated artifact.read function; their URI template is a locator, not an access grant. No resource inventory, catalog resources or subscriptions are provided. Transport success preserves reported operation status; unknown write delivery requires durable operation inspection before retry.")
+            .with_instructions("MMMM uses canonical contract 0.2.0 through the shared local Coordinator. This facade supports MCP 2025-11-25 only. Use the canonical function name and DTO. Artifact resources expose bounded text/blob slices through authenticated artifact.read. Catalog resources expose one complete DataRecord through authenticated catalog.describe with an explicit current context. URI templates are locators, not access grants; no snapshot capture or restoration occurs during a read. No resource inventory or subscriptions are provided. Transport success preserves reported operation status; unknown write delivery requires durable operation inspection before retry.")
     }
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Owned(vec![ProtocolVersion::V_2025_11_25])
@@ -927,7 +1124,7 @@ impl ServerHandler for McpFacade {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        artifact_resource_templates(request.as_ref().and_then(|params| params.cursor.as_deref()))
+        resource_templates(request.as_ref().and_then(|params| params.cursor.as_deref()))
     }
     async fn read_resource(
         &self,
@@ -936,12 +1133,12 @@ impl ServerHandler for McpFacade {
     ) -> Result<ReadResourceResponse, ErrorData> {
         if context.ct.is_cancelled() {
             return Err(ErrorData::internal_error(
-                "Artifact resource read was canceled before dispatch",
+                "Registered resource read was canceled before dispatch",
                 None,
             ));
         }
         Ok(self
-            .read_artifact(request, context.ct.cancelled())
+            .read_registered_resource(request, context.ct.cancelled())
             .await?
             .into())
     }
@@ -1867,8 +2064,8 @@ mod tests {
         assert_eq!(list["resources"], json!([]));
         assert!(list.get("nextCursor").is_none());
         assert!(list.get("resultType").is_none());
-        let templates = serde_json::to_value(artifact_resource_templates(None).unwrap()).unwrap();
-        assert_eq!(templates["resourceTemplates"].as_array().unwrap().len(), 1);
+        let templates = serde_json::to_value(resource_templates(None).unwrap()).unwrap();
+        assert_eq!(templates["resourceTemplates"].as_array().unwrap().len(), 2);
         assert_eq!(
             templates["resourceTemplates"][0]["uriTemplate"],
             ARTIFACT_URI_TEMPLATE
@@ -1876,7 +2073,7 @@ mod tests {
         assert!(templates.get("resultType").is_none());
         for cursor in ["", "invented-cursor"] {
             assert!(artifact_resource_list(Some(cursor)).is_err());
-            assert!(artifact_resource_templates(Some(cursor)).is_err());
+            assert!(resource_templates(Some(cursor)).is_err());
         }
     }
     #[tokio::test]
@@ -1960,63 +2157,303 @@ mod tests {
         drop(permit);
     }
     #[tokio::test]
-    async fn canceled_artifact_worker_keeps_shared_tool_and_drain_permit_until_actual_return() {
-        let gate = Arc::new(ArtifactWorkerGate {
-            entered: AtomicBool::new(false),
-            released: Mutex::new(false),
-            changed: std::sync::Condvar::new(),
-        });
-        let spy = Arc::new(ArtifactSpy {
-            calls: Mutex::new(Vec::new()),
-            output: artifact_output(),
-            denied: false,
-            gate: Some(gate.clone()),
-        });
-        let server = Arc::new(artifact_facade(spy.clone()));
-        let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
-        let reader = server.clone();
-        let running = tokio::spawn(async move {
-            reader
-                .read_artifact(
-                    ReadResourceRequestParams::new(artifact_uri(0, 65_536)),
-                    async {
+    async fn canceled_registered_resource_worker_keeps_shared_tool_and_drain_permit_until_actual_return()
+     {
+        for (uri, output) in [
+            (artifact_uri(0, 65_536), artifact_output()),
+            (catalog_uri().to_owned(), catalog_record(false)),
+        ] {
+            let gate = Arc::new(ArtifactWorkerGate {
+                entered: AtomicBool::new(false),
+                released: Mutex::new(false),
+                changed: std::sync::Condvar::new(),
+            });
+            let spy = Arc::new(ArtifactSpy {
+                calls: Mutex::new(Vec::new()),
+                output,
+                denied: false,
+                gate: Some(gate.clone()),
+            });
+            let server = Arc::new(artifact_facade(spy.clone()));
+            let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+            let reader = server.clone();
+            let running = tokio::spawn(async move {
+                reader
+                    .read_registered_resource(ReadResourceRequestParams::new(uri), async {
                         let _ = cancelled.await;
-                    },
+                    })
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !gate.entered.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            cancel.send(()).unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(3), running)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err()
+            );
+            assert_eq!(server.calls.available_permits(), 0);
+            let tool = server
+                .execute(
+                    function("prefab.validate"),
+                    prefab(),
+                    std::future::pending(),
                 )
-                .await
-        });
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while !gate.entered.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .unwrap();
-        cancel.send(()).unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_secs(3), running)
+                .await;
+            assert_eq!(error_text(&tool)["code"], "SERVER_BUSY");
+            *gate.released.lock().unwrap() = true;
+            gate.changed.notify_all();
+            let permit = tokio::time::timeout(Duration::from_secs(3), server.calls.acquire())
                 .await
                 .unwrap()
-                .unwrap()
-                .is_err()
+                .unwrap();
+            assert_eq!(spy.calls.lock().unwrap().len(), 1);
+            drop(permit);
+        }
+    }
+
+    fn catalog_record(unknown: bool) -> Value {
+        let bytes: &[u8] = if unknown {
+            include_bytes!("../../../examples/data-record-unknown.json")
+        } else {
+            include_bytes!("../../../examples/data-record-known.json")
+        };
+        parse_json(bytes).unwrap()
+    }
+    fn catalog_uri() -> &'static str {
+        "mmmm://catalog/snapshot-fixture/minecraft%3Ablock/minecraft%3Astone?contextId=context-fixture"
+    }
+    #[test]
+    fn catalog_locator_is_exact_fn21_with_explicit_context_and_encoded_namespaced_segments() {
+        let locator = CatalogLocator::parse(catalog_uri()).unwrap();
+        assert_eq!(locator.uri(), catalog_uri());
+        assert_eq!(
+            locator.request(),
+            json!({"snapshotId":"snapshot-fixture","kind":"minecraft:block","resourceId":"minecraft:stone","contextId":"context-fixture"})
         );
-        assert_eq!(server.calls.available_permits(), 0);
-        let tool = server
-            .execute(
-                function("prefab.validate"),
-                prefab(),
+        ContractValidator::shared()
+            .unwrap()
+            .validate("RecordQuery", &locator.request())
+            .unwrap();
+        let uri = "mmmm://catalog/snapshot:local/mmmm%3Ablock%2Fdefinition/minecraft%3Apath%2Fname?contextId=context:local";
+        let locator = CatalogLocator::parse(uri).unwrap();
+        assert_eq!(locator.uri(), uri);
+        assert_eq!(
+            locator.request(),
+            json!({"snapshotId":"snapshot:local","kind":"mmmm:block/definition","resourceId":"minecraft:path/name","contextId":"context:local"})
+        );
+        assert_eq!(
+            CATALOG_URI_TEMPLATE,
+            "mmmm://catalog/{+snapshotId}/{kind}/{resourceId}?contextId={+contextId}"
+        );
+        // Query and record catalog IDs are ResourceLocation, not FN31 opaque IDs.
+        assert!(ResourceId::new("minecraft:path/name").is_err());
+        assert_eq!(
+            catalog_component_encode("minecraft:path/name"),
+            "minecraft%3Apath%2Fname"
+        );
+    }
+    #[test]
+    fn catalog_locator_rejects_missing_guessed_context_aliases_and_extra_query_fields() {
+        let invalid = [
+            catalog_uri().replace("?contextId=context-fixture", ""),
+            catalog_uri().replace("context-fixture", ""),
+            catalog_uri().replace("snapshot-fixture", "Snapshot-fixture"),
+            catalog_uri().replace("snapshot-fixture", "snapshot%3Afixture"),
+            catalog_uri().replace("context-fixture", "context%3Afixture"),
+            catalog_uri().replace("%3A", ":"),
+            catalog_uri().replace("%3A", "%3a"),
+            catalog_uri().replace("minecraft%3Astone", "minecraft%253Astone"),
+            catalog_uri().replace("minecraft%3Astone", "%6Dinecraft%3Astone"),
+            catalog_uri().replace("minecraft%3Astone", "minecraft%3Apath/name"),
+            catalog_uri().replace("minecraft%3Astone", "minecraft%3Astone%"),
+            catalog_uri().replace("minecraft%3Astone", "minecraft%3Astone%A"),
+            catalog_uri().replace("minecraft%3Astone", "minecraft%3Astone%ZZ"),
+            catalog_uri().replace("minecraft%3Astone", "minecraft%3A%ED%95%9C"),
+            catalog_uri().replace("mmmm://catalog/", "file:///"),
+            format!("{}&contextId=context-other", catalog_uri()),
+            format!("{}&offset=0", catalog_uri()),
+            format!("{}#never-echo", catalog_uri()),
+            "x".repeat(MAX_FRAME_BYTES + 1),
+        ];
+        for uri in invalid {
+            let error = match CatalogLocator::parse(&uri) {
+                Err(error) => error,
+                Ok(_) => panic!("Invalid catalog locator admitted"),
+            };
+            assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+            assert_eq!(
+                error.message,
+                "Invalid canonical catalog record locator with explicit context"
+            );
+            assert!(error.data.is_none());
+        }
+    }
+    #[test]
+    fn catalog_resource_preserves_complete_known_unknown_record_and_utf8_byte_count() {
+        for unknown in [false, true] {
+            let record = catalog_record(unknown);
+            let uri = if unknown {
+                catalog_uri().replace("minecraft%3Ablock", "mmmm%3Amass_density")
+            } else {
+                catalog_uri().into()
+            };
+            let locator = CatalogLocator::parse(&uri).unwrap();
+            let result =
+                serde_json::to_value(catalog_resource_result(&locator, record.clone()).unwrap())
+                    .unwrap();
+            let content = &result["contents"][0];
+            assert_eq!(content["mimeType"], "application/json");
+            assert_eq!(content["uri"], uri);
+            let text = content["text"].as_str().unwrap();
+            assert_eq!(parse_json(text.as_bytes()).unwrap(), record);
+            assert_eq!(
+                content["_meta"]["io.github.daejunnom.mmmm/catalogRecord"]["recordBytes"],
+                text.len()
+            );
+            assert_eq!(
+                content["_meta"]["io.github.daejunnom.mmmm/catalogRecord"]["contextId"],
+                "context-fixture"
+            );
+            assert!(content.get("blob").is_none());
+            assert!(result.get("resultType").is_none());
+            if unknown {
+                assert!(record.get("value").is_none());
+                assert!(record.get("reason").is_some());
+            }
+        }
+    }
+    #[test]
+    fn catalog_resource_rejects_wrong_snapshot_kind_resource_schema_and_escaped_output_budget() {
+        let locator = CatalogLocator::parse(catalog_uri()).unwrap();
+        for field in 0..6 {
+            let mut record = catalog_record(false);
+            match field {
+                0 => record["snapshotId"] = json!("snapshot-other"),
+                1 => record["kind"] = json!("minecraft:item"),
+                2 => record["resourceId"] = json!("minecraft:dirt"),
+                3 => record["valueType"] = json!(""),
+                4 => record["contractVersion"] = json!("0.3.0"),
+                _ => record["unknownField"] = json!(true),
+            }
+            assert!(catalog_resource_result(&locator, record).is_err());
+        }
+        let mut oversized = catalog_record(false);
+        oversized["value"] = json!("\"".repeat(MAX_FRAME_BYTES / 3));
+        assert!(bounded_json(&oversized).is_ok());
+        assert!(catalog_resource_result(&locator, oversized).is_err());
+        let mut too_many_nodes = catalog_record(false);
+        too_many_nodes["value"] = json!(vec![0; MAX_FRAME_NODES]);
+        assert!(catalog_resource_result(&locator, too_many_nodes).is_err());
+    }
+    #[tokio::test]
+    async fn catalog_resource_routes_once_to_original_fn21_and_preserves_denial() {
+        let spy = artifact_spy(catalog_record(false));
+        let server = artifact_facade(spy.clone());
+        server
+            .read_registered_resource(
+                ReadResourceRequestParams::new(catalog_uri()),
                 std::future::pending(),
             )
-            .await;
-        assert_eq!(error_text(&tool)["code"], "SERVER_BUSY");
-        *gate.released.lock().unwrap() = true;
-        gate.changed.notify_all();
-        let permit = tokio::time::timeout(Duration::from_secs(3), server.calls.acquire())
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(spy.calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            *spy.calls.lock().unwrap(),
+            vec![(
+                "catalog.describe".into(),
+                json!({"snapshotId":"snapshot-fixture","kind":"minecraft:block","resourceId":"minecraft:stone","contextId":"context-fixture"})
+            )]
+        );
+        let denied = Arc::new(ArtifactSpy {
+            calls: Mutex::new(Vec::new()),
+            output: catalog_record(false),
+            denied: true,
+            gate: None,
+        });
+        let server = artifact_facade(denied.clone());
+        let error = server
+            .read_registered_resource(
+                ReadResourceRequestParams::new(catalog_uri()),
+                std::future::pending(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.data.as_ref().unwrap()["code"], "RESOURCE_FORBIDDEN");
+        assert!(
+            !serde_json::to_string(&error)
+                .unwrap()
+                .contains("private untrusted")
+        );
+        assert_eq!(denied.calls.lock().unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn catalog_uri_mrtr_busy_and_wrong_return_do_not_fall_back_capture_or_stage() {
+        let spy = artifact_spy(catalog_record(false));
+        let server = artifact_facade(spy.clone());
+        for uri in [
+            catalog_uri().replace("?contextId=context-fixture", ""),
+            "file:///never-echo".into(),
+        ] {
+            assert!(
+                server
+                    .read_registered_resource(
+                        ReadResourceRequestParams::new(uri),
+                        std::future::pending()
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        for field in ["inputResponses", "requestState"] {
+            let mut request = json!({"uri":catalog_uri()});
+            request[field] = if field == "requestState" {
+                json!("unsupported")
+            } else {
+                json!({})
+            };
+            assert!(
+                server
+                    .read_registered_resource(
+                        serde_json::from_value(request).unwrap(),
+                        std::future::pending()
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        let permit = server.calls.acquire().await.unwrap();
+        let error = server
+            .read_registered_resource(
+                ReadResourceRequestParams::new(catalog_uri()),
+                std::future::pending(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.data.as_ref().unwrap()["code"], "SERVER_BUSY");
+        assert!(spy.calls.lock().unwrap().is_empty());
         drop(permit);
+        let mut wrong = catalog_record(false);
+        wrong["snapshotId"] = json!("snapshot-other");
+        let spy = artifact_spy(wrong);
+        let server = artifact_facade(spy.clone());
+        assert!(
+            server
+                .read_registered_resource(
+                    ReadResourceRequestParams::new(catalog_uri()),
+                    std::future::pending()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(spy.calls.lock().unwrap().len(), 1);
+        assert_eq!(spy.calls.lock().unwrap()[0].0, "catalog.describe");
     }
 
     #[derive(Default)]
@@ -2170,7 +2607,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            1
+            2
         );
         assert_eq!(
             frames[&4]["result"]["contents"][0]["text"],
@@ -2185,6 +2622,52 @@ mod tests {
             assert!(frame["result"].get("resultType").is_none());
         }
         assert_eq!(spy.calls.lock().unwrap().len(), 1);
+        assert!(io.drained.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn rmcp_catalog_resource_roundtrip_is_one_original_record_and_one_fn21_call() {
+        let frames = [
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"RAM catalog protocol check","version":"1"}}}),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            json!({"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":catalog_uri()}}),
+        ];
+        let io = Arc::new(RamIo {
+            incoming: Mutex::new(
+                frames
+                    .iter()
+                    .map(|frame| encode_json(frame).unwrap())
+                    .collect(),
+            ),
+            eof_after_writes: 2,
+            ..RamIo::default()
+        });
+        let record = catalog_record(false);
+        let spy = artifact_spy(record.clone());
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            serve_facade(artifact_facade(spy.clone()), io.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let written = io.written.lock().unwrap();
+        assert_eq!(written.len(), 2);
+        let response = written
+            .iter()
+            .map(|frame| parse_json_with_limits(frame, limits()).unwrap())
+            .find(|frame| frame["id"] == 2)
+            .unwrap();
+        let content = &response["result"]["contents"][0];
+        assert_eq!(content["uri"], catalog_uri());
+        assert_eq!(content["mimeType"], "application/json");
+        assert_eq!(
+            parse_json(content["text"].as_str().unwrap().as_bytes()).unwrap(),
+            record
+        );
+        assert!(response["result"].get("resultType").is_none());
+        assert_eq!(spy.calls.lock().unwrap().len(), 1);
+        assert_eq!(spy.calls.lock().unwrap()[0].0, "catalog.describe");
         assert!(io.drained.load(Ordering::SeqCst) >= 1);
     }
 
