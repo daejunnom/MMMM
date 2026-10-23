@@ -2746,6 +2746,36 @@ List 재인코딩을 실제 source 소비/함수 생성/설치 인과 증거로 
 기존 loaded47/cache94·root identity 사실과 causalLink=unproven·settled=false 및 원
 fence를 유지하며, Numeric47을 별도 DataPack PACK_CASE의 성공으로 해석하지 않는다.
 
+후속 기록 코어 `loaded_pack_sources.rs`의 52,468 bytes·SHA
+`526725ad44c0b4fcb6458ab6c7c7f3ca8772a65ef085a6e11aadc442df5939d9`를 별도 격리
+snapshot에서 검사했다. Windows583은 tools slot의 num-traits build-script 실행이
+Application Control 4551로 차단돼 검사 바이너리를 만들기 전에 실패했다. 원 실패와
+정상 drain/output/export/scratch 정리/lease 해제를 보존했다. Windows 경로를 계속
+시도한 585는 이미 검증했던 의존성이 있는 고정 checks slot을 사용해 18 tests PASS·
+59 filtered out이다. Ubuntu는 사용하지 않았다.
+
+585의 입력은 clean Git `6656c5ad20811fc2add936faccf74df0f9ea6561`에 정확한 신규 코어와
+검사용 module 등록만 반영한 534개·12,271,435 bytes다. 전후 manifest SHA
+`2fa00dce65a2351aef968985c09e26592301738697ad814d8f338ce60c5616a3`가 같았다.
+production_registration=false이며 작업 폴더에서 진행 중인 JNI/Java 통합과 다른 미완성
+변경은 입력에 포함하지 않았다. 실제 실행은 31,592 ms·command 0·Job peak 630,353,920
+bytes·7 processes·gap 148 ms이며 owned tail을 정책대로 종료한 뒤 drain했다. 출력/
+export·scratch 정리·lease 해제와 감독/정리 오류 0이다. 세 unused 경고는 아직 연결하지
+않은 production 경계에 관한 것으로 남겼고 strict 통과로 보고하지 않는다.
+검사한 원 코어 bytes를 외부 증거에 보존한 뒤 587에서 이 소스만 rustfmt로 정리했다.
+공유 소스는 61,275 bytes·SHA
+`b72892629d833f91f9b0cc482f55d31a6644f5e5aa27668188269186f0353e22`이며 formatter 외의
+알고리즘 변경은 없다. 이 WIP의 Git 정본에는 코어만 공유하며 production module/JNI/
+Java hook 등록과 전체 통합 검증은 별도 작업이다.
+
+검사는 실제 future가 Resource보다 먼저 bind되는 순서, 다른 pack 객체, 실제 parse 반환
+객체 불일치, 실패 함수가 빠진 부분 게시, 설치 뒤 reload 실패, 기한 뒤 제한된 실제
+효과 보존, 최초 Throwable 보존과 retired capture 재사용 거절을 포함한다. 이는 VM 호출
+없는 기록 상태 검사다. 실제 class/loader/generation·strong JNI reference·phase별 root
+관측·fresh successor·원 loader hook의 production 연결과 그 검증은 계속 진행 중이다.
+관측 코어 성공을 원 source 소비·실제 function 설치·SourceAdmission·target profile 또는
+게임 인수 성공으로 바꾸지 않는다.
+
 사용자 계정 인증 문제로 Minecraft 클라이언트 로그인·실제 ADMIN pairing·시각 검증은
 not_run이다. 클라이언트 인증을 우회하거나 필수 인수를 줄이지 않고, 독립 구현과 서버 측
 관측을 계속한다. 필수 게임 인수와 공개 v0.1.0 배포 완료 조건은 아래와 같다.
