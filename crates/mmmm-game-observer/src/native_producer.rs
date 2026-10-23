@@ -382,6 +382,62 @@ pub(crate) unsafe fn owned_file_port(
     };
     Ok(token.is_current().then_some(token))
 }
+
+/// Actual observed bootstrap anchor Class generation. An anchor's name or
+/// Java constructor is not registration; this joins the exact prepared Class
+/// object to the installed initial-definition producer for each current call.
+pub(crate) unsafe fn owned_root_anchor_class(
+    env: *mut JNIEnv,
+    class: jclass,
+) -> Result<Option<(u64, u64)>> {
+    let ti = owned_files_vm();
+    if ti.is_null() || status() < 0 || unsafe { ffi::exception(env)? } {
+        return Ok(None);
+    }
+    if unsafe { ffi::class_signature(ti, class)? }
+        != b"Lio/github/daejunnom/mmmm/observer/DefinitionOwnedPackFilesBridge$RootAnchor;"
+        || unsafe { actual_loader(env, ti, class)? } != 0
+        || !unsafe { ffi::class_prepared(ti, class)? }
+    {
+        return Ok(None);
+    }
+    let references = {
+        let state = STATE
+            .get()
+            .ok_or(ProducerError::StateUnavailable)?
+            .lock()
+            .map_err(|_| ProducerError::StateUnavailable)?;
+        if state.closed {
+            return Ok(None);
+        }
+        state
+            .references
+            .iter()
+            .filter(|reference| reference.kind == ReferenceKind::Class)
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    let mut found = None;
+    for reference in references {
+        if unsafe { ffi::same_object(env, class, reference.handle as jobject)? } {
+            if found.is_some() {
+                return Ok(None);
+            }
+            let Some(generation) = core(|core| Ok(core.ordinary_generation(reference.id)))? else {
+                return Ok(None);
+            };
+            found = Some((reference.id, generation));
+        }
+    }
+    Ok(found)
+}
+
+/// One active consumer's actual observed anchor generation remains current.
+/// The caller already holds OwnedFilePortToken's operation lease.
+pub(crate) fn owned_root_anchor_current(class: (u64, u64)) -> bool {
+    status() >= 0
+        && core(|core| Ok(core.ordinary_generation(class.0) == Some(class.1))).unwrap_or(false)
+}
 fn fail(code: jint) {
     let mut prior = status();
     while prior >= 0 {
@@ -686,6 +742,7 @@ pub(crate) fn on_load(vm: *mut JavaVM, options: *mut c_char) -> jint {
 }
 pub(crate) fn on_unload() {
     STATUS.store(VM_DEAD, Ordering::Release);
+    crate::owned_pack_files::on_unload();
     JVMTI.store(ptr::null_mut(), Ordering::Release);
     // Agent_OnUnload may occur after VM destruction. No JNI calls are permitted.
 }
@@ -758,6 +815,9 @@ unsafe extern "C" fn vm_init(ti: *mut JvmtiEnv, env: *mut JNIEnv, _thread: jthre
 }
 unsafe extern "C" fn vm_death(_ti: *mut JvmtiEnv, env: *mut JNIEnv) {
     STATUS.store(VM_DEAD, Ordering::Release);
+    // This actual VMDeath callback supplies the still-valid event environment.
+    // Registry drains no active file lease and invokes no Java callback here.
+    unsafe { crate::owned_pack_files::vm_death(env) };
     let references = match STATE.get().and_then(|state| state.lock().ok()) {
         Some(mut state) => {
             state.closed = true;

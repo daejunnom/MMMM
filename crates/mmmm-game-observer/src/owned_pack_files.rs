@@ -1,6 +1,10 @@
-//! Actual platform-issued, one-call owned-file consumer. No path is accepted in
+//! Actual platform-issued owned-file consumer. No path is accepted in
 //! the source bundle. Filesystem selection comes only from the private Fabric
-//! port, under its original request/context checks. No grant or reload is issued.
+//! port, under its original request/context checks. Native-retained roots have
+//! separately bounded identity ownership, never a grant or reload capability.
+
+#[path = "owned_pack_roots.rs"]
+mod roots;
 
 use crate::{
     ffi::{self, JNIEnv, jmethodID, jobject},
@@ -32,6 +36,8 @@ enum Failure {
     Busy,
     Changed,
     Io(io::Error),
+    RetainedIo(std::sync::Arc<roots::RetainedCloseCause>),
+    Lifetime(&'static crate::library_lifetime::LibraryLifetimeError),
     Checkpoint(jobject),
     Post(Box<Failure>, Box<Failure>),
     Panic,
@@ -50,9 +56,26 @@ struct Checks {
     method: jmethodID,
     status: i32,
     token: native_producer::OwnedFilePortToken,
+    anchor_class: Cell<Option<(u64, u64)>>,
     effects: Cell<bool>,
 }
 impl Checks {
+    fn anchor_current(&self) -> bool {
+        self.anchor_class
+            .get()
+            .is_none_or(native_producer::owned_root_anchor_current)
+    }
+    fn bind_anchor(&self, class: (u64, u64)) -> Result<()> {
+        if self.anchor_class.get().is_some_and(|prior| prior != class) {
+            return Err(Failure::Changed);
+        }
+        self.anchor_class.set(Some(class));
+        if self.anchor_current() {
+            Ok(())
+        } else {
+            Err(Failure::Changed)
+        }
+    }
     fn ffi(&self, error: ffi::FfiError) -> Failure {
         // SAFETY: only this JNI frame's actual pending Throwable is cleared and
         // retained as a local ref. It is returned to Java in the same call.
@@ -79,6 +102,7 @@ impl Control for Checks {
     type Error = Failure;
     fn check(&self) -> Result<()> {
         if !self.token.is_current()
+            || !self.anchor_current()
             || native_producer::status() != self.status
             || self.status < 0
             || self.status & REQUIRED_STATUS != REQUIRED_STATUS
@@ -90,7 +114,10 @@ impl Control for Checks {
         // live. No Rust mutex is held while the original Java check executes.
         unsafe { ffi::call_void_zero(self.env, self.port, self.method) }
             .map_err(|e| self.ffi(e))?;
-        if !self.token.is_current() || native_producer::status() != self.status {
+        if !self.token.is_current()
+            || !self.anchor_current()
+            || native_producer::status() != self.status
+        {
             return Err(Failure::Unavailable);
         }
         Ok(())
@@ -241,11 +268,16 @@ fn create(
     root: &HeldDirectory,
     entries: &[Entry],
     checks: &Checks,
+    bindings: &roots::Bindings,
+    bundle: &[u8; 32],
 ) -> Result<Vec<(String, FileFacts)>> {
     // All acquired children are consumed/closed in reverse dependency order.
     // Failed or partial creations are preserved; Drop never deletes a child.
+    let reservation = roots::Reservation::reserve(checks, bindings, bundle)?;
+    checks.check()?;
     checks.effects.set(true);
-    let pack = root.create_directory_new(OsStr::new(PACK), checks)?;
+    let created = root.create_directory_new(OsStr::new(PACK), checks)?;
+    let pack = reservation.install(created, checks, bindings)?;
     let mut directories = BTreeMap::<String, HeldDirectory>::new();
     let mut facts = Vec::with_capacity(48);
     let result = (|| {
@@ -302,7 +334,71 @@ fn create(
     for (_, directory) in directories.into_iter().rev() {
         result = finish(result, directory.close(checks));
     }
-    finish(result, pack.close(checks))
+    // The registry, rather than this call's Drop, owns the actual original
+    // root and ancestry. A partial error preserves it for a fresh successor.
+    let result = finish(result, pack.revalidate(checks));
+    if result.is_ok() {
+        reservation.completed()?;
+    }
+    result
+}
+
+fn setup(
+    env: *mut JNIEnv,
+    bridge: jobject,
+    port: jobject,
+    cleanup: bool,
+) -> Result<(Checks, jmethodID, jmethodID)> {
+    let status = native_producer::status();
+    let vm = native_producer::owned_files_vm();
+    if status < 0 || status & REQUIRED_STATUS != REQUIRED_STATUS || vm.is_null() {
+        return Err(Failure::Unavailable);
+    }
+    let class = unsafe { ffi::object_class(env, port) }.map_err(|_| Failure::Unavailable)?;
+    let setup = (|| {
+        if unsafe { ffi::class_signature(vm, class) }.map_err(|_| Failure::Unavailable)?
+            != b"Lio/github/daejunnom/mmmm/fabric/NativeCalibrationPackFiles$NativeCall;"
+        {
+            return Err(Failure::Invalid);
+        }
+        let method = unsafe { ffi::method_id(env, class, c"checkpoint", c"()V") }
+            .map_err(|_| Failure::Unavailable)?;
+        let root = unsafe { ffi::method_id(env, class, c"nativeRoot", c"()Ljava/lang/String;") }
+            .map_err(|_| Failure::Unavailable)?;
+        let relative =
+            unsafe { ffi::method_id(env, class, c"nativeRelative", c"()Ljava/lang/String;") }
+                .map_err(|_| Failure::Unavailable)?;
+        let checkpoint = || {
+            // Cleanup validates exact native ownership before collecting the
+            // fresh callback's error; it never reuses a cancelled write grant.
+            if cleanup {
+                Ok(())
+            } else {
+                unsafe { ffi::call_void_zero(env, port, method) }
+            }
+        };
+        let token = unsafe { native_producer::owned_file_port(env, bridge, class, &checkpoint) }
+            .map_err(|_| Failure::Unavailable)?
+            .ok_or(Failure::Unavailable)?;
+        Ok((method, root, relative, token))
+    })();
+    let (method, root, relative, token) = finish(
+        setup,
+        unsafe { ffi::delete_local(env, class) }.map_err(|_| Failure::Unavailable),
+    )?;
+    Ok((
+        Checks {
+            env,
+            port,
+            method,
+            status,
+            token,
+            anchor_class: Cell::new(None),
+            effects: Cell::new(false),
+        },
+        root,
+        relative,
+    ))
 }
 
 fn run(
@@ -323,47 +419,8 @@ fn run(
         return Err(Failure::Busy);
     }
     let _active = Active;
-    let status = native_producer::status();
-    let vm = native_producer::owned_files_vm();
-    if status < 0 || status & REQUIRED_STATUS != REQUIRED_STATUS || vm.is_null() {
-        return Err(Failure::Unavailable);
-    }
-    // SAFETY: all references and methods are used within the original JNI call.
-    let class = unsafe { ffi::object_class(env, port) }.map_err(|_| Failure::Unavailable)?;
-    let setup = (|| {
-        if unsafe { ffi::class_signature(vm, class) }.map_err(|_| Failure::Unavailable)?
-            != b"Lio/github/daejunnom/mmmm/fabric/NativeCalibrationPackFiles$NativeCall;"
-        {
-            return Err(Failure::Invalid);
-        }
-        let method = unsafe { ffi::method_id(env, class, c"checkpoint", c"()V") }
-            .map_err(|_| Failure::Unavailable)?;
-        let root = unsafe { ffi::method_id(env, class, c"nativeRoot", c"()Ljava/lang/String;") }
-            .map_err(|_| Failure::Unavailable)?;
-        let relative =
-            unsafe { ffi::method_id(env, class, c"nativeRelative", c"()Ljava/lang/String;") }
-                .map_err(|_| Failure::Unavailable)?;
-        let checkpoint = || {
-            // SAFETY: invoked only after the producer has joined this exact
-            // actual port to its original host/game loader and current Classes.
-            unsafe { ffi::call_void_zero(env, port, method) }
-        };
-        let token = unsafe { native_producer::owned_file_port(env, bridge, class, &checkpoint) }
-            .map_err(|_| Failure::Unavailable)?
-            .ok_or(Failure::Unavailable)?;
-        Ok((method, root, relative, token))
-    })();
-    // SAFETY: this is only the acquired local Class reference.
-    let release = unsafe { ffi::delete_local(env, class) }.map_err(|_| Failure::Unavailable);
-    let (method, root_method, relative_method, token) = finish(setup, release)?;
-    let checks = Checks {
-        env,
-        port,
-        method,
-        status,
-        token,
-        effects: Cell::new(false),
-    };
+    let _root_call = roots::enter()?;
+    let (checks, root_method, relative_method) = setup(env, bridge, port, false)?;
     let result = (|| {
         checks.check()?;
         let data =
@@ -384,7 +441,17 @@ fn run(
         }
         let root = HeldDirectory::open_root(&selected, &checks)?;
         let result = if operation == 1 {
-            create(&root, &entries, &checks)
+            match roots::Bindings::load(&checks) {
+                Ok(bindings) => {
+                    let created = (|| {
+                        let bundle: [u8; 32] =
+                            data[8..40].try_into().map_err(|_| Failure::Invalid)?;
+                        create(&root, &entries, &checks, &bindings, &bundle)
+                    })();
+                    finish(created, bindings.close(&checks))
+                }
+                Err(error) => Err(error),
+            }
         } else {
             // Storage's caller is the actual private SavedDataStorage issuer.
             // Nested existing-parent walking is supplied by the shared kernel.
@@ -400,6 +467,53 @@ fn run(
     })();
     effects.set(checks.effects.get());
     finish(result, checks.check())
+}
+
+fn retained(
+    env: *mut JNIEnv,
+    bridge: jobject,
+    port: jobject,
+    frame: jobject,
+    operation: i32,
+) -> (roots::HeldFacts, Result<()>) {
+    let mut facts = roots::HeldFacts::default();
+    let result = (|| {
+        if port.is_null() || !matches!(operation, 3 | 4) {
+            return Err(Failure::Invalid);
+        }
+        if ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(Failure::Busy);
+        }
+        let _active = Active;
+        let _root_call = roots::enter()?;
+        let (checks, root_method, _) = setup(env, bridge, port, operation == 4)?;
+        let data = unsafe { ffi::whole_byte_array(env, frame, 0) }.map_err(|e| checks.ffi(e))?;
+        if !data.is_empty() {
+            return Err(Failure::Invalid);
+        }
+        let bindings = roots::Bindings::load(&checks)?;
+        let result = if operation == 3 {
+            (|| {
+                checks.check()?;
+                let selected = path(checks.text(root_method)?)?;
+                roots::observe(&checks, &bindings, &selected, &mut facts)
+            })()
+        } else {
+            roots::retire(&checks, &bindings, &mut facts)
+        };
+        finish(result, bindings.close(&checks))
+    })();
+    (facts, result)
+}
+
+pub(crate) unsafe fn vm_death(env: *mut JNIEnv) {
+    unsafe { roots::vm_death(env) }
+}
+pub(crate) fn on_unload() {
+    roots::on_unload()
 }
 
 fn encode_failure(error: Failure, bytes: &mut Vec<u8>, refs: &mut Vec<jobject>) {
@@ -435,6 +549,47 @@ fn encode_failure(error: Failure, bytes: &mut Vec<u8>, refs: &mut Vec<jobject>) 
             #[cfg(not(windows))]
             bytes.push(0);
         }
+        Failure::RetainedIo(error) => {
+            use mmmm_owned_files::RetainedCloseStage;
+            bytes.extend_from_slice(&[
+                10,
+                match error.stage {
+                    RetainedCloseStage::BeforeClose => 1,
+                    RetainedCloseStage::NativeClose => 2,
+                    RetainedCloseStage::AfterClose => 3,
+                },
+                u8::from(error.pin.is_some()),
+            ]);
+            if let Some(pin) = error.pin {
+                bytes.extend_from_slice(&(pin as u16).to_be_bytes());
+            }
+            bytes.push(5);
+            optional_i32(bytes, mmmm_owned_files::native_os_error(&error.error));
+            bytes.push(0); // Actual close errors have no directory-create frame.
+        }
+        Failure::Lifetime(error) => {
+            use crate::library_lifetime::LibraryLifetimeError;
+            let (kind, operation, status, native) = match error {
+                LibraryLifetimeError::UnsupportedTarget => (1, "target", None, None),
+                LibraryLifetimeError::NativeFailure {
+                    operation,
+                    status,
+                    source,
+                } => (
+                    2,
+                    *operation,
+                    Some(*status),
+                    source.as_ref().and_then(io::Error::raw_os_error),
+                ),
+                LibraryLifetimeError::InvalidObservation { operation, .. } => {
+                    (3, *operation, None, None)
+                }
+            };
+            bytes.extend_from_slice(&[9, kind, operation.len() as u8]);
+            bytes.extend_from_slice(operation.as_bytes());
+            optional_i32(bytes, status);
+            optional_i32(bytes, native);
+        }
         Failure::Checkpoint(actual) => {
             bytes.push(6);
             bytes.extend_from_slice(&(refs.len() as u16).to_be_bytes());
@@ -456,7 +611,8 @@ fn optional_i32(bytes: &mut Vec<u8>, value: Option<i32>) {
 }
 
 /// Returns a bounded binary receipt plus the original Java Throwable localrefs.
-/// No native filesystem handle or request witness is retained after this call.
+/// Retained roots keep only native handles and one actual immutable anchor;
+/// caller frames, control tokens, local refs and request authority end here.
 pub(crate) unsafe fn call(
     env: *mut JNIEnv,
     bridge: jobject,
@@ -464,6 +620,25 @@ pub(crate) unsafe fn call(
     frame: jobject,
     operation: i32,
 ) -> jobject {
+    if matches!(operation, 3 | 4) {
+        let (facts, result) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            retained(env, bridge, port, frame, operation)
+        }))
+        .unwrap_or_else(|_| (roots::HeldFacts::default(), Err(Failure::Panic)));
+        let mut bytes = Vec::new();
+        facts.encode(operation as u8, &mut bytes);
+        let status_index = bytes.len();
+        let failed = result.is_err();
+        let mut refs = Vec::new();
+        match result {
+            Ok(()) => bytes.push(0),
+            Err(error) => {
+                bytes.push(1);
+                encode_failure(error, &mut bytes, &mut refs);
+            }
+        }
+        return unsafe { reply(env, bytes, refs, status_index, failed) };
+    }
     let effects = Cell::new(false);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run(env, bridge, port, frame, operation, &effects)
@@ -492,12 +667,25 @@ pub(crate) unsafe fn call(
             encode_failure(error, &mut bytes, &mut refs);
         }
     }
+    unsafe { reply(env, bytes, refs, 9, failed) }
+}
+
+/// Both receipt codecs preserve pending setup Throwables in the original
+/// frame. Their fixed prefixes have different lengths; neither may overwrite
+/// a root state or turn a failed allocation into an affirmative observation.
+unsafe fn reply(
+    env: *mut JNIEnv,
+    mut bytes: Vec<u8>,
+    mut refs: Vec<jobject>,
+    status_index: usize,
+    failed: bool,
+) -> jobject {
     // Preserve a setup JNI failure as its actual Throwable too. A failed reply
     // allocation leaves the VM's exception pending and cannot become success.
     let pending = unsafe { ffi::take_exception(env) }.unwrap_or(ptr::null_mut());
     if !pending.is_null() {
-        let primary = bytes.split_off(10);
-        bytes[9] = 1;
+        let primary = bytes.split_off(status_index + 1);
+        bytes[status_index] = 1;
         bytes.push(7);
         if failed {
             bytes.extend_from_slice(&primary);
@@ -620,6 +808,60 @@ mod tests {
         assert_eq!(bytes[0], 7);
         assert_eq!(bytes[1], 5);
         assert_eq!(references, [actual]);
+    }
+    #[test]
+    fn retained_receipt_prefix_keeps_identity_and_close_counts_separate() {
+        // Pure codec coverage: these are transport values, never a native
+        // root constructor, JVM identity witness or actual close observation.
+        let mut bytes = Vec::new();
+        roots::HeldFacts {
+            state: 7,
+            grade: 2,
+            identity: 0,
+            pins: 66,
+            closed: 63,
+            shared: 2,
+            uncertain: 1,
+        }
+        .encode(4, &mut bytes);
+        assert_eq!(&bytes[..8], b"MMMMPKH1");
+        assert_eq!(&bytes[8..12], &[4, 7, 2, 0]);
+        assert_eq!(&bytes[12..], &[0, 66, 0, 63, 0, 2, 0, 1]);
+        assert_eq!(bytes.len(), 20);
+    }
+    #[test]
+    fn retained_close_cause_keeps_actual_error_stage_and_pin_for_replay() {
+        let original = std::sync::Arc::new(roots::RetainedCloseCause {
+            pin: Some(7),
+            stage: mmmm_owned_files::RetainedCloseStage::NativeClose,
+            error: io::Error::from_raw_os_error(5),
+        });
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        let mut refs = Vec::new();
+        encode_failure(Failure::RetainedIo(original.clone()), &mut first, &mut refs);
+        encode_failure(
+            Failure::RetainedIo(original.clone()),
+            &mut second,
+            &mut refs,
+        );
+        assert_eq!(first, second);
+        assert_eq!(&first[..6], &[10, 2, 1, 0, 7, 5]);
+        assert_eq!(&first[6..], &[1, 0, 0, 0, 5, 0]);
+        assert_eq!(original.error.raw_os_error(), Some(5));
+        assert!(refs.is_empty());
+    }
+    #[test]
+    fn unsupported_native_lifetime_is_explicit_failure_without_identity() {
+        static ORIGINAL: crate::library_lifetime::LibraryLifetimeError =
+            crate::library_lifetime::LibraryLifetimeError::UnsupportedTarget;
+        let mut bytes = Vec::new();
+        let mut refs = Vec::new();
+        encode_failure(Failure::Lifetime(&ORIGINAL), &mut bytes, &mut refs);
+        assert_eq!(&bytes[..3], &[9, 1, 6]);
+        assert_eq!(&bytes[3..9], b"target");
+        assert_eq!(&bytes[9..], &[0, 0]);
+        assert!(refs.is_empty());
     }
     #[test]
     fn path_transport_rejects_embedded_nul_without_lossy_decoding() {

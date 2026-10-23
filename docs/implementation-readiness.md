@@ -2474,6 +2474,61 @@ gap 143 ms·자연 종료이며 drain·출력 완료·export·scratch 정리·le
 이후 Runtime 변경의 CI 성공으로 대신하지 않는다. 현재 서버는 중지 상태이고 계정
 인증 문제로 클라이언트·ADMIN pairing·시각 검증은 계속 미실행이다.
 
+## Pack root와 JNI 참조의 실제 소유 수명
+
+native registry는 실제 열린 pack root와 원 Java anchor를 최대 8개 보존한다. anchor는
+server·Attempt·원 Invocation·SealedFiles의 실제 객체이며 직렬화된 ID가 아니다.
+기존 ACTIVE 직렬화 아래 하나의 active lease를 유지하고, directory effect 전에 registry
+예약과 native image 수명을 확인한다. Windows는 실제 image PIN, 지원 Unix는 현재
+image의 NOLOAD/NODELETE handle과 marker identity를 확인하며 한 번의 시도와 최대
+하나의 handle을 유지한다. unsupported와 실패는 effect 전에 닫힌 결과로 남긴다.
+
+실제 HeldDirectory를 registry에 보존한 뒤 원 onRootHeld callback을 호출하고 같은
+anchor의 실제 IsSameObject readback 뒤에만 descendant 쓰기를 허용한다. successor의
+op3는 fresh control과 현재 선택 경로를 열어 보존한 native root identity를 비교한다.
+이 identity 연속성은 현재 pack 내용·membership 또는 loaded source 인과를 증명하지
+않는다. 원 쓰기 토큰·JNIEnv·local ref·callback은 후속 수명에 저장하지 않는다.
+
+op4와 server stopping은 fresh cleanup을 사용한다. last-owned ancestry pin마다 실제
+close를 한 번씩 시도하고 shared·uncertain·원 control/OS 오류를 구분한다. Busy는
+원 root/state를 복원하며 poison은 실제 참조와 첫 원인을 보존하고 새 admission을 막는다.
+VMDeath는 실제 event JNI 환경과 active lease 부재에서만 global reference를 해제한다.
+AgentUnload와 늦은 Drop은 native 정리만 수행하며 JNI 해제를 추정하지 않는다.
+8개 record의 수명은 VMDeath까지여서 반복 server session에서 한도에 도달할 수 있다.
+fresh acquire가 HeldDirectory를 반환하기 전의 close uncertainty와 공유 참조는 전체
+close 성공으로 올리지 않는다. settled=false·기존 effect/fence·causalLink=unproven을
+유지하며 source admission·쓰기 결과 확정·게임 인수나 release proof를 발급하지 않는다.
+
+Java의 history 13개·pack 7개·held-root 8개 유한 진단과 typed native 오류는 Rust
+Coordinator의 실제 consumer에서 검사한다. 새 library_lifetime과 owned_pack_roots는
+등록된 observer 모듈이며, 새 Java codec 검사는 기존 test source set에 둔다. 기존
+검사로 표현하지 못한 retained ancestry의 한 번씩 close·shared 상태 및 새 typed
+진단 경계를 검사하며 별도 대형 fixture 자료는 추가하지 않았다.
+
+Windows 552 format 뒤 553의 observer 59개·owned-files 6개, 554의 Coordinator
+calibration_bootstrap 집중 7개가 통과했다. command 0·22,576/96,799 ms이며 20개 제품
+입력의 전후 pin은 c016b6f725c36b67b0cfa5b4358e63639d5a55310842477dbdcbf87e01a028c0이다.
+555와 557 strict는 각각 중첩 조건문 lint 한 건으로 exit 101이며 원 기록을 보존했다.
+조건 평가 순서와 오류 보존이 같은 let-chain 두 곳으로 교정한 뒤 556/558 format과
+559의 owned-files·observer·Coordinator·Application·CLI all-target strict가 통과했다.
+559는 command 0·2,182 ms·Job peak 309,731,328 bytes·7 process·gap 101 ms·자연 종료다.
+현재 20개·713,478 bytes의 전후 manifest digest는
+`a90d6126a88b99903ae63b511aa4a55707fa4a9361f44ea24c26fdc7891f93b0`으로 같다.
+553/554 이후 digest가 바뀐 정확한 두 소스는 위 조건문 정리이며 앞선 테스트 실행을
+현재 소스에서 다시 수행했다고 표현하지 않는다. 각 실제 관리 실행은 drain·출력
+완료·export·scratch 정리·lease 해제 및 감독/정리 오류 0이다. 실제 JNI/VMDeath·native
+image pin·Java/C 컴파일과 게임 검증은 이 순수 Rust 검사로 입증하지 않았다.
+
+이전 2920b0f의 Rust CI 91 집계 성공과 JVM CI 82 집계 실패를 metadata로 확인했다.
+이 20개 변경의 CI 결과나 원 artifact 감사 결과로 대체하지 않는다. 현재 Windows
+우선 실행을 유지하며 이번 변경 검증에 WSL을 사용하지 않았다.
+
+560의 저장소 검사는 새 tool545 image의 프로세스 생성에서 Windows Application
+Control 오류 4551로 차단됐다. 생성 전 실패·원 진단·export·scratch 정리·lease 해제를
+보존했다. Windows에서 기존 고정 bootstrap image를 사용한 561의 저장소 검사는
+533개 index metadata·정책 blob 하나·위반 0으로 통과했다. command 0·922 ms·drain·
+출력 완료·export·정리·lease 해제이며 새 도구가 실행됐다고 표현하지 않는다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

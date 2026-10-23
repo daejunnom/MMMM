@@ -24,7 +24,8 @@ $record = [ordered]@{ schema='mmmm-jvm-ci-result/1'; source_sha=$ExpectedSourceS
     status='not_run'; phase=$phase; gradle_exit=$null; required_tasks=$tasks; required_test_modules=$testModules; tasks=@(); tests=@();
     game_verification='not_run'; release_verification='not_run'; evidence_errors=@(); failure_details=@();
     profile=[ordered]@{ gradle='9.6.0'; jdk_archive_release='25.0.4.1+1'; gradle_workers=2;
-        junit_forks=1; launcher_heap_bytes=268435456; daemon_heap_bytes=1073741824; test_heap_bytes=536870912;
+        junit_forks=1; launcher_heap_bytes=1073741824; daemon_heap_bytes=1073741824; test_heap_bytes=536870912;
+        launcher_metaspace_bytes=402653184; daemon_metaspace_bytes=402653184; fixed_jvm_argument_count=19;
         managed_output_bytes=67108864; timeout_seconds=1200; slot_bytes=8589934592; catalog_bytes=12884901888;
         shared_build_cache=$false; configuration_cache=$false; parallel_projects=$false; automatic_jdk_download=$false;
         successful_evidence_reuse=$false; kernel_memory_quota='not_established' } }
@@ -106,6 +107,41 @@ function Get-RegularHash([string]$Path, [long]$Limit) {
         if ($stream.Length -gt $Limit) { throw 'FILE_BUDGET_EXCEEDED' }
         return [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant()
     } finally { $stream.Dispose() }
+}
+
+function Get-GradleAgentPin([string]$Path) {
+    $full = Get-NativePath $Path $false
+    $before = [System.IO.FileInfo]::new($full)
+    $length = $before.Length; $modified = $before.LastWriteTimeUtc.Ticks; $created = $before.CreationTimeUtc.Ticks
+    if ($length -le 0 -or $length -gt 10MB) { throw 'GRADLE_AGENT_FILE_BUDGET' }
+    $stream = $null; $hash = $null; $failure = $null; $pin = $null
+    try {
+        $stream = [System.IO.File]::Open($full, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        if ($stream.Length -ne $length) { throw 'GRADLE_AGENT_SIZE_CHANGED' }
+        $hash = [System.Security.Cryptography.IncrementalHash]::CreateHash([System.Security.Cryptography.HashAlgorithmName]::SHA256)
+        $buffer = [byte[]]::new(65536); $observed = 0L
+        while ($true) {
+            $count = $stream.Read($buffer, 0, [int][System.Math]::Min($buffer.Length, $length - $observed + 1))
+            if ($count -eq 0) { break }
+            $observed += $count
+            if ($observed -gt $length) { throw 'GRADLE_AGENT_SIZE_CHANGED' }
+            $hash.AppendData($buffer, 0, $count)
+        }
+        if ($observed -ne $length -or $stream.Length -ne $length) { throw 'GRADLE_AGENT_SIZE_CHANGED' }
+        $after = [System.IO.FileInfo]::new((Get-NativePath $full $false))
+        if ($after.Length -ne $length -or $after.LastWriteTimeUtc.Ticks -ne $modified -or $after.CreationTimeUtc.Ticks -ne $created) { throw 'GRADLE_AGENT_METADATA_CHANGED' }
+        $pin = [ordered]@{ bytes=$length; sha256=[System.Convert]::ToHexString($hash.GetHashAndReset()).ToLowerInvariant(); modified=$modified; created=$created }
+    } catch { $failure = $_ }
+    foreach ($resource in @(@{ value=$hash; stage='gradle_agent_hash_close' }, @{ value=$stream; stage='gradle_agent_stream_close' })) {
+        if ($null -eq $resource.value) { continue }
+        try { $resource.value.Dispose() }
+        catch {
+            $record.failure_details += Get-SafeFailureRecord $_ $resource.stage
+            if ($null -eq $failure) { $failure = $_ }
+        }
+    }
+    if ($null -ne $failure) { throw $failure }
+    return $pin
 }
 
 function Get-PinnedArchive([string]$Url, [string]$Path, [string]$Digest) {
@@ -296,6 +332,12 @@ try {
         $releaseText -cnotmatch '(?m)^JAVA_RUNTIME_VERSION="25\.0\.4\.1\+1[^"\r\n]*"\r?$') { throw 'PINNED_JDK_RELEASE_MISMATCH' }
     $record.jdk_release_sha256 = Get-RegularHash $releaseFile 64KB
     $gradleMain = Get-NativePath (Join-Path $toolchains 'gradle/gradle-9.6.0/lib/gradle-gradle-cli-main-9.6.0.jar') $false
+    $gradleAgent = Get-NativePath (Join-Path $toolchains 'gradle/gradle-9.6.0/lib/agents/gradle-instrumentation-agent-9.6.0.jar') $false
+    $operation = 'gradle_agent_precheck'
+    $agentPin = Get-GradleAgentPin $gradleAgent
+    # This is an observed component digest from the already pinned distribution,
+    # checked again after Java returns; it is not an independent upstream digest.
+    $record.gradle_agent = [ordered]@{ relative_path='lib/agents/gradle-instrumentation-agent-9.6.0.jar'; bytes=$agentPin.bytes; sha256=$agentPin.sha256; post_checked=$false }
     $env:JAVA_HOME = $javaHome
     $env:GRADLE_USER_HOME = $managedGradleHome
     $env:TMP = $scratch; $env:TEMP = $scratch; $env:TMPDIR = $scratch
@@ -308,6 +350,26 @@ try {
         $stream.Dispose()
     }
     $init = Join-Path $scratch 'jvm-ci.init.gradle'
+    # Gradle v9.6.0 (3f750f03d77e42327c5f9fcb9992110088330a32):
+    # JpmsConfiguration.forDaemonProcesses(25, true), plus the existing build caps.
+    # The client and requested build VM consume this one array. Compatibility
+    # still depends on the actual JVM and agent; matching args is not a daemon-mode fact.
+    $fixedJvmArgs = @('-Xms128m','-Xmx1g','-XX:MaxMetaspaceSize=384m','-Dfile.encoding=UTF-8',
+        "-Djava.io.tmpdir=$scratch", "-XX:ErrorFile=$gradleBuild/jvm-fatal-%p.log",
+        '--add-opens=java.base/java.lang=ALL-UNNAMED','--add-opens=java.base/java.lang.invoke=ALL-UNNAMED',
+        '--add-opens=java.base/java.util=ALL-UNNAMED','--add-opens=java.prefs/java.util.prefs=ALL-UNNAMED',
+        '--add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED','--add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED',
+        '--add-opens=java.base/java.nio.charset=ALL-UNNAMED','--add-opens=java.base/java.net=ALL-UNNAMED',
+        '--add-opens=java.base/java.util.concurrent=ALL-UNNAMED','--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED',
+        '--add-opens=java.xml/javax.xml.namespace=ALL-UNNAMED','--add-opens=java.base/java.time=ALL-UNNAMED',
+        '--enable-native-access=ALL-UNNAMED')
+    if ($fixedJvmArgs.Count -ne $record.profile.fixed_jvm_argument_count) { throw 'FIXED_JVM_ARGUMENT_COUNT' }
+    foreach ($argument in $fixedJvmArgs) {
+        # Gradle's ArgumentsSplitter supports quoted tokens, but not escaped quotes.
+        if ($argument -cmatch '["\x00-\x1f\x7f]' -or $utf8.GetByteCount($argument) -gt 4096) { throw 'FIXED_JVM_ARGUMENT_ENCODING' }
+    }
+    $buildJvmArgs = ($fixedJvmArgs | ForEach-Object { '"' + $_ + '"' }) -join ' '
+    if ($utf8.GetByteCount($buildJvmArgs) -gt 16KB) { throw 'FIXED_JVM_ARGUMENT_BUDGET' }
     $initText = @'
 import groovy.json.JsonOutput
 import java.security.MessageDigest
@@ -316,6 +378,18 @@ def evidence = new File(System.getProperty('mmmm.ci.evidence'))
 def events = new File(evidence, 'jvm-task-events.ndjson')
 def inputs = new File(evidence, 'jvm-classpath-inputs.ndjson')
 def sourceSha = System.getProperty('mmmm.ci.sourceSha')
+// Facts from the JVM evaluating this init script, not a daemon/client identity proof.
+def expectedNumeric = __MMMM_FIXED_NUMERIC_ARGS__
+def actualArgs = java.lang.management.ManagementFactory.runtimeMXBean.inputArguments
+if (actualArgs.size() > 64 || actualArgs.any { it.getBytes('UTF-8').length > 4096 } || actualArgs.sum { it.getBytes('UTF-8').length } > 16384) throw new GradleException('JVM_ARGUMENT_OBSERVATION_BUDGET')
+def numeric = actualArgs.findAll { it.startsWith('-Xms') || it.startsWith('-Xmx') || it.startsWith('-XX:MaxMetaspaceSize=') }
+def vmFacts = [schema:'mmmm-jvm-build-vm/1', source_sha:sourceSha, gradle_version:org.gradle.util.GradleVersion.current().version,
+    max_heap_bytes:Runtime.runtime.maxMemory(), input_argument_count:actualArgs.size(),
+    fixed_numeric_arg_shape_matches:numeric.size() == expectedNumeric.size() && expectedNumeric.every { expected -> numeric.count { it == expected } == 1 },
+    file_encoding_utf8:java.nio.charset.Charset.defaultCharset().name() == 'UTF-8']
+def vmBytes = (JsonOutput.toJson(vmFacts) + '\n').getBytes('UTF-8')
+if (vmBytes.length > 2048) throw new GradleException('JVM_BUILD_VM_EVIDENCE_BUDGET')
+java.nio.file.Files.newOutputStream(new File(evidence, 'jvm-build-vm.json').toPath(), java.nio.file.StandardOpenOption.CREATE_NEW, java.nio.file.StandardOpenOption.WRITE).withCloseable { it.write(vmBytes) }
 gradle.taskGraph.beforeTask { task ->
     if (!selected.contains(task.path)) return
     if (!(task instanceof org.gradle.api.tasks.compile.JavaCompile) && !(task instanceof org.gradle.api.tasks.testing.Test)) return
@@ -358,20 +432,39 @@ gradle.taskGraph.afterTask { task, state ->
     # JSON arrays with the fixed task names are valid Groovy list literals.
     # Use the command's own required list for both task selection and evidence.
     $initText = $initText.Replace('__MMMM_REQUIRED_TASKS__', (ConvertTo-Json -InputObject $tasks -Compress))
+    $numericArgs = @($fixedJvmArgs | Where-Object { $_ -cmatch '^(-Xms|-Xmx|-XX:MaxMetaspaceSize=)' })
+    $initText = $initText.Replace('__MMMM_FIXED_NUMERIC_ARGS__', (ConvertTo-Json -InputObject $numericArgs -Compress))
     [System.IO.File]::WriteAllText($init, $initText, $utf8)
     $record.init_script_sha256 = Get-RegularHash $init 64KB
-    $arguments = @('-Xms64m','-Xmx256m','-XX:MaxMetaspaceSize=192m', "-XX:ErrorFile=$gradleBuild/jvm-fatal-%p.log",
-        "-Djava.io.tmpdir=$scratch", '-cp',$gradleMain,
+    # CurrentProcess filters Gradle's own agent switch before comparing immutable
+    # args. Keep it launcher-only; placing it in org.gradle.jvmargs would mismatch.
+    $arguments = $fixedJvmArgs + @("-javaagent:$gradleAgent", '-cp',$gradleMain,
         'org.gradle.launcher.GradleMain','--project-dir',(Join-Path $checkoutRoot 'jvm'),'--project-cache-dir',$projectCache,
         '--init-script',$init,'--console=plain','--no-daemon','--no-parallel','--max-workers=2','--no-build-cache','--no-configuration-cache',
         '--rerun-tasks','--continue', "-Dmmmm.ci.evidence=$evidence", "-Dmmmm.ci.sourceSha=$ExpectedSourceSha",
         '-Dorg.gradle.java.installations.auto-download=false', '-Dorg.gradle.java.installations.auto-detect=false',
-        "-Dorg.gradle.java.installations.paths=$javaHome", "-Dorg.gradle.jvmargs=-Xms128m -Xmx1g -XX:MaxMetaspaceSize=384m -Dfile.encoding=UTF-8 `"-Djava.io.tmpdir=$scratch`" `"-XX:ErrorFile=$gradleBuild/jvm-fatal-%p.log`"") + $tasks
+        "-Dorg.gradle.java.installations.paths=$javaHome", "-Dorg.gradle.jvmargs=$buildJvmArgs") + $tasks
     & $java @arguments
     $nativeExit = $LASTEXITCODE
     $record.gradle_exit = $nativeExit
+    $operation = 'gradle_agent_postcheck'
+    $agentAfter = Get-GradleAgentPin $gradleAgent
+    if ($agentAfter.bytes -ne $agentPin.bytes -or $agentAfter.sha256 -cne $agentPin.sha256 -or $agentAfter.modified -ne $agentPin.modified -or $agentAfter.created -ne $agentPin.created) { throw 'GRADLE_AGENT_PIN_CHANGED' }
+    $record.gradle_agent.post_checked = $true
     $phase = 'evidence_export'
     $operation = 'source_and_test_evidence'
+    $buildVmPath = Get-NativePath (Join-Path $evidence 'jvm-build-vm.json') $false
+    if ([System.IO.FileInfo]::new($buildVmPath).Length -gt 2048) { throw 'JVM_BUILD_VM_EVIDENCE_BUDGET' }
+    $buildVm = [System.IO.File]::ReadAllText($buildVmPath, $utf8) | ConvertFrom-Json
+    $vmFields = @('schema','source_sha','gradle_version','max_heap_bytes','input_argument_count','fixed_numeric_arg_shape_matches','file_encoding_utf8')
+    if (@($buildVm.PSObject.Properties).Count -ne $vmFields.Count -or @($buildVm.PSObject.Properties | Where-Object { $_.Name -cnotin $vmFields }).Count -ne 0 -or
+        $buildVm.schema -cne 'mmmm-jvm-build-vm/1' -or $buildVm.source_sha -cne $ExpectedSourceSha -or $buildVm.gradle_version -cne '9.6.0' -or
+        $buildVm.max_heap_bytes -isnot [long] -or $buildVm.max_heap_bytes -le 64MB -or $buildVm.max_heap_bytes -gt $record.profile.daemon_heap_bytes -or
+        $buildVm.input_argument_count -isnot [long] -or $buildVm.input_argument_count -lt $fixedJvmArgs.Count -or $buildVm.input_argument_count -gt 64 -or
+        $buildVm.fixed_numeric_arg_shape_matches -isnot [bool] -or $buildVm.fixed_numeric_arg_shape_matches -ne $true -or
+        $buildVm.file_encoding_utf8 -isnot [bool] -or $buildVm.file_encoding_utf8 -ne $true) { throw 'JVM_BUILD_VM_EVIDENCE_INVALID' }
+    $record.build_vm = $buildVm
+    $record.build_vm_probe_sha256 = Get-RegularHash $buildVmPath 2048
     $finalSourceSha = @(& git -C $checkoutRoot rev-parse HEAD)
     if ($LASTEXITCODE -ne 0 -or $finalSourceSha.Count -ne 1 -or $finalSourceSha[0] -cne $ExpectedSourceSha) { throw 'SOURCE_SHA_CHANGED_DURING_BUILD' }
     & git -C $checkoutRoot diff --quiet HEAD -- jvm contracts examples tools/bootstrap/jvm-ci.ps1 tools/bootstrap/jvm-runtime-probe.ps1 tools/bootstrap/jvm-archive.py .github/workflows/jvm.yml tools/bootstrap/WindowsBootstrap.cs

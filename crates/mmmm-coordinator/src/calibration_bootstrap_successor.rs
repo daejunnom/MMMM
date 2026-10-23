@@ -37,8 +37,8 @@ impl SuccessorObservation {
     }
 
     pub(crate) fn readback(self, original: &Value) -> AppResult<ReadbackEvidence> {
-        // The present pack reader cannot prove original root identity continuity;
-        // selected resource bytes do not prove the loaded function's causality.
+        // A retained root observation covers only that original directory.
+        // It proves neither current pack bytes nor loaded function causality.
         // Keep previously confirmed journal effects without promoting new facts.
         Ok(ReadbackEvidence {
             invocation_id: decode(&original["invocationId"])?,
@@ -51,7 +51,7 @@ impl SuccessorObservation {
             evidence: json!({"kind":"native_calibration_bootstrap_successor_readback",
                 "sourceRefs":[self.evidence],"currentContext":self.context,
                 "originalInvocationId":original["invocationId"],
-                "limitations":["original_pack_root_identity_continuity_unproven",
+                "limitations":["retained_root_identity_is_not_current_pack_bytes_or_membership",
                     "loaded_function_source_causality_unproven"]}),
             direct_changes: Vec::new(),
         })
@@ -303,7 +303,13 @@ fn validate_payload(
             }
         }
     }
-    validate_observation(&payload["observation"], &entered.entry.source)
+    validate_observation(&payload["observation"], &entered.entry.source)?;
+    if payload["observation"]["pack"]["status"] == "observed"
+        && payload["history"]["rootAnchorRecorded"] != true
+    {
+        return Err(unavailable());
+    }
+    Ok(())
 }
 
 fn validate_history(history: &Value) -> AppResult<()> {
@@ -319,8 +325,28 @@ fn validate_history(history: &Value) -> AppResult<()> {
             "initializationReturns",
             "reloadOutcome",
             "reloadFailure",
+            "rootAnchorReserved",
+            "rootAnchorRecorded",
+            "rootRetirement",
+            "rootRetirementFailure",
         ],
     )?;
+    let reserved = history["rootAnchorReserved"]
+        .as_bool()
+        .ok_or_else(unavailable)?;
+    let recorded = history["rootAnchorRecorded"]
+        .as_bool()
+        .ok_or_else(unavailable)?;
+    if recorded && !reserved {
+        return Err(unavailable());
+    }
+    if !history["rootRetirement"].is_null() {
+        if !reserved {
+            return Err(unavailable());
+        }
+        validate_held_root(&history["rootRetirement"], 4)?;
+    }
+    validate_failure(&history["rootRetirementFailure"])?;
     let terminal = history["resultTerminal"]
         .as_bool()
         .ok_or_else(unavailable)?;
@@ -411,7 +437,7 @@ fn validate_failure(value: &Value) -> AppResult<()> {
     if value.is_null() {
         return Ok(());
     }
-    if !value.is_object() || encode_json(value).map_err(|_| unavailable())?.len() > 16 * 1024 {
+    if !value.is_object() || encode_json(value).map_err(|_| unavailable())?.len() > 32 * 1024 {
         return Err(unavailable());
     }
     let mut pending = vec![(value, 0usize)];
@@ -421,7 +447,7 @@ fn validate_failure(value: &Value) -> AppResult<()> {
         if count > 64 || depth > 8 {
             return Err(unavailable());
         }
-        exact(node, &["type", "code", "cause", "suppressed", "truncated"])?;
+        validate_failure_fields(node)?;
         if !node["type"]
             .as_str()
             .is_some_and(|value| !value.is_empty() && value.len() <= 2048)
@@ -445,6 +471,243 @@ fn validate_failure(value: &Value) -> AppResult<()> {
         }
     }
     Ok(())
+}
+
+fn validate_failure_fields(node: &Value) -> AppResult<()> {
+    let mut fields = vec!["type", "code", "cause", "suppressed", "truncated"];
+    if node["type"]
+        == "io.github.daejunnom.mmmm.observer.DefinitionOwnedPackFilesBridge$NativeFailure"
+    {
+        fields.push("effectsMayExist");
+        if !node["effectsMayExist"].is_boolean()
+            || !matches!(
+                node["code"].as_str(),
+                Some(
+                    "UNSAFE_SELECTION"
+                        | "NATIVE_UNAVAILABLE"
+                        | "NATIVE_BUSY"
+                        | "SOURCE_CHANGED"
+                        | "NATIVE_IO"
+                        | "ORIGINAL_CHECKPOINT"
+                        | "NATIVE_PANIC"
+                        | "NATIVE_CHANGED"
+                        | "NATIVE_LIFETIME_UNAVAILABLE"
+                        | "NATIVE_RETAINED_CLOSE"
+                )
+            )
+        {
+            return Err(unavailable());
+        }
+        for field in [
+            "nativeError",
+            "nativeCreate",
+            "nativeLifetime",
+            "retainedClose",
+        ] {
+            if node.get(field).is_some() {
+                fields.push(field);
+            }
+        }
+        if let Some(error) = node.get("nativeError")
+            && (node["code"] != "NATIVE_IO" || !signed_i32(error))
+        {
+            return Err(unavailable());
+        }
+        if let Some(create) = node.get("nativeCreate") {
+            exact(
+                create,
+                &[
+                    "ntStatus",
+                    "completionStatus",
+                    "informationUnsigned",
+                    "closeNativeError",
+                ],
+            )?;
+            if node["code"] != "NATIVE_IO"
+                || !signed_i32(&create["ntStatus"])
+                || !optional_i32(&create["completionStatus"])
+                || !optional_i32(&create["closeNativeError"])
+                || (!create["informationUnsigned"].is_null()
+                    && !create["informationUnsigned"].as_str().is_some_and(|text| {
+                        !text.is_empty()
+                            && text.len() <= 20
+                            && text.bytes().all(|byte| byte.is_ascii_digit())
+                            && text.parse::<u64>().is_ok()
+                    }))
+            {
+                return Err(unavailable());
+            }
+        }
+        if let Some(lifetime) = node.get("nativeLifetime") {
+            exact(lifetime, &["kind", "operation", "status", "nativeCode"])?;
+            let kind = lifetime["kind"].as_str().ok_or_else(unavailable)?;
+            if node["code"] != "NATIVE_LIFETIME_UNAVAILABLE"
+                || !matches!(
+                    kind,
+                    "unsupported_target" | "native_failure" | "invalid_observation"
+                )
+                || !lifetime["operation"].as_str().is_some_and(|text| {
+                    !text.is_empty()
+                        && text.len() <= 96
+                        && text.bytes().all(|byte| (32..=126).contains(&byte))
+                })
+                || !optional_i32(&lifetime["status"])
+                || !optional_i32(&lifetime["nativeCode"])
+                || (kind == "native_failure" && lifetime["status"].is_null())
+                || (kind == "invalid_observation"
+                    && (!lifetime["status"].is_null() || !lifetime["nativeCode"].is_null()))
+                || (kind == "unsupported_target"
+                    && (lifetime["operation"] != "target"
+                        || !lifetime["status"].is_null()
+                        || !lifetime["nativeCode"].is_null()))
+            {
+                return Err(unavailable());
+            }
+        }
+        if let Some(close) = node.get("retainedClose") {
+            exact(close, &["stage", "pin"])?;
+            if node["code"] != "NATIVE_RETAINED_CLOSE"
+                || !matches!(
+                    close["stage"].as_str(),
+                    Some("before_close" | "native_close" | "after_close")
+                )
+                || (!close["pin"].is_null() && close["pin"].as_u64().is_none_or(|pin| pin >= 66))
+                || (!(node["truncated"] == true && node["cause"].is_null())
+                    && (node["cause"]["code"] != "NATIVE_IO"
+                        || node["cause"]["type"]
+                            != "io.github.daejunnom.mmmm.observer.DefinitionOwnedPackFilesBridge$NativeFailure"))
+            {
+                return Err(unavailable());
+            }
+        }
+        if (node["code"] == "NATIVE_LIFETIME_UNAVAILABLE") != node.get("nativeLifetime").is_some()
+            || (node["code"] == "NATIVE_RETAINED_CLOSE") != node.get("retainedClose").is_some()
+        {
+            return Err(unavailable());
+        }
+    }
+    exact(node, &fields)
+}
+fn signed_i32(value: &Value) -> bool {
+    value
+        .as_i64()
+        .is_some_and(|value| i32::try_from(value).is_ok())
+}
+fn optional_i32(value: &Value) -> bool {
+    value.is_null() || signed_i32(value)
+}
+
+/// Closed descriptive codec only. The private host producer's actual object /
+/// native root join supplies evidence; parsed JSON cannot construct that join.
+fn validate_held_root(value: &Value, operation: u64) -> AppResult<()> {
+    exact(
+        value,
+        &[
+            "operation",
+            "state",
+            "evidenceGrade",
+            "identity",
+            "pins",
+            "closed",
+            "shared",
+            "uncertain",
+        ],
+    )?;
+    let state = value["state"].as_str().ok_or_else(unavailable)?;
+    if value["operation"] != operation
+        || !matches!(
+            state,
+            "unknown"
+                | "reserved"
+                | "held_unpublished"
+                | "published_partial"
+                | "complete"
+                | "retiring"
+                | "reference_released"
+                | "close_uncertain"
+                | "vm_owned"
+        )
+        || !matches!(
+            value["evidenceGrade"].as_str(),
+            Some("unknown" | "windows_create_handle" | "posix_cooperative")
+        )
+        || !matches!(
+            value["identity"].as_str(),
+            Some("not_observed" | "same" | "different")
+        )
+    {
+        return Err(unavailable());
+    }
+    let counts = ["pins", "closed", "shared", "uncertain"]
+        .map(|field| value[field].as_u64().filter(|count| *count <= 66));
+    let [Some(pins), Some(closed), Some(shared), Some(uncertain)] = counts else {
+        return Err(unavailable());
+    };
+    if closed + shared + uncertain > pins
+        || (operation == 4 && value["identity"] != "not_observed")
+        || (matches!(state, "unknown" | "reserved")
+            && (value["evidenceGrade"] != "unknown"
+                || value["identity"] != "not_observed"
+                || pins != 0
+                || closed != 0
+                || shared != 0
+                || uncertain != 0))
+    {
+        return Err(unavailable());
+    }
+    Ok(())
+}
+
+fn validate_pack(value: &Value) -> AppResult<()> {
+    exact(
+        value,
+        &[
+            "status",
+            "reason",
+            "identityContinuity",
+            "currentBytes",
+            "fullPackMembership",
+            "retainedRoot",
+            "failure",
+        ],
+    )?;
+    if value["currentBytes"] != "not_observed" || value["fullPackMembership"] != "unproven" {
+        return Err(unavailable());
+    }
+    if !value["retainedRoot"].is_null() {
+        validate_held_root(&value["retainedRoot"], 3)?;
+    }
+    validate_failure(&value["failure"])?;
+    match (value["status"].as_str(), value["reason"].as_str()) {
+        (Some("observed"), Some("native_retained_root_identity_only"))
+            if value["failure"].is_null()
+                && value["identityContinuity"] == "same"
+                && value["retainedRoot"]["identity"] == "same"
+                && matches!(
+                    value["retainedRoot"]["state"].as_str(),
+                    Some("held_unpublished" | "published_partial" | "complete")
+                )
+                && matches!(
+                    value["retainedRoot"]["evidenceGrade"].as_str(),
+                    Some("windows_create_handle" | "posix_cooperative")
+                ) =>
+        {
+            Ok(())
+        }
+        (Some("unknown"), Some("retained_root_not_published"))
+            if value["identityContinuity"] == "unproven"
+                && value["retainedRoot"].is_null()
+                && value["failure"].is_null() =>
+        {
+            Ok(())
+        }
+        (Some("unknown"), Some("native_retained_root_observation_failed"))
+            if value["identityContinuity"] == "unproven" && !value["failure"].is_null() =>
+        {
+            Ok(())
+        }
+        _ => Err(unavailable()),
+    }
 }
 
 fn validate_observation(value: &Value, source: &BootstrapSource) -> AppResult<()> {
@@ -478,12 +741,7 @@ fn validate_observation(value: &Value, source: &BootstrapSource) -> AppResult<()
     if to < from {
         return Err(unavailable());
     }
-    exact(&value["pack"], &["status", "reason", "identityContinuity"])?;
-    if value["pack"]
-        != json!({"status":"unknown","reason":"readonly_pack_observer_unavailable","identityContinuity":"unproven"})
-    {
-        return Err(unavailable());
-    }
+    validate_pack(&value["pack"])?;
     let loaded = &value["loadedSources"];
     exact(loaded, &["status", "causalLink", "functions", "failure"])?;
     if loaded["causalLink"] != "unproven" {
@@ -601,7 +859,8 @@ mod tests {
     fn original_result_requires_actual_terminal_history() {
         let mut history = json!({"originalResult":null,"originalFailure":null,"resultTerminal":false,
             "effectPhase":"accepted","fileFacts":null,"initializationAttemptedCount":0,
-            "initializationReturns":[],"reloadOutcome":"not_attempted","reloadFailure":null});
+            "initializationReturns":[],"reloadOutcome":"not_attempted","reloadFailure":null,
+            "rootAnchorReserved":false,"rootAnchorRecorded":false,"rootRetirement":null,"rootRetirementFailure":null});
         assert!(validate_history(&history).is_ok());
         history["originalFailure"] = json!({"type":"unit-syntax-only"});
         assert!(validate_history(&history).is_err());
@@ -609,5 +868,65 @@ mod tests {
         history["reloadOutcome"] = json!("completed");
         history["reloadFailure"] = json!({"type":"unit-syntax-only"});
         assert!(validate_history(&history).is_err());
+    }
+
+    #[test]
+    fn retained_root_description_cannot_expand_to_pack_bytes_or_loaded_causality() {
+        // Grammar-only values: parsing these creates no JNI anchor, native
+        // identity, authenticated host or current authority association.
+        let mut pack = json!({"status":"observed","reason":"native_retained_root_identity_only",
+            "identityContinuity":"same","currentBytes":"not_observed","fullPackMembership":"unproven",
+            "failure":null,"retainedRoot":{"operation":3,"state":"complete","evidenceGrade":"posix_cooperative",
+                "identity":"same","pins":0,"closed":0,"shared":0,"uncertain":0}});
+        assert!(validate_pack(&pack).is_ok());
+        pack["currentBytes"] = json!("known");
+        assert!(validate_pack(&pack).is_err());
+        pack["currentBytes"] = json!("not_observed");
+        pack["fullPackMembership"] = json!("known");
+        assert!(validate_pack(&pack).is_err());
+        pack["fullPackMembership"] = json!("unproven");
+        pack["retainedRoot"]["identity"] = json!("different");
+        assert!(validate_pack(&pack).is_err());
+        pack["retainedRoot"]["identity"] = json!("same");
+        pack["retainedRoot"]["extraAuthority"] = json!(true);
+        assert!(validate_pack(&pack).is_err());
+    }
+
+    #[test]
+    fn retained_close_keeps_consumed_uncertainty_and_bounds_distinct_pin_counts() {
+        let mut close = json!({"operation":4,"state":"close_uncertain","evidenceGrade":"windows_create_handle",
+            "identity":"not_observed","pins":66,"closed":63,"shared":2,"uncertain":1});
+        assert!(validate_held_root(&close, 4).is_ok());
+        close["uncertain"] = json!(2);
+        assert!(validate_held_root(&close, 4).is_err());
+        close["uncertain"] = json!(1);
+        close["identity"] = json!("same");
+        assert!(validate_held_root(&close, 4).is_err());
+        close = json!({"operation":4,"state":"unknown","evidenceGrade":"unknown",
+            "identity":"not_observed","pins":0,"closed":0,"shared":0,"uncertain":0});
+        assert!(validate_held_root(&close, 4).is_ok());
+        close["pins"] = json!(1);
+        assert!(validate_held_root(&close, 4).is_err());
+    }
+
+    #[test]
+    fn typed_native_failure_keeps_actual_signed_codes_and_close_context() {
+        let io = json!({"type":"io.github.daejunnom.mmmm.observer.DefinitionOwnedPackFilesBridge$NativeFailure",
+            "code":"NATIVE_IO","effectsMayExist":true,"nativeError":5,"cause":null,"suppressed":[],"truncated":false,
+            "nativeCreate":{"ntStatus":-1073741790i32,"completionStatus":null,"informationUnsigned":"18446744073709551615","closeNativeError":6}});
+        let mut close = json!({"type":"io.github.daejunnom.mmmm.observer.DefinitionOwnedPackFilesBridge$NativeFailure",
+            "code":"NATIVE_RETAINED_CLOSE","effectsMayExist":true,"cause":io,"suppressed":[],"truncated":false,
+            "retainedClose":{"stage":"native_close","pin":65}});
+        assert!(validate_failure(&close).is_ok());
+        close["retainedClose"]["pin"] = json!(66);
+        assert!(validate_failure(&close).is_err());
+        close["retainedClose"]["pin"] = json!(65);
+        close["cause"]["nativeError"] = json!(2147483648u64);
+        assert!(validate_failure(&close).is_err());
+        close["cause"] = Value::Null;
+        close["truncated"] = json!(true);
+        assert!(validate_failure(&close).is_ok());
+        close["retainedClose"]["path"] = json!("caller-syntax-only");
+        assert!(validate_failure(&close).is_err());
     }
 }

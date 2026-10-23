@@ -12,6 +12,7 @@ import io.github.daejunnom.mmmm.host.HostRuntime;
 import io.github.daejunnom.mmmm.host.HostSession;
 import io.github.daejunnom.mmmm.host.NativeInvocationReservations;
 import io.github.daejunnom.mmmm.host.NativePlanApproval;
+import io.github.daejunnom.mmmm.observer.DefinitionOwnedPackFilesBridge;
 import io.github.daejunnom.mmmm.sdk.ContractException;
 import io.github.daejunnom.mmmm.sdk.ContractJson;
 import io.github.daejunnom.mmmm.sdk.Invocation;
@@ -128,6 +129,7 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
         private final MinecraftServer owner;
         private final Invocation original;
         private final String invocationDigest, bundleDigest, manifestDigest, gameInstanceId, worldId;
+        private final NativeCalibrationPackFiles.SealedFiles sourceFiles;
         private final List<Program> programs;
         private final Set<String> targetIds;
         private final List<NativeLoadedCalibrationSources.ExpectedSource<Identifier>> expectedSources;
@@ -137,10 +139,15 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
         private volatile ObjectNode fileFacts;
         private volatile int initializationAttemptedCount;
         private volatile List<Integer> initializationReturns = List.of();
+        private volatile DefinitionOwnedPackFilesBridge.RootAnchor reservedRootAnchor;
+        private volatile DefinitionOwnedPackFilesBridge.RootAnchor heldRootAnchor;
+        private volatile DefinitionOwnedPackFilesBridge.HeldRootReceipt rootRetirement;
+        private volatile Throwable rootRetirementFailure;
 
         private Attempt(NativeCalibrationBootstrap bootstrap, Invocation invocation, CompletionStage<ProviderResult> actualResult) {
             owner = bootstrap.server; original = invocation; invocationDigest = ContractJson.digest(invocation.wire());
             bundleDigest = bootstrap.bundleDigest; manifestDigest = bootstrap.manifestDigest;
+            sourceFiles = bootstrap.source;
             gameInstanceId = invocation.context().path("environment").path("gameInstanceId").asText();
             worldId = invocation.context().path("environment").path("worldId").asText();
             programs = bootstrap.programs;
@@ -171,6 +178,36 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
         String invocationDigest() { return invocationDigest; }
         String sourceBundleDigest() { return bundleDigest; }
         String frozenManifestDigest() { return manifestDigest; }
+        NativeCalibrationPackFiles.SealedFiles sourceFiles() { return sourceFiles; }
+        DefinitionOwnedPackFilesBridge.RootAnchor rootAnchorForCleanup() { return reservedRootAnchor; }
+        DefinitionOwnedPackFilesBridge.RootAnchor heldRootAnchor() { return heldRootAnchor; }
+        void requireActualServer(MinecraftServer actual) { if (actual != owner) throw invalid(); }
+        synchronized void reserveRootAnchor(DefinitionOwnedPackFilesBridge.RootAnchor locator) {
+            Objects.requireNonNull(locator);
+            if (reservedRootAnchor != null) throw invalid();
+            // Locator ownership only. No native root or publication is claimed.
+            reservedRootAnchor = locator;
+        }
+        synchronized void retainRootAnchor(DefinitionOwnedPackFilesBridge.RootAnchor actual) {
+            Objects.requireNonNull(actual);
+            if (actual != reservedRootAnchor || heldRootAnchor != null) throw invalid();
+            heldRootAnchor = actual; effectPhase = "pack_root_held";
+        }
+        void retireRoot(MinecraftServer actual, Runnable cleanup) {
+            requireActualServer(actual);
+            if (reservedRootAnchor == null || retirementConsumed(rootRetirement)) return;
+            try { rootRetirement = NativeCalibrationPackFiles.retireRetainedRoot(actual, this, cleanup); }
+            catch (RuntimeException | Error failure) {
+                if (failure instanceof DefinitionOwnedPackFilesBridge.NativeFailure nativeFailure
+                        && nativeFailure.completedHeldReceipt() != null) rootRetirement = nativeFailure.completedHeldReceipt();
+                Throwable before = rootRetirementFailure;
+                if (before == null) rootRetirementFailure = failure; else preserve(before, failure);
+                throw failure;
+            }
+        }
+        private static boolean retirementConsumed(DefinitionOwnedPackFilesBridge.HeldRootReceipt actual) {
+            return actual != null && Set.of("reference_released", "close_uncertain", "vm_owned").contains(actual.state());
+        }
         void requireScope(ObjectNode context) {
             if (!stringSet(context.path("scope").path("externalTargetIds")).containsAll(targetIds)) throw invalid();
         }
@@ -194,6 +231,9 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
             ObjectNode installed = fileFacts;
             if (installed == null) history.putNull("fileFacts"); else history.set("fileFacts", installed.deepCopy());
             ArrayNode returns = history.putArray("initializationReturns"); initializationReturns.forEach(returns::add);
+            history.put("rootAnchorReserved", reservedRootAnchor != null).put("rootAnchorRecorded", heldRootAnchor != null);
+            if (rootRetirement == null) history.putNull("rootRetirement"); else history.set("rootRetirement", heldRootFacts(rootRetirement));
+            history.set("rootRetirementFailure", throwable(rootRetirementFailure));
             return history;
         }
 
@@ -207,8 +247,22 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
                 response.set("history", history());
                 ObjectNode observation = response.putObject("observation").put("format", "mmmm.native.calibration-bootstrap-observation/1")
                         .put("observedFromTick", Long.toString(from)).put("observedToTick", Long.toString(from));
-                observation.putObject("pack").put("status", "unknown").put("reason", "readonly_pack_observer_unavailable")
-                        .put("identityContinuity", "unproven");
+                ObjectNode pack = observation.putObject("pack").put("status", "unknown").put("reason", "retained_root_not_published")
+                        .put("identityContinuity", "unproven").put("currentBytes", "not_observed").put("fullPackMembership", "unproven");
+                pack.putNull("retainedRoot"); pack.putNull("failure");
+                if (heldRootAnchor != null) {
+                    try {
+                        var retained = observeRetainedPack(actual, this, current);
+                        pack.set("retainedRoot", heldRootFacts(retained));
+                        pack.put("status", "observed").put("reason", "native_retained_root_identity_only");
+                        pack.put("identityContinuity", retained.identity());
+                    } catch (RuntimeException failure) {
+                        if (failure instanceof DefinitionOwnedPackFilesBridge.NativeFailure nativeFailure
+                                && nativeFailure.completedHeldReceipt() != null) pack.set("retainedRoot", heldRootFacts(nativeFailure.completedHeldReceipt()));
+                        pack.put("reason", "native_retained_root_observation_failed");
+                        pack.set("failure", observedFailure(failure, current));
+                    }
+                }
                 ObjectNode loaded = observation.putObject("loadedSources").put("status", "unknown").put("causalLink", "unproven");
                 ArrayNode functions = loaded.putArray("functions"); loaded.putNull("failure");
                 try {
@@ -257,6 +311,27 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
         }
     }
 
+    private static ObjectNode heldRootFacts(DefinitionOwnedPackFilesBridge.HeldRootReceipt actual) {
+        return ContractJson.newObject().put("operation", actual.operation()).put("state", actual.state())
+                .put("evidenceGrade", actual.evidenceGrade()).put("identity", actual.identity()).put("pins", actual.pins())
+                .put("closed", actual.closed()).put("shared", actual.shared()).put("uncertain", actual.uncertain());
+    }
+
+    private static DefinitionOwnedPackFilesBridge.HeldRootReceipt observeRetainedPack(MinecraftServer server,
+            Attempt attempt, Runnable current) {
+        return checked(() -> {
+            current.run(); Pack selected = null; int count = 0;
+            for (Pack pack : server.getPackRepository().getAvailablePacks()) {
+                current.run(); if (++count > MAX_PACKS) throw limit();
+                if (pack.getId().equals("file/mmmm-calibration-normative47")) {
+                    if (selected != null) throw invalid(); selected = pack;
+                }
+            }
+            if (selected == null) throw new ContractException("CALIBRATION_BOOTSTRAP_PACK_UNAVAILABLE", "The actual repository did not expose the original pack");
+            return withPackRoot(selected, current, root -> NativeCalibrationPackFiles.observeRetainedRoot(server, attempt, root, current));
+        }, current);
+    }
+
     /** Wire capacity only. This formatter creates no native observation or permission. */
     static boolean appendSuccessorPair(ObjectNode response, String objectiveId, byte[] objective, String objectiveSha,
                                        String storageId, byte[] storage, String storageSha) {
@@ -272,7 +347,7 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
             // The actual original/history/loaded/current fields are already in
             // this response. Reserve the bounded failure wire and the maximum
             // growth of the actual final unsigned tick before admitting a pair.
-            retained = withinFrame(response, 16 * 1024 + 10 - actualTick.length(), 256);
+            retained = withinFrame(response, 32 * 1024 + 10 - actualTick.length(), 512);
             return retained;
         } catch (RuntimeException | Error failure) { primary = failure; throw failure; }
         finally {
@@ -300,6 +375,22 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
         count[0]++;
         ObjectNode node = ContractJson.newObject().put("type", actual.getClass().getName());
         if (actual instanceof ContractException contract && contract.code().matches("[A-Z][A-Z0-9_]{0,127}")) node.put("code", contract.code());
+        else if (actual instanceof DefinitionOwnedPackFilesBridge.NativeFailure nativeFailure) {
+            node.put("code", nativeFailure.code()).put("effectsMayExist", nativeFailure.effectsMayExist());
+            if (nativeFailure.nativeError() != null) node.put("nativeError", nativeFailure.nativeError());
+            var create = nativeFailure.nativeCreate();
+            if (create != null) {
+                ObjectNode observed = node.putObject("nativeCreate").put("ntStatus", create.ntStatus()).put("completionStatus", create.completionStatus())
+                        .put("closeNativeError", create.closeNativeError());
+                if (create.information() == null) observed.putNull("informationUnsigned");
+                else observed.put("informationUnsigned", Long.toUnsignedString(create.information()));
+            }
+            var lifetime = nativeFailure.nativeLifetime();
+            if (lifetime != null) node.putObject("nativeLifetime").put("kind", lifetime.kind()).put("operation", lifetime.operation())
+                    .put("status", lifetime.status()).put("nativeCode", lifetime.nativeCode());
+            var close = nativeFailure.retainedClose();
+            if (close != null) node.putObject("retainedClose").put("stage", close.stage()).put("pin", close.pin());
+        }
         else node.putNull("code");
         node.putNull("cause"); ArrayNode suppressed = node.putArray("suppressed");
         if (depth >= 8 || seen.put(actual, Boolean.TRUE) != null) return node.put("truncated", true);
@@ -507,7 +598,7 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
         try {
             check(admitted.original, gate, true); prepared.recheck(gate);
             admitted.attempt.effectPhase = "pack_attempted";
-            var installed = prepared.files.execute(admitted.original, gate); files = installed;
+            var installed = prepared.files.execute(admitted.attempt, gate); files = installed;
             admitted.attempt.fileFacts = installed.toWire(); admitted.attempt.effectPhase = "pack_created";
             check(admitted.original, gate, true); admitted.attempt.effectPhase = "storage_acquire_attempted";
             prepared.storage.acquire(gate); admitted.attempt.effectPhase = "storage_acquired";
@@ -588,9 +679,22 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
     }
 
     private static void requireRoot(Pack pack, Path created, Runnable gate) {
-        checked(() -> {
-            if (pack.getClass() != Pack.class || created.getFileSystem() != Path.of(".").getFileSystem()) throw invalid();
+        if (created.getFileSystem() != Path.of(".").getFileSystem()) throw invalid();
+        withPackRoot(pack, gate, root -> {
+            if (!root.toAbsolutePath().normalize().equals(created.toAbsolutePath().normalize())) throw invalid();
+            // This lexical/current-file check alone issues no retained identity
+            // or loaded-source causality claim. Native owns the retained root.
+            try { gate.run(); if (!Files.isSameFile(root, created)) throw invalid(); gate.run(); }
+            catch (IOException failure) { throw rootUnavailable(failure); }
+            return null;
+        });
+    }
+
+    private static <T> T withPackRoot(Pack pack, Runnable gate, Function<Path, T> observe) {
+        return checked(() -> {
+            if (pack.getClass() != Pack.class) throw invalid();
             int count = 0;
+            T observed = null;
             try (var opened = pack.open()) {
                 for (var iterator = opened.iterator(); iterator.hasNext();) {
                     gate.run(); var resources = iterator.next();
@@ -598,17 +702,19 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
                         if (++count != 1 || resources.getClass() != FixedPathPackResources.class
                                 || !((Object) resources instanceof FixedPathPackReadAccess access)) throw invalid();
                         List<Path> roots = access.mmmm$rootPaths();
-                        if (roots.size() != 1 || !roots.getFirst().toAbsolutePath().normalize().equals(created.toAbsolutePath().normalize())) throw invalid();
-                        // Current root metadata only. This does not turn the closed installation handles into a retained identity lease.
-                        gate.run(); if (!Files.isSameFile(roots.getFirst(), created)) throw invalid(); gate.run();
+                        if (roots.size() != 1 || roots.getFirst().getFileSystem() != Path.of(".").getFileSystem()) throw invalid();
+                        gate.run(); observed = observe.apply(roots.getFirst()); gate.run();
                     }
                 }
             } catch (IOException failure) {
-                var typed = new ContractException("CALIBRATION_BOOTSTRAP_PACK_ROOT_UNAVAILABLE", "The actual installed resource root cannot be observed");
-                typed.initCause(failure); throw typed;
+                throw rootUnavailable(failure);
             }
-            if (count != 1) throw invalid(); return null;
+            if (count != 1) throw invalid(); return observed;
         }, gate);
+    }
+    private static ContractException rootUnavailable(IOException failure) {
+        var typed = new ContractException("CALIBRATION_BOOTSTRAP_PACK_ROOT_UNAVAILABLE", "The actual installed resource root cannot be observed");
+        typed.initCause(failure); return typed;
     }
 
     @Override public CompletionStage<ObjectNode> poll(HostSession owner, String invocationId, HostDispatcher.InspectionControl request) { return history(owner, invocationId, request); }

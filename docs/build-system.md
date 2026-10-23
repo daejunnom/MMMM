@@ -138,6 +138,16 @@ Gradle build와 project cache, Gradle user home, Java 임시 파일과 테스트
 잡지 않도록 구성한다. 재사용 가능한 daemon을 도입하려면 소유자, 종료 조건과
 파일 수명을 먼저 정의한다. 다른 프로젝트 또는 사용자 전역 cache와 daemon을 정리하지 않는다.
 
+JVM CI launcher와 Gradle build VM에는 동일한 고정 인자 19개를 사용한다. heap 1 GiB,
+metaspace 384 MiB, encoding·locale·필수 module open/export 및 Gradle이 요구하는
+인자를 일치시키고 launcher에만 실제 선택된 instrumentation agent를 연결한다.
+agent 파일의 물리 경로·크기·수정 정보와 SHA-256을 실행 전후 확인한다. 이는 선택한
+파일의 관측이며 별도 upstream digest나 전체 Gradle/JDK image 인증은 아니다.
+고정 인자와 heap 일치만으로 같은 VM 사용을 추정하지 않고, 실제 build VM의 유한한
+fact record를 검사한다. Windows Job의 2 GiB·32 process 및 기존 출력·시간·저장
+상한은 유지한다. 이 launcher 변경은 과거 Linux 감독 실패의 원인이나 해결을 입증한
+것이 아니며 현재 실행의 결과는 구현 착수 조건에 별도로 기록한다.
+
 [MMMM-D025](DECISIONS.md)의 소유 JVM helper에는 Rust 관리 route가 native spawn 전에
 `DOTNET_EnableDiagnostics=0`을 고정 child environment override로 넣는다. 부모의
 설정을 조회해 선택하거나 전역 환경을 변경하지 않는다. helper 안에서 시작 후 이 값을

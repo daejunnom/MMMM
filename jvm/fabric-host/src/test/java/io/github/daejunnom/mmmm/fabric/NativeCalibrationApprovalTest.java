@@ -9,11 +9,14 @@ import io.github.daejunnom.mmmm.host.HostRuntime;
 import io.github.daejunnom.mmmm.host.HostSession;
 import io.github.daejunnom.mmmm.host.NativePlanApproval;
 import io.github.daejunnom.mmmm.host.NativeInvocationReservations;
+import io.github.daejunnom.mmmm.observer.DefinitionOwnedPackFilesBridge;
 import io.github.daejunnom.mmmm.sdk.ContractException;
 import io.github.daejunnom.mmmm.sdk.ContractJson;
 import io.github.daejunnom.mmmm.sdk.Invocation;
 import io.github.daejunnom.mmmm.sdk.ProviderResult;
 import java.io.IOException;
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
 import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -359,24 +362,58 @@ final class NativeCalibrationApprovalTest {
                 () -> bounded.invoke(null, excessiveHeader)).getCause(), "An oversized original header must still fail closed");
     }
 
+    @Test void successorNativeDiagnosticsKeepLifetimeCloseStageAndNumericFactsWithoutMessages() throws Exception {
+        // Existing throwable fixtures contain only ContractException and Java
+        // graphs. This is a private-frame codec fixture, never native evidence.
+        byte[] frame;
+        try (var bytes = new ByteArrayOutputStream(); var out = new DataOutputStream(bytes)) {
+            out.write("MMMMPKH1".getBytes(StandardCharsets.US_ASCII)); out.writeByte(4); out.writeByte(7); out.writeByte(1); out.writeByte(0);
+            out.writeShort(4); out.writeShort(2); out.writeShort(1); out.writeShort(1); out.writeByte(1);
+            out.writeByte(7);
+            out.writeByte(9); out.writeByte(2); byte[] operation = "GetModuleHandleExW".getBytes(StandardCharsets.US_ASCII);
+            out.writeByte(operation.length); out.write(operation); out.writeByte(1); out.writeInt(Integer.MIN_VALUE); out.writeByte(1); out.writeInt(5);
+            out.writeByte(10); out.writeByte(2); out.writeByte(1); out.writeShort(3);
+            out.writeByte(5); out.writeByte(1); out.writeInt(6); out.writeByte(1); out.writeInt(Integer.MIN_VALUE);
+            out.writeByte(1); out.writeInt(-1); out.writeByte(1); out.writeLong(-1L); out.writeByte(1); out.writeInt(7);
+            frame = bytes.toByteArray();
+        }
+        var decode = DefinitionOwnedPackFilesBridge.class.getDeclaredMethod("decodeHeld", Object[].class, int.class); decode.setAccessible(true);
+        var thrown = assertThrows(java.lang.reflect.InvocationTargetException.class,
+                () -> decode.invoke(null, new Object[] {frame}, 4));
+        var actual = assertInstanceOf(DefinitionOwnedPackFilesBridge.NativeFailure.class, thrown.getCause());
+        JsonNode diagnostic = NativeCalibrationBootstrap.throwable(actual);
+        assertEquals("NATIVE_LIFETIME_UNAVAILABLE", diagnostic.path("code").asText());
+        assertEquals("native_failure", diagnostic.path("nativeLifetime").path("kind").asText());
+        assertEquals("GetModuleHandleExW", diagnostic.path("nativeLifetime").path("operation").asText());
+        assertEquals(Integer.MIN_VALUE, diagnostic.path("nativeLifetime").path("status").intValue());
+        JsonNode close = diagnostic.path("suppressed").get(0);
+        assertEquals("NATIVE_RETAINED_CLOSE", close.path("code").asText());
+        assertEquals("native_close", close.path("retainedClose").path("stage").asText()); assertEquals(3, close.path("retainedClose").path("pin").intValue());
+        JsonNode io = close.path("cause"); assertEquals("NATIVE_IO", io.path("code").asText()); assertEquals(6, io.path("nativeError").intValue());
+        assertEquals("18446744073709551615", io.path("nativeCreate").path("informationUnsigned").asText());
+        assertEquals(7, io.path("nativeCreate").path("closeNativeError").intValue());
+        assertTrue(ContractJson.bytes(diagnostic).length <= 32 * 1024); assertTrue(jsonNodes(diagnostic) <= 512);
+    }
+
     @Test void successorPairCapacityReservesActualDiagnosticNodesAndTheFinalTickWidth() throws Exception {
         ObjectNode response = successorWireFixture();
         var resources = ContractJson.object(response.path("currentContext").path("scope")).withArray("resourceIds");
-        int addedPairNodes = 8, targetNodes = 4096 - 256 - addedPairNodes;
+        int addedPairNodes = 8, targetNodes = 4096 - 512 - addedPairNodes;
         int remaining = targetNodes - jsonNodes(response);
         assertTrue(remaining > 0);
         for (int i = 0; i < remaining; i++) resources.add("capacity-resource-" + i);
         byte[] raw = "{}".getBytes(StandardCharsets.US_ASCII);
         assertTrue(NativeCalibrationBootstrap.appendSuccessorPair(response, "capacity-objective", raw, ContractJson.sha256(raw),
                 "capacity-storage", raw, ContractJson.sha256(raw)));
-        assertEquals(4096 - 256, jsonNodes(response));
+        assertEquals(4096 - 512, jsonNodes(response));
         byte[] retained = ContractJson.bytes(response);
         assertFalse(NativeCalibrationBootstrap.appendSuccessorPair(response, "capacity-extra-objective", raw, ContractJson.sha256(raw),
                 "capacity-extra-storage", raw, ContractJson.sha256(raw)));
         assertArrayEquals(retained, ContractJson.bytes(response));
         JsonNode failure = NativeCalibrationBootstrap.throwable(branchingFailureGraph());
         // A maximum 32-object diagnostic is at most 192 JSON value nodes.
-        // The 256-node reserve also leaves room for the eight RPC wrapper nodes.
+        // The 512-node reserve also admits typed native lifetime/create facts
+        // and leaves room for the eight RPC wrapper nodes.
         assertTrue(jsonNodes(failure) <= 192); assertTrue(ContractJson.bytes(failure).length <= 16 * 1024);
         ContractJson.object(response.path("observation").path("targetImages")).set("failure", failure);
         ContractJson.object(response.path("observation")).put("observedToTick", "4294967295");
@@ -392,12 +429,14 @@ final class NativeCalibrationApprovalTest {
                 .put("initializationAttemptedCount", 47).put("reloadOutcome", "completed");
         history.putNull("originalResult"); history.set("originalFailure", NativeCalibrationBootstrap.throwable(new IllegalStateException("capacity-only")));
         history.putNull("reloadFailure"); var returns = history.putArray("initializationReturns"); for (int i = 0; i < 47; i++) returns.add(1);
+        history.put("rootAnchorReserved", false).put("rootAnchorRecorded", false); history.putNull("rootRetirement"); history.putNull("rootRetirementFailure");
         ObjectNode files = history.putObject("fileFacts").put("sourceBundleDigest", digest).put("verifiedFileCount", 48);
         var paths = files.putArray("files");
         for (int i = 0; i < 48; i++) paths.addObject().put("path", "capacity-only/source-" + i + ".mcfunction").put("byteLength", 65536).put("rawSha256", digest);
         ObjectNode observation = response.putObject("observation").put("format", "mmmm.native.calibration-bootstrap-observation/1")
                 .put("observedFromTick", "0").put("observedToTick", "0");
-        observation.putObject("pack").put("status", "unknown").put("reason", "readonly_pack_observer_unavailable").put("identityContinuity", "unproven");
+        ObjectNode pack = observation.putObject("pack").put("status", "unknown").put("reason", "retained_root_not_published").put("identityContinuity", "unproven")
+                .put("currentBytes", "not_observed").put("fullPackMembership", "unproven"); pack.putNull("retainedRoot"); pack.putNull("failure");
         ObjectNode loaded = observation.putObject("loadedSources").put("status", "unknown").put("causalLink", "unproven"); loaded.putNull("failure");
         var functions = loaded.putArray("functions");
         for (int i = 0; i < 47; i++) functions.addObject().put("functionId", "mmmm_calibration:capacity_only_" + i + "/" + "0".repeat(24))

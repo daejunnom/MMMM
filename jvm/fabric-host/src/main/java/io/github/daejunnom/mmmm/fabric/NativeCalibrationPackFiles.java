@@ -113,15 +113,18 @@ final class NativeCalibrationPackFiles {
             ObjectNode target = object(); target.put("targetId", TARGET); target.put("rawBytesHex", HexFormat.of().formatHex(bytes));
             target.put("rawSha256", ContractJson.sha256(bytes)); return target;
         }
-        FileFacts execute(Invocation invocation, Runnable current) {
-            Objects.requireNonNull(invocation); Objects.requireNonNull(current);
+        FileFacts execute(NativeCalibrationBootstrap.Attempt attempt, Runnable current) {
+            Objects.requireNonNull(attempt); Objects.requireNonNull(current);
+            attempt.requireActualServer(server);
+            Invocation invocation = attempt.original();
+            if (attempt.sourceFiles() != sealed) throw failure("CALIBRATION_PACK_INVOCATION_MISMATCH");
             if (attempted || !invocation.context().equals(context) || !"mmmm:calibration_bootstrap_execute".equals(invocation.actionId())) {
                 throw failure("CALIBRATION_PACK_INVOCATION_MISMATCH");
             }
             HostDispatcher.exactFields(invocation.arguments(), Set.of("sourceBundleDigest"));
             if (!sealed.digest.equals(text(invocation.arguments(), "sourceBundleDigest"))) throw failure("CALIBRATION_PACK_INVOCATION_MISMATCH");
             return NativeCalibrationStateReader.currentContext(server, level, owner, context, current::run, (actual, checkpoint) -> {
-                NativeCall port = packCall(this, checkpoint::check);
+                NativeCall port = packCall(this, attempt, checkpoint::check);
                 // Sticky before the first CreateNew. Any uncertain partial effect
                 // stays preserved and this prepared capability cannot retry.
                 if (attempted) throw failure("CALIBRATION_PACK_ALREADY_ATTEMPTED"); attempted = true;
@@ -129,6 +132,26 @@ final class NativeCalibrationPackFiles {
                 return new FileFacts(root.resolve(BASENAME), sealed.digest, receipt);
             });
         }
+    }
+
+    static DefinitionOwnedPackFilesBridge.HeldRootReceipt observeRetainedRoot(MinecraftServer server,
+            NativeCalibrationBootstrap.Attempt attempt, Path actualSelectedRoot, Runnable current) {
+        Objects.requireNonNull(current); attempt.requireActualServer(server);
+        var anchor = attempt.heldRootAnchor();
+        if (anchor == null) throw failure("CALIBRATION_PACK_ROOT_NOT_HELD");
+        return DefinitionOwnedPackFilesBridge.observeHeldRoot(new NativeCall(server, attempt, anchor,
+                actualAbsolute(actualSelectedRoot), "", current));
+    }
+
+    static DefinitionOwnedPackFilesBridge.HeldRootReceipt retireRetainedRoot(MinecraftServer server,
+            NativeCalibrationBootstrap.Attempt attempt, Runnable cleanup) {
+        Objects.requireNonNull(cleanup); attempt.requireActualServer(server);
+        var anchor = attempt.rootAnchorForCleanup();
+        if (anchor == null) throw failure("CALIBRATION_PACK_ROOT_NOT_HELD");
+        // No path is reopened or selected for retirement. Native binding checks
+        // precede this fresh cleanup checkpoint and physical release continues
+        // even when that checkpoint reports its original failure.
+        return DefinitionOwnedPackFilesBridge.retireHeldRoot(new NativeCall(server, attempt, anchor, null, "", cleanup));
     }
     static final class FileFacts {
         private final Path root;
@@ -193,22 +216,63 @@ final class NativeCalibrationPackFiles {
         }
     }
     private static NativeCall packCall(PreparedFiles prepared, Runnable current) {
+        return new NativeCall(prepared.root, BASENAME, packCheck(prepared, current));
+    }
+    private static NativeCall packCall(PreparedFiles prepared, NativeCalibrationBootstrap.Attempt attempt, Runnable current) {
+        attempt.requireActualServer(prepared.server);
+        if (attempt.sourceFiles() != prepared.sealed) throw failure("CALIBRATION_PACK_INVOCATION_MISMATCH");
+        Runnable check = packCheck(prepared, current);
+        var anchor = DefinitionOwnedPackFilesBridge.newRootAnchor(prepared.server, attempt, attempt.original(), prepared.sealed);
+        // Keep this authority-free locator even if native root registration
+        // succeeds but its publication callback or later checkpoint fails.
+        attempt.reserveRootAnchor(anchor);
+        return new NativeCall(prepared.server, attempt, anchor, prepared.root, BASENAME, check);
+    }
+    private static Runnable packCheck(PreparedFiles prepared, Runnable current) {
         Runnable check = () -> {
             current.run();
             if (!actualAbsolute(prepared.server.getWorldPath(LevelResource.DATAPACK_DIR)).equals(prepared.root)) throw failure("CALIBRATION_PACK_ROOT_CHANGED");
             current.run();
         };
-        check.run(); return new NativeCall(prepared.root, BASENAME, check);
+        check.run(); return check;
     }
     /** Private, single-call callback carrier. No request callback is retained by a receipt. */
     private static final class NativeCall {
         private final Path root;
         private final String relative;
         private final Runnable current;
-        private NativeCall(Path root, String relative, Runnable current) { this.root = root; this.relative = relative; this.current = current; }
+        private final MinecraftServer server;
+        private final NativeCalibrationBootstrap.Attempt attempt;
+        private final DefinitionOwnedPackFilesBridge.RootAnchor anchor;
+        private NativeCall(Path root, String relative, Runnable current) {
+            this.root = root; this.relative = relative; this.current = current;
+            server = null; attempt = null; anchor = null;
+        }
+        private NativeCall(MinecraftServer server, NativeCalibrationBootstrap.Attempt attempt,
+                           DefinitionOwnedPackFilesBridge.RootAnchor anchor, Path root, String relative, Runnable current) {
+            this.server = Objects.requireNonNull(server); this.attempt = Objects.requireNonNull(attempt);
+            this.anchor = Objects.requireNonNull(anchor); this.root = root; this.relative = relative;
+            this.current = Objects.requireNonNull(current); attempt.requireActualServer(server);
+        }
         private void checkpoint() { current.run(); }
-        private String nativeRoot() { checkpoint(); return root.toString(); }
+        private String nativeRoot() { checkpoint(); if (root == null) throw failure("CALIBRATION_PACK_ROOT_NOT_SELECTED"); return root.toString(); }
         private String nativeRelative() { checkpoint(); return relative; }
+        // Immutable actual-object/data getters intentionally invoke no request
+        // checkpoint. Retirement must verify these bindings before preserving a
+        // failed fresh cleanup checkpoint and still attempting physical close.
+        private Object nativeServer() { return server; }
+        private Object nativeAttempt() { return attempt; }
+        private Object nativeInvocation() { return attempt == null ? null : attempt.original(); }
+        private Object nativeBundle() { return attempt == null ? null : attempt.sourceFiles(); }
+        private Object nativeAnchor() { return anchor; }
+        private String nativeInvocationDigest() { return attempt == null ? "" : attempt.invocationDigest(); }
+        private String nativeBundleDigest() { return attempt == null ? "" : attempt.sourceBundleDigest(); }
+        private String nativeManifestDigest() { return attempt == null ? "" : attempt.frozenManifestDigest(); }
+        private void onRootHeld() {
+            if (attempt == null || anchor == null) throw failure("CALIBRATION_PACK_ROOT_NOT_HELD");
+            attempt.retainRootAnchor(anchor);
+        }
+        private Object nativeHeldAnchor() { return attempt == null ? null : attempt.heldRootAnchor(); }
     }
     private static ObjectNode object() { return JsonNodeFactory.instance.objectNode(); }
     private static String storageRelative(Path root, Path folder, Path file) {

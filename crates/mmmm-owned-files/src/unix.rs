@@ -318,6 +318,20 @@ impl HeldDirectory {
     pub fn revalidate<C: Control>(&self, checks: &C) -> Result<(), C::Error> {
         revalidate_directories(&self.parents, checks)
     }
+    pub fn identity_evidence(&self) -> DirectoryIdentityEvidence {
+        DirectoryIdentityEvidence::PosixCooperative
+    }
+    pub(crate) fn same_leaf_identity<C: Control>(
+        &self,
+        selected: &Self,
+        checks: &C,
+    ) -> Result<bool, C::Error> {
+        let held = self.parents.last().ok_or_else(|| checks.changed())?;
+        let selected = selected.parents.last().ok_or_else(|| checks.changed())?;
+        let held = Identity::from(&checks.io(|| held.file.metadata())?);
+        let selected = Identity::from(&checks.io(|| selected.file.metadata())?);
+        Ok(held.same_directory(selected))
+    }
     pub fn require_child_absent<C: Control>(
         &self,
         child: &OsStr,
@@ -449,6 +463,11 @@ impl HeldDirectory {
     /// No namespace deletion occurs; a shared pin remains owned by its child.
     pub fn close<C: Control>(self, checks: &C) -> Result<(), C::Error> {
         release_pins(self.parents, checks, |directory| directory.file)
+    }
+    /// Consume this ancestry reference and observe every last-owned native close.
+    /// Shared-reference release does not observe that pin's eventual native close.
+    pub fn close_retained<C: Control>(self, checks: &C) -> RetainedCloseReport<C::Error> {
+        release_retained_pins(self.parents, checks, |directory| directory.file)
     }
 }
 impl Selected {

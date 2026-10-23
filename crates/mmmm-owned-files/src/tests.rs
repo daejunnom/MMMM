@@ -69,6 +69,108 @@ fn original_cancel_prevents_even_starting_the_operation() {
         Err(Failure::Cancelled)
     ));
 }
+
+// Synthetic closers exercise mandatory release and causal accounting without
+// duplicating the consumers' owned filesystem fixtures or issuing native I/O.
+#[test]
+fn retained_release_attempts_every_last_pin_after_cancel_and_native_failure() {
+    let checks = Checks {
+        cancelled: Cell::new(true),
+    };
+    let mut attempted = Vec::new();
+    let report = release_retained_pins_with((0..3).map(Arc::new).collect(), &checks, |pin| {
+        attempted.push(pin);
+        if pin == 1 {
+            Err(io::Error::from_raw_os_error(5))
+        } else {
+            Ok(())
+        }
+    });
+    assert_eq!(attempted, [2, 1, 0]);
+    assert_eq!(report.pins, 3);
+    assert_eq!(report.closed, 2);
+    assert_eq!(report.shared, 0);
+    assert_eq!(report.native_close_uncertain, 1);
+    assert!(!report.all_pins_closed());
+    assert_eq!(report.failures.len(), 9);
+    assert_eq!(report.failures[0].pin, None);
+    assert_eq!(report.failures[0].stage, RetainedCloseStage::BeforeClose);
+    assert!(matches!(report.failures[0].error, Failure::Cancelled));
+    let native = report
+        .failures
+        .iter()
+        .find(|failure| failure.stage == RetainedCloseStage::NativeClose)
+        .unwrap();
+    assert_eq!(native.pin, Some(1));
+    let Failure::Io(error) = &native.error else {
+        panic!("original native error required")
+    };
+    assert_eq!(error.raw_os_error(), Some(5));
+    assert_eq!(report.failures.last().unwrap().pin, None);
+    assert_eq!(
+        report.failures.last().unwrap().stage,
+        RetainedCloseStage::AfterClose
+    );
+}
+
+#[test]
+fn retained_release_distinguishes_unobserved_shared_from_successful_native_close() {
+    let checks = Checks {
+        cancelled: Cell::new(false),
+    };
+    let other_owner = Arc::new(7);
+    let mut attempted = Vec::new();
+    let report = release_retained_pins_with(
+        vec![Arc::new(3), Arc::clone(&other_owner)],
+        &checks,
+        |pin| {
+            attempted.push(pin);
+            Ok(())
+        },
+    );
+    assert_eq!(attempted, [3]);
+    assert_eq!(report.pins, 2);
+    assert_eq!(report.closed, 1);
+    assert_eq!(report.shared, 1);
+    assert_eq!(report.native_close_uncertain, 0);
+    assert!(report.failures.is_empty());
+    assert!(!report.all_pins_closed());
+    assert_eq!(*other_owner, 7);
+
+    let report = release_retained_pins_with(vec![other_owner], &checks, |_| Ok(()));
+    assert_eq!(report.closed, 1);
+    assert!(report.all_pins_closed());
+}
+
+#[test]
+fn retained_release_keeps_all_bounded_causes_and_closes_after_new_cancellation() {
+    let checks = Checks {
+        cancelled: Cell::new(false),
+    };
+    let mut attempted = 0;
+    let report = release_retained_pins_with((0..66).map(Arc::new).collect(), &checks, |_| {
+        attempted += 1;
+        checks.cancelled.set(true);
+        Err(io::Error::from_raw_os_error(6))
+    });
+    assert_eq!(attempted, 66);
+    assert_eq!(report.closed, 0);
+    assert_eq!(report.native_close_uncertain, 66);
+    // Initial and first per-pin checks succeeded; all later causes are kept.
+    assert_eq!(report.failures.len(), 198);
+    assert_eq!(report.failures[0].pin, Some(65));
+    assert_eq!(report.failures[0].stage, RetainedCloseStage::NativeClose);
+    assert!(matches!(report.failures[0].error, Failure::Io(_)));
+    assert_eq!(
+        report
+            .failures
+            .iter()
+            .filter(|failure| failure.stage == RetainedCloseStage::NativeClose)
+            .count(),
+        66
+    );
+}
+
 #[test]
 fn secret_and_parent_spellings_are_rejected_before_control_or_filesystem_access() {
     struct Never;

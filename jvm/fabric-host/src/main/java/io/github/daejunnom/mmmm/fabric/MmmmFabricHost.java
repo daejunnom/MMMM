@@ -78,6 +78,7 @@ public final class MmmmFabricHost implements ModInitializer {
     private volatile HostSession session;
     private volatile PairedLoopbackServer endpoint;
     private volatile boolean reloading;
+    private volatile boolean stopping;
     private String gameInstanceId;
     private String epoch;
     private String worldId;
@@ -101,13 +102,13 @@ public final class MmmmFabricHost implements ModInitializer {
         ServerLifecycleEvents.SERVER_STARTED.register(current -> {
             bootstrapAttempts.clear(); completedReadonlyPairings.clear();
             server = current;
-            reloading = false;
+            reloading = false; stopping = false;
             gameInstanceId = "game-" + UUID.randomUUID();
             worldId = "world-" + UUID.randomUUID();
             newGeneration();
         });
-        ServerLifecycleEvents.SERVER_STOPPING.register(current -> disconnect());
-        ServerLifecycleEvents.SERVER_STOPPED.register(current -> { disconnect(); bootstrapAttempts.clear(); tombstones.clear(); loaded.clear(); entities.clear(); reloading = false; server = null; });
+        ServerLifecycleEvents.SERVER_STOPPING.register(current -> stopServer(current, false));
+        ServerLifecycleEvents.SERVER_STOPPED.register(current -> stopServer(current, true));
         ServerLifecycleEvents.START_DATA_PACK_RELOAD.register((current, resources) -> {
             // The asynchronous reload interval cannot retain an old write grant or target profile.
             if (server == current) { reloading = true; disconnect(); newGeneration(); }
@@ -116,6 +117,36 @@ public final class MmmmFabricHost implements ModInitializer {
             // Changed registry generations never silently replace bindings or contexts in an existing plan.
             if (server == current) { disconnect(); newGeneration(); reloading = false; }
         });
+    }
+
+    private void stopServer(MinecraftServer actual, boolean stopped) {
+        if (server != actual) return;
+        stopping = true;
+        Throwable primary = null;
+        // Each attempt receives a fresh lifecycle-only checkpoint. No expired
+        // write session or original request callback participates in cleanup.
+        for (NativeCalibrationBootstrap.Attempt attempt : List.copyOf(bootstrapAttempts.values())) {
+            try {
+                attempt.retireRoot(actual, () -> {
+                    if (server != actual || !actual.isSameThread()) throw new ContractException("CALIBRATION_ROOT_CLEANUP_OWNER_CHANGED", "The actual server lifecycle cleanup owner changed");
+                });
+            } catch (RuntimeException | Error failure) {
+                if (primary == null) primary = failure; else if (primary != failure) primary.addSuppressed(failure);
+            }
+        }
+        try { disconnect(); }
+        catch (RuntimeException | Error failure) {
+            if (primary == null) primary = failure; else if (primary != failure) primary.addSuppressed(failure);
+        } finally {
+            if (stopped) {
+                // Native close uncertainty or an unretired root is not deletion
+                // or successful close. Its bounded native owner remains until
+                // VM retirement, and may keep later root admission unavailable.
+                bootstrapAttempts.clear(); tombstones.clear(); loaded.clear(); entities.clear(); reloading = false; server = null;
+            }
+        }
+        if (primary instanceof RuntimeException failure) throw failure;
+        if (primary instanceof Error failure) throw failure;
     }
 
     private void newGeneration() {
@@ -1535,7 +1566,7 @@ public final class MmmmFabricHost implements ModInitializer {
     private final class PlatformAuthority implements HostAuthority {
         private final ObjectNode installedFacts;
         private PlatformAuthority(ObjectNode installedFacts) { this.installedFacts = installedFacts; }
-        @Override public boolean ready() { return server != null && epoch != null && !reloading; }
+        @Override public boolean ready() { return server != null && epoch != null && !reloading && !stopping; }
         @Override public ObjectNode hello() {
             if (installedFacts == null) throw new ContractException("HELLO_UNAVAILABLE", "Installed platform facts are unavailable");
             return installedFacts.deepCopy();
@@ -1799,7 +1830,7 @@ public final class MmmmFabricHost implements ModInitializer {
         contracts.validate("ActionDescriptor", result); return result;
     }
     private void requireServerThread() {
-        if (server == null || reloading || !server.isSameThread()) throw new ContractException("HOST_NOT_READY", "This operation requires the active ready server thread");
+        if (server == null || reloading || stopping || !server.isSameThread()) throw new ContractException("HOST_NOT_READY", "This operation requires the active ready server thread");
     }
     private void disconnect() {
         definitionCollection.retireAll();

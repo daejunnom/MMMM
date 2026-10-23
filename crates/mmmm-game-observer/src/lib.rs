@@ -18,6 +18,7 @@
 mod classfile;
 mod definitions;
 mod ffi;
+mod library_lifetime;
 mod native_producer;
 mod owned_pack_files;
 
@@ -106,7 +107,8 @@ pub unsafe extern "C" fn Java_io_github_daejunnom_mmmm_observer_DefinitionObserv
     native_producer::hidden_forwarder(env.cast(), actual)
 }
 
-/// Narrow actual-platform port, with no persistent consumer filesystem handle map.
+/// Narrow actual-platform port with at most eight native-owned root anchors.
+/// A retained root grants no subsequent request, read, write or reload authority.
 ///
 /// # Safety
 /// Arguments must be live references from this attached thread's pinned JDK 25

@@ -12,7 +12,22 @@
  * their compatibility with the actual headers checks the required C convention.
  * ClassLoader.defineClass0/1/2 native symbols are not declared by these headers
  * and are outside this witness's signature claims.
+ * Selected OS headers also check the module-retention ABI. Function addresses
+ * appear only in unevaluated _Generic operands; no loader operation is called.
  */
+
+/* GNU Dl_info/RTLD_NOLOAD/RTLD_NODELETE are public GNU extensions. Select their
+ * declarations before any header can include glibc's feature selection. */
+#if defined(MMMM_OBSERVER_ABI_PROFILE) && MMMM_OBSERVER_ABI_PROFILE == 2
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+#elif defined(MMMM_OBSERVER_ABI_PROFILE) && MMMM_OBSERVER_ABI_PROFILE == 3
+/* Keep Darwin's public dladdr and dlopen mode declarations visible in C11. */
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE 1
+#endif
+#endif
 
 #include <jni.h>
 #include <jvmti.h>
@@ -22,6 +37,12 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+
+#if defined(MMMM_OBSERVER_ABI_PROFILE) && MMMM_OBSERVER_ABI_PROFILE == 1
+#include <windows.h>
+#elif defined(MMMM_OBSERVER_ABI_PROFILE) && (MMMM_OBSERVER_ABI_PROFILE == 2 || MMMM_OBSERVER_ABI_PROFILE == 3)
+#include <dlfcn.h>
+#endif
 
 #if defined(__cplusplus) || !defined(__STDC_VERSION__) || __STDC_VERSION__ < 201112L
 #error MMMM_ABI_C11_REQUIRED
@@ -130,6 +151,70 @@ MMMM_SIZE_ALIGN(JNINativeMethod, 24, 8);
 _Static_assert(offsetof(JNINativeMethod, name) == 0 &&
                offsetof(JNINativeMethod, signature) == 8 &&
                offsetof(JNINativeMethod, fnPtr) == 16, "MMMM_ABI_NATIVE_METHOD_OFFSETS");
+
+/* Native image lifetime is a separate observation from these declarations.
+ * This witness neither pins a module nor grants loaded-artifact identity.
+ * Public contracts:
+ * https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulehandleexw
+ * https://raw.githubusercontent.com/bminor/glibc/master/dlfcn/dlfcn.h
+ * https://raw.githubusercontent.com/bminor/glibc/master/bits/dlfcn.h
+ * https://raw.githubusercontent.com/apple-oss-distributions/dyld/main/include/dlfcn.h
+ */
+#if MMMM_OBSERVER_ABI_PROFILE == 1
+MMMM_SIZE_ALIGN(BOOL, 4, 4);
+MMMM_SIZE_ALIGN(DWORD, 4, 4);
+MMMM_SIZE_ALIGN(WCHAR, 2, 2);
+MMMM_SIZE_ALIGN(HMODULE, 8, 8);
+_Static_assert(_Generic((BOOL)0, int: 1, default: 0),
+               "MMMM_ABI_MODULE_PIN_BOOL_TYPE");
+_Static_assert(_Generic((DWORD)0, unsigned long: 1, default: 0),
+               "MMMM_ABI_MODULE_PIN_DWORD_TYPE");
+_Static_assert(_Generic((WCHAR)0, unsigned short: 1, default: 0),
+               "MMMM_ABI_MODULE_PIN_WCHAR_TYPE");
+typedef int (*MmmmGetModuleHandleExW)(unsigned long, const WCHAR *, HMODULE *);
+_Static_assert(_Generic(&GetModuleHandleExW, MmmmGetModuleHandleExW: 1, default: 0),
+               "MMMM_ABI_SIGNATURE_GetModuleHandleExW");
+_Static_assert(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS == 0x00000004 &&
+               GET_MODULE_HANDLE_EX_FLAG_PIN == 0x00000001 &&
+               (GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN) == 5,
+               "MMMM_ABI_MODULE_PIN_WINDOWS_FLAGS");
+#elif MMMM_OBSERVER_ABI_PROFILE == 2 || MMMM_OBSERVER_ABI_PROFILE == 3
+MMMM_SIZE_ALIGN(Dl_info, 32, 8);
+_Static_assert(offsetof(Dl_info, dli_fname) == 0 &&
+               offsetof(Dl_info, dli_fbase) == 8 &&
+               offsetof(Dl_info, dli_sname) == 16 &&
+               offsetof(Dl_info, dli_saddr) == 24,
+               "MMMM_ABI_DL_INFO_OFFSETS");
+_Static_assert(_Generic(((Dl_info *)0)->dli_fname, const char *: 1, default: 0),
+               "MMMM_ABI_DL_INFO_FILENAME_TYPE");
+_Static_assert(_Generic(((Dl_info *)0)->dli_fbase, void *: 1, default: 0),
+               "MMMM_ABI_DL_INFO_BASE_TYPE");
+_Static_assert(_Generic(((Dl_info *)0)->dli_sname, const char *: 1, default: 0),
+               "MMMM_ABI_DL_INFO_SYMBOL_NAME_TYPE");
+_Static_assert(_Generic(((Dl_info *)0)->dli_saddr, void *: 1, default: 0),
+               "MMMM_ABI_DL_INFO_SYMBOL_ADDRESS_TYPE");
+typedef int (*MmmmDladdr)(const void *, Dl_info *);
+typedef void *(*MmmmDlopen)(const char *, int);
+typedef void *(*MmmmDlsym)(void *, const char *);
+typedef char *(*MmmmDlerror)(void);
+_Static_assert(_Generic(&dladdr, MmmmDladdr: 1, default: 0),
+               "MMMM_ABI_SIGNATURE_dladdr");
+_Static_assert(_Generic(&dlopen, MmmmDlopen: 1, default: 0),
+               "MMMM_ABI_SIGNATURE_dlopen");
+_Static_assert(_Generic(&dlsym, MmmmDlsym: 1, default: 0),
+               "MMMM_ABI_SIGNATURE_dlsym");
+_Static_assert(_Generic(&dlerror, MmmmDlerror: 1, default: 0),
+               "MMMM_ABI_SIGNATURE_dlerror");
+#if MMMM_OBSERVER_ABI_PROFILE == 2
+_Static_assert(RTLD_NOW == 0x00002 && RTLD_LOCAL == 0 &&
+               RTLD_NOLOAD == 0x00004 && RTLD_NODELETE == 0x01000,
+               "MMMM_ABI_MODULE_PIN_GNU_MODES");
+#else
+_Static_assert(RTLD_NOW == 0x2 && RTLD_LOCAL == 0x4 && RTLD_NOLOAD == 0x10 &&
+               RTLD_NODELETE == 0x80 && RTLD_FIRST == 0x100,
+               "MMMM_ABI_MODULE_PIN_DARWIN_MODES");
+#endif
+#endif
 
 typedef jclass (*MmmmFindClass)(JNIEnv *, const char *);
 typedef jthrowable (*MmmmExceptionOccurred)(JNIEnv *);

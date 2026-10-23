@@ -111,7 +111,8 @@ jobs:
             rust_toolchain = '1.96.0'; rust_target = $env:MMMM_RUST_TARGET; build_jobs = 2;
             command_timeout_seconds = 1200; artifact_retention_days = 14;
             gradle_version = '9.6.0'; jdk_archive_release = '25.0.4.1+1'; gradle_workers = 2; junit_forks = 1;
-            launcher_heap_bytes = 268435456; daemon_heap_bytes = 1073741824; test_heap_bytes = 536870912;
+            launcher_heap_bytes = 1073741824; daemon_heap_bytes = 1073741824; test_heap_bytes = 536870912;
+            launcher_metaspace_bytes = 402653184; daemon_metaspace_bytes = 402653184; fixed_jvm_argument_count = 19;
             managed_output_bytes = 67108864; bootstrap_output_bytes = 134217728;
             slot_bytes = 8589934592; catalog_bytes = 12884901888; disk_observation_seconds = 5
           }

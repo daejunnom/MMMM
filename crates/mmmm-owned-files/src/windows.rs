@@ -69,6 +69,7 @@ struct Directory {
     path: PathBuf,
     file: File,
     identity: Identity,
+    created_handle: bool,
 }
 pub struct Selected {
     path: PathBuf,
@@ -185,6 +186,7 @@ fn open_directories<C: Control>(path: &Path, checks: &C) -> Result<Vec<Arc<Direc
             path: parent.to_owned(),
             file,
             identity: actual,
+            created_handle: false,
         }));
     }
 
@@ -266,6 +268,7 @@ impl HeldDirectory {
             path,
             file,
             identity: actual,
+            created_handle: false,
         }));
         let directory = Self { parents };
         directory.revalidate(checks)?;
@@ -283,6 +286,26 @@ impl HeldDirectory {
     }
     pub fn revalidate<C: Control>(&self, checks: &C) -> Result<(), C::Error> {
         revalidate_directories(&self.parents, checks)
+    }
+    pub fn identity_evidence(&self) -> DirectoryIdentityEvidence {
+        if self.parents.last().is_some_and(|leaf| leaf.created_handle) {
+            DirectoryIdentityEvidence::WindowsCreateReturnedHandle
+        } else {
+            DirectoryIdentityEvidence::WindowsOpenedHandle
+        }
+    }
+    pub(crate) fn same_leaf_identity<C: Control>(
+        &self,
+        selected: &Self,
+        checks: &C,
+    ) -> Result<bool, C::Error> {
+        let held = self.parents.last().ok_or_else(|| checks.changed())?;
+        let selected = selected.parents.last().ok_or_else(|| checks.changed())?;
+        let held = identity(&held.file, checks)?;
+        let selected = identity(&selected.file, checks)?;
+        Ok(held.volume == selected.volume
+            && held.index == selected.index
+            && held.attributes == selected.attributes)
     }
     fn child_path<C: Control>(
         &self,
@@ -344,6 +367,7 @@ impl HeldDirectory {
             path,
             file,
             identity: actual,
+            created_handle: true,
         }));
         let created = Self { parents };
         created.revalidate(checks)?;
@@ -383,6 +407,11 @@ impl HeldDirectory {
     /// Releases this reference; actual CloseHandle is checked for each last pin.
     pub fn close<C: Control>(self, checks: &C) -> Result<(), C::Error> {
         release_pins(self.parents, checks, |directory| directory.file)
+    }
+    /// Consume this ancestry reference and observe every last-owned native close.
+    /// A shared reference, including pending-create ancestry, is not full close.
+    pub fn close_retained<C: Control>(self, checks: &C) -> RetainedCloseReport<C::Error> {
+        release_retained_pins(self.parents, checks, |directory| directory.file)
     }
 }
 impl Selected {

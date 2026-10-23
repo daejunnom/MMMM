@@ -1460,9 +1460,11 @@ mod tests {
             "history":{"originalResult":null,"originalFailure":capacity_failure_tree(),"resultTerminal":true,
                 "effectPhase":"reload_future_returned","fileFacts":{"sourceBundleDigest":bundle,"verifiedFileCount":48,"files":file_facts},
                 "initializationAttemptedCount":47,"initializationReturns":vec![1;47],"reloadOutcome":"failed",
-                "reloadFailure":capacity_failure_tree()},
+                "reloadFailure":capacity_failure_tree(),"rootAnchorReserved":false,"rootAnchorRecorded":false,
+                "rootRetirement":null,"rootRetirementFailure":null},
             "observation":{"format":"mmmm.native.calibration-bootstrap-observation/1","observedFromTick":"0","observedToTick":"0",
-                "pack":{"status":"unknown","reason":"readonly_pack_observer_unavailable","identityContinuity":"unproven"},
+                "pack":{"status":"unknown","reason":"retained_root_not_published","identityContinuity":"unproven",
+                    "currentBytes":"not_observed","fullPackMembership":"unproven","retainedRoot":null,"failure":null},
                 "loadedSources":{"status":"known","causalLink":"unproven","functions":functions,"failure":null},
                 "targetImages":{"status":"known","targets":images,"failure":null}}})
     }
