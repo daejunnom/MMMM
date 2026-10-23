@@ -2,17 +2,23 @@
 //! compiler. Explicit authored verifier doubles exist only in this test module;
 //! they are not game/profile acceptance or provider readiness evidence.
 use super::*;
+use crate::native_animation::{NativeAnimationCall, assemble_owned_animations};
 use mmmm_compiler::{
     TargetEvidenceVerifier, TargetRuntimeRules,
+    animation::{
+        AnimationBindingVerifier, AnimationBindings, AnimationCompileSettings,
+        AnimationEventBinding, AnimationEvidenceVerifier, AnimationTargetRules,
+    },
     scene::{ResolvedSceneCommand, SceneBlockState, SceneCodecCapabilities, SceneStateBinding},
 };
-use mmmm_contracts::{ResourceLocation, StateId};
+use mmmm_contracts::{RationalTime, ResourceLocation, StateId, SymbolId};
 use mmmm_domain::{
     DomainError, Instance, Prefab,
     commands::{CommandModule, CommandNode},
     transform::Matrix4,
     types::Display,
 };
+use std::cell::Cell;
 
 fn example(bytes: &[u8]) -> Value {
     mmmm_contracts::parse_json(bytes).unwrap()
@@ -251,6 +257,496 @@ fn static_owned_pack_uses_only_sealed_scene_coverage() {
             expected,
             "{case} owned coverage must retain the existing compiler rejection"
         );
+    }
+}
+
+/// Existing canonical Prefab/Instance/Clip examples are reduced in memory to
+/// one display and two placements. The block fixture cannot exercise per-
+/// instance display UUID/origin joins; no new source fixture or proof is stored.
+fn animated_scene(
+    instances: usize,
+    mutate_clip: impl FnOnce(&mut Value),
+) -> (ProjectCatalog, Vec<Value>, SceneDraft) {
+    let mut prefab = example(include_bytes!("../../../examples/prefab.json"));
+    prefab["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|node| node["nodeId"] == "root" || node["nodeId"] == "door");
+    for field in [
+        "ports",
+        "state",
+        "references",
+        "commandModuleIds",
+        "resources",
+    ] {
+        prefab[field] = json!([]);
+    }
+    prefab["clipIds"] = json!(["clip-door"]);
+    revise("Prefab", &mut prefab);
+    let mut clip = example(include_bytes!("../../../examples/animation-clip.json"));
+    mutate_clip(&mut clip);
+    revise("AnimationClip", &mut clip);
+    let mut placements = Vec::new();
+    for index in 0..instances {
+        let mut instance = example(include_bytes!("../../../examples/instance.json"));
+        instance["instanceId"] = json!(format!("instance-animation-{index}"));
+        instance["prefabRevision"] = prefab["revision"].clone();
+        instance["placement"]["translation"][0] = json!(index * 16);
+        revise("Instance", &mut instance);
+        placements.push(instance);
+    }
+    let mut project = example(include_bytes!("../../../examples/project.json"));
+    project["prefabIds"] = json!([prefab["prefabId"]]);
+    project["instanceIds"] = json!(
+        placements
+            .iter()
+            .map(|value| value["instanceId"].clone())
+            .collect::<Vec<_>>()
+    );
+    project["resourceIds"] = json!([]);
+    let mut pins = vec![
+        json!({"kind":"prefab","objectId":prefab["prefabId"],"revision":prefab["revision"]}),
+        json!({"kind":"clip","objectId":clip["clipId"],"revision":clip["revision"]}),
+    ];
+    pins.extend(placements.iter().map(|value| json!({"kind":"instance","objectId":value["instanceId"],"revision":value["revision"]})));
+    project["ownedResources"] = json!(pins);
+    revise("Project", &mut project);
+    let scene = scene_lower(
+        &source_only_target(),
+        SceneBuildInputs::new(
+            project.clone(),
+            vec![prefab.clone()],
+            placements.clone(),
+            vec![],
+            vec![],
+            vec![],
+        ),
+        &Native26_3SceneCodec,
+        &DisplaySourceRegistry,
+    )
+    .unwrap();
+    let mut owned = vec![prefab, clip];
+    owned.extend(placements);
+    (
+        ProjectCatalog::from_project(&project).unwrap(),
+        owned,
+        scene,
+    )
+}
+
+struct DisplaySourceRegistry;
+impl SceneRegistryVerifier for DisplaySourceRegistry {
+    fn verify_codec(
+        &self,
+        _: &VerifiedTarget,
+        _: &Sha256Digest,
+    ) -> Result<SceneCodecCapabilities, DomainError> {
+        Ok(SceneCodecCapabilities {
+            static_affine_display: true,
+            text_background_geometry: false,
+            staged_command_blocks: false,
+            scoped_state: false,
+            resource_pack_assets: false,
+        })
+    }
+    fn verify_encoded(
+        &self,
+        _: &VerifiedTarget,
+        _: &Sha256Digest,
+        instruction: &NativeSceneInstruction,
+        _: &str,
+    ) -> Result<(), DomainError> {
+        if matches!(
+            instruction,
+            NativeSceneInstruction::Display { .. } | NativeSceneInstruction::DisplayRemove { .. }
+        ) {
+            Ok(())
+        } else {
+            Err(DomainError::new(
+                "TEST_CODEC_UNSUPPORTED",
+                "Only authored display instructions are covered",
+            ))
+        }
+    }
+    fn display_payload(
+        &self,
+        _: &VerifiedTarget,
+        display: &Display,
+    ) -> Result<BTreeMap<String, Value>, DomainError> {
+        Ok(display
+            .payload
+            .iter()
+            .map(|(key, value)| {
+                (
+                    if key == "blockState" {
+                        "block_state".into()
+                    } else {
+                        key.clone()
+                    },
+                    value.clone(),
+                )
+            })
+            .collect())
+    }
+    fn block_state(
+        &self,
+        target: &VerifiedTarget,
+        state: &SceneBlockState,
+        turns: i32,
+    ) -> Result<SceneBlockState, DomainError> {
+        BlockOnlyRegistry.block_state(target, state, turns)
+    }
+    fn resolve_command(
+        &self,
+        target: &VerifiedTarget,
+        module: &CommandModule,
+        node: &CommandNode,
+        prefab: &Prefab,
+        instance: &Instance,
+        matrix: &Matrix4,
+        state: &BTreeMap<StateId, SceneStateBinding>,
+    ) -> Result<ResolvedSceneCommand, DomainError> {
+        BlockOnlyRegistry.resolve_command(target, module, node, prefab, instance, matrix, state)
+    }
+    fn asset_path(
+        &self,
+        target: &VerifiedTarget,
+        value: &Value,
+        resource: &SceneResource,
+    ) -> Result<Option<String>, DomainError> {
+        BlockOnlyRegistry.asset_path(target, value, resource)
+    }
+    fn resource_media(
+        &self,
+        target: &VerifiedTarget,
+        declared: &ResourceRef,
+        stored: &ResourceRef,
+    ) -> Result<(), DomainError> {
+        BlockOnlyRegistry.resource_media(target, declared, stored)
+    }
+}
+
+/// Authored verifier doubles remain confined to this source-boundary module.
+/// They never enter ProductionFactory or attest real artifacts/UUIDs/game state.
+struct AuthoredAnimationCall {
+    reject: &'static str,
+    interrupted: Cell<bool>,
+    snapshots: Cell<usize>,
+}
+impl AuthoredAnimationCall {
+    fn new(reject: &'static str) -> Self {
+        Self {
+            reject,
+            interrupted: Cell::new(false),
+            snapshots: Cell::new(0),
+        }
+    }
+}
+impl AnimationBindingVerifier for AuthoredAnimationCall {
+    fn verify_animation_bindings(
+        &self,
+        _: &ResourceRef,
+        bytes: &[u8],
+        _: &AnimationBindings,
+    ) -> Result<Sha256Digest, DomainError> {
+        if self.reject == "binding" {
+            Err(DomainError::new(
+                "BINDING_UNVERIFIED",
+                "Authored binding oracle refused",
+            ))
+        } else {
+            Ok(raw_digest(bytes))
+        }
+    }
+}
+impl AnimationEvidenceVerifier for AuthoredAnimationCall {
+    fn verify_animation_target(
+        &self,
+        _: &Sha256Digest,
+        _: &Sha256Digest,
+    ) -> Result<AnimationTargetRules, DomainError> {
+        if self.reject == "target-and-cancel" {
+            self.interrupted.set(true);
+            return Err(DomainError::new(
+                "ACTUAL_TARGET_ERROR",
+                "Authored target refused before cancellation",
+            ));
+        }
+        if self.reject == "target" {
+            return Err(DomainError::new(
+                "TARGET_UNVERIFIED",
+                "Authored target oracle refused",
+            ));
+        }
+        Ok(AnimationTargetRules {
+            row_major_f32_matrix_codec: true,
+            explicit_zero_disables_interpolation: true,
+            sampled_linear_trs_whole_interval: true,
+        })
+    }
+    fn verify_linear_interval(
+        &self,
+        _: &VerifiedTarget,
+        _: &Sha256Digest,
+        _: &Sha256Digest,
+        _: &Sha256Digest,
+        _: &RationalTime,
+    ) -> Result<(), DomainError> {
+        if self.reject == "interval" {
+            Err(DomainError::new(
+                "UNSUPPORTED_TRANSFORM",
+                "Authored interval oracle refused",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+impl NativeAnimationCall for AuthoredAnimationCall {
+    fn check_current(&self) -> AppResult<()> {
+        Ok(())
+    }
+    fn settings(&self) -> AppResult<AnimationCompileSettings> {
+        Ok(AnimationCompileSettings {
+            target_tps: RationalTime::from_integer(if self.reject == "tps" { 60 } else { 20 }),
+            max_component_error: 1e-6,
+            max_catchup_ticks: 8,
+            max_catchup_events: 4096,
+        })
+    }
+    fn event_bindings(
+        &self,
+        _: &mmmm_domain::time::AnimationClip,
+    ) -> AppResult<BTreeMap<SymbolId, AnimationEventBinding>> {
+        if self.reject == "source-and-cancel" {
+            self.interrupted.set(true);
+            return Err(AppError::new(
+                "ACTUAL_SOURCE_ERROR",
+                "Authored source refused before cancellation",
+            ));
+        }
+        if self.reject == "event-invalid" || self.reject == "metadata" {
+            let bytes = b"return 1\n".to_vec();
+            let mut source = mmmm_compiler::StagedResource {
+                reference: ResourceRef {
+                    resource_id: ResourceId::new("authored-event-source").unwrap(),
+                    sha256: raw_digest(&bytes),
+                    media_type: "text/x-mcfunction; charset=utf-8".into(),
+                    size_bytes: bytes.len() as u64,
+                },
+                bytes,
+            };
+            if self.reject == "event-invalid" {
+                source.reference.sha256 = Sha256Digest::from_bytes([0; 32]);
+            }
+            return Ok(BTreeMap::from([(
+                SymbolId::new("event-function").unwrap(),
+                AnimationEventBinding {
+                    function: ResourceLocation::new("fixture:authored_event").unwrap(),
+                    source,
+                    contract: mmmm_compiler::GeneratedFunctionContract {
+                        inputs: vec![],
+                        outputs: vec![],
+                        state_reads: vec![],
+                        state_writes: vec![],
+                        execution_context: "server",
+                        reentrancy: "non_reentrant",
+                        scheduled_callbacks: vec![],
+                        cleanup: vec![],
+                        requirements: if self.reject == "metadata" {
+                            vec!["x".repeat(8 * 1024 * 1024 + 1)]
+                        } else {
+                            vec![]
+                        },
+                    },
+                },
+            )]));
+        }
+        Ok(BTreeMap::new())
+    }
+    fn binding_snapshot(&self, _: &AnimationBindings, bytes: &[u8]) -> AppResult<ResourceRef> {
+        self.snapshots.set(self.snapshots.get() + 1);
+        Ok(ResourceRef {
+            resource_id: ResourceId::new(format!(
+                "source-test-binding-{}",
+                &raw_digest(bytes).as_str()[..16]
+            ))
+            .unwrap(),
+            sha256: if self.reject == "snapshot" {
+                Sha256Digest::from_bytes([0; 32])
+            } else {
+                raw_digest(bytes)
+            },
+            media_type: "application/json".into(),
+            size_bytes: bytes.len() as u64,
+        })
+    }
+}
+
+#[test]
+fn owned_animation_assembler_preserves_two_exact_instance_bindings_without_runtime_claims() {
+    let (project, owned, scene) = animated_scene(2, |_| {});
+    assert_ne!(
+        scene.animation_bindings().values().next().unwrap().nodes
+            [&mmmm_contracts::NodeId::new("door").unwrap()]
+            .display_uuid,
+        scene.animation_bindings().values().nth(1).unwrap().nodes
+            [&mmmm_contracts::NodeId::new("door").unwrap()]
+            .display_uuid
+    );
+    let inputs = assemble_owned_animations(
+        &project,
+        &owned,
+        scene,
+        &source_only_target(),
+        &AuthoredAnimationCall::new(""),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let request = json!({"contextId":"animation-source-context","projectId":project.project_id(),"expectedRevision":project.revision(),"targetProfileId":project.target_profile_id(),"outputPolicy":"private_staging_only"});
+    let pack = mmmm_compiler::pack_build(&request, &source_only_target(), inputs).unwrap();
+    assert_eq!(pack.manifest().validation_stage, "statically_checked");
+    assert_eq!(
+        pack.manifest()
+            .entry_points
+            .keys()
+            .filter(|key| key.starts_with("clip_"))
+            .count(),
+        18
+    );
+    assert!(
+        pack.manifest()
+            .runtime_dependencies
+            .iter()
+            .any(|value| value == "mmmm:animation_tick_dispatch")
+    );
+}
+
+#[test]
+fn owned_animation_assembler_refuses_missing_duplicate_stale_and_uninstantiated_sources() {
+    for case in ["missing", "duplicate", "stale", "uninstantiated"] {
+        let (project, mut owned, scene) =
+            animated_scene(if case == "uninstantiated" { 0 } else { 1 }, |_| {});
+        match case {
+            "missing" => {
+                owned.remove(1);
+            }
+            "duplicate" => owned.push(owned[1].clone()),
+            "stale" => {
+                owned[1]["duration"] = json!({"numerator":"3","denominator":"1"});
+                revise("AnimationClip", &mut owned[1]);
+            }
+            _ => {}
+        }
+        assert!(
+            assemble_owned_animations(
+                &project,
+                &owned,
+                scene,
+                &source_only_target(),
+                &AuthoredAnimationCall::new(""),
+                &|| Ok(())
+            )
+            .is_err(),
+            "{case} cannot omit an actual owned clip"
+        );
+    }
+}
+
+#[test]
+fn owned_animation_assembler_keeps_each_independent_verifier_and_original_failure() {
+    for (case, expected) in [
+        ("binding", "BINDING_UNVERIFIED"),
+        ("target", "TARGET_UNVERIFIED"),
+        ("interval", "UNSUPPORTED_TRANSFORM"),
+        ("snapshot", "RESOURCE_DIGEST_MISMATCH"),
+        ("tps", "STALE_CONTEXT"),
+    ] {
+        let (project, owned, scene) = animated_scene(1, |_| {});
+        assert_eq!(
+            assemble_owned_animations(
+                &project,
+                &owned,
+                scene,
+                &source_only_target(),
+                &AuthoredAnimationCall::new(case),
+                &|| Ok(())
+            )
+            .unwrap_err()
+            .code,
+            expected
+        );
+    }
+    let (project, owned, scene) = animated_scene(1, |clip| {
+        clip["events"] = json!([{"eventId":"event-required","at":{"numerator":"1","denominator":"1"},"functionSymbolId":"event-function","scrubPolicy":"suppress","authoredSequence":0}]);
+    });
+    assert_eq!(
+        assemble_owned_animations(
+            &project,
+            &owned,
+            scene,
+            &source_only_target(),
+            &AuthoredAnimationCall::new(""),
+            &|| Ok(())
+        )
+        .unwrap_err()
+        .code,
+        "REFERENCE_UNRESOLVED"
+    );
+    for (case, expected) in [
+        ("event-invalid", "RESOURCE_DIGEST_MISMATCH"),
+        ("metadata", "RESOURCE_BUDGET_EXCEEDED"),
+    ] {
+        let (project, owned, scene) = animated_scene(1, |clip| {
+            clip["events"] = json!([{"eventId":"event-required","at":{"numerator":"1","denominator":"1"},"functionSymbolId":"event-function","scrubPolicy":"suppress","authoredSequence":0}]);
+        });
+        let call = AuthoredAnimationCall::new(case);
+        assert_eq!(
+            assemble_owned_animations(
+                &project,
+                &owned,
+                scene,
+                &source_only_target(),
+                &call,
+                &|| Ok(())
+            )
+            .unwrap_err()
+            .code,
+            expected
+        );
+        assert_eq!(
+            call.snapshots.get(),
+            0,
+            "Invalid source/metadata must fail before private snapshot staging"
+        );
+    }
+    for (case, expected) in [
+        ("source-and-cancel", "ACTUAL_SOURCE_ERROR"),
+        ("target-and-cancel", "ACTUAL_TARGET_ERROR"),
+    ] {
+        let (project, owned, scene) = animated_scene(1, |_| {});
+        let call = AuthoredAnimationCall::new(case);
+        let error = assemble_owned_animations(
+            &project,
+            &owned,
+            scene,
+            &source_only_target(),
+            &call,
+            &|| {
+                if call.interrupted.get() {
+                    Err(AppError::new(
+                        "DEADLINE_EXCEEDED",
+                        "Original checkpoint expired",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, expected);
+        let cause = std::error::Error::source(&error).unwrap().to_string();
+        assert!(cause.contains(expected) && cause.contains("DEADLINE_EXCEEDED"));
     }
 }
 

@@ -11,6 +11,7 @@ use crate::{
         ResourceRightsRegistry, SharedFeaturePermissions, SharedFeatureProducts,
         SharedFeatureSymbols, SharedManualScenes, SharedResourceRights, manual_data_adapter,
     },
+    native_animation::NativeAnimationCallOwner,
     native_backend::{HostNativeBackend, NativeBackendComposition, NativeReadinessRegistry},
     owned_planning_data::OwnedPlanningData,
     planning_context::{
@@ -59,6 +60,7 @@ pub use compatibility_registration::{
 /// this factory, after an actual authenticated host/source observation.
 pub struct NativeSourceInputs {
     pub scene_registry: Rc<dyn SceneRegistryVerifier>,
+    pub animation_owner: Option<Rc<dyn NativeAnimationCallOwner>>,
     pub data: SharedPlanningData,
     pub dependencies: SharedPlanningDependencies,
     pub permissions: Option<SharedFeaturePermissions>,
@@ -111,6 +113,7 @@ impl ProductionFactory {
             executable_digest,
             NativeSourceInputs {
                 scene_registry: Rc::new(UnregisteredSceneRegistry),
+                animation_owner: None,
                 data: Rc::new(RefCell::new(Box::new(UnregisteredPlanningData))),
                 dependencies: Rc::new(RefCell::new(PlanningDependencyRegistry::default())),
                 permissions: None,
@@ -286,6 +289,7 @@ impl DaemonSourceFactory for ProductionFactory {
             permissions: inputs.permissions.clone(),
             readiness: inputs.readiness.clone(),
             scene_registry: inputs.scene_registry,
+            animation_owner: inputs.animation_owner,
             owned_inventory: Some(Rc::new(metadata.clone())),
             compatibility: compatibility.clone(),
         }));

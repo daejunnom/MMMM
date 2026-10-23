@@ -1503,6 +1503,7 @@ fn explicit_factory_keeps_supplied_data_and_original_store_budget_and_source_inp
         binary_digest(),
         NativeSourceInputs {
             scene_registry: Rc::new(UnregisteredSceneRegistry),
+            animation_owner: None,
             data: supplied,
             dependencies: Rc::new(RefCell::new(PlanningDependencyRegistry::default())),
             permissions: None,

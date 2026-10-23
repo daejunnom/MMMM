@@ -2865,6 +2865,42 @@ unavailable이며 Active 동시 JNI frame의 별도 상한과 실제 호스트 �
 not_run이다. 클라이언트 인증을 우회하거나 필수 인수를 줄이지 않고, 독립 구현과 서버 측
 관측을 계속한다. 필수 게임 인수와 공개 v0.1.0 배포 완료 조건은 아래와 같다.
 
+공유 `f170e1b286b79c89403c3892f94a5d41a926a1b6`에는 위 native JNI·Java 훅과
+Bootstrap transport 27개 소스를 포함했다. Windows606은 stage된 546개 경로와 정책
+blob 하나에서 위반 0을 확인했다. 실제 Java 검사는 이후 Windows607에서 실행했다.
+
+607은 고정 candidate의 Git blob으로 만든 JVM 소스 snapshot과 기존 `f266a1a`의
+선택 도구체인 출처를 분리하는 로컬 검사다. Gradle 1·command 1로 실패했다. Guava의
+누락 annotation classfile 경고 15개가 기존 `-Werror`에서 Fabric compile을 막았고,
+provider SDK의 fixture 조회도 `NoSuchFileException` 4개로 실패했다. 검증 입력에서
+`tests/example-index.json`이 빠진 것을 확인했다. 사후에는 source inventory 변경도
+감지해 `SOURCE_SNAPSHOT_INVENTORY_CHANGED`를 별도로 보존했다. 이 원인은 아직
+확정하지 않았으며 task/XML 집계도 완료하지 못했다. 원 helper와 실패 기록을 보존한다.
+
+선택 도구체인 파일 8개와 instrumentation agent는 전후 일치했다. 실행은 46,270 ms·
+Job peak 1,269,166,080 bytes·5 processes·gap 150 ms이며 자연 종료·drain·완전한
+출력·export·scratch 정리·lease 해제와 감독/정리 오류 0이다. 선택 파일의 일치를 전체
+도구체인 트리 동등성, candidate CI generation, 게임 또는 릴리스 증거로 확대하지 않는다.
+
+owned Clip의 제작 입력은 기존 `pack.build` source 경로에서 sealed scene의 각
+instance와 정확히 조합한다. 원 Store borrow·request witness·Project revision·ACL·기한과
+취소를 유지하고, 기존 binding·target·state·artifact verifier를 독립적으로 호출한다.
+예정 scene UUID를 실제 runtime binding으로 승격하지 않으며 기본 구성의 owner 부재는
+`SOURCE_UNAVAILABLE`로 남긴다. 미사용 owned Clip도 조용히 버리지 않는다.
+
+Windows608은 clean `f170e1b`와 정확한 Coordinator 6소스 overlay의 전체 library
+검사에서 396 PASS·실패 0·기존 격리용 자식 검사 1 ignored·filtered 0을 확인했다.
+새 세 검사는 두 instance의 원 binding 보존, 누락·중복·stale·미사용 source 거절과
+독립 verifier·원 실패 보존을 다룬다. 입력 547개·12,653,502 bytes의 전후 manifest SHA는
+`688319a5c5cccd006ba21366c2386cf4fda7fc6217450fdcea33aec921425566`로 같았다.
+command 0·162,533 ms·Job peak 1,671,446,528 bytes·8 processes·gap 148 ms이며
+owned tail 정리 뒤 drain·완전한 출력·export·scratch 정리·lease 해제와 감독/정리 오류
+0이다. 실제 owner 생산자, PACK_CASE·matrix/reset·pose writer 증거 발급과 Clip
+init/play/tick dispatch, 실제 client renderer 검증은 별도 미완료다.
+같은 6소스의 Windows609 Coordinator lib/tests strict Clippy도 PASS이며 전후 manifest는
+608과 같다. command 0·51,520 ms·peak 1,024,258,048 bytes·8 processes·gap 147 ms,
+자연 종료·drain·output/export·scratch 정리·lease 해제와 감독/정리 오류 0을 확인했다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

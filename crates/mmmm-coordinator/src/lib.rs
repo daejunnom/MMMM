@@ -24,6 +24,7 @@ pub mod host_relay;
 pub mod http;
 pub mod lifecycle;
 pub mod local_setup;
+pub mod native_animation;
 pub mod native_backend;
 mod native_catalog;
 pub mod native_display_readback;

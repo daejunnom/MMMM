@@ -8,6 +8,7 @@ use crate::{
     authority::LocalAuthority,
     feature_sources::SharedFeaturePermissions,
     host::HostBridge,
+    native_animation::{NativeAnimationCallOwner, NativeAnimationFrame, lower_owned_animations},
     native_targets::{NativeObservation, NativeSelector, NativeTargetError, NativeTargetReader},
     planning_source::{
         BorrowedProjectSource, LocalPlanningAccess, PlanningBackendPort, PlanningStore,
@@ -174,6 +175,9 @@ pub struct NativeBackendComposition {
     pub readiness: NativeReadinessRegistry,
     pub compatibility: RegisteredCompatibilityProfiles,
     pub scene_registry: Rc<dyn SceneRegistryVerifier>,
+    /// The actual same-call binding/evidence owner is independent of scene
+    /// codec admission. Absence keeps authored animation unavailable.
+    pub animation_owner: Option<Rc<dyn NativeAnimationCallOwner>>,
     /// A registered Rust provider supplies metadata routes independently of
     /// Java. Absent registration leaves those routes unavailable.
     pub owned_inventory: Option<Rc<dyn OwnedNativeInventory>>,
@@ -258,6 +262,16 @@ impl HostNativeBackend {
         resources: &[SceneResource],
         target: &VerifiedTarget,
     ) -> AppResult<SceneDraft> {
+        self.lower_scene_sources(project, owned, resources, target, false)
+    }
+    fn lower_scene_sources(
+        &self,
+        project: &Value,
+        owned: &[Value],
+        resources: &[SceneResource],
+        target: &VerifiedTarget,
+        pack_animation: bool,
+    ) -> AppResult<SceneDraft> {
         let catalog = ProjectCatalog::from_project(project)?;
         let mut groups: BTreeMap<OwnedKind, Vec<Value>> = BTreeMap::new();
         let mut seen = BTreeSet::new();
@@ -284,13 +298,19 @@ impl HostNativeBackend {
             {
                 return Err(stale());
             }
-            if matches!(pin.kind, OwnedKind::Clip | OwnedKind::PhysicsDefinition) {
+            if pin.kind == OwnedKind::PhysicsDefinition
+                || (pin.kind == OwnedKind::Clip && !pack_animation)
+            {
                 return Err(error(
                     "UNOWNED_REQUIRED_CAPABILITY",
                     "Animation or physics source needs its independently verified complete lowering codec",
                 ));
             }
-            groups.entry(pin.kind).or_default().push(value.clone());
+            // Clip is consumed only by the pack assembler after this exact
+            // source validation. Static native apply retains its refusal.
+            if pin.kind != OwnedKind::Clip {
+                groups.entry(pin.kind).or_default().push(value.clone());
+            }
         }
         if catalog
             .pins()
@@ -792,16 +812,33 @@ impl PlanningBackendPort for HostNativeBackend {
                 });
             }
         }
-        let draft = self.lower_sources(project.project(), owned, &all_resources, &target)?;
-        if !draft.required_clip_ids().is_empty() {
-            return Err(error(
-                "UNOWNED_REQUIRED_CAPABILITY",
-                "Pack needs complete instance-qualified animation lowering",
-            ));
-        }
+        let draft =
+            self.lower_scene_sources(project.project(), owned, &all_resources, &target, true)?;
+        let has_clips = project.pins().iter().any(|pin| pin.kind == OwnedKind::Clip)
+            || !draft.required_clip_ids().is_empty();
+        let inputs = if has_clips {
+            let request = self
+                .composition
+                .request
+                .current_witness("pack.build")
+                .map_err(service_error)?;
+            let frame = NativeAnimationFrame::new(
+                store,
+                &request,
+                &access,
+                &self.composition.data,
+                project,
+                context,
+                &target,
+                owned,
+            );
+            lower_owned_animations(self.composition.animation_owner.as_deref(), &frame, draft)?
+        } else {
+            static_scene_pack_inputs(project.project(), draft)
+        };
         access.authorize_project(principal, project.project_id(), Some(context), Access::Plan)?;
         check_budget(budget)?;
-        Ok(static_scene_pack_inputs(project.project(), draft))
+        Ok(inputs)
     }
     fn snapshot_native_targets_with_store(
         &mut self,
