@@ -14,7 +14,7 @@ pub(super) use pidfd::Diagnostic as PidfdDiagnostic;
 
 const STAT_BYTES: usize = 8192;
 const ROLLUP_BYTES: usize = 32 * 1024;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 const DIRECTORY_ENTRIES: usize = 100_000;
 pub(super) const LIVE_LIMIT: usize = 32;
 
@@ -301,6 +301,242 @@ pub struct LifetimeEvidence {
     pub query_failure_count: u64,
     pub first_query_failure: Option<Box<LifetimeQueryFailure>>,
     pub last_query_failure: Option<Box<LifetimeQueryFailure>>,
+    pub incomplete_enumeration: EnumerationEvidence,
+}
+
+/// Admission failures are diagnostics, never original identity or exit facts.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct EnumerationEvidence {
+    count: u64,
+    recovered_samples: u64,
+    first: Option<Box<EnumerationDiagnostic>>,
+    last: Option<Box<EnumerationDiagnostic>>,
+    following_failure: Option<Box<EnumerationFailureDiagnostic>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct EnumerationFailureDiagnostic {
+    kind: &'static str,
+    message: String,
+    message_truncated: bool,
+    drained: bool,
+    stat_observation: Option<StatDiagnostic>,
+    pidfd_observation: Option<PidfdDiagnostic>,
+}
+impl EnumerationFailureDiagnostic {
+    fn capture(error: &ProcessError) -> Self {
+        let mut message = error.message.clone();
+        let message_truncated = message.len() > 16 * 1024;
+        if message_truncated {
+            let mut end = 16 * 1024;
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+        }
+        Self {
+            kind: error.kind,
+            message,
+            message_truncated,
+            drained: error.drained,
+            stat_observation: error.linux_stat_diagnostic.as_deref().copied(),
+            pidfd_observation: error.linux_pidfd_diagnostic,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct EnumerationDiagnostic {
+    pass: usize,
+    native_errno: i32,
+    original: EnumerationFailureDiagnostic,
+    post_control: Option<EnumerationFailureDiagnostic>,
+    candidate_close: Option<EnumerationFailureDiagnostic>,
+    enumeration_close: Option<EnumerationFailureDiagnostic>,
+    final_anchor: Option<EnumerationFailureDiagnostic>,
+}
+
+struct IncompleteEnumeration {
+    original: ProcessError,
+    post_control: Option<ProcessError>,
+    candidate_close: Option<ProcessError>,
+    enumeration_close: Option<ProcessError>,
+    final_anchor: Option<ProcessError>,
+}
+impl IncompleteEnumeration {
+    fn new(original: ProcessError) -> Self {
+        Self {
+            original,
+            post_control: None,
+            candidate_close: None,
+            enumeration_close: None,
+            final_anchor: None,
+        }
+    }
+    fn recoverable(&self) -> bool {
+        self.post_control.is_none()
+            && self.candidate_close.is_none()
+            && self.enumeration_close.is_none()
+            && self.final_anchor.is_none()
+    }
+    fn diagnostic(&self, pass: usize) -> EnumerationDiagnostic {
+        EnumerationDiagnostic {
+            pass,
+            native_errno: 2,
+            original: EnumerationFailureDiagnostic::capture(&self.original),
+            post_control: self
+                .post_control
+                .as_ref()
+                .map(EnumerationFailureDiagnostic::capture),
+            candidate_close: self
+                .candidate_close
+                .as_ref()
+                .map(EnumerationFailureDiagnostic::capture),
+            enumeration_close: self
+                .enumeration_close
+                .as_ref()
+                .map(EnumerationFailureDiagnostic::capture),
+            final_anchor: self
+                .final_anchor
+                .as_ref()
+                .map(EnumerationFailureDiagnostic::capture),
+        }
+    }
+    fn into_failure(mut self) -> ProcessError {
+        for (stage, error) in [
+            ("post_control", self.post_control),
+            ("candidate_close", self.candidate_close),
+            ("enumeration_close", self.enumeration_close),
+            ("final_anchor", self.final_anchor),
+        ] {
+            if let Some(error) = error {
+                self.original.drained &= error.drained;
+                self.original
+                    .message
+                    .push_str(&format!("; incomplete_enumeration_{stage}={error}"));
+            }
+        }
+        self.original
+    }
+}
+
+struct EnumerationWork {
+    passes: usize,
+    entries: usize,
+}
+impl EnumerationWork {
+    fn new() -> Self {
+        Self {
+            passes: 0,
+            entries: 0,
+        }
+    }
+    fn begin_pass(&mut self) -> Result<(), ProcessError> {
+        if self.passes >= 2 {
+            return Err(metadata("native enumeration pass bound exceeded"));
+        }
+        self.passes += 1;
+        Ok(())
+    }
+    fn entry(&mut self) -> Result<(), ProcessError> {
+        self.entries = self
+            .entries
+            .checked_add(1)
+            .ok_or_else(|| metadata("native enumeration work overflow"))?;
+        if self.entries > DIRECTORY_ENTRIES {
+            return Err(metadata(
+                "native process enumeration exceeds its shared entry bound",
+            ));
+        }
+        Ok(())
+    }
+}
+enum EnumerationPass<T> {
+    Complete(T),
+    Incomplete(Box<IncompleteEnumeration>),
+}
+
+impl EnumerationEvidence {
+    fn merge(&mut self, next: Self) {
+        self.count = self.count.saturating_add(next.count);
+        self.recovered_samples = self
+            .recovered_samples
+            .saturating_add(next.recovered_samples);
+        if self.first.is_none() {
+            self.first = next.first;
+        }
+        if next.last.is_some() {
+            self.last = next.last;
+        }
+        if next.following_failure.is_some() {
+            self.following_failure = next.following_failure;
+        }
+    }
+}
+
+fn enumeration_sample<T>(
+    pending: &mut PendingObservations,
+    mut observe: impl FnMut(
+        &mut EnumerationWork,
+        &mut PendingObservations,
+    ) -> Result<EnumerationPass<T>, ProcessError>,
+) -> (Result<T, ProcessError>, EnumerationEvidence) {
+    let mut work = EnumerationWork::new();
+    let mut evidence = EnumerationEvidence::default();
+    let mut first: Option<ProcessError> = None;
+    for _ in 0..2 {
+        // The outer collector is never reset by a fresh pass.
+        let mut pass_pending = PendingObservations::default();
+        let result = work
+            .begin_pass()
+            .and_then(|()| observe(&mut work, &mut pass_pending));
+        pending.merge(pass_pending);
+        match result {
+            Ok(EnumerationPass::Complete(value)) => {
+                if first.is_some() {
+                    evidence.recovered_samples = 1;
+                }
+                return (Ok(value), evidence);
+            }
+            Ok(EnumerationPass::Incomplete(incomplete)) => {
+                evidence.count += 1;
+                let diagnostic = Box::new(incomplete.diagnostic(work.passes));
+                if evidence.first.is_none() {
+                    evidence.first = Some(diagnostic.clone());
+                }
+                evidence.last = Some(diagnostic);
+                let retry = incomplete.recoverable() && work.passes < 2;
+                let mut error = (*incomplete).into_failure();
+                if let Some(original) = first.take() {
+                    error.drained &= original.drained;
+                    error
+                        .message
+                        .push_str(&format!("; first_incomplete_enumeration={original}"));
+                }
+                if !retry {
+                    return (Err(error), evidence);
+                }
+                first = Some(error);
+            }
+            Err(mut error) => {
+                if let Some(original) = first.take() {
+                    evidence.following_failure =
+                        Some(Box::new(EnumerationFailureDiagnostic::capture(&error)));
+                    error.drained &= original.drained;
+                    error
+                        .message
+                        .push_str(&format!("; first_incomplete_enumeration={original}"));
+                }
+                return (Err(error), evidence);
+            }
+        }
+    }
+    (
+        Err(first.unwrap_or_else(|| {
+            metadata("native enumeration did not complete within its pass bound")
+        })),
+        evidence,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -439,6 +675,17 @@ pub(super) struct PendingObservations {
 }
 
 impl PendingObservations {
+    fn merge(&mut self, next: Self) {
+        if let Some(history) = next.leader {
+            PendingHistory::merge(&mut self.leader, history);
+        }
+        if let Some(history) = next.member {
+            PendingHistory::merge(&mut self.member, history);
+        }
+        if next.last_role.is_some() {
+            self.last_role = next.last_role;
+        }
+    }
     pub(super) fn record(&mut self, observation: PendingObservation) {
         let role = observation.role;
         let history = match role {
@@ -568,6 +815,7 @@ fn accumulate(
     sample: &mut Sample,
     observation: MemberObservation,
     pending: &mut PendingObservations,
+    include_rss: bool,
 ) -> Result<(), ProcessError> {
     match observation {
         MemberObservation::Settled(Some(member)) => push(sample, member)?,
@@ -579,14 +827,14 @@ fn accumulate(
             push(sample, member)?;
         }
     }
-    if !pending.is_empty() {
-        super::resource_policy::check_linux_jvm_budget(
-            sample.live_processes,
-            Some(sample.known_rss_bytes),
-            sample.max_virtual_bytes,
-        )?;
-    }
-    Ok(())
+    // These are actual lower bounds even if this pass later loses an unbound
+    // candidate. Never let a fresh pass wash out an already observed overage.
+    super::resource_policy::check_linux_partial_budget(
+        sample.live_processes,
+        sample.known_rss_bytes,
+        sample.max_virtual_bytes,
+        include_rss,
+    )
 }
 
 fn push(sample: &mut Sample, member: MemberSample) -> Result<(), ProcessError> {
@@ -737,6 +985,24 @@ fn initial_candidate_stat_open_disappeared(
         && matches!(file, MetadataRole::Stat)
         && matches!(operation, MetadataOperation::Open)
         && error.raw_os_error() == Some(3)
+}
+
+fn initial_unbound_stat_open_incomplete(
+    unbound: bool,
+    process: ProcessRole,
+    file: MetadataRole,
+    operation: MetadataOperation,
+    error: &std::io::Error,
+) -> bool {
+    unbound
+        && matches!(process, ProcessRole::EnumeratedCandidate)
+        && matches!(file, MetadataRole::Stat)
+        && matches!(operation, MetadataOperation::Open)
+        && error.raw_os_error() == Some(2)
+}
+
+fn candidate_is_unbound(pid: i32, leader: i32, mut retained: impl Iterator<Item = i32>) -> bool {
+    pid != leader && !retained.any(|original| original == pid)
 }
 
 fn metadata_io_error(
@@ -1037,6 +1303,12 @@ mod native {
         initial: Stat,
     }
 
+    enum CandidateOpen {
+        Opened(ProcDirectory),
+        Unavailable,
+        Incomplete(Box<IncompleteEnumeration>),
+    }
+
     enum RetainedBinding {
         Unattempted,
         Bound(pidfd::BoundPidfd),
@@ -1179,8 +1451,16 @@ mod native {
             pending: &mut PendingObservations,
             control: &mut ObservationControl<'_>,
         ) -> Result<GroupObservation, ProcessError> {
-            let result =
-                self.sample_inner(include_rss, held_child_reservation_valid, pending, control);
+            let (result, enumeration) = enumeration_sample(pending, |work, pass_pending| {
+                self.sample_inner(
+                    include_rss,
+                    held_child_reservation_valid,
+                    pass_pending,
+                    control,
+                    work,
+                )
+            });
+            self.evidence.incomplete_enumeration.merge(enumeration);
             let held = self
                 .members
                 .iter()
@@ -1223,7 +1503,8 @@ mod native {
             held_child_reservation_valid: bool,
             pending: &mut PendingObservations,
             control: &mut ObservationControl<'_>,
-        ) -> Result<GroupObservation, ProcessError> {
+            work: &mut EnumerationWork,
+        ) -> Result<EnumerationPass<GroupObservation>, ProcessError> {
             // This output belongs only to this scan, including its failure
             // path. Prior observations live in the tracker, never here.
             *pending = PendingObservations::default();
@@ -1273,7 +1554,7 @@ mod native {
                     return Err(error);
                 }
             };
-            accumulate(&mut sample, leader_sample, pending)?;
+            accumulate(&mut sample, leader_sample, pending, include_rss)?;
             // Observe the original held inodes first. A missing numeric entry
             // cannot silently evict an unresolved original lifetime.
             let mut index = 0;
@@ -1292,7 +1573,7 @@ mod native {
                         evidence: &mut self.evidence,
                     },
                 )?;
-                accumulate(&mut sample, observation, pending)?;
+                accumulate(&mut sample, observation, pending, include_rss)?;
                 if member.lifetime.gone {
                     let member = self.members.remove(index);
                     close_member(member, control, &mut self.evidence)?;
@@ -1312,7 +1593,6 @@ mod native {
                 }
                 (Err(original), after) => return finish_observation(Err(original), after),
             };
-            let mut observed_entries = 0usize;
             let enumerated = (|| {
                 loop {
                     control.check("enumeration_next")?;
@@ -1320,12 +1600,7 @@ mod native {
                     let Some(name) = control.finish(next, "enumeration_next")? else {
                         break;
                     };
-                    observed_entries += 1;
-                    if observed_entries > DIRECTORY_ENTRIES {
-                        return Err(metadata(
-                            "native process enumeration exceeds its entry bound",
-                        ));
-                    }
+                    work.entry()?;
                     if name.is_empty() || !name.iter().all(u8::is_ascii_digit) {
                         continue;
                     }
@@ -1333,17 +1608,30 @@ mod native {
                     if pid == group {
                         continue;
                     }
-                    let Some(member) = open_process_checked(
+                    // A namespace probe of a retained PID is not a fresh
+                    // unbound admission, even though it uses the same pathname.
+                    let unbound = candidate_is_unbound(
+                        pid,
+                        group,
+                        self.members
+                            .iter()
+                            .map(|entry| entry.process.initial.identity.pid),
+                    );
+                    let member = match open_process_checked(
                         &self.root,
                         pid,
                         ProcessRole::EnumeratedCandidate,
+                        unbound,
                         control,
                         &mut self.evidence,
-                    )?
-                    else {
-                        // This candidate disappeared before it had an anchored
-                        // identity. It is not a confirmed owned-process exit.
-                        continue;
+                    )? {
+                        CandidateOpen::Opened(member) => member,
+                        CandidateOpen::Incomplete(incomplete) => return Ok(Some(incomplete)),
+                        CandidateOpen::Unavailable => {
+                            // This candidate disappeared before it had an anchored
+                            // identity. It is not a confirmed owned-process exit.
+                            continue;
+                        }
                     };
                     let stat = member.initial;
                     let belongs = belongs_to_owned_group(stat, group);
@@ -1408,7 +1696,7 @@ mod native {
                             evidence: &mut self.evidence,
                         },
                     )?;
-                    accumulate(&mut sample, observation, pending)?;
+                    accumulate(&mut sample, observation, pending, include_rss)?;
                     let held = self
                         .members
                         .iter()
@@ -1421,19 +1709,31 @@ mod native {
                         .sum();
                     self.evidence.max_retained_fds = self.evidence.max_retained_fds.max(held);
                 }
-                Ok(())
+                Ok(None)
             })();
             let closed = entries.close(control, &mut self.evidence);
-            finish_observation(enumerated, closed)?;
+            let enumerated = match enumerated {
+                Ok(Some(mut incomplete)) => {
+                    incomplete.enumeration_close = closed.err();
+                    if incomplete.recoverable() {
+                        let final_anchor = self.check_leader(control).map(|_| ());
+                        incomplete.final_anchor =
+                            control.finish(final_anchor, "sample_incomplete").err();
+                    }
+                    return Ok(EnumerationPass::Incomplete(incomplete));
+                }
+                other => other,
+            };
+            finish_observation(enumerated.map(|_| ()), closed)?;
             self.check_leader(control)?;
             control.check("sample_complete")?;
             // The provisional member facts above never bypass this final
             // check of the original held leader anchor.
-            Ok(if !pending.is_empty() {
+            Ok(EnumerationPass::Complete(if !pending.is_empty() {
                 GroupObservation::Pending(sample)
             } else {
                 GroupObservation::Complete(sample)
-            })
+            }))
         }
 
         fn check_leader(
@@ -1826,9 +2126,10 @@ mod native {
         root: &File,
         pid: i32,
         role: ProcessRole,
+        unbound: bool,
         control: &mut ObservationControl<'_>,
         evidence: &mut LifetimeEvidence,
-    ) -> Result<Option<ProcDirectory>, ProcessError> {
+    ) -> Result<CandidateOpen, ProcessError> {
         let name = CString::new(pid.to_string()).map_err(|_| metadata("invalid numeric PID"))?;
         control.check("candidate_directory_open")?;
         let descriptor = unsafe {
@@ -1841,7 +2142,7 @@ mod native {
         if descriptor < 0 {
             let error = std::io::Error::last_os_error();
             let result = if error.raw_os_error() == Some(libc::ENOENT) {
-                Ok(None)
+                Ok(CandidateOpen::Unavailable)
             } else {
                 Err(metadata_io_error(
                     role,
@@ -1858,44 +2159,71 @@ mod native {
             control,
             evidence,
         )?;
-        let stat_open = (|| {
-            control.check("candidate_stat_open")?;
-            let opened = open_file_io(&directory, MetadataRole::Stat.file_name()?);
-            match opened {
-                Ok(file) => {
-                    checked_open_file(Ok(file), "candidate_stat_open", control, evidence).map(Some)
-                }
-                Err(error) => {
-                    let result = if initial_candidate_stat_open_disappeared(
+        if let Err(before) = control.check("candidate_stat_open") {
+            return finish_observation(
+                Err(before),
+                close_file(directory, "candidate_directory_close", control, evidence),
+            );
+        }
+        let opened = match open_file_io(&directory, MetadataRole::Stat.file_name()?) {
+            Err(error)
+                if initial_unbound_stat_open_incomplete(
+                    unbound,
+                    role,
+                    MetadataRole::Stat,
+                    MetadataOperation::Open,
+                    &error,
+                ) =>
+            {
+                let mut incomplete = IncompleteEnumeration::new(metadata_io_error(
+                    role,
+                    MetadataRole::Stat,
+                    MetadataOperation::Open,
+                    error,
+                ));
+                // Keep the original ENOENT even if control or exact FD close fails.
+                // A failure at either stage makes this gap non-recoverable.
+                incomplete.post_control = control.check("candidate_stat_open").err();
+                incomplete.candidate_close =
+                    close_file(directory, "candidate_directory_close", control, evidence).err();
+                return Ok(CandidateOpen::Incomplete(Box::new(incomplete)));
+            }
+            other => other,
+        };
+        let stat_open = match opened {
+            Ok(file) => {
+                checked_open_file(Ok(file), "candidate_stat_open", control, evidence).map(Some)
+            }
+            Err(error) => {
+                let result = if initial_candidate_stat_open_disappeared(
+                    role,
+                    MetadataRole::Stat,
+                    MetadataOperation::Open,
+                    &error,
+                ) {
+                    Ok(None)
+                } else {
+                    Err(metadata_io_error(
                         role,
                         MetadataRole::Stat,
                         MetadataOperation::Open,
-                        &error,
-                    ) {
-                        Ok(None)
-                    } else {
-                        Err(metadata_io_error(
-                            role,
-                            MetadataRole::Stat,
-                            MetadataOperation::Open,
-                            error,
-                        ))
-                    };
-                    control.finish(result, "candidate_stat_open")
-                }
+                        error,
+                    ))
+                };
+                control.finish(result, "candidate_stat_open")
             }
-        })();
+        };
         let mut stat = match stat_open {
             Ok(Some(stat)) => stat,
             result => {
                 return finish_observation(
-                    result.map(|_| None),
+                    result.map(|_| CandidateOpen::Unavailable),
                     close_file(directory, "candidate_directory_close", control, evidence),
                 );
             }
         };
         match read_stat_checked(&mut stat, pid, role, control) {
-            Ok(Some(initial)) => Ok(Some(ProcDirectory {
+            Ok(Some(initial)) => Ok(CandidateOpen::Opened(ProcDirectory {
                 directory,
                 stat,
                 initial,
@@ -1906,7 +2234,7 @@ mod native {
                     closed,
                     close_file(directory, "candidate_directory_close", control, evidence),
                 );
-                finish_observation(result.map(|_| None), closed)
+                finish_observation(result.map(|_| CandidateOpen::Unavailable), closed)
             }
         }
     }
@@ -3443,6 +3771,247 @@ pub(super) mod tests {
         );
     }
 
+    fn incomplete_enumeration() -> Box<IncompleteEnumeration> {
+        Box::new(IncompleteEnumeration::new(metadata_io_error(
+            ProcessRole::EnumeratedCandidate,
+            MetadataRole::Stat,
+            MetadataOperation::Open,
+            std::io::Error::from_raw_os_error(2),
+        )))
+    }
+
+    #[test]
+    fn only_an_initial_unbound_stat_open_errno_two_is_incomplete_enumeration() {
+        assert!(!candidate_is_unbound(123, 123, [456].into_iter()));
+        assert!(!candidate_is_unbound(456, 123, [456].into_iter()));
+        assert!(candidate_is_unbound(789, 123, [456].into_iter()));
+        for unbound in [false, true] {
+            for role in [
+                ProcessRole::ReservedLeader,
+                ProcessRole::OwnedMember,
+                ProcessRole::EnumeratedCandidate,
+            ] {
+                for file in [
+                    MetadataRole::PidDirectory,
+                    MetadataRole::Stat,
+                    MetadataRole::RssRollup,
+                ] {
+                    for operation in [
+                        MetadataOperation::Open,
+                        MetadataOperation::Rewind,
+                        MetadataOperation::Read,
+                    ] {
+                        for code in [2, 3, 4, 5, 13, 38] {
+                            assert_eq!(
+                                initial_unbound_stat_open_incomplete(
+                                    unbound,
+                                    role,
+                                    file,
+                                    operation,
+                                    &std::io::Error::from_raw_os_error(code)
+                                ),
+                                unbound
+                                    && matches!(role, ProcessRole::EnumeratedCandidate)
+                                    && matches!(file, MetadataRole::Stat)
+                                    && matches!(operation, MetadataOperation::Open)
+                                    && code == 2
+                            );
+                        }
+                        assert!(!initial_unbound_stat_open_incomplete(
+                            unbound,
+                            role,
+                            file,
+                            operation,
+                            &std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "untrusted native detail"
+                            )
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_enumeration_has_two_passes_one_result_and_retains_original_pending() {
+        let mut pending = PendingObservations::default();
+        let mut calls = 0;
+        let (result, evidence) = enumeration_sample(&mut pending, |work, facts| {
+            calls += 1;
+            work.entry()?;
+            if calls == 1 {
+                facts.record(pending_observation_for_role(PendingRole::OwnedMember));
+                Ok(EnumerationPass::Incomplete(incomplete_enumeration()))
+            } else {
+                facts.record(pending_observation_for_role(PendingRole::ReservedLeader));
+                Ok(EnumerationPass::Complete(17))
+            }
+        });
+        assert_eq!(result.unwrap(), 17);
+        assert_eq!(calls, 2);
+        assert_eq!(pending.member.as_ref().unwrap().count, 1);
+        assert_eq!(pending.leader.as_ref().unwrap().count, 1);
+        assert_eq!(pending.last_role, Some(PendingRole::ReservedLeader));
+        assert_eq!(evidence.count, 1);
+        assert_eq!(evidence.recovered_samples, 1);
+        assert_eq!(evidence.first.as_ref().unwrap().native_errno, 2);
+        assert!(
+            evidence
+                .first
+                .as_ref()
+                .unwrap()
+                .original
+                .message
+                .contains("os_error=Some(2)")
+        );
+        let mut history = EnumerationEvidence::default();
+        history.merge(evidence);
+        history.merge(EnumerationEvidence::default());
+        assert_eq!(history.count, 1);
+        assert_eq!(history.last.as_ref().unwrap().pass, 1);
+        assert!(serde_json::to_value(history).unwrap()["following_failure"].is_null());
+    }
+
+    #[test]
+    fn repeated_incomplete_enumeration_never_emits_complete_or_renews_its_work_budget() {
+        let mut pending = PendingObservations::default();
+        let mut calls = 0;
+        let (result, evidence) = enumeration_sample::<()>(&mut pending, |work, _| {
+            calls += 1;
+            work.entry()?;
+            Ok(EnumerationPass::Incomplete(incomplete_enumeration()))
+        });
+        let error = result.unwrap_err();
+        assert_eq!(calls, 2);
+        assert_eq!(evidence.count, 2);
+        assert_eq!(evidence.recovered_samples, 0);
+        assert_eq!(evidence.last.as_ref().unwrap().pass, 2);
+        assert!(error.message.contains("first_incomplete_enumeration="));
+
+        let mut calls = 0;
+        let (result, evidence) = enumeration_sample::<()>(&mut pending, |work, _| {
+            calls += 1;
+            if calls == 1 {
+                for _ in 0..DIRECTORY_ENTRIES {
+                    work.entry()?;
+                }
+                Ok(EnumerationPass::Incomplete(incomplete_enumeration()))
+            } else {
+                work.entry()?;
+                Ok(EnumerationPass::Complete(()))
+            }
+        });
+        let error = result.unwrap_err();
+        assert_eq!(calls, 2);
+        assert!(error.message.contains("shared entry bound"));
+        assert!(error.message.contains("os_error=Some(2)"));
+        assert!(
+            evidence
+                .following_failure
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("shared entry bound")
+        );
+        let mut work = EnumerationWork::new();
+        work.begin_pass().unwrap();
+        work.begin_pass().unwrap();
+        assert!(work.begin_pass().is_err());
+    }
+
+    #[test]
+    fn incomplete_enumeration_keeps_close_control_and_later_identity_failures() {
+        for stage in 0..4 {
+            let mut pending = PendingObservations::default();
+            let mut calls = 0;
+            let (result, evidence) = enumeration_sample::<()>(&mut pending, |_, _| {
+                calls += 1;
+                let mut incomplete = incomplete_enumeration();
+                let mut following =
+                    ProcessError::new("original_checkpoint", "original bounded failure");
+                following.drained = false;
+                match stage {
+                    0 => incomplete.post_control = Some(following),
+                    1 => incomplete.candidate_close = Some(following),
+                    2 => incomplete.enumeration_close = Some(following),
+                    _ => incomplete.final_anchor = Some(following),
+                }
+                Ok(EnumerationPass::Incomplete(incomplete))
+            });
+            let error = result.unwrap_err();
+            assert_eq!(calls, 1);
+            assert!(!error.drained);
+            assert!(error.message.contains("os_error=Some(2)"));
+            assert!(error.message.contains("original bounded failure"));
+            let diagnostic = evidence.first.unwrap();
+            assert!(
+                diagnostic.post_control.is_some()
+                    || diagnostic.candidate_close.is_some()
+                    || diagnostic.enumeration_close.is_some()
+                    || diagnostic.final_anchor.is_some()
+            );
+        }
+        for kind in ["cancelled", "timeout", "process_identity"] {
+            let mut pending = PendingObservations::default();
+            let mut calls = 0;
+            let (result, evidence) = enumeration_sample::<()>(&mut pending, |work, _| {
+                calls += 1;
+                if calls == 1 {
+                    work.entry()?;
+                    Ok(EnumerationPass::Incomplete(incomplete_enumeration()))
+                } else {
+                    // The pass control fails before enumeration or any new bind.
+                    assert_eq!(work.entries, 1);
+                    Err(ProcessError::new(kind, "original second-pass checkpoint"))
+                }
+            });
+            let error = result.unwrap_err();
+            assert_eq!(calls, 2);
+            assert_eq!(error.kind, kind);
+            assert!(error.message.contains("os_error=Some(2)"));
+            assert_eq!(evidence.following_failure.unwrap().kind, kind);
+        }
+    }
+
+    #[test]
+    fn first_pass_partial_overage_without_rss_pending_cannot_recover_by_rescanning() {
+        use super::super::resource_policy::{JVM_VM_LIMIT, MEMORY_LIMIT};
+        for (include_rss, live, rss, virtual_bytes) in [
+            (false, LIVE_LIMIT, None, 0),
+            (true, 0, Some(MEMORY_LIMIT + 1), 0),
+            (true, 0, Some(0), JVM_VM_LIMIT + 1),
+        ] {
+            let mut pending = PendingObservations::default();
+            let mut calls = 0;
+            let (result, evidence) = enumeration_sample::<()>(&mut pending, |_, facts| {
+                calls += 1;
+                let mut sample = Sample {
+                    live_processes: live,
+                    aggregate_rss_bytes: include_rss.then_some(0),
+                    known_rss_bytes: 0,
+                    max_virtual_bytes: 0,
+                };
+                accumulate(
+                    &mut sample,
+                    MemberObservation::Settled(Some(MemberSample {
+                        live: true,
+                        rss,
+                        virtual_bytes,
+                    })),
+                    facts,
+                    include_rss,
+                )?;
+                Ok(EnumerationPass::Incomplete(incomplete_enumeration()))
+            });
+            assert_eq!(result.unwrap_err().kind, "resource_budget");
+            assert_eq!(calls, 1);
+            assert!(pending.is_empty());
+            assert_eq!(evidence.count, 0);
+            assert_eq!(evidence.recovered_samples, 0);
+        }
+    }
+
     #[test]
     fn stat_reads_exact_identity_threads_and_vm_after_the_last_comm_terminator() {
         let actual = parse_stat(&stat('S', 5), 123).unwrap();
@@ -3767,7 +4336,13 @@ pub(super) mod tests {
                 max_virtual_bytes: 0,
             };
             let mut pending = PendingObservations::default();
-            accumulate(&mut sample, MemberObservation::Settled(None), &mut pending).unwrap();
+            accumulate(
+                &mut sample,
+                MemberObservation::Settled(None),
+                &mut pending,
+                true,
+            )
+            .unwrap();
             accumulate(
                 &mut sample,
                 MemberObservation::Pending(
@@ -3779,6 +4354,7 @@ pub(super) mod tests {
                     Box::new(pending_observation()),
                 ),
                 &mut pending,
+                true,
             )
             .unwrap();
             assert_eq!(sample.aggregate_rss_bytes, None);
@@ -3788,6 +4364,7 @@ pub(super) mod tests {
                 &mut sample,
                 MemberObservation::Settled(Some(member)),
                 &mut pending,
+                true,
             )
             .unwrap_err();
             assert_eq!(error.kind, "resource_budget");
@@ -3823,7 +4400,8 @@ pub(super) mod tests {
                     virtual_bytes: actual.virtual_bytes,
                     rss: None,
                 })),
-                &mut pending
+                &mut pending,
+                true,
             )
             .unwrap_err()
             .kind,
@@ -3871,6 +4449,7 @@ pub(super) mod tests {
                         Box::new(observation),
                     ),
                     &mut pending,
+                    true,
                 )
                 .unwrap();
             }
@@ -3901,6 +4480,7 @@ pub(super) mod tests {
                     rss: Some(MEMORY_LIMIT + 1),
                 })),
                 &mut pending,
+                true,
             )
             .unwrap_err();
             assert_eq!(error.kind, "resource_budget");

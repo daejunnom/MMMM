@@ -594,13 +594,7 @@ impl Tracker {
         };
         *peak_observed_processes = (*peak_observed_processes).max(live);
         self.record_complete()?;
-        if live > PROCESS_LIMIT as usize {
-            return Err(ProcessError::new(
-                "resource_budget",
-                format!("Linux owned live process budget exceeded; live={live}"),
-            ));
-        }
-        Ok(())
+        check_linux_process_budget(live)
     }
 
     #[cfg(test)]
@@ -700,6 +694,32 @@ impl Tracker {
 
     pub fn evidence(&self) -> Evidence {
         self.evidence.clone()
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn check_linux_process_budget(live: usize) -> Result<(), ProcessError> {
+    if live > PROCESS_LIMIT as usize {
+        return Err(ProcessError::new(
+            "resource_budget",
+            format!("Linux owned live process budget exceeded; live={live}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Check measured lower bounds without recording a complete sample or its peaks.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn check_linux_partial_budget(
+    live: usize,
+    known_rss: u64,
+    virtual_bytes: u64,
+    include_rss: bool,
+) -> Result<(), ProcessError> {
+    if include_rss {
+        check_linux_jvm_budget(live, Some(known_rss), virtual_bytes)
+    } else {
+        check_linux_process_budget(live)
     }
 }
 
@@ -910,6 +930,35 @@ mod tests {
         assert_eq!(error.kind, "resource_budget");
         assert_eq!(json(&tracker)["sample_count"], 2);
         assert_eq!(json(&tracker)["peak_observed_processes"], 33);
+    }
+
+    #[test]
+    fn linux_partial_process_count_checks_both_policies_without_completing_a_sample() {
+        for include_rss in [false, true] {
+            check_linux_partial_budget(32, 4096, 8192, include_rss).unwrap();
+            let error = check_linux_partial_budget(33, 4096, 8192, include_rss).unwrap_err();
+            assert_eq!(error.kind, "resource_budget");
+            assert!(error.message.contains("live=33"));
+        }
+        check_linux_partial_budget(32, u64::MAX, u64::MAX, false).unwrap();
+        let error = check_linux_partial_budget(33, u64::MAX, u64::MAX, false).unwrap_err();
+        assert_eq!(error.kind, "resource_budget");
+        assert_eq!(
+            error.message,
+            "Linux owned live process budget exceeded; live=33"
+        );
+    }
+
+    #[test]
+    fn linux_partial_jvm_checks_exact_rss_and_vm_boundaries_and_each_overage() {
+        check_linux_partial_budget(32, MEMORY_LIMIT, JVM_VM_LIMIT, true).unwrap();
+        for (known_rss, virtual_bytes) in [
+            (MEMORY_LIMIT + 1, JVM_VM_LIMIT),
+            (MEMORY_LIMIT, JVM_VM_LIMIT + 1),
+        ] {
+            let error = check_linux_partial_budget(32, known_rss, virtual_bytes, true).unwrap_err();
+            assert_eq!(error.kind, "resource_budget");
+        }
     }
 
     #[test]
@@ -1298,6 +1347,82 @@ mod tests {
                 .unwrap();
             assert_eq!(json(&tracker)["sample_count"], 3);
             assert_eq!(json(&tracker)["max_observed_sample_gap_ms"], 2000);
+        }
+        // Also cover pending facts and final Complete from the same native call.
+        for role in [PendingRole::ReservedLeader, PendingRole::OwnedMember] {
+            for (prior_complete, elapsed, recovers) in [
+                (true, LINUX_PENDING_GAP, true),
+                (true, LINUX_PENDING_GAP + Duration::from_millis(1), false),
+                (false, LINUX_PENDING_GAP, false),
+            ] {
+                let at = Instant::now();
+                let mut tracker = Tracker::linux_jvm();
+                if prior_complete {
+                    tracker
+                        .record_linux_jvm_at(1, Some(4096), 8192, at)
+                        .unwrap();
+                }
+                let attempted_at = at + TARGET;
+                assert!(tracker.begin_linux_sample_at(attempted_at).unwrap());
+                let observation = pending_observation_for_role(role);
+                let original = observation.original_error();
+                let mut first_pass = PendingObservations::default();
+                first_pass.record(observation);
+                // Production merges both passes once before finishing the one
+                // final result; it never records the first pass as Complete.
+                tracker.record_linux_pending_observations(first_pass);
+                let before = json(&tracker);
+                let original_complete = prior_complete.then_some(at);
+                assert_eq!(tracker.last_complete, original_complete);
+                assert_eq!(tracker.last_attempt, Some(attempted_at));
+                let now = at + elapsed;
+                let result = tracker.finish_linux_sample_at(
+                    GroupObservation::Complete(Sample {
+                        live_processes: 2,
+                        aggregate_rss_bytes: Some(8192),
+                        known_rss_bytes: 8192,
+                        max_virtual_bytes: 16384,
+                    }),
+                    now,
+                );
+                if recovers {
+                    result.unwrap();
+                    assert!(!tracker.linux_pending());
+                    assert_eq!(tracker.last_complete, Some(now));
+                    let evidence = json(&tracker);
+                    assert_eq!(
+                        evidence["sample_count"],
+                        before["sample_count"].as_u64().unwrap() + 1
+                    );
+                    assert_eq!(evidence["max_observed_sample_gap_ms"], 1000);
+                    assert_eq!(evidence["incomplete_memory_sample_count"], 0);
+                    assert_eq!(evidence["peak_observed_processes"], 2);
+                    assert_eq!(evidence["peak_observed_aggregate_rss_bytes"], 8192);
+                    assert_eq!(evidence["peak_observed_per_process_vm_bytes"], 16384);
+                    let field = match role {
+                        PendingRole::ReservedLeader => "pending_leader_observations",
+                        PendingRole::OwnedMember => "pending_member_observations",
+                    };
+                    assert_eq!(evidence[field], before[field]);
+                    assert_eq!(evidence[field]["count"], 1);
+                } else {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.kind, original.kind);
+                    assert_eq!(error.drained, original.drained);
+                    assert!(error.message.starts_with(&original.message));
+                    let reason = if prior_complete {
+                        "exceeded the 1000ms complete resource sample gap"
+                    } else {
+                        "requires an earlier complete resource sample"
+                    };
+                    assert!(error.message.contains(reason));
+                    assert_eq!(json(&tracker), before);
+                    assert_eq!(tracker.last_complete, original_complete);
+                    assert!(tracker.linux_pending());
+                }
+                assert_eq!(tracker.last_attempt, Some(attempted_at));
+                assert_eq!(tracker.last_pending_role, Some(role));
+            }
         }
     }
 

@@ -2655,6 +2655,82 @@ decode를 관측했다. 이는 해당 CI의 새 helper/default-flat 소비 성�
 Application Control 실패를 바꾸지 않는다. generation 경로의 observer 소비·실제 pack
 root/JNI 참조 수명·게임 인수·source admission·전체 JDK 인증은 별도 미입증이다.
 
+### Linux 열거 공백의 제한된 재관측과 Windows 검증
+
+원 CI85의 ENOENT 기록을 보존하고 `linux_resources.rs`와 `resource_policy.rs`를
+수정했다. pathname을 열기 전에 leader/retained PID를 구분하며, 아직 bound하지 않은
+후보의 최초 stat open에서 실제 errno 2가 나온 경우에만 불완전 열거로 기록한다.
+같은 원 identity·reservation·ObservationControl·기한과 합계 100,000 entry 예산 아래
+최대 두 번의 전체 scan을 허용한다. 후보/열거 FD close·후행 control·원 leader anchor가
+성공해야 두 번째 scan으로 진행하고, 외부에는 최종 GroupObservation 하나만 반환한다.
+원 실패와 후행 실패 또는 회복 이력을 보존한다. 기존 ESRCH·pidfd retirement·held
+identity 검사를 완화하지 않는다.
+
+각 accumulate에서 실제 count/RSS/VM 하한을 검사하여 첫 pass에서 확인한 초과를
+재관측으로 지울 수 없게 했다. 두 pass의 pending 이력은 한 번 병합하며 최종 Complete도
+원 last_complete 기준 1,000 ms 공백 검사를 먼저 통과해야 한다. 원 pending 이력·기한·
+last_attempt을 초기화하지 않는다. 기존 test module에 순수 검사 7개를 추가했고 같은
+호출 안의 pending→Complete 경계·선행 Complete 부재·후행 실패도 기존 검사에 포함했다.
+독립 소스 검토에서 발견한 Linux 전용 즉시 호출 closure는 직접 match로 교정했다.
+
+Windows577은 clean Git `d47204a970c4281fbb3b84f18f82432fc85038c4` snapshot에 위 두
+소스만 덮어쓴 입력으로 실제 library 251 tests PASS·기존 1 ignored다. Windows578의
+같은 package lib/tests strict Clippy도 PASS다. 각 입력 533개·12,210,954 bytes의 전후
+manifest SHA는 `09574689723c69960da734d1bae07c0940c4f89dc3fe3bab0cfa3540fb89ee12`로
+동일했다. 별도 작업 폴더의 미완성 정책 변경과 untracked 초안은 입력에 포함하지 않았다.
+579의 정확한 두 소스 rustfmt check와 580의 index 533개/정책 blob 1개/위반 0 검사도
+통과했다. 기존 고정 supervisor tool image의 digest는 검증 뒤에도 바뀌지 않았다.
+Git tree metadata를 먼저 제한하고 snapshot의 각 원 blob OID를 대조한 뒤 정확한 두
+소스 overlay digest를 고정했다. 전체 compiler/dependency/toolchain image 인증은 아니다.
+두 소스의 SHA는 각각
+`08555ec505c17d4ae5bb82872d6f27c4d7eee1940dfd94a3d272e90fb4306be9`,
+`93ae907ef6cb90d8f69b4b0f18bcf6659ef447f75caab4b8da64054c312bb867`이다.
+
+577은 41,647 ms·Job peak 533,082,112 bytes·11 processes·gap 139 ms·command 0이며,
+정책에 따라 남은 owned tail을 종료한 후 drain했다. 578은 15,895 ms·peak 424,222,720
+bytes·8 processes·gap 113 ms·command 0·자연 종료다. 둘 다 출력/export·scratch 정리·
+lease 해제와 감독/정리 오류 0이다. snapshot과 원시 로그는 저장소 밖 관리 수명을 따른다.
+준비574는 verbatim drive 표기를 일반 drive 표기와 직접 비교한 guard에서, 준비576은
+PowerShell ordered map의 크기 집계에서 실패했다. 두 실행 모두 Cargo 호출 전이며 원
+실패·완전한 출력·정상 정리 기록을 보존했다. 575의 유한한 경로 진단으로 전자를 확인하고
+명시적인 동일 drive 표기 처리와 합계 반복문으로 수정했다. 실패를 검사 성공으로 바꾸지 않는다.
+이번 변경의 실제 Linux native/strict 결과는 후속 CI에서 확인해야 한다. WSL은 사용하지 않았다.
+
+별도로 위 변경 전 `d47204a`의
+[Rust96](https://github.com/daejunnom/MMMM/actions/runs/39960679636)과
+[JVM87](https://github.com/daejunnom/MMMM/actions/runs/39960679978)은 최종 success이며,
+각 3개 OS의 tests/lint 또는 JVM/native/startup 및 집계 step 성공을 metadata로 확인했다.
+이 성공은 앞선 간헐적인 CI85 실패를 지우지 않으며, 이번 두 소스 수정의 실행 증거도 아니다.
+해당 두 새 CI의 원 artifact 감사와 실제 게임·클라이언트·공개 배포는 별도로 남아 있다.
+
+### 실제 함수 로더의 읽기 전용 ABI 관측
+
+Windows570/573은 보존한 공식 26.3 server bundle과 그 안의 정확한 game JAR를
+scratch로만 추출해 선택 JDK의 javap로 ServerFunctionLibrary·ReloadableServerResources·
+Resource 세 class를 읽었다. bundle/game/JDK 선택 입력 6개를 전후 대조했고 원 retained
+owner 및 비활성 조건을 확인했다. 게임 main·installer·server는 실행하지 않았다.
+선택 executable/modules/JVM/archive pin은 전체 JDK 인증이나 SourceAdmission이 아니다.
+570은 command 0·3,113 ms·peak 207,495,168 bytes, 573은 command 0·2,352 ms·peak
+208,400,384 bytes이며 각각 자연 종료·drain·출력/export·scratch 정리·lease 해제와
+감독/정리 오류 0이다. 준비571은 probe 번호를 전역 치환하면서 bundle digest 안의 같은
+숫자까지 바꿔 첫 pin에서 실패했다. javap 실행 전 실패를 보존하고 경로/대상만 좁게 바꾼
+573으로 교정했다. 원 game bundle의 bytes/digest는 바꾸지 않았다.
+
+실제 bytecode는 Resource.open()의 원 streamSupplier.get() 반환 stream을
+InputStreamReader(UTF_8)와 BufferedReader에 전달함을 보여 준다. readLines가 만든
+실제 List를 원 fromLines에 전달하지만, 개별 parse future의 실패는 로그로 소비되고
+해당 함수가 게시 map에서 빠질 수 있다. functions field 게시 뒤 tags build가 실패하는
+부분 효과도 가능하다. 따라서 outer reload future 성공·같은 문자열·다시 연 resource·
+List 재인코딩을 실제 source 소비/함수 생성/설치 인과 증거로 쓰지 않는다. 원 selection과
+실제 Supplier/future/continuation/list/새 manager/library/Resource/Function 객체의
+관계 및 소비 bytes를 연결할 production producer 구현은 아직 진행 중이다.
+기존 loaded47/cache94·root identity 사실과 causalLink=unproven·settled=false 및 원
+fence를 유지하며, Numeric47을 별도 DataPack PACK_CASE의 성공으로 해석하지 않는다.
+
+사용자 계정 인증 문제로 Minecraft 클라이언트 로그인·실제 ADMIN pairing·시각 검증은
+not_run이다. 클라이언트 인증을 우회하거나 필수 인수를 줄이지 않고, 독립 구현과 서버 측
+관측을 계속한다. 필수 게임 인수와 공개 v0.1.0 배포 완료 조건은 아래와 같다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.
