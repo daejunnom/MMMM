@@ -3882,6 +3882,67 @@ Windows676은 의도한2개 staged 파일의 index554 files·정책 blob1·viola
 정상 drain/output/export·scratch 제거·lease 해제·감독/정리 오류0을 확인했다. 최종 source pin·
 index/worktree blob2개·추가 줄의 공개 경로 정책·diff check도 확인했으며 다른 변경은 제외했다.
 
+### 고정 e92a919의 3OS 검사 결과
+
+고정 `e92a91960d020a2788a3ebc9e5ebb78d6262c2b3`의
+[Rust120](https://github.com/daejunnom/MMMM/actions/runs/40072389683)과
+[JVM114](https://github.com/daejunnom/MMMM/actions/runs/40072389678)은 각각 3OS 필수 job과
+집계가 모두 성공했다. Rust는 실제 test·strict·export, JVM은 필수 JVM·observer·export를
+확인했다. optional 개발 JAR는 다시 dispatch하지 않았으며 실제 게임·배포 인수는 별도다.
+
+macOS120 원 ZIP90,961 bytes·SHA
+`d0fff3f7b0273126fefd05b0b612eb48646ff62daa311e754c40c84a0c7ee840`를 API digest·실제 source·
+target·run에 대조하고 열린 원 ZIP에서 압축 해제 없이 필요한 member의 길이·EOF·digest를
+확인했다. test는283,008 ms·command0·completed이며 peak aggregate RSS1,926,053,888 bytes·
+footprint1,636,950,272 bytes·gap299 ms다. Coordinator423·observer120 PASS이며 앞선 ordinary
+추가13개 검사가 각각 실제 ok였다. native stdio binary와 보강한 Darwin 순수 terminal 검사도
+실행됐다. tools263 PASS·1 ignored이며 ignored 검사를 실행했다고 표시하지 않는다.
+
+strict는68,020 ms·command0·completed이며 peak aggregate RSS1,449,705,472 bytes·
+footprint1,158,602,752 bytes·gap291 ms다. 두 단계 모두 원 로그의 별도 진단 보존, 실제
+drain·output_complete·storage observed·export·scratch 제거·lease 해제·감독/정리 오류0을
+확인했다. 관측 로그에 `parent_last_signal_failure: Some`은 없었다. 실제 EPERM 후행 branch의
+발생이나 과거 경합의 재현을 이 성공으로 주장하지 않으며 Rust119의 원 실패는 보존한다.
+
+### 실제 후속 target의 두 제한 본문 검사
+
+후속 소스는 Schedule에서 실제로 받은 provider와 TaskCreated에서 실제로 받은 action의
+기존 same-frame captured-method token을 소비한다. issuer가 해석한 실제 jmethodID의 declaring
+Class를 held Class에 join하고 loader·issuer·generation·현재 status와 method의 실제 name·
+descriptor·modifiers를 전후 확인한다. 그 identity의 ordinary source view에서 선택 메서드가
+snapshot에 정확히 하나 있어야 하며 순수 matcher 결과도 실제 메서드와 일치해야 한다.
+core lock 안에서는 VM 호출이나 token 재검사를 수행하지 않는다.
+
+지원 정책은 원 Windows641/642의26.3 관측을 근거로 하는 두 body다. CallFunction의
+`lambda$execute$0`은 CommandQueueEntry allocation·dup·고정 인자 순서·UnboundEntryAction.bind·
+정확한 constructor·areturn을 검사한다. UnboundEntryAction의 `lambda$bind$0`은 고정 네 인자·
+해당 interface.execute·return을 검사한다. source와 VM의 CP는 각각 해석하며 숫자 index를
+비교하지 않는다. owner·name·descriptor·reference tag·interface count/zero·EOF·handler 부재·
+최소 stack/locals를 요구하고 추가 명령과 효과를 거부한다. modifier는 각각 private static과
+private instance에 선택 ACC_SYNTHETIC만 지원한다. 이 선택은 명시한 지원 정책이며 원 javap에서
+그 numeric flag를 관측했다는 주장이 아니다. 실제 bind·constructor·execute의 callee body와
+receiver dispatch closure는 이 부분 검사로 입증하지 않는다.
+
+기존 Recipe 경로와 load47 동작은 유지하고 새 Run wrapper는 위 두 실제 callback에만 연결했다.
+원 ClassfileError와 role을 private cause까지 보존하며 실제 native·Locals 후행 오류가 생기면
+primary를 덮지 않고 별도 post로 남긴다. 기존 두 필드 root_boundary 진단을 사용한다.
+기존 inline encoder로5개 semantic 검사, native metadata guard1개와 JNI 오류 보존2개를 추가했다.
+이8개는 소스 검토를 마쳤으며 다음 커밋의 실제 실행 결과와 구분한다. 새 외부 fixture는 없다.
+
+원 offset0의 `pack_original_callsite_body_unproven`은 그대로이므로 현재 invocation은 이 후속
+Schedule/TaskCreated 검사에 도달하지 못한다. transformed FunctionCommand·handler와 람다3개·
+stage hook·controlled startup·별도 phase49·request-scoped Rust 취득과 Java effect 직전 재확인은
+계속 미구현이다. 기존 Rust prewrite 거절을 유지한다. 계정 인증 문제로 실제 클라이언트 접속·
+관리자 pairing·시각 검증은 `not_run`이며 우회하거나 완료로 바꾸지 않는다.
+
+Windows677은 외부에 고정한 source4개와 doc witness1개의 총879,580 bytes를 사전 확인하고
+빈 owned cwd의 stdin으로 Rust4개만 포맷했다. after manifest826 bytes·SHA
+`3ae97e6886cdbd9495ce29b0f0b670e987f3ed2a6671b2006fcf41cab68e42db`와 전5개 사후 pin을
+대조했으며 doc witness는 수정하지 않았다. command0·1,129 ms·peak Job committed51,666,944
+bytes·최대3 process·gap101 ms, 정상 drain/output/export·scratch 제거·lease 해제와 감독/정리
+오류0을 확인했다. 원 source·doc·helper·manifest는 외부 보존한다. 이 문단은 포맷 이후 별도로
+추가한 실행 기록이며 새8개 검사의 컴파일·실행 성공으로 취급하지 않는다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

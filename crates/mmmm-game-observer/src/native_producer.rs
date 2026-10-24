@@ -18,8 +18,9 @@ use std::sync::{Mutex, OnceLock};
 
 pub(crate) use crate::classfile::PackCapturedRecipeKind;
 use crate::classfile::{
-    CaptureField, ClassfileError, HiddenForwarder, PlainTextInstantiateMatch,
-    match_hidden_forwarder, match_pack_captured_forwarder, match_plain_text_instantiate,
+    CaptureField, ClassfileError, HiddenForwarder, PackOrdinaryTargetMatch,
+    PlainTextInstantiateMatch, match_hidden_forwarder, match_pack_captured_forwarder,
+    match_pack_entry_action_target, match_pack_task_provider_target, match_plain_text_instantiate,
 };
 use crate::definitions::{
     AttemptId, DefinitionKind, ExecutableSnapshot, HiddenRecipe, MAX_CLASS_BYTES, MAX_METHODS,
@@ -2277,6 +2278,37 @@ pub(crate) enum PlainTextBodyObservation {
     },
 }
 
+/// Partial description of the ordinary method selected by an actual captured
+/// receiver. This is neither a dispatch closure nor source/run permission.
+pub(crate) enum PackTargetBodyObservation {
+    Unavailable,
+    Matched(PackOrdinaryTargetMatch),
+    Unproven {
+        error: ClassfileError,
+        post: Option<ProducerError>,
+    },
+}
+
+#[derive(Eq, PartialEq)]
+struct PackTargetMethodMetadata {
+    owner_signature: Vec<u8>,
+    name_mutf8: Vec<u8>,
+    descriptor_mutf8: Vec<u8>,
+    modifiers: jint,
+}
+
+impl PackTargetMethodMetadata {
+    fn matches_snapshot(&self, snapshot: &ExecutableSnapshot) -> bool {
+        let mut methods = snapshot.methods.iter().filter(|method| {
+            method.name_mutf8 == self.name_mutf8 && method.descriptor_mutf8 == self.descriptor_mutf8
+        });
+        let Some(method) = methods.next() else {
+            return false;
+        };
+        method.modifiers == self.modifiers && methods.next().is_none()
+    }
+}
+
 /// Describe only the selected ordinary PlainTextFunction.instantiate body.
 /// The caller first joins its actual plain object's Class to `class`; no named
 /// lookup or caller-supplied receipt can select the source. Even a match does
@@ -2389,6 +2421,136 @@ impl PackCapturedMethodToken<'_> {
         }
         let current = unsafe { self.target.has_current_class_status(env)? };
         Ok(current && self.is_current())
+    }
+
+    unsafe fn target_metadata(
+        &self,
+        env: *mut JNIEnv,
+        frame: &SourceCaptureToken,
+    ) -> Result<Option<PackTargetMethodMetadata>> {
+        if !unsafe { self.recheck(env, frame)? }
+            || self.target.class_id != self.context.lookup_class_id
+            || self.target.issuer_epoch != self.context.issuer_epoch
+            || self.target.hidden_source_class_id != self.context.hidden_class_id
+            || self.target.hidden_source_generation != self.context.generation
+        {
+            return Ok(None);
+        }
+        let ti = owned_files_vm();
+        if ti.is_null() {
+            return Ok(None);
+        }
+        let class = self.target.target_class_handle as jclass;
+        let method = self.target.method_handle as jmethodID;
+        let declaring = unsafe { ffi::method_declaring_class(ti, method)? };
+        let joined = unsafe { ffi::same_object(env, declaring, class) };
+        let closed = unsafe { ffi::delete_local(env, declaring) };
+        let joined = joined?;
+        closed?;
+        if !joined
+            || unsafe { existing_source_loader(env, ti, class)? }
+                != Some(self.context.defining_loader_id)
+        {
+            return Ok(None);
+        }
+        let owner_signature = unsafe { ffi::class_signature(ti, class)? };
+        let (name_mutf8, descriptor_mutf8) = unsafe { ffi::method_name(ti, method)? };
+        let modifiers = unsafe { ffi::method_modifiers(ti, method)? };
+        if !unsafe { self.recheck(env, frame)? } {
+            return Ok(None);
+        }
+        Ok(Some(PackTargetMethodMetadata {
+            owner_signature,
+            name_mutf8,
+            descriptor_mutf8,
+            modifiers,
+        }))
+    }
+
+    /// Inspect only this hidden receiver's already resolved actual target.
+    /// The caller must first verify the actual captured references in this
+    /// frame. Named Classes or decoded IDs cannot substitute for this token.
+    /// Current offset0 still rejects before Schedule/TaskCreated can reach this
+    /// observation; it does not complete bind/constructor or PACK dispatch proof.
+    pub(crate) unsafe fn ordinary_target_body(
+        &self,
+        env: *mut JNIEnv,
+        frame: &SourceCaptureToken,
+    ) -> Result<PackTargetBodyObservation> {
+        let Some(before) = (unsafe { self.target_metadata(env, frame)? }) else {
+            return Ok(PackTargetBodyObservation::Unavailable);
+        };
+        let Some(owner) = class_internal(&before.owner_signature) else {
+            return Ok(PackTargetBodyObservation::Unavailable);
+        };
+        let _matching =
+            Operation::acquire(SNAPSHOT_RESERVATION).ok_or(ProducerError::StateUnavailable)?;
+        let expected_identity = (
+            self.target.issuer_epoch,
+            self.target.class_id,
+            self.target.definition_generation,
+            self.context.defining_loader_id,
+        );
+        let matched = core(|core| {
+            Ok(core.with_ordinary_source(
+                expected_identity.0,
+                expected_identity.1,
+                expected_identity.2,
+                expected_identity.3,
+                |source| {
+                    if source.identity() != expected_identity
+                        || !source.name_utf8().iter().copied().eq(owner
+                            .iter()
+                            .map(|byte| if *byte == b'/' { b'.' } else { *byte }))
+                    {
+                        return None;
+                    }
+                    if !before.matches_snapshot(source.snapshot()) {
+                        return Some(Err(ClassfileError::SnapshotMismatch(
+                            "resolved_target_method_metadata",
+                        )));
+                    }
+                    Some(match self.kind {
+                        PackCapturedRecipeKind::TaskProvider => match_pack_task_provider_target(
+                            source.terminal_bytes(),
+                            source.snapshot(),
+                        ),
+                        PackCapturedRecipeKind::EntryAction => match_pack_entry_action_target(
+                            source.terminal_bytes(),
+                            source.snapshot(),
+                        ),
+                    })
+                },
+            ))
+        })?
+        .flatten();
+        let Some(matched) = matched else {
+            return Ok(PackTargetBodyObservation::Unavailable);
+        };
+        let post = (|| -> Result<()> {
+            if unsafe { self.target_metadata(env, frame)? }.as_ref() != Some(&before) {
+                return Err(ProducerError::StateUnavailable);
+            }
+            Ok(())
+        })();
+        match matched {
+            Err(error) => Ok(PackTargetBodyObservation::Unproven {
+                error,
+                post: post.err(),
+            }),
+            Ok(matched) => {
+                post?;
+                if matched.method().owner().as_bytes() != owner
+                    || matched.method().name().as_bytes() != before.name_mutf8
+                    || matched.method().descriptor().as_bytes() != before.descriptor_mutf8
+                    || matched.method().is_interface()
+                        != matches!(self.kind, PackCapturedRecipeKind::EntryAction)
+                {
+                    return Ok(PackTargetBodyObservation::Unavailable);
+                }
+                Ok(PackTargetBodyObservation::Matched(matched))
+            }
+        }
     }
 
     /// Capture values are read from the exact actual receiver, not from Java
@@ -2760,6 +2922,39 @@ fn encode_hidden_forwarder(
 #[cfg(test)]
 mod pack_recipe_frame_tests {
     use super::*;
+
+    #[test]
+    fn ordinary_target_requires_one_snapshot_method_with_exact_actual_metadata() {
+        // Pure metadata guard only: this fixture creates no Class/method token.
+        let metadata = PackTargetMethodMetadata {
+            owner_signature: b"Lsample/Owner;".to_vec(),
+            name_mutf8: b"target".to_vec(),
+            descriptor_mutf8: b"()V".to_vec(),
+            modifiers: 0x000a,
+        };
+        let method = MethodSnapshot {
+            name_mutf8: metadata.name_mutf8.clone(),
+            descriptor_mutf8: metadata.descriptor_mutf8.clone(),
+            modifiers: metadata.modifiers,
+            code: MethodCode::Bytecodes(vec![0xb1]),
+        };
+        let mut snapshot = ExecutableSnapshot {
+            constant_pool_count: 1,
+            constant_pool: vec![],
+            methods: vec![method.clone()],
+        };
+        assert!(metadata.matches_snapshot(&snapshot));
+        snapshot.methods[0].modifiers |= 0x1000;
+        assert!(!metadata.matches_snapshot(&snapshot));
+        snapshot.methods[0] = method.clone();
+        snapshot.methods[0].descriptor_mutf8 = b"(I)V".to_vec();
+        assert!(!metadata.matches_snapshot(&snapshot));
+        snapshot.methods[0] = method.clone();
+        snapshot.methods[0].name_mutf8 = b"other".to_vec();
+        assert!(!metadata.matches_snapshot(&snapshot));
+        snapshot.methods = vec![method.clone(), method];
+        assert!(!metadata.matches_snapshot(&snapshot));
+    }
 
     struct RestoreOperations(Option<LocalOperations>);
     impl Drop for RestoreOperations {

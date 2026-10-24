@@ -75,6 +75,10 @@ enum Error {
     Fact(Failure),
     Gap(&'static str),
     PlainTextBody(ClassfileError),
+    PackTargetBody {
+        kind: native_producer::PackCapturedRecipeKind,
+        error: ClassfileError,
+    },
     Root(owned_pack_files::Failure),
     Post(Box<Error>, Box<Error>),
 }
@@ -167,6 +171,10 @@ enum NativeCause {
     Post(Box<NativeCause>, Box<NativeCause>),
     Boundary(&'static str),
     PlainTextBody(ClassfileError),
+    PackTargetBody {
+        kind: native_producer::PackCapturedRecipeKind,
+        error: ClassfileError,
+    },
     ObservedReason {
         engine: Option<String>,
         observer: Option<String>,
@@ -1839,6 +1847,12 @@ fn error_cause(locals: &mut Locals, index: usize, error: Error, current: bool) -
             }
             NativeCause::PlainTextBody(error)
         }
+        Error::PackTargetBody { kind, error } => {
+            if !current && let Ok(mut registry) = state() {
+                registry.note(index, Failure::Identity, None);
+            }
+            NativeCause::PackTargetBody { kind, error }
+        }
     }
 }
 fn record_error(
@@ -1933,6 +1947,7 @@ fn error_code(error: &Error) -> &'static str {
         Error::Fact(failure) => failure_name(*failure),
         Error::Gap(code) => code,
         Error::PlainTextBody(_) => "pack_plain_text_instantiate_body_unproven",
+        Error::PackTargetBody { kind, .. } => pack_target_body_code(*kind),
         Error::Root(_) => "native_root_observation_failed",
         Error::Post(_, _) => "observation_and_post_failed",
     }
@@ -3322,6 +3337,17 @@ fn native_cause_json(cause: &NativeCause) -> Value {
                 "pack_plain_text_instantiate_body_unproven/{kind}:{reason}"
             )})
         }
+        NativeCause::PackTargetBody { kind, error } => {
+            let (error_kind, reason) = match error {
+                ClassfileError::Malformed(reason) => ("malformed", *reason),
+                ClassfileError::Unsupported(reason) => ("unsupported", *reason),
+                ClassfileError::Bounds(reason) => ("bounds", *reason),
+                ClassfileError::SnapshotMismatch(reason) => ("snapshot_mismatch", *reason),
+            };
+            json!({"kind":"root_boundary","failure":format!(
+                "{}/{error_kind}:{reason}", pack_target_body_code(*kind)
+            )})
+        }
         NativeCause::ObservedReason { engine, observer } => {
             json!({"kind":"observed_reason","engine":engine,"observer":observer})
         }
@@ -3365,6 +3391,70 @@ fn plain_text_body_result(observation: native_producer::PlainTextBodyObservation
                 Some(post) => Error::Post(
                     Box::new(primary),
                     Box::new(plain_text_body_native_error(post)),
+                ),
+                None => primary,
+            })
+        }
+    }
+}
+
+fn pack_target_body_code(kind: native_producer::PackCapturedRecipeKind) -> &'static str {
+    match kind {
+        native_producer::PackCapturedRecipeKind::TaskProvider => {
+            "pack_task_provider_target_body_unproven"
+        }
+        native_producer::PackCapturedRecipeKind::EntryAction => {
+            "pack_entry_action_target_body_unproven"
+        }
+    }
+}
+
+fn pack_target_body_native_error(
+    kind: native_producer::PackCapturedRecipeKind,
+    error: native_producer::ProducerError,
+) -> Error {
+    match error {
+        native_producer::ProducerError::Ffi(error) => Error::Ffi(error),
+        native_producer::ProducerError::Core(_)
+        | native_producer::ProducerError::StateUnavailable => Error::Gap(match kind {
+            native_producer::PackCapturedRecipeKind::TaskProvider => {
+                "pack_task_provider_target_metadata_failed"
+            }
+            native_producer::PackCapturedRecipeKind::EntryAction => {
+                "pack_entry_action_target_metadata_failed"
+            }
+        }),
+    }
+}
+
+fn pack_target_body_result(
+    kind: native_producer::PackCapturedRecipeKind,
+    observation: native_producer::PackTargetBodyObservation,
+) -> Result<()> {
+    match observation {
+        native_producer::PackTargetBodyObservation::Unavailable => {
+            Err(Error::Gap(pack_target_body_code(kind)))
+        }
+        native_producer::PackTargetBodyObservation::Matched(matched) => {
+            let owner = match kind {
+                native_producer::PackCapturedRecipeKind::TaskProvider => {
+                    "net/minecraft/commands/execution/tasks/CallFunction"
+                }
+                native_producer::PackCapturedRecipeKind::EntryAction => {
+                    "net/minecraft/commands/execution/UnboundEntryAction"
+                }
+            };
+            if matched.method().owner() != owner {
+                return Err(Error::Gap(pack_target_body_code(kind)));
+            }
+            Ok(())
+        }
+        native_producer::PackTargetBodyObservation::Unproven { error, post } => {
+            let primary = Error::PackTargetBody { kind, error };
+            Err(match post {
+                Some(post) => Error::Post(
+                    Box::new(primary),
+                    Box::new(pack_target_body_native_error(kind, post)),
                 ),
                 None => primary,
             })
@@ -3485,6 +3575,50 @@ fn pack_captured(
     kind: native_producer::PackCapturedRecipeKind,
     captures: &[jobject],
 ) -> Result<()> {
+    pack_captured_for(
+        locals,
+        index,
+        token,
+        receiver,
+        kind,
+        captures,
+        PackCapturedPurpose::Recipe,
+    )
+}
+
+enum PackCapturedPurpose {
+    Recipe,
+    RunTargetBody,
+}
+
+fn pack_run_captured_target(
+    locals: &mut Locals,
+    index: usize,
+    token: &SourceCaptureToken,
+    receiver: jobject,
+    kind: native_producer::PackCapturedRecipeKind,
+    captures: &[jobject],
+) -> Result<()> {
+    pack_captured_for(
+        locals,
+        index,
+        token,
+        receiver,
+        kind,
+        captures,
+        PackCapturedPurpose::RunTargetBody,
+    )
+}
+
+fn pack_captured_for(
+    locals: &mut Locals,
+    index: usize,
+    token: &SourceCaptureToken,
+    receiver: jobject,
+    kind: native_producer::PackCapturedRecipeKind,
+    captures: &[jobject],
+    purpose: PackCapturedPurpose,
+) -> Result<()> {
     let owner = match kind {
         native_producer::PackCapturedRecipeKind::TaskProvider => {
             b"Lnet/minecraft/commands/execution/tasks/CallFunction;".as_slice()
@@ -3511,6 +3645,15 @@ fn pack_captured(
             .map_err(|_| Error::Gap("pack_captured_postcheck_unavailable"))?
     {
         return Err(Failure::Identity.into());
+    }
+    if matches!(purpose, PackCapturedPurpose::RunTargetBody) {
+        let body = unsafe { recipe.ordinary_target_body(locals.env, token) }
+            .map_err(|error| pack_target_body_native_error(kind, error))
+            .and_then(|observation| pack_target_body_result(kind, observation));
+        // This is a partial body observation of the actual Schedule/TaskCreated
+        // receiver, not proof of its bind/constructor dispatch closure. The
+        // current offset0 deny prevents this Invocation from reaching it.
+        locals.finish(body)?;
     }
     locals.live()
 }
@@ -3848,7 +3991,7 @@ fn pack_run_event(
                     return Err(Failure::Identity.into());
                 }
                 let provider = field_id(locals, index, frame, Field::Provider)?;
-                pack_captured(
+                pack_run_captured_target(
                     locals,
                     index,
                     token,
@@ -3905,7 +4048,7 @@ fn pack_run_event(
                     child,
                     action,
                 )?;
-                pack_captured(
+                pack_run_captured_target(
                     locals,
                     index,
                     token,
@@ -4700,6 +4843,105 @@ mod tests {
                 assert!(matches!(*post, Error::Ffi(ffi::FfiError::PendingException)));
             }
             _ => panic!("a real post failure must preserve the original pure body failure"),
+        }
+    }
+
+    #[test]
+    fn pack_target_body_errors_keep_each_role_and_original_closed_failure() {
+        for (kind, code) in [
+            (
+                native_producer::PackCapturedRecipeKind::TaskProvider,
+                "pack_task_provider_target_body_unproven",
+            ),
+            (
+                native_producer::PackCapturedRecipeKind::EntryAction,
+                "pack_entry_action_target_body_unproven",
+            ),
+        ] {
+            for (error, error_kind, reason) in [
+                (
+                    ClassfileError::Malformed("bad_code"),
+                    "malformed",
+                    "bad_code",
+                ),
+                (
+                    ClassfileError::Unsupported("invoke"),
+                    "unsupported",
+                    "invoke",
+                ),
+                (
+                    ClassfileError::Bounds("code_length"),
+                    "bounds",
+                    "code_length",
+                ),
+                (
+                    ClassfileError::SnapshotMismatch("selected_target"),
+                    "snapshot_mismatch",
+                    "selected_target",
+                ),
+            ] {
+                let result = pack_target_body_result(
+                    kind,
+                    native_producer::PackTargetBodyObservation::Unproven {
+                        error: error.clone(),
+                        post: None,
+                    },
+                );
+                match result {
+                    Err(Error::PackTargetBody {
+                        kind: actual,
+                        error: actual_error,
+                    }) => {
+                        assert!(actual == kind);
+                        assert_eq!(actual_error, error);
+                    }
+                    _ => panic!("a target-body failure must retain its role and pure cause"),
+                }
+                assert_eq!(
+                    error_code(&Error::PackTargetBody {
+                        kind,
+                        error: error.clone()
+                    }),
+                    code
+                );
+                assert_eq!(
+                    native_cause_json(&NativeCause::PackTargetBody { kind, error }),
+                    json!({
+                        "kind":"root_boundary",
+                        "failure":format!("{code}/{error_kind}:{reason}"),
+                    })
+                );
+            }
+            assert!(matches!(
+                pack_target_body_result(kind, native_producer::PackTargetBodyObservation::Unavailable),
+                Err(Error::Gap(actual)) if actual == code
+            ));
+        }
+    }
+
+    #[test]
+    fn pack_target_body_error_precedes_a_real_native_post_failure() {
+        let result = pack_target_body_result(
+            native_producer::PackCapturedRecipeKind::EntryAction,
+            native_producer::PackTargetBodyObservation::Unproven {
+                error: ClassfileError::SnapshotMismatch("selected_target"),
+                post: Some(native_producer::ProducerError::Ffi(
+                    ffi::FfiError::PendingException,
+                )),
+            },
+        );
+        match result {
+            Err(Error::Post(primary, post)) => {
+                assert!(matches!(
+                    *primary,
+                    Error::PackTargetBody {
+                        kind: native_producer::PackCapturedRecipeKind::EntryAction,
+                        error: ClassfileError::SnapshotMismatch("selected_target"),
+                    }
+                ));
+                assert!(matches!(*post, Error::Ffi(ffi::FfiError::PendingException)));
+            }
+            _ => panic!("a real target post failure must keep the pure body failure primary"),
         }
     }
 

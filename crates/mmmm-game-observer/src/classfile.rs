@@ -105,6 +105,19 @@ impl PlainTextInstantiateMatch {
     }
 }
 
+/// Describes one ordinary forwarding target only. Symbolic bind, constructor
+/// and execute references are not proofs of their actual dispatch or bodies.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PackOrdinaryTargetMatch {
+    method: MethodSymbol,
+}
+
+impl PackOrdinaryTargetMatch {
+    pub(crate) fn method(&self) -> &MethodSymbol {
+        &self.method
+    }
+}
+
 impl HiddenForwarder {
     pub(crate) fn class_name(&self) -> &str {
         &self.class_name
@@ -1465,6 +1478,204 @@ pub(crate) fn match_plain_text_instantiate(
             interface: false,
         },
     })
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum PackTargetSemantics {
+    TaskProvider {
+        allocated_class: String,
+        bind: MethodSymbol,
+        constructor: MethodSymbol,
+    },
+    EntryAction {
+        execute: MethodSymbol,
+    },
+}
+
+fn pack_task_target_semantics(
+    bytes: &[u8],
+    pool: &Pool,
+) -> Result<PackTargetSemantics, ClassfileError> {
+    let mut reader = Reader::new(bytes);
+    if reader.u1()? != 0xbb {
+        return Err(ClassfileError::Unsupported("PACK task target allocation"));
+    }
+    let allocated_class = pool.class(reader.u2()?)?;
+    if allocated_class != "net/minecraft/commands/execution/CommandQueueEntry"
+        || reader.u1()? != 0x59
+    {
+        return Err(ClassfileError::Unsupported(
+            "PACK task target allocated class",
+        ));
+    }
+    let reference = ValueType::Reference("java/lang/Object".to_owned());
+    for slot in [1, 2, 0] {
+        expect_load(&mut reader, &reference, slot)?;
+    }
+    if reader.u1()? != 0xb9 {
+        return Err(ClassfileError::Unsupported(
+            "PACK task target bind invocation",
+        ));
+    }
+    let bind = pool.method(reader.u2()?)?;
+    if bind.owner != "net/minecraft/commands/execution/UnboundEntryAction"
+        || bind.name != "bind"
+        || bind.descriptor != "(Ljava/lang/Object;)Lnet/minecraft/commands/execution/EntryAction;"
+        || !bind.interface
+        || reader.u1()? != 2
+        || reader.u1()? != 0
+    {
+        return Err(ClassfileError::Unsupported(
+            "PACK task target bind semantics",
+        ));
+    }
+    if reader.u1()? != 0xb7 {
+        return Err(ClassfileError::Unsupported(
+            "PACK task target constructor invocation",
+        ));
+    }
+    let constructor = pool.method(reader.u2()?)?;
+    if constructor.owner != allocated_class
+        || constructor.name != "<init>"
+        || constructor.descriptor
+            != "(Lnet/minecraft/commands/execution/Frame;Lnet/minecraft/commands/execution/EntryAction;)V"
+        || constructor.interface
+        || reader.u1()? != 0xb0
+    {
+        return Err(ClassfileError::Unsupported(
+            "PACK task target constructor semantics",
+        ));
+    }
+    if reader.offset != bytes.len() {
+        return Err(ClassfileError::Unsupported(
+            "PACK task target has additional instructions",
+        ));
+    }
+    Ok(PackTargetSemantics::TaskProvider {
+        allocated_class,
+        bind,
+        constructor,
+    })
+}
+
+fn pack_entry_target_semantics(
+    bytes: &[u8],
+    pool: &Pool,
+) -> Result<PackTargetSemantics, ClassfileError> {
+    let mut reader = Reader::new(bytes);
+    let reference = ValueType::Reference("java/lang/Object".to_owned());
+    for slot in [0, 1, 2, 3] {
+        expect_load(&mut reader, &reference, slot)?;
+    }
+    if reader.u1()? != 0xb9 {
+        return Err(ClassfileError::Unsupported(
+            "PACK entry target execute invocation",
+        ));
+    }
+    let execute = pool.method(reader.u2()?)?;
+    if execute.owner != "net/minecraft/commands/execution/UnboundEntryAction"
+        || execute.name != "execute"
+        || execute.descriptor
+            != "(Ljava/lang/Object;Lnet/minecraft/commands/execution/ExecutionContext;Lnet/minecraft/commands/execution/Frame;)V"
+        || !execute.interface
+        || reader.u1()? != 4
+        || reader.u1()? != 0
+        || reader.u1()? != 0xb1
+    {
+        return Err(ClassfileError::Unsupported(
+            "PACK entry target execute semantics",
+        ));
+    }
+    if reader.offset != bytes.len() {
+        return Err(ClassfileError::Unsupported(
+            "PACK entry target has additional instructions",
+        ));
+    }
+    Ok(PackTargetSemantics::EntryAction { execute })
+}
+
+fn match_pack_ordinary_target(
+    terminal_bytes: &[u8],
+    snapshot: &ExecutableSnapshot,
+    kind: PackCapturedRecipeKind,
+) -> Result<PackOrdinaryTargetMatch, ClassfileError> {
+    let parsed = parse_classfile(terminal_bytes)?;
+    let shape = kind.shape();
+    let is_interface = kind == PackCapturedRecipeKind::EntryAction;
+    if parsed.class_name != shape.target_owner || (parsed.flags & 0x0200 != 0) != is_interface {
+        return Err(ClassfileError::Unsupported("PACK ordinary declaring class"));
+    }
+    let method = parsed.selected_method(shape.target_name, shape.target_descriptor)?;
+    // This explicitly supports absent or present ACC_SYNTHETIC. The source
+    // javap policy input did not independently establish that numeric flag.
+    let expected = if is_interface { 0x0002 } else { 0x000a };
+    if method.flags & !0x1000 != expected {
+        return Err(ClassfileError::Unsupported(
+            "PACK ordinary target modifiers",
+        ));
+    }
+    let code = supported_code(method)?;
+    let (stack, locals) = if is_interface { (4, 4) } else { (5, 3) };
+    if code.max_stack < stack || code.max_locals < locals {
+        return Err(ClassfileError::Malformed("PACK ordinary Code limits"));
+    }
+    let semantics = match kind {
+        PackCapturedRecipeKind::TaskProvider => {
+            pack_task_target_semantics(&code.bytes, &parsed.pool)?
+        }
+        PackCapturedRecipeKind::EntryAction => {
+            pack_entry_target_semantics(&code.bytes, &parsed.pool)?
+        }
+    };
+    let vm_pool = snapshot_pool_structure(snapshot)?;
+    let actual = snapshot_method(snapshot, method)?;
+    let actual_semantics = match kind {
+        PackCapturedRecipeKind::TaskProvider => {
+            pack_task_target_semantics(bytecodes(actual)?, &vm_pool)?
+        }
+        PackCapturedRecipeKind::EntryAction => {
+            pack_entry_target_semantics(bytecodes(actual)?, &vm_pool)?
+        }
+    };
+    if actual_semantics != semantics {
+        return Err(ClassfileError::SnapshotMismatch(
+            "PACK ordinary target semantics",
+        ));
+    }
+    Ok(PackOrdinaryTargetMatch {
+        method: MethodSymbol {
+            owner: parsed.class_name.clone(),
+            name: method.name.clone(),
+            descriptor: method.descriptor.clone(),
+            interface: is_interface,
+        },
+    })
+}
+
+/// Matches only CallFunction's selected queue-construction forwarding body.
+/// Native must join the result to its current issuer-resolved actual method.
+pub(crate) fn match_pack_task_provider_target(
+    terminal_bytes: &[u8],
+    snapshot: &ExecutableSnapshot,
+) -> Result<PackOrdinaryTargetMatch, ClassfileError> {
+    match_pack_ordinary_target(
+        terminal_bytes,
+        snapshot,
+        PackCapturedRecipeKind::TaskProvider,
+    )
+}
+
+/// Matches only UnboundEntryAction's selected execute forwarding body. Actual
+/// receiver dispatch, startup finality and the complete PACK gate remain separate.
+pub(crate) fn match_pack_entry_action_target(
+    terminal_bytes: &[u8],
+    snapshot: &ExecutableSnapshot,
+) -> Result<PackOrdinaryTargetMatch, ClassfileError> {
+    match_pack_ordinary_target(
+        terminal_bytes,
+        snapshot,
+        PackCapturedRecipeKind::EntryAction,
+    )
 }
 
 /// Matches a complete original zero-capture recipe against VM executable

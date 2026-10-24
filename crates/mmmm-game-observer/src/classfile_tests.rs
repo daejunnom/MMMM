@@ -1231,3 +1231,400 @@ fn plain_text_declared_throws_and_signature_are_passive_but_unknown_attributes_a
     append_method_attribute(&mut unknown, 1, SAM_NAME, &[]);
     assert!(super::match_plain_text_instantiate(&unknown.recipe.input, &unknown.snapshot).is_err());
 }
+
+struct PackTargetReferences {
+    interface_call: usize,
+    allocation_class: Option<usize>,
+    constructor_call: Option<usize>,
+}
+
+fn fixture_class(fixture: &mut Fixture, name: &str) -> usize {
+    let name_index = fixture.pool.len();
+    fixture.pool.push(PoolEntry::Utf8(name.as_bytes().to_vec()));
+    let class = fixture.pool.len();
+    fixture.pool.push(PoolEntry::Class(name_index));
+    class
+}
+
+fn fixture_method(
+    fixture: &mut Fixture,
+    owner: &str,
+    name: &str,
+    descriptor: &str,
+    interface: bool,
+) -> usize {
+    let class = fixture_class(fixture, owner);
+    let name_index = fixture.pool.len();
+    fixture.pool.push(PoolEntry::Utf8(name.as_bytes().to_vec()));
+    let descriptor_index = fixture.pool.len();
+    fixture
+        .pool
+        .push(PoolEntry::Utf8(descriptor.as_bytes().to_vec()));
+    let name_type = fixture.pool.len();
+    fixture
+        .pool
+        .push(PoolEntry::NameAndType(name_index, descriptor_index));
+    let reference = fixture.pool.len();
+    fixture.pool.push(PoolEntry::MethodReference {
+        tag: if interface { 11 } else { 10 },
+        class,
+        name_type,
+    });
+    reference
+}
+
+// Reuse the independent source/VM encoders. These original-API policy recipes
+// are authored data, not observed transformed definitions or dispatch proofs.
+fn pack_target_policy(
+    kind: super::PackCapturedRecipeKind,
+) -> (&'static str, &'static str, &'static str) {
+    match kind {
+        super::PackCapturedRecipeKind::TaskProvider => (
+            "net/minecraft/commands/execution/tasks/CallFunction",
+            "lambda$execute$0",
+            "(Lnet/minecraft/commands/ExecutionCommandSource;Lnet/minecraft/commands/execution/Frame;Lnet/minecraft/commands/execution/UnboundEntryAction;)Lnet/minecraft/commands/execution/CommandQueueEntry;",
+        ),
+        super::PackCapturedRecipeKind::EntryAction => (
+            "net/minecraft/commands/execution/UnboundEntryAction",
+            "lambda$bind$0",
+            "(Ljava/lang/Object;Lnet/minecraft/commands/execution/ExecutionContext;Lnet/minecraft/commands/execution/Frame;)V",
+        ),
+    }
+}
+
+fn pack_target_fixture(kind: super::PackCapturedRecipeKind) -> (Fixture, PackTargetReferences) {
+    let (mut fixture, _, _, _) = bootstrap_fixture();
+    let (owner, name, descriptor) = pack_target_policy(kind);
+    fixture.pool[SELF_NAME] = PoolEntry::Utf8(owner.as_bytes().to_vec());
+    fixture.pool[SAM_NAME] = PoolEntry::Utf8(name.as_bytes().to_vec());
+    fixture.pool[SAM_DESCRIPTOR] = PoolEntry::Utf8(descriptor.as_bytes().to_vec());
+    let (instructions, references, access) = match kind {
+        super::PackCapturedRecipeKind::TaskProvider => {
+            fixture.class_access = 0x0021;
+            let allocation = fixture_class(
+                &mut fixture,
+                "net/minecraft/commands/execution/CommandQueueEntry",
+            );
+            let bind = fixture_method(
+                &mut fixture,
+                "net/minecraft/commands/execution/UnboundEntryAction",
+                "bind",
+                "(Ljava/lang/Object;)Lnet/minecraft/commands/execution/EntryAction;",
+                true,
+            );
+            let constructor = fixture_method(
+                &mut fixture,
+                "net/minecraft/commands/execution/CommandQueueEntry",
+                "<init>",
+                "(Lnet/minecraft/commands/execution/Frame;Lnet/minecraft/commands/execution/EntryAction;)V",
+                false,
+            );
+            (
+                vec![
+                    Instruction::PoolOperand(0xbb, allocation),
+                    bytes(&[0x59, 0x2b, 0x2c, 0x2a]),
+                    Instruction::PoolOperand(0xb9, bind),
+                    bytes(&[2, 0]),
+                    Instruction::PoolOperand(0xb7, constructor),
+                    bytes(&[0xb0]),
+                ],
+                PackTargetReferences {
+                    interface_call: bind,
+                    allocation_class: Some(allocation),
+                    constructor_call: Some(constructor),
+                },
+                0x100a,
+            )
+        }
+        super::PackCapturedRecipeKind::EntryAction => {
+            fixture.class_access = 0x0601;
+            let execute = fixture_method(
+                &mut fixture,
+                "net/minecraft/commands/execution/UnboundEntryAction",
+                "execute",
+                "(Ljava/lang/Object;Lnet/minecraft/commands/execution/ExecutionContext;Lnet/minecraft/commands/execution/Frame;)V",
+                true,
+            );
+            (
+                vec![
+                    bytes(&[0x2a, 0x2b, 0x2c, 0x2d]),
+                    Instruction::PoolOperand(0xb9, execute),
+                    bytes(&[4, 0, 0xb1]),
+                ],
+                PackTargetReferences {
+                    interface_call: execute,
+                    allocation_class: None,
+                    constructor_call: None,
+                },
+                0x1002,
+            )
+        }
+    };
+    fixture.methods = vec![MethodSpec {
+        access,
+        name: SAM_NAME,
+        descriptor: SAM_DESCRIPTOR,
+        instructions: Some(instructions),
+        handlers: Vec::new(),
+    }];
+    fixture.rebuild();
+    (fixture, references)
+}
+
+fn match_pack_target(
+    fixture: &Fixture,
+    kind: super::PackCapturedRecipeKind,
+) -> Result<super::PackOrdinaryTargetMatch, ClassfileError> {
+    match kind {
+        super::PackCapturedRecipeKind::TaskProvider => {
+            super::match_pack_task_provider_target(&fixture.recipe.input, &fixture.snapshot)
+        }
+        super::PackCapturedRecipeKind::EntryAction => {
+            super::match_pack_entry_action_target(&fixture.recipe.input, &fixture.snapshot)
+        }
+    }
+}
+
+#[test]
+fn ordinary_pack_targets_match_reordered_pools_and_explicit_optional_synthetic_policy() {
+    for kind in [
+        super::PackCapturedRecipeKind::TaskProvider,
+        super::PackCapturedRecipeKind::EntryAction,
+    ] {
+        let (mut fixture, references) = pack_target_fixture(kind);
+        assert_ne!(
+            fixture.source_map[references.interface_call],
+            fixture.vm_map[references.interface_call]
+        );
+        for synthetic in [0, 0x1000] {
+            fixture.methods[0].access = (fixture.methods[0].access & !0x1000) | synthetic;
+            fixture.rebuild();
+            let matched = match_pack_target(&fixture, kind).unwrap();
+            let (owner, name, descriptor) = pack_target_policy(kind);
+            assert_eq!(matched.method().owner(), owner);
+            assert_eq!(matched.method().name(), name);
+            assert_eq!(matched.method().descriptor(), descriptor);
+            assert_eq!(
+                matched.method().is_interface(),
+                kind == super::PackCapturedRecipeKind::EntryAction
+            );
+        }
+    }
+}
+
+#[test]
+fn ordinary_pack_targets_reject_extra_effects_wrong_load_order_counts_and_handlers() {
+    for kind in [
+        super::PackCapturedRecipeKind::TaskProvider,
+        super::PackCapturedRecipeKind::EntryAction,
+    ] {
+        let (fixture, _) = pack_target_fixture(kind);
+        let mut extra = fixture.clone_for_metadata();
+        extra.methods[0]
+            .instructions
+            .as_mut()
+            .unwrap()
+            .push(bytes(&[0x00]));
+        extra.rebuild();
+        assert!(match_pack_target(&extra, kind).is_err());
+        let mut effect = fixture.clone_for_metadata();
+        effect.methods[0]
+            .instructions
+            .as_mut()
+            .unwrap()
+            .insert(0, call());
+        effect.rebuild();
+        assert!(match_pack_target(&effect, kind).is_err());
+        let mut dynamic = fixture.clone_for_metadata();
+        dynamic.methods[0]
+            .instructions
+            .as_mut()
+            .unwrap()
+            .insert(0, bytes(&[0xba, 0, 0, 0, 0]));
+        dynamic.rebuild();
+        assert!(match_pack_target(&dynamic, kind).is_err());
+        let mut handler = fixture.clone_for_metadata();
+        handler.methods[0].handlers.push([0, 3, 0, 0]);
+        handler.rebuild();
+        assert!(match_pack_target(&handler, kind).is_err());
+        let mut order = fixture.clone_for_metadata();
+        let instructions = order.methods[0].instructions.as_mut().unwrap();
+        match kind {
+            super::PackCapturedRecipeKind::TaskProvider => {
+                instructions[1] = bytes(&[0x59, 0x2c, 0x2b, 0x2a])
+            }
+            super::PackCapturedRecipeKind::EntryAction => {
+                instructions[0] = bytes(&[0x2a, 0x2b, 0x2d, 0x2c])
+            }
+        }
+        order.rebuild();
+        assert!(match_pack_target(&order, kind).is_err());
+        let expected_count = if kind == super::PackCapturedRecipeKind::TaskProvider {
+            2
+        } else {
+            4
+        };
+        for (count, zero) in [(0, 0), (3, 0), (expected_count, 1)] {
+            let mut invalid = fixture.clone_for_metadata();
+            let instructions = invalid.methods[0].instructions.as_mut().unwrap();
+            match kind {
+                super::PackCapturedRecipeKind::TaskProvider => {
+                    instructions[3] = bytes(&[count, zero])
+                }
+                super::PackCapturedRecipeKind::EntryAction => {
+                    instructions[2] = bytes(&[count, zero, 0xb1])
+                }
+            }
+            invalid.rebuild();
+            assert!(match_pack_target(&invalid, kind).is_err());
+        }
+    }
+}
+
+#[test]
+fn ordinary_pack_targets_reject_wrong_symbol_roles_and_reference_tags() {
+    for kind in [
+        super::PackCapturedRecipeKind::TaskProvider,
+        super::PackCapturedRecipeKind::EntryAction,
+    ] {
+        let (fixture, references) = pack_target_fixture(kind);
+        for mutation in 0..4 {
+            let mut invalid = fixture.clone_for_metadata();
+            let PoolEntry::MethodReference {
+                tag,
+                class,
+                name_type,
+            } = invalid.pool[references.interface_call].clone()
+            else {
+                panic!("fixture method reference")
+            };
+            let PoolEntry::NameAndType(name, descriptor) = invalid.pool[name_type].clone() else {
+                panic!("fixture name type")
+            };
+            match mutation {
+                0 => {
+                    invalid.pool[references.interface_call] = PoolEntry::MethodReference {
+                        tag: 10,
+                        class,
+                        name_type,
+                    }
+                }
+                1 => invalid.pool[class] = PoolEntry::Class(OBJECT_NAME),
+                2 => invalid.pool[name] = PoolEntry::Utf8(b"other".to_vec()),
+                _ => invalid.pool[descriptor] = PoolEntry::Utf8(b"()V".to_vec()),
+            }
+            assert_eq!(tag, 11);
+            invalid.rebuild();
+            assert!(match_pack_target(&invalid, kind).is_err());
+        }
+        if let Some(allocation) = references.allocation_class {
+            let mut invalid = fixture.clone_for_metadata();
+            invalid.pool[allocation] = PoolEntry::Class(OBJECT_NAME);
+            invalid.rebuild();
+            assert!(match_pack_target(&invalid, kind).is_err());
+        }
+        if let Some(constructor) = references.constructor_call {
+            let PoolEntry::MethodReference { class, .. } = fixture.pool[constructor].clone() else {
+                panic!("fixture constructor class")
+            };
+            for (tag, owner) in [(10, OBJECT_CLASS), (11, class)] {
+                let mut invalid = fixture.clone_for_metadata();
+                let PoolEntry::MethodReference { name_type, .. } =
+                    invalid.pool[constructor].clone()
+                else {
+                    panic!("fixture constructor")
+                };
+                invalid.pool[constructor] = PoolEntry::MethodReference {
+                    tag,
+                    class: owner,
+                    name_type,
+                };
+                invalid.rebuild();
+                assert!(match_pack_target(&invalid, kind).is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn ordinary_pack_targets_require_exact_source_and_vm_modifiers_and_unique_selected_method() {
+    for kind in [
+        super::PackCapturedRecipeKind::TaskProvider,
+        super::PackCapturedRecipeKind::EntryAction,
+    ] {
+        let (fixture, _) = pack_target_fixture(kind);
+        for bit in [
+            0x0001, 0x0004, 0x0008, 0x0010, 0x0020, 0x0040, 0x0100, 0x0400,
+        ] {
+            let mut invalid = fixture.clone_for_metadata();
+            invalid.methods[0].access ^= bit;
+            if invalid.methods[0].access & (0x0100 | 0x0400) != 0 {
+                invalid.methods[0].instructions = None;
+            }
+            invalid.rebuild();
+            assert!(match_pack_target(&invalid, kind).is_err());
+        }
+        let mut flags = fixture.clone_for_metadata();
+        flags.snapshot.methods[0].modifiers ^= 0x1000;
+        assert!(match_pack_target(&flags, kind).is_err());
+        let mut duplicate = fixture.clone_for_metadata();
+        duplicate
+            .snapshot
+            .methods
+            .push(duplicate.snapshot.methods[0].clone());
+        assert!(match_pack_target(&duplicate, kind).is_err());
+        let mut wrong_kind = fixture.clone_for_metadata();
+        wrong_kind.class_access ^= 0x0200;
+        wrong_kind.rebuild();
+        assert!(match_pack_target(&wrong_kind, kind).is_err());
+        for (label, value) in [
+            (SELF_NAME, b"fixtures/OtherOwner".as_slice()),
+            (SAM_NAME, b"other".as_slice()),
+            (SAM_DESCRIPTOR, b"()V".as_slice()),
+        ] {
+            let mut invalid = fixture.clone_for_metadata();
+            invalid.pool[label] = PoolEntry::Utf8(value.to_vec());
+            invalid.rebuild();
+            assert!(match_pack_target(&invalid, kind).is_err());
+        }
+    }
+}
+
+#[test]
+fn ordinary_pack_targets_reject_partial_vm_remap_and_changed_vm_pool_meaning() {
+    for kind in [
+        super::PackCapturedRecipeKind::TaskProvider,
+        super::PackCapturedRecipeKind::EntryAction,
+    ] {
+        let (fixture, references) = pack_target_fixture(kind);
+        let mut partial = fixture.clone_for_metadata();
+        let MethodCode::Bytecodes(code) = &mut partial.snapshot.methods[0].code else {
+            panic!("fixture bytecodes")
+        };
+        let offset = if kind == super::PackCapturedRecipeKind::TaskProvider {
+            8
+        } else {
+            5
+        };
+        code[offset..offset + 2]
+            .copy_from_slice(&fixture.source_map[references.interface_call].to_be_bytes());
+        assert!(match_pack_target(&partial, kind).is_err());
+        let mut changed = fixture.clone_for_metadata();
+        let mut vm_pool = fixture.pool.clone();
+        let PoolEntry::MethodReference {
+            class, name_type, ..
+        } = vm_pool[references.interface_call].clone()
+        else {
+            panic!("fixture VM reference")
+        };
+        vm_pool[references.interface_call] = PoolEntry::MethodReference {
+            tag: 10,
+            class,
+            name_type,
+        };
+        vm_pool.push(PoolEntry::Utf8(b"vm-unused-constant".to_vec()));
+        let order = (0..vm_pool.len()).rev().collect::<Vec<_>>();
+        changed.snapshot.constant_pool = pool_encoding(&vm_pool, &order).0;
+        assert!(match_pack_target(&changed, kind).is_err());
+    }
+}
