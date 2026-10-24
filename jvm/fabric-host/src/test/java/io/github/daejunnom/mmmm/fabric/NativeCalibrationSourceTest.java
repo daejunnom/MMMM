@@ -73,7 +73,7 @@ final class NativeCalibrationSourceTest {
     }
     private record Inputs(Invocation original, ObjectNode context, ObjectNode facts, ObjectNode request) { }
     private Inputs inputs() throws IOException {
-        Path path = Path.of("examples", "invocation.json"); if (!Files.isRegularFile(path)) path = Path.of("..", "..", "examples", "invocation.json");
+        Path path = Path.of(System.getProperty("mmmm.checkout"), "examples", "invocation.json");
         Invocation original = new Invocation(contracts, ContractJson.parse(Files.readAllBytes(path))); ObjectNode context = original.context();
         ObjectNode facts = ContractJson.newObject().put("registryGeneration", "31").put("observedAt", "2026-10-14T00:00:00Z");
         facts.set("environment", context.get("environment").deepCopy());

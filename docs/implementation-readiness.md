@@ -3019,7 +3019,37 @@ projection 네 검사의 실제 `ok`와 Coordinator 396 PASS·기존 1 ignored�
 drain·output/export·scratch 정리·lease 해제와 감독/정리 오류 0을 확인했다.
 동일 source의 [JVM96](https://github.com/daejunnom/MMMM/actions/runs/39992422469)은 세 OS
 JVM/native/header/startup와 집계 성공 metadata다. Linux Rust 실패와 JVM 원 기록의
-세부 감사는 별도로 진행하며, 이 고정 CI에는 이후 JNI 입장·cleanup 변경이 포함되지 않는다.
+세부 감사는 아래와 같으며, 이 고정 CI에는 이후 JNI 입장·cleanup 변경이 포함되지 않는다.
+
+Rust105 Linux 원 기록에서는 `rustc-LLVM ERROR: out of memory` 이후
+`mmmm-coordinator (lib test)` 컴파일의 SIGABRT와 Cargo101을 확인했다. stdout은 비어
+있고 실제 test 실행이나 assertion 실패 근거는 없다. 74,782 ms 뒤 명령 실패를 유지한
+채 drain·output/export·scratch 정리·lease 해제와 감독/정리 오류 0을 확인했다.
+프로세스별 RLIMIT_AS soft/hard readback은 2 GiB이며 aggregate memory quota는 없다.
+이 상한과 host 메모리 중 직접 원인은 미확정이다. 원 실패를 보존하고 별도 수정의
+실제 실행 결과로 후속 검증한다.
+
+JVM96 Windows 원 JSON/NDJSON 감사에서는 정확한 source와 required 11 task 실행,
+7개 모듈의 428 tests·37 reports·failure/error/skipped 0을 대조했다. 원 XML 자체는
+읽지 않았다. JVM/native/header/startup 네 단계의 process·finish·finalization 원 bytes
+12개 digest binding과 성공·drain·output/export·scratch 정리·lease 해제를 확인했다.
+startup은 development fixture이며 Minecraft가 아니다. C ABI 및 startup input pin의
+실물 전체를 이번 감사에서 hash한 결과나 source admission·whole-JDK 인수가 아니다.
+
+JVM Test의 작업 디렉터리는 외부 managed TMP/TMPDIR 아래 모듈·task별 경로로 옮긴다.
+실제 Test 직전에 해당 경로를 만들고, fixture/source 정본은 `mmmm.checkout`으로 계속
+식별한다. 두 Fabric 검사의 기존 fixture 읽기도 이 source property를 사용한다.
+617의 최초 logger는 미확정이며 이 수정만으로 원인 규명을 완료했다고 표시하지 않는다.
+
+외부 local-source-snapshot helper v3는 위 root Gradle 변경 하나를 역변환하면 원본과
+정확히 일치하는지 검사한다. 정본 JVM helper의 세 fixture scope 변경 역검증과 나머지
+호환 입력의 일치 조건, JVM 인수 19개·11 task·7 모듈·XML 및 정상 성공 gate를 유지한다.
+source postcheck 실패 때는 별도 `diagnostic_only` task/XML 요약만 유한하게 보존하고
+source binding을 unproven으로 둔다. 원 ErrorRecord·phase·operation을 복원해 다시 던지며
+진단 성공을 source 성공으로 바꾸지 않는다. v1/v2와 607/617 원 실패는 보존한다.
+실제 v3 Windows 실행과 Test CWD·사후 source 검사 통과는 다음 고정 candidate에서
+별도로 확인한다. 선택 toolchain origin과 candidate source는 구분하며 전체 toolchain
+tree 동일성·게임·릴리스는 입증하지 않는다.
 
 ## 첫 공개 배포 인수
 

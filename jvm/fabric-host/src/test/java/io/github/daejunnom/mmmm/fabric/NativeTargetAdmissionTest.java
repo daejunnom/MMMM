@@ -239,8 +239,7 @@ final class NativeTargetAdmissionTest {
     }
     private record Inputs(ObjectNode context, ObjectNode facts, ObjectNode request) { }
     private static Inputs inputs() throws IOException {
-        Path source = Path.of("examples", "execution-context.json");
-        if (!Files.isRegularFile(source)) source = Path.of("..", "..", "examples", "execution-context.json");
+        Path source = Path.of(System.getProperty("mmmm.checkout"), "examples", "execution-context.json");
         ObjectNode context = ContractJson.object(ContractJson.parse(Files.readAllBytes(source)));
         ObjectNode facts = ContractJson.newObject().put("registryGeneration", GENERATION).put("observedAt", "2026-10-14T00:00:00Z"); facts.set("environment", context.get("environment").deepCopy());
         ObjectNode instruction = ContractJson.newObject().put("kind", "command_data").put("dimension", "minecraft:overworld").put("source", "say 😀");

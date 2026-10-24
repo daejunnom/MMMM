@@ -23,6 +23,18 @@ subprojects {
         reproducibleFileOrder = true
     }
     tasks.withType(Test).configureEach {
+        // Managed Test CWD; fixture/source root stays in mmmm.checkout.
+        def managedScratch = System.getenv('TMP') ?: System.getenv('TMPDIR')
+        if (managedScratch == null || !new File(managedScratch).isAbsolute()) {
+            throw new GradleException('Tests require an absolute managed scratch directory')
+        }
+        def testWork = new File(managedScratch, "jvm-test-work/${project.name}/${name}")
+        workingDir testWork
+        doFirst {
+            if (!testWork.isDirectory() && !testWork.mkdirs()) {
+                throw new GradleException('Could not create the managed test working directory')
+            }
+        }
         useJUnitPlatform()
         maxParallelForks = 1
         maxHeapSize = '512m'
