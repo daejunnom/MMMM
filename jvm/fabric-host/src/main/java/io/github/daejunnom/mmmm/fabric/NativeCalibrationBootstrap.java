@@ -54,11 +54,44 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
     static final String PURPOSE = "numeric_calibration_bootstrap/1";
     static final String ACTION_ID = "mmmm:calibration_bootstrap_execute";
     static final String PACK_TARGET = "calibration-bootstrap-pack";
+    static final String PACK_PURPOSE = "pack_calibration_bootstrap/1";
+    static final String PACK_ACTION_ID = "mmmm:command_execute";
+    static final String PACK_COMMAND = "function mmmm_calibration:pack/entry";
+    static final String PACK_CASE_TARGET = "calibration-pack-case-pack";
     private static final Set<String> MANIFEST_FIELDS = Set.of("kind", "purpose", "selectionDigest", "hostEpoch",
             "registryGeneration", "runtimeSourceFactsDigest", "suiteDigest", "recipeSha256", "plan", "sourceBundle", "programs");
     private static final Set<String> PROGRAM_FIELDS = Set.of("caseId", "functionId", "objective", "storage", "initializationCommands");
     private static final int MAX_TARGETS = 95, MAX_PACKS = 256;
     private static final int MAX_SOURCE_RECEIPT_BYTES = 64 * 1024;
+
+    /** Routing metadata only. Rust validates the source recipe and issues the retained root kind. */
+    enum Purpose {
+        NUMERIC47(PURPOSE, "native_calibration_bootstrap_approval/1", ACTION_ID,
+                PACK_TARGET, "mmmm-calibration-normative47", 48),
+        PACK_CASE(PACK_PURPOSE, "native_pack_calibration_bootstrap_approval/1", PACK_ACTION_ID,
+                PACK_CASE_TARGET, "mmmm-calibration-pack-case", 3);
+        private final String wire, manifestKind, actionId, targetId, basename;
+        private final int entryCount;
+        Purpose(String wire, String manifestKind, String actionId, String targetId, String basename, int entryCount) {
+            this.wire = wire; this.manifestKind = manifestKind; this.actionId = actionId;
+            this.targetId = targetId; this.basename = basename; this.entryCount = entryCount;
+        }
+        String wire() { return wire; }
+        String manifestKind() { return manifestKind; }
+        String actionId() { return actionId; }
+        String targetId() { return targetId; }
+        String basename() { return basename; }
+        int entryCount() { return entryCount; }
+        static Purpose fromWire(String wire) {
+            for (Purpose purpose : values()) if (purpose.wire.equals(wire)) return purpose;
+            throw invalid();
+        }
+    }
+
+    static ObjectNode arguments(Purpose purpose, String bundleDigest) {
+        return purpose == Purpose.PACK_CASE ? ContractJson.newObject().put("command", PACK_COMMAND)
+                : ContractJson.newObject().put("sourceBundleDigest", bundleDigest);
+    }
 
     /** Only the closed, protected bootstrap manifest constructs a program. */
     static final class Program {
@@ -90,7 +123,7 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
         private Prepared(NativeCalibrationPackFiles.PreparedFiles files, NativeCalibrationStorageAcquisition.Prepared storage, ObjectNode images) {
             this.files = files; this.storage = storage; this.images = images.deepCopy();
         }
-        private void recheck(Runnable current) { checked(() -> { files.checkCurrent(current); storage.recheck(current); return null; }, current); }
+        private void recheck(Runnable current) { checked(() -> { files.checkCurrent(current); if (storage != null) storage.recheck(current); return null; }, current); }
     }
 
     /** Only an actual attempted effect can produce this in-process diagnostic. It is never a ready or replay grant. */
@@ -117,6 +150,7 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
         private final String digest;
         private final CompletableFuture<ProviderResult> result = new CompletableFuture<>();
         private volatile CompletionStage<Void> actualReload;
+        private volatile boolean cancellationRequested;
         private final Attempt attempt;
         private Accepted(NativeCalibrationBootstrap owner, Invocation invocation) {
             original = invocation; digest = ContractJson.digest(invocation.wire());
@@ -132,6 +166,7 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
         private final Invocation original;
         private final String invocationDigest, bundleDigest, manifestDigest, gameInstanceId, worldId;
         private final NativeCalibrationPackFiles.SealedFiles sourceFiles;
+        private final Purpose purpose;
         private final List<Program> programs;
         private final Set<String> targetIds;
         private final List<NativeLoadedCalibrationSources.ExpectedSource<Identifier>> expectedSources;
@@ -153,10 +188,11 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
             owner = bootstrap.server; original = invocation; invocationDigest = ContractJson.digest(invocation.wire());
             bundleDigest = bootstrap.bundleDigest; manifestDigest = bootstrap.manifestDigest;
             sourceFiles = bootstrap.source;
+            purpose = bootstrap.purpose;
             gameInstanceId = invocation.context().path("environment").path("gameInstanceId").asText();
             worldId = invocation.context().path("environment").path("worldId").asText();
             programs = bootstrap.programs;
-            Set<String> ids = new HashSet<>(); ids.add(PACK_TARGET);
+            Set<String> ids = new HashSet<>(); ids.add(purpose.targetId());
             for (Program program : programs) {
                 ids.add("calibration-objective-" + program.objective());
                 ids.add("calibration-storage-" + ContractJson.sha256(program.storage().getBytes(StandardCharsets.UTF_8)));
@@ -164,9 +200,12 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
             targetIds = Set.copyOf(ids);
             var converter = new FileToIdConverter(Registries.elementsDirPath(ServerFunctionLibrary.TYPE_KEY), ".mcfunction");
             var expected = new ArrayList<NativeLoadedCalibrationSources.ExpectedSource<Identifier>>(47);
-            for (Program program : programs) {
-                Identifier id = Identifier.parse(program.functionId());
-                String path = "data/mmmm_calibration/function/" + program.functionId().substring("mmmm_calibration:".length()) + ".mcfunction";
+            List<String> functionIds = purpose == Purpose.PACK_CASE
+                    ? List.of("mmmm_calibration:pack/entry", "mmmm_calibration:pack/dependency")
+                    : programs.stream().map(Program::functionId).toList();
+            for (String functionId : functionIds) {
+                Identifier id = Identifier.parse(functionId);
+                String path = "data/mmmm_calibration/function/" + functionId.substring("mmmm_calibration:".length()) + ".mcfunction";
                 JsonNode matched = null;
                 for (JsonNode entry : bootstrap.manifest.path("sourceBundle").path("entries")) {
                     if (path.equals(entry.path("path").asText())) matched = entry;
@@ -183,6 +222,7 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
         String invocationDigest() { return invocationDigest; }
         String sourceBundleDigest() { return bundleDigest; }
         String frozenManifestDigest() { return manifestDigest; }
+        Purpose purpose() { return purpose; }
         NativeCalibrationPackFiles.SealedFiles sourceFiles() { return sourceFiles; }
         DefinitionOwnedPackFilesBridge.RootAnchor rootAnchorForCleanup() { return reservedRootAnchor; }
         DefinitionOwnedPackFilesBridge.RootAnchor heldRootAnchor() { return heldRootAnchor; }
@@ -305,7 +345,7 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
                 pack.putNull("retainedRoot"); pack.putNull("failure");
                 if (heldRootAnchor != null) {
                     try {
-                        var retained = withRetainedPackRoot(actual, current, root -> {
+                        var retained = withRetainedPackRoot(actual, sourceFiles.repositoryId(), current, root -> {
                             var facts = NativeCalibrationPackFiles.observeRetainedRoot(actual, this, root, current);
                             if (sourceCapture != null) {
                                 try {
@@ -349,7 +389,9 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
                 ObjectNode images = observation.putObject("targetImages").put("status", "unknown");
                 images.putArray("targets"); images.putNull("failure");
                 try {
-                    boolean known = true; int bytes = 0;
+                    // PACK's command/marker readback has not been implemented.
+                    // An empty numeric target loop is not known PACK coverage.
+                    boolean known = purpose == Purpose.NUMERIC47; int bytes = 0;
                     for (Program program : programs) {
                         current.run();
                         String objectiveId = "calibration-objective-" + program.objective();
@@ -387,12 +429,12 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
                 .put("closed", actual.closed()).put("shared", actual.shared()).put("uncertain", actual.uncertain());
     }
 
-    private static <T> T withRetainedPackRoot(MinecraftServer server, Runnable current, Function<Path, T> observe) {
+    private static <T> T withRetainedPackRoot(MinecraftServer server, String repositoryId, Runnable current, Function<Path, T> observe) {
         return checked(() -> {
             current.run(); Pack selected = null; int count = 0;
             for (Pack pack : server.getPackRepository().getAvailablePacks()) {
                 current.run(); if (++count > MAX_PACKS) throw limit();
-                if (pack.getId().equals("file/mmmm-calibration-normative47")) {
+                if (pack.getId().equals(repositoryId)) {
                     if (selected != null) throw invalid(); selected = pack;
                 }
             }
@@ -522,6 +564,7 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
     private final NativePlanApproval plan;
     private final NativeInvocationReservations reservations;
     private final NativeCalibrationPackFiles.SealedFiles source;
+    private final Purpose purpose;
     private final List<Program> programs;
     private final String bundleDigest, manifestDigest, contextId;
     private final AtomicBoolean closed = new AtomicBoolean(), activated = new AtomicBoolean();
@@ -536,7 +579,8 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
         this.retainAccepted = Objects.requireNonNull(retainAccepted); this.server = Objects.requireNonNull(server);
         this.player = Objects.requireNonNull(player); this.levels = Objects.requireNonNull(levels);
         bounded(input); manifest = input.deepCopy(); HostDispatcher.exactFields(manifest, MANIFEST_FIELDS);
-        if (!"native_calibration_bootstrap_approval/1".equals(text(manifest, "kind")) || !PURPOSE.equals(text(manifest, "purpose"))
+        purpose = Purpose.fromWire(text(manifest, "purpose"));
+        if (!purpose.manifestKind().equals(text(manifest, "kind"))
                 || !session.epoch().equals(text(manifest, "hostEpoch")) || session.verifiedWriteProfile()) throw invalid();
         for (String field : Set.of("selectionDigest", "runtimeSourceFactsDigest", "suiteDigest", "recipeSha256")) sha(manifest, field);
         if (!text(manifest, "suiteDigest").equals(text(manifest, "recipeSha256"))
@@ -546,15 +590,15 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
                 || !inner.path("nativeExecutions").isArray() || !inner.path("nativeExecutions").isEmpty()
                 || !inner.path("contextPins").isArray() || inner.path("contextPins").size() != 1) throw invalid();
         plan = new NativePlanApproval(contracts, inner, clock); step = ContractJson.object(inner.path("steps").get(0)).deepCopy();
-        if (!ACTION_ID.equals(text(step, "actionId"))) throw invalid();
+        if (!purpose.actionId().equals(text(step, "actionId"))) throw invalid();
         contextId = text(step, "contextId");
-        source = NativeCalibrationPackFiles.SealedFiles.fromPrivateRustBundle(ContractJson.object(manifest.path("sourceBundle")));
+        source = NativeCalibrationPackFiles.SealedFiles.fromPrivateRustBundle(ContractJson.object(manifest.path("sourceBundle")), purpose);
         bundleDigest = sha(ContractJson.object(manifest.path("sourceBundle")), "bundleDigest");
-        ObjectNode arguments = ContractJson.newObject().put("sourceBundleDigest", bundleDigest);
+        ObjectNode arguments = arguments(purpose, bundleDigest);
         if (!ContractJson.digest(arguments).equals(text(step, "argumentsDigest"))) throw invalid();
-        if (!manifest.path("programs").isArray() || manifest.path("programs").size() != 47) throw invalid();
+        if (!manifest.path("programs").isArray() || manifest.path("programs").size() != (purpose == Purpose.NUMERIC47 ? 47 : 0)) throw invalid();
         List<Program> parsed = new ArrayList<>(); Set<String> cases = new HashSet<>(), functions = new HashSet<>(), targets = new HashSet<>();
-        targets.add(PACK_TARGET);
+        targets.add(purpose.targetId());
         for (JsonNode value : manifest.path("programs")) {
             Program program = new Program(ContractJson.object(value));
             if (!cases.add(program.caseId()) || !functions.add(program.functionId())) throw invalid();
@@ -569,10 +613,11 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
             targets.add("calibration-storage-" + ContractJson.sha256(program.storage().getBytes(StandardCharsets.UTF_8)));
             parsed.add(program);
         }
-        if (targets.size() != MAX_TARGETS || !stringSet(step.path("resourcesRead")).equals(targets)
+        int targetCount = purpose == Purpose.NUMERIC47 ? MAX_TARGETS : 1;
+        if (targets.size() != targetCount || !stringSet(step.path("resourcesRead")).equals(targets)
                 || !stringSet(step.path("resourcesWritten")).equals(targets)) throw invalid();
         Set<String> conditions = new HashSet<>();
-        if (!step.path("preconditions").isArray() || step.path("preconditions").size() != MAX_TARGETS) throw invalid();
+        if (!step.path("preconditions").isArray() || step.path("preconditions").size() != targetCount) throw invalid();
         for (JsonNode value : step.path("preconditions")) {
             HostDispatcher.exactFields(ContractJson.object(value), Set.of("kind", "subject", "expected", "coverage"));
             if (!"resource_hash".equals(value.path("kind").asText()) || !"full_target".equals(value.path("coverage").asText())
@@ -584,6 +629,7 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
     }
 
     String selectionDigest() { return text(manifest, "selectionDigest"); }
+    Purpose purpose() { return purpose; }
     String manifestDigest() { return manifestDigest; }
     String registryGeneration() { return text(manifest, "registryGeneration"); }
     String runtimeSourceFactsDigest() { return text(manifest, "runtimeSourceFactsDigest"); }
@@ -613,8 +659,7 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
         if (!contextId.equals(original.contextId()) || !original.context().equals(session.context(contextId))) throw invalid();
         for (String field : Set.of("stepId", "bindingId", "actionId", "actionDigest", "implementationDigest", "argumentsDigest", "contextDigest"))
             if (!step.path(field).equals(original.wire().path(field))) throw invalid();
-        HostDispatcher.exactFields(original.arguments(), Set.of("sourceBundleDigest"));
-        if (!bundleDigest.equals(original.arguments().path("sourceBundleDigest").asText())) throw invalid();
+        if (!arguments(purpose, bundleDigest).equals(original.arguments())) throw invalid();
         current.check(session, original.context(), control, sources); control.run();
     }
 
@@ -623,15 +668,16 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
         ServerLevel level = levels.apply(context.path("dimension").asText());
         if (level == null || level.getServer() != server || server.getLevel(level.dimension()) != level) throw invalid();
         var files = NativeCalibrationPackFiles.prepare(server, level, session, context, source, control);
-        var state = NativeCalibrationStorageAcquisition.prepare(server, level, session, context, programs, control);
+        var state = purpose == Purpose.NUMERIC47
+                ? NativeCalibrationStorageAcquisition.prepare(server, level, session, context, programs, control) : null;
         ObjectNode images = ContractJson.newObject().put("format", "mmmm.native.calibration-target-images/1")
                 .put("protocolVersion", ContractJson.VERSION).put("contextId", contextId).put("contextDigest", context.path("contextDigest").asText())
                 .put("runtimeSourceFactsDigest", runtimeSourceFactsDigest()).put("hostArtifactDigest", step.path("implementationDigest").asText())
                 .put("registryGeneration", registryGeneration()).put("observedFromTick", Long.toString(fromTick))
                 .put("observedToTick", Long.toString(Integer.toUnsignedLong(server.getTickCount()))).put("observedAt", Instant.now().toString());
         images.set("environment", context.path("environment").deepCopy()); ArrayNode targetRows = images.putArray("targets");
-        targetRows.add(files.beforeTargets()); state.beforeTargets().forEach(targetRows::add);
-        if (targetRows.size() != MAX_TARGETS) throw invalid();
+        targetRows.add(files.beforeTargets()); if (state != null) state.beforeTargets().forEach(targetRows::add);
+        if (targetRows.size() != (purpose == Purpose.NUMERIC47 ? MAX_TARGETS : 1)) throw invalid();
         Set<String> ids = new HashSet<>();
         for (JsonNode row : targetRows) {
             if (!ids.add(row.path("targetId").asText())) throw invalid();
@@ -702,20 +748,22 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
             admitted.attempt.effectPhase = "pack_attempted";
             var installed = prepared.files.execute(admitted.attempt, gate); files = installed;
             admitted.attempt.fileFacts = installed.toWire(); admitted.attempt.effectPhase = "pack_created";
-            check(admitted.original, gate, true); admitted.attempt.effectPhase = "storage_acquire_attempted";
-            prepared.storage.acquire(gate); admitted.attempt.effectPhase = "storage_acquired";
-            prepared.storage.recheck(gate); check(admitted.original, gate, true);
-            ServerPlayer actualPlayer = player.get(); ServerLevel level = levels.apply(admitted.original.context().path("dimension").asText());
-            if (actualPlayer == null || actualPlayer.level() != level) throw invalid();
-            var commandSource = NativeCommands.source(actualPlayer, level, admitted.original.context());
-            for (Program program : programs) for (String command : program.initializationCommands()) {
-                check(admitted.original, gate, false); NativeCommandDispatch.requireIdle(server);
-                var parsed = server.getCommands().getDispatcher().parse(new StringReader(command), commandSource);
-                admitted.attempt.effectPhase = "objective_attempted"; admitted.attempt.initializationAttemptedCount++;
-                int returned = NativeCommandDispatch.execute(server, parsed); returns.add(returned);
-                admitted.attempt.initializationReturns = List.copyOf(returns);
-                if (returned <= 0) throw new ContractException("CALIBRATION_BOOTSTRAP_INIT_FAILED", "The actual objective initialization did not report success");
-                prepared.storage.recheck(gate); check(admitted.original, gate, false);
+            if (purpose == Purpose.NUMERIC47) {
+                check(admitted.original, gate, true); admitted.attempt.effectPhase = "storage_acquire_attempted";
+                prepared.storage.acquire(gate); admitted.attempt.effectPhase = "storage_acquired";
+                prepared.storage.recheck(gate); check(admitted.original, gate, true);
+                ServerPlayer actualPlayer = player.get(); ServerLevel level = levels.apply(admitted.original.context().path("dimension").asText());
+                if (actualPlayer == null || actualPlayer.level() != level) throw invalid();
+                var commandSource = NativeCommands.source(actualPlayer, level, admitted.original.context());
+                for (Program program : programs) for (String command : program.initializationCommands()) {
+                    check(admitted.original, gate, false); NativeCommandDispatch.requireIdle(server);
+                    var parsed = server.getCommands().getDispatcher().parse(new StringReader(command), commandSource);
+                    admitted.attempt.effectPhase = "objective_attempted"; admitted.attempt.initializationAttemptedCount++;
+                    int returned = NativeCommandDispatch.execute(server, parsed); returns.add(returned);
+                    admitted.attempt.initializationReturns = List.copyOf(returns);
+                    if (returned <= 0) throw new ContractException("CALIBRATION_BOOTSTRAP_INIT_FAILED", "The actual objective initialization did not report success");
+                    prepared.storage.recheck(gate); check(admitted.original, gate, false);
+                }
             }
             check(admitted.original, gate, true);
             var repository = server.getPackRepository(); admitted.attempt.effectPhase = "repository_reload_attempted";
@@ -761,10 +809,19 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
                 if (terminal == null) {
                     try {
                         check(admitted.original, gate, false);
-                        ObjectNode output = ContractJson.newObject().put("completionClaim", "bootstrap_reload_observation_only")
-                                .put("sourceBundleDigest", bundleDigest).put("installedFileCount", 48)
-                                .put("initializedObjectiveCount", returns.size()).put("reloadOutcome", "completed");
-                        admitted.result.complete(ProviderResult.complete(contracts, output, "unknown"));
+                        if (purpose == Purpose.PACK_CASE) {
+                            if (!admitted.cancellationRequested) admitted.attempt.effectPhase = "pack_reload_observed_command_not_dispatched";
+                            // The original action is synchronous and has no job
+                            // callbacks. Preserve this slice's actual effects
+                            // without inventing a job or command completion.
+                            throw new ContractException("CAPABILITY_UNAVAILABLE",
+                                    "The original PACK command remains undispatched after the source reload slice");
+                        } else {
+                            ObjectNode output = ContractJson.newObject().put("completionClaim", "bootstrap_reload_observation_only")
+                                    .put("sourceBundleDigest", bundleDigest).put("installedFileCount", 48)
+                                    .put("initializedObjectiveCount", returns.size()).put("reloadOutcome", "completed");
+                            admitted.result.complete(ProviderResult.complete(contracts, output, "unknown"));
+                        }
                     } catch (RuntimeException | Error post) { terminal = post; }
                 } else terminal = finish(terminal, () -> check(admitted.original, gate, false));
                 if (terminal != null) { preserve(terminal, new InterruptedBootstrap(files, returns, true, failure == null, admitted.actualReload)); admitted.result.completeExceptionally(terminal); }
@@ -821,9 +878,9 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
         typed.initCause(failure); return typed;
     }
 
-    @Override public CompletionStage<ObjectNode> poll(HostSession owner, String invocationId, HostDispatcher.InspectionControl request) { return history(owner, invocationId, request); }
-    @Override public CompletionStage<ObjectNode> cancel(HostSession owner, String invocationId, HostDispatcher.InspectionControl request) { return history(owner, invocationId, request); }
-    private CompletionStage<ObjectNode> history(HostSession owner, String invocationId, HostDispatcher.InspectionControl request) {
+    @Override public CompletionStage<ObjectNode> poll(HostSession owner, String invocationId, HostDispatcher.InspectionControl request) { return history(owner, invocationId, request, false); }
+    @Override public CompletionStage<ObjectNode> cancel(HostSession owner, String invocationId, HostDispatcher.InspectionControl request) { return history(owner, invocationId, request, true); }
+    private CompletionStage<ObjectNode> history(HostSession owner, String invocationId, HostDispatcher.InspectionControl request, boolean cancel) {
         return tasks.submit(() -> {
             Accepted original = accepted; if (original == null) throw invalid();
             Runnable gate = control(owner, original.original.context(), request);
@@ -831,8 +888,19 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
                 gate.run();
                 if (!original.original.invocationId().equals(invocationId)
                         || !reservations.containsExact(original.original)) throw invalid();
-                return ContractJson.newObject().put("invocationId", original.original.invocationId())
-                        .put("status", original.result.isDone() ? "unknown" : "running").put("effects", "unknown");
+                if (cancel && purpose == Purpose.PACK_CASE) {
+                    original.cancellationRequested = true;
+                    original.attempt.effectPhase = "pack_command_cancelled_before_dispatch";
+                }
+                ObjectNode state = ContractJson.newObject().put("invocationId", original.original.invocationId())
+                        .put("status", purpose == Purpose.PACK_CASE ? "unknown"
+                                : original.result.isDone() ? "unknown" : "running")
+                        .put("effects", "unknown");
+                // This slice has issued no command result or job. A cancelled
+                // reply cannot prove an already started engine reload stopped.
+                if (purpose == Purpose.PACK_CASE) state.put("furtherEffectsPossible", true).put("providerCompleted", false)
+                        .put("cancellationRequested", original.cancellationRequested).put("terminationConfirmed", false);
+                return state;
             }, gate);
         });
     }
@@ -853,6 +921,7 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
         ObjectNode schema = ContractJson.newObject().put("type", "object").put("additionalProperties", false);
         schema.putArray("required").add("sourceBundleDigest"); schema.putObject("properties").putObject("sourceBundleDigest").put("type", "string").put("pattern", "^[a-f0-9]{64}$"); return schema;
     }
+
     static ObjectNode outputSchema() {
         ObjectNode schema = ContractJson.newObject().put("type", "object").put("additionalProperties", false);
         schema.putArray("required").add("completionClaim").add("sourceBundleDigest").add("installedFileCount").add("initializedObjectiveCount").add("reloadOutcome");

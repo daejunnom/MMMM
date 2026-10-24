@@ -5,6 +5,7 @@ use crate::{
     host::{BootstrapHostRoute, BootstrapRouteBudget},
     workspace_bootstrap::NativeOwnerWitness,
 };
+use mmmm_compiler::calibration::{CalibrationPackProgram, CalibrationSourceKind};
 use mmmm_contracts::{PlanId, raw_digest};
 
 pub(super) struct BootstrapApprovals {
@@ -88,7 +89,7 @@ pub(crate) fn validate_frame(
     value: &Value,
     validator: &ContractValidator,
 ) -> Result<ManagementKind, ManagementError> {
-    if value["purpose"] != purpose::PURPOSE {
+    if !purpose::is_purpose(field(value, "purpose")?) {
         return Err(invalid());
     }
     match field(value, "kind")? {
@@ -178,7 +179,8 @@ pub(crate) fn validate_frame(
             let manifest = &value["manifest"];
             let plan = &manifest["plan"];
             let context = &contexts[0];
-            if context["principalRef"] != plan["principalId"]
+            if value["purpose"] != manifest["purpose"]
+                || context["principalRef"] != plan["principalId"]
                 || context["projectId"] != plan["projectId"]
                 || context["contextId"] != plan["contextPins"][0]["contextId"]
                 || context["contextDigest"] != plan["contextPins"][0]["contextDigest"]
@@ -273,7 +275,8 @@ fn validate_manifest(value: &Value, validator: &ContractValidator) -> Result<(),
             "programs",
         ],
     )?;
-    if value["kind"] != purpose::MANIFEST_KIND || value["purpose"] != purpose::PURPOSE {
+    let source_kind = purpose::kind_for_purpose(field(value, "purpose")?).ok_or_else(invalid)?;
+    if value["kind"] != purpose::manifest_kind_for_kind(source_kind) {
         return Err(invalid());
     }
     for key in [
@@ -290,16 +293,45 @@ fn validate_manifest(value: &Value, validator: &ContractValidator) -> Result<(),
     {
         return Err(invalid());
     }
-    let suite = mmmm_compiler::calibration_dispatch::CalibrationDispatchPlan::normative47()
-        .map_err(|_| invalid())?;
-    if value["suiteDigest"] != suite.suite_digest().as_str()
-        || value["recipeSha256"] != suite.suite_digest().as_str()
+    let suite = match source_kind {
+        CalibrationSourceKind::Numeric47 => Some(
+            mmmm_compiler::calibration_dispatch::CalibrationDispatchPlan::normative47()
+                .map_err(|_| invalid())?,
+        ),
+        CalibrationSourceKind::PackCase => None,
+    };
+    let recipe_digest = match &suite {
+        Some(suite) => suite.suite_digest().clone(),
+        None => CalibrationPackProgram::java_26_3()
+            .map_err(|_| invalid())?
+            .program_digest()
+            .clone(),
+    };
+    if value["suiteDigest"] != recipe_digest.as_str()
+        || value["recipeSha256"] != recipe_digest.as_str()
     {
         return Err(invalid());
     }
     let bundle = &value["sourceBundle"];
-    exact(bundle, &["bundleDigest", "rawResource", "entries"])?;
-    let expected=suite.source_entries().iter().map(|(path,bytes)|json!({"path":path,"rawSha256":raw_digest(bytes),"byteLength":bytes.len(),"rawBytesHex":bytes.iter().map(|byte|format!("{byte:02x}")).collect::<String>()})).collect::<Vec<_>>();
+    match source_kind {
+        CalibrationSourceKind::Numeric47 => {
+            exact(bundle, &["bundleDigest", "rawResource", "entries"])?;
+        }
+        CalibrationSourceKind::PackCase => {
+            exact(
+                bundle,
+                &["bundleDigest", "rawResource", "entries", "sourceKind"],
+            )?;
+            if bundle["sourceKind"] != source_kind.name() {
+                return Err(invalid());
+            }
+        }
+    }
+    let source_entries = source_kind.source_entries().map_err(|_| invalid())?;
+    if source_entries.len() != source_kind.entry_count() {
+        return Err(invalid());
+    }
+    let expected=source_entries.iter().map(|(path,bytes)|json!({"path":path,"rawSha256":raw_digest(bytes),"byteLength":bytes.len(),"rawBytesHex":bytes.iter().map(|byte|format!("{byte:02x}")).collect::<String>()})).collect::<Vec<_>>();
     if bundle["entries"] != json!(expected)
         || bundle["bundleDigest"]
             != canonical_digest(&bundle["entries"])
@@ -317,7 +349,7 @@ fn validate_manifest(value: &Value, validator: &ContractValidator) -> Result<(),
     {
         return Err(invalid());
     }
-    let expected=suite.programs().iter().map(|p|json!({"caseId":p.case().case_id(),"functionId":p.invocation_command().strip_prefix("function ").unwrap_or(""),"objective":p.scope().objective(),"storage":p.scope().storage(),"initializationCommands":p.initialization_commands()})).collect::<Vec<_>>();
+    let expected = suite.as_ref().map(|suite| suite.programs().iter().map(|p|json!({"caseId":p.case().case_id(),"functionId":p.invocation_command().strip_prefix("function ").unwrap_or(""),"objective":p.scope().objective(),"storage":p.scope().storage(),"initializationCommands":p.initialization_commands()})).collect::<Vec<_>>()).unwrap_or_default();
     if value["programs"] != json!(expected) {
         return Err(invalid());
     }
@@ -372,11 +404,17 @@ fn validate_manifest(value: &Value, validator: &ContractValidator) -> Result<(),
             "preconditions",
         ],
     )?;
-    if step["actionId"] != purpose::ACTION
+    let arguments = match source_kind {
+        CalibrationSourceKind::Numeric47 => json!({"sourceBundleDigest":bundle["bundleDigest"]}),
+        CalibrationSourceKind::PackCase => {
+            json!({"command":"function mmmm_calibration:pack/entry"})
+        }
+    };
+    if step["actionId"] != purpose::action_for_kind(source_kind)
         || step["contextId"] != plan["contextPins"][0]["contextId"]
         || step["contextDigest"] != plan["contextPins"][0]["contextDigest"]
         || step["argumentsDigest"]
-            != canonical_digest(&json!({"sourceBundleDigest":bundle["bundleDigest"]}))
+            != canonical_digest(&arguments)
                 .map_err(|_| invalid())?
                 .as_str()
     {
@@ -393,24 +431,27 @@ fn validate_manifest(value: &Value, validator: &ContractValidator) -> Result<(),
     for key in ["stepId", "bindingId", "contextId"] {
         RequestId::new(field(step, key)?).map_err(|_| invalid())?;
     }
-    let mut targets = vec![json!(purpose::PACK_TARGET)];
-    for p in suite.programs() {
-        targets.push(json!(format!(
-            "calibration-objective-{}",
-            p.scope().objective()
-        )));
-        targets.push(json!(format!(
-            "calibration-storage-{}",
-            raw_digest(p.scope().storage().as_str().as_bytes())
-        )));
+    let mut targets = vec![json!(purpose::pack_target_for_kind(source_kind))];
+    if let Some(suite) = &suite {
+        for p in suite.programs() {
+            targets.push(json!(format!(
+                "calibration-objective-{}",
+                p.scope().objective()
+            )));
+            targets.push(json!(format!(
+                "calibration-storage-{}",
+                raw_digest(p.scope().storage().as_str().as_bytes())
+            )));
+        }
     }
+    let requirements = purpose::absence_requirements_for_kind(source_kind, &bundle["bundleDigest"])
+        .map_err(|_| invalid())?;
     if step["resourcesRead"] != json!(targets)
         || step["resourcesWritten"] != json!(targets)
-        || array(step, "preconditions")?.len() != 95
+        || array(step, "preconditions")?.len() != requirements.len()
     {
         return Err(invalid());
     }
-    let requirements = purpose::absence_requirements(&suite, &bundle["bundleDigest"]);
     for (condition, requirement) in array(step, "preconditions")?.iter().zip(requirements) {
         validator
             .validate("Precondition", condition)
@@ -451,6 +492,8 @@ impl HostBootstrapProcessor {
         let (public, token, witness) = offer.into_parts();
         let public = Arc::new(public);
         let value = public.value();
+        let offered_kind =
+            purpose::kind_for_purpose(field(value, "purpose")?).ok_or_else(invalid)?;
         budget.check()?;
         if Instant::now() >= reply_deadline
             || token.is_none()
@@ -543,9 +586,14 @@ impl HostBootstrapProcessor {
             .registry
             .manifest(store, &plan, &context, &value["runtimeSourceFacts"])
             .map_err(|cause| retain_error(&self.pack_bootstrap, &public, cause))?;
+        // The registry chooses from its actual same-Store typed source. A
+        // public purpose string may only agree with that selection, not pick it.
+        if manifest["purpose"] != purpose::purpose_for_kind(offered_kind) {
+            return Err(ManagementError::WrongReply);
+        }
         let reply = PublicFrame::from_value(
             json!({"kind":"host_apply_approval_authority","protocolVersion":mmmm_contracts::CONTRACT_VERSION,
-            "nonce":witness.nonce(),"purpose":purpose::PURPOSE,"contexts":[context],"approvedSources":{(NATIVE_SOURCE_ID):hello["hostBuild"]},
+            "nonce":witness.nonce(),"purpose":manifest["purpose"],"contexts":[context],"approvedSources":{(NATIVE_SOURCE_ID):hello["hostBuild"]},
             "approvedActions":[plan["steps"][0]["actionDigest"]],"permissions":READ_PERMISSIONS,"manifest":manifest}),
         )?;
         budget.check()?;
@@ -586,6 +634,7 @@ impl HostBootstrapProcessor {
         if !same(&pending.witness, &witness)
             || pending.complete_issued
             || public.nonce() != witness.nonce()
+            || public.value()["purpose"] != pending.manifest["purpose"]
             || public.value()["selectionDigest"] != pending.manifest["selectionDigest"]
             || public.value()["manifestDigest"]
                 != canonical_digest(&pending.manifest)
@@ -635,6 +684,8 @@ impl HostBootstrapProcessor {
             .deadline()
             .min(budget.deadline())
             .min(reply_deadline);
+        let source_kind =
+            purpose::kind_for_purpose(field(&pending.manifest, "purpose")?).ok_or_else(invalid)?;
         let route = self
             .hosts
             .prepare_bootstrap_route(
@@ -643,6 +694,7 @@ impl HostBootstrapProcessor {
                 pending.context.clone(),
                 pending.public.value()["hostHello"].clone(),
                 expires,
+                source_kind,
                 BootstrapRouteBudget {
                     original: &pending.budget,
                     reply_deadline: effective_deadline,
@@ -655,7 +707,7 @@ impl HostBootstrapProcessor {
         pending.route = Some(route);
         let complete = PublicFrame::from_value(
             json!({"kind":"host_apply_approval_complete","protocolVersion":mmmm_contracts::CONTRACT_VERSION,
-            "nonce":witness.nonce(),"purpose":purpose::PURPOSE,"selectionDigest":pending.manifest["selectionDigest"],"manifestDigest":canonical_digest(&pending.manifest).map_err(|_|invalid())?,
+            "nonce":witness.nonce(),"purpose":pending.manifest["purpose"],"selectionDigest":pending.manifest["selectionDigest"],"manifestDigest":canonical_digest(&pending.manifest).map_err(|_|invalid())?,
             "ready":true,"coordinatorEpoch":epoch,"hostEpoch":pending.context["environment"]["sessionEpoch"],"contextId":pending.context["contextId"]}),
         )?;
         budget.check()?;
@@ -828,5 +880,168 @@ impl HostBootstrapProcessor {
             .pending
             .values()
             .any(|pending| pending.complete_issued)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pack_manifest_input() -> (Value, Value) {
+        // Closed-grammar inputs only. These values create no Store association,
+        // typed registry source, ADMIN completion, current absence or run grant.
+        let kind = CalibrationSourceKind::PackCase;
+        let source = CalibrationPackProgram::java_26_3().unwrap();
+        let entries = source
+            .source_entries()
+            .iter()
+            .map(|(path, bytes)| {
+                json!({
+                    "path":path,"rawSha256":raw_digest(bytes),"byteLength":bytes.len(),
+                    "rawBytesHex":bytes.iter().map(|byte|format!("{byte:02x}")).collect::<String>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let entries = json!(entries);
+        let bundle_digest = canonical_digest(&entries).unwrap();
+        let raw = mmmm_contracts::canonical_bytes(&entries).unwrap();
+        let bundle = json!({"sourceKind":kind.name(),"bundleDigest":bundle_digest,
+            "rawResource":{"resourceId":"pack-management-source","sha256":raw_digest(&raw),
+                "sizeBytes":raw.len(),"mediaType":"application/vnd.mmmm.calibration-bootstrap-source+json"},
+            "entries":entries});
+        let requirements =
+            purpose::absence_requirements_for_kind(kind, &bundle["bundleDigest"]).unwrap();
+        assert_eq!(requirements.len(), 1);
+        let preconditions = requirements.iter().map(|requirement| json!({
+            "kind":"resource_hash","subject":requirement["targetId"],"coverage":"full_target",
+            "expected":raw_digest(&mmmm_contracts::canonical_bytes(requirement).unwrap())
+        })).collect::<Vec<_>>();
+        let targets = json!([purpose::pack_target_for_kind(kind)]);
+        let mut context: Value =
+            serde_json::from_slice(include_bytes!("../../../examples/execution-context.json"))
+                .unwrap();
+        context["scope"]["externalTargetIds"] = targets.clone();
+        context["contextDigest"] = json!(projected_digest("ExecutionContext", &context).unwrap());
+        let digest = raw_digest(b"pack management grammar only; not an approval or host");
+        let arguments = json!({"command":"function mmmm_calibration:pack/entry"});
+        let manifest = json!({
+            "kind":purpose::manifest_kind_for_kind(kind),"purpose":purpose::purpose_for_kind(kind),
+            "selectionDigest":digest,"hostEpoch":context["environment"]["sessionEpoch"],
+            "registryGeneration":"pack-management-generation","runtimeSourceFactsDigest":digest,
+            "suiteDigest":source.program_digest(),"recipeSha256":source.program_digest(),
+            "sourceBundle":bundle,"programs":[],
+            "plan":{"kind":"native_plan_approval","protocolVersion":mmmm_contracts::CONTRACT_VERSION,
+                "principalId":context["principalRef"],"projectId":context["projectId"],
+                "planId":"pack-management-plan","planHash":digest,"policyRevision":context["policyRevision"],
+                "contextPins":[{"contextId":context["contextId"],"contextDigest":context["contextDigest"],
+                    "environment":context["environment"]}],"expiresAt":"2099-01-01T00:00:00Z",
+                "nativeExecutions":[],"steps":[{"stepId":"pack-management-step","bindingId":"pack-management-binding",
+                    "actionId":purpose::action_for_kind(kind),"actionDigest":digest,"implementationDigest":digest,
+                    "argumentsDigest":canonical_digest(&arguments).unwrap(),"contextId":context["contextId"],
+                    "contextDigest":context["contextDigest"],"resourcesRead":targets,"resourcesWritten":targets,
+                    "preconditions":preconditions}]}
+        });
+        (manifest, context)
+    }
+
+    #[test]
+    fn pack_manifest_requires_its_exact_recipe_command_and_single_absence_target() {
+        let validator = ContractValidator::shared().unwrap();
+        let (manifest, _) = pack_manifest_input();
+        validate_manifest(&manifest, validator).unwrap();
+        assert_eq!(
+            manifest["sourceBundle"]["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(manifest["programs"], json!([]));
+        assert_eq!(
+            manifest["plan"]["steps"][0]["preconditions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        for (field, value) in [
+            ("purpose", json!(purpose::PURPOSE)),
+            ("kind", json!(purpose::MANIFEST_KIND)),
+            (
+                "programs",
+                json!([{"initializationCommands":["scoreboard objectives add caller dummy"]}]),
+            ),
+            (
+                "suiteDigest",
+                manifest["sourceBundle"]["bundleDigest"].clone(),
+            ),
+            (
+                "recipeSha256",
+                manifest["sourceBundle"]["rawResource"]["sha256"].clone(),
+            ),
+        ] {
+            let mut changed = manifest.clone();
+            changed[field] = value;
+            assert!(validate_manifest(&changed, validator).is_err(), "{field}");
+        }
+        let mut changed = manifest.clone();
+        changed["sourceBundle"]["sourceKind"] = json!("numeric47");
+        assert!(validate_manifest(&changed, validator).is_err());
+        let mut changed = manifest.clone();
+        changed["sourceBundle"]
+            .as_object_mut()
+            .unwrap()
+            .remove("sourceKind");
+        assert!(validate_manifest(&changed, validator).is_err());
+        let mut changed = manifest.clone();
+        changed["plan"]["steps"][0]["actionId"] = json!(purpose::ACTION);
+        assert!(validate_manifest(&changed, validator).is_err());
+        let mut changed = manifest.clone();
+        changed["plan"]["steps"][0]["argumentsDigest"] = json!(
+            canonical_digest(&json!({
+                "sourceBundleDigest":manifest["sourceBundle"]["bundleDigest"]
+            }))
+            .unwrap()
+        );
+        assert!(validate_manifest(&changed, validator).is_err());
+        let mut changed = manifest.clone();
+        changed["plan"]["steps"][0]["resourcesWritten"] = json!([purpose::PACK_TARGET]);
+        assert!(validate_manifest(&changed, validator).is_err());
+        let mut changed = manifest.clone();
+        let condition = changed["plan"]["steps"][0]["preconditions"][0].clone();
+        changed["plan"]["steps"][0]["preconditions"]
+            .as_array_mut()
+            .unwrap()
+            .push(condition);
+        assert!(validate_manifest(&changed, validator).is_err());
+    }
+
+    #[test]
+    fn authority_frame_cannot_relabel_a_pack_manifest_as_numeric() {
+        let validator = ContractValidator::shared().unwrap();
+        let (manifest, context) = pack_manifest_input();
+        let digest = raw_digest(b"pack management authority grammar only");
+        let frame = json!({"kind":"host_apply_approval_authority",
+            "protocolVersion":mmmm_contracts::CONTRACT_VERSION,"nonce":"pack-management-offer",
+            "purpose":manifest["purpose"],"contexts":[context],"approvedSources":{(NATIVE_SOURCE_ID):digest},
+            "approvedActions":[manifest["plan"]["steps"][0]["actionDigest"]],
+            "permissions":READ_PERMISSIONS,"manifest":manifest});
+        assert!(matches!(
+            validate_frame(&frame, validator),
+            Ok(ManagementKind::Authority)
+        ));
+        let mut changed = frame.clone();
+        changed["purpose"] = json!(purpose::PURPOSE);
+        assert!(validate_frame(&changed, validator).is_err());
+        let mut changed = frame.clone();
+        changed["purpose"] = json!("pack_calibration_bootstrap/2");
+        assert!(validate_frame(&changed, validator).is_err());
+        let mut changed = frame.clone();
+        changed["manifest"]["plan"]["steps"][0]["resourcesRead"] = json!([
+            purpose::pack_target_for_kind(CalibrationSourceKind::PackCase),
+            "calibration-objective-caller"
+        ]);
+        assert!(validate_frame(&changed, validator).is_err());
     }
 }

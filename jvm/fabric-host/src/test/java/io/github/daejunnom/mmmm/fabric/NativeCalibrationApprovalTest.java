@@ -389,6 +389,117 @@ final class NativeCalibrationApprovalTest {
         assertTrue(unarmed.path("failure").isNull()); assertTrue(unarmed.path("currentFailure").isNull());
     }
 
+    @Test void packSourceTransportCannotBeReboundToTheNumericFrameOrAnotherRoster() throws Exception {
+        // Existing fixtures cover numeric approval and opaque receipt capacity.
+        // These arbitrary bytes cover the new closed transport only: native
+        // must still compare actual source bytes with Rust's canonical recipe.
+        ObjectNode pack = privateSourceTransport(true);
+        var sealed = NativeCalibrationPackFiles.SealedFiles.fromPrivateRustBundle(pack, NativeCalibrationBootstrap.Purpose.PACK_CASE);
+        Field frameField = NativeCalibrationPackFiles.SealedFiles.class.getDeclaredField("frame"); frameField.setAccessible(true);
+        byte[] frame = (byte[]) frameField.get(sealed);
+        assertEquals("MMMMPK02", new String(frame, 0, 8, StandardCharsets.US_ASCII));
+        assertEquals(2, Byte.toUnsignedInt(frame[8]));
+        assertEquals(3, Short.toUnsignedInt(java.nio.ByteBuffer.wrap(frame, 41, 2).getShort()));
+        assertEquals("file/mmmm-calibration-pack-case", sealed.repositoryId());
+        assertThrows(ContractException.class, () -> NativeCalibrationPackFiles.SealedFiles.fromPrivateRustBundle(pack));
+        assertThrows(ContractException.class, () -> NativeCalibrationPackFiles.SealedFiles.fromPrivateRustBundle(
+                pack.deepCopy().put("sourceKind", "numeric47"), NativeCalibrationBootstrap.Purpose.PACK_CASE));
+        ObjectNode missingKind = pack.deepCopy(); missingKind.remove("sourceKind");
+        assertThrows(ContractException.class, () -> NativeCalibrationPackFiles.SealedFiles.fromPrivateRustBundle(
+                missingKind, NativeCalibrationBootstrap.Purpose.PACK_CASE));
+        ObjectNode anotherPath = pack.deepCopy(); ((ObjectNode) anotherPath.path("entries").get(0)).put("path", "data/other/function/unrelated.mcfunction");
+        assertThrows(ContractException.class, () -> NativeCalibrationPackFiles.SealedFiles.fromPrivateRustBundle(
+                anotherPath, NativeCalibrationBootstrap.Purpose.PACK_CASE));
+        ObjectNode numeric = privateSourceTransport(false);
+        byte[] legacy = (byte[]) frameField.get(NativeCalibrationPackFiles.SealedFiles.fromPrivateRustBundle(numeric));
+        assertEquals("MMMMPK01", new String(legacy, 0, 8, StandardCharsets.US_ASCII));
+        assertEquals(48, Short.toUnsignedInt(java.nio.ByteBuffer.wrap(legacy, 40, 2).getShort()));
+        assertThrows(ContractException.class, () -> NativeCalibrationPackFiles.SealedFiles.fromPrivateRustBundle(
+                numeric, NativeCalibrationBootstrap.Purpose.PACK_CASE));
+    }
+
+    @Test void packApprovalCompletionRequiresTheSameExactPurposeAndCommandArguments() {
+        for (var purpose : NativeCalibrationBootstrap.Purpose.values()) {
+            ObjectNode offer = ContractJson.newObject().put("purpose", purpose.wire()).put("nonce", "approval-test");
+            offer.putObject("hostHello").putObject("environment").put("sessionEpoch", "host-test"); offer.putArray("contextIds").add("context-test");
+            ObjectNode complete = ContractJson.newObject().put("kind", "host_apply_approval_complete").put("protocolVersion", ContractJson.VERSION)
+                    .put("nonce", "approval-test").put("ready", true).put("coordinatorEpoch", "coordinator-test").put("hostEpoch", "host-test")
+                    .put("contextId", "context-test").put("purpose", purpose.wire()).put("selectionDigest", "a".repeat(64)).put("manifestDigest", "b".repeat(64));
+            assertDoesNotThrow(() -> ManualHostConnection.validateBootstrapCompletion(offer, complete, "a".repeat(64), "b".repeat(64)));
+            ObjectNode crossed = complete.deepCopy().put("purpose", purpose == NativeCalibrationBootstrap.Purpose.PACK_CASE
+                    ? NativeCalibrationBootstrap.PURPOSE : NativeCalibrationBootstrap.PACK_PURPOSE);
+            assertThrows(ContractException.class, () -> ManualHostConnection.validateBootstrapCompletion(offer, crossed, "a".repeat(64), "b".repeat(64)));
+        }
+        ObjectNode expected = ContractJson.newObject().put("command", "function mmmm_calibration:pack/entry");
+        assertEquals(expected, NativeCalibrationBootstrap.arguments(NativeCalibrationBootstrap.Purpose.PACK_CASE, "a".repeat(64)));
+    }
+
+    @Test void packReceiptCodecUsesTheSameClosedFrameRosterAndKeepsActualFailureFirst() throws Exception {
+        // Codec-only input: no VM, filesystem, RootAnchor or source authority.
+        ObjectNode source = privateSourceTransport(true);
+        var sealed = NativeCalibrationPackFiles.SealedFiles.fromPrivateRustBundle(source, NativeCalibrationBootstrap.Purpose.PACK_CASE);
+        Field field = NativeCalibrationPackFiles.SealedFiles.class.getDeclaredField("frame"); field.setAccessible(true);
+        byte[] frame = (byte[]) field.get(sealed);
+        var rosterMethod = DefinitionOwnedPackFilesBridge.class.getDeclaredMethod("sourceRoster", byte[].class, int.class); rosterMethod.setAccessible(true);
+        var decode = DefinitionOwnedPackFilesBridge.class.getDeclaredMethod("decode", Object[].class, int.class, List.class); decode.setAccessible(true);
+        var legacyDecode = DefinitionOwnedPackFilesBridge.class.getDeclaredMethod("decode", Object[].class, int.class); legacyDecode.setAccessible(true);
+        List<?> roster = (List<?>) rosterMethod.invoke(null, frame, 1); assertEquals(3, roster.size());
+        byte[] receipt;
+        try (var bytes = new ByteArrayOutputStream(); var out = new DataOutputStream(bytes)) {
+            out.write("MMMMPKR1".getBytes(StandardCharsets.US_ASCII)); out.writeByte(1); out.writeByte(0); out.writeShort(3);
+            for (JsonNode row : source.path("entries")) {
+                byte[] path = row.path("path").textValue().getBytes(StandardCharsets.US_ASCII);
+                out.writeShort(path.length); out.write(path); out.writeLong(row.path("byteLength").longValue());
+                out.write(HexFormat.of().parseHex(row.path("rawSha256").textValue()));
+            }
+            receipt = bytes.toByteArray();
+        }
+        var decoded = (DefinitionOwnedPackFilesBridge.Receipt) decode.invoke(null, new Object[] { receipt }, 1, roster);
+        assertEquals(3, decoded.files().size());
+        assertThrows(java.lang.reflect.InvocationTargetException.class, () -> legacyDecode.invoke(null, new Object[] { receipt }, 1));
+        byte[] changed = receipt.clone(); changed[changed.length - 1] ^= 1;
+        assertThrows(java.lang.reflect.InvocationTargetException.class, () -> decode.invoke(null, new Object[] { changed }, 1, roster));
+        for (int offset : List.of(0, 8, 42)) {
+            byte[] malformed = frame.clone(); malformed[offset] ^= 1;
+            assertThrows(java.lang.reflect.InvocationTargetException.class, () -> rosterMethod.invoke(null, malformed, 1));
+        }
+        for (int size : List.of(0, 8, 9, 40, 41, 42, frame.length - 1)) {
+            byte[] truncated = java.util.Arrays.copyOf(frame, size);
+            assertThrows(java.lang.reflect.InvocationTargetException.class, () -> rosterMethod.invoke(null, truncated, 1));
+        }
+        assertTrue(((List<?>) rosterMethod.invoke(null, new byte[0], 2)).isEmpty());
+        assertThrows(java.lang.reflect.InvocationTargetException.class, () -> rosterMethod.invoke(null, frame, 2));
+        byte[] absence;
+        try (var bytes = new ByteArrayOutputStream(); var out = new DataOutputStream(bytes)) {
+            out.write("MMMMPKR1".getBytes(StandardCharsets.US_ASCII)); out.writeByte(0); out.writeByte(0); out.writeShort(0);
+            absence = bytes.toByteArray();
+        }
+        assertTrue(((DefinitionOwnedPackFilesBridge.Receipt) decode.invoke(null, new Object[] { absence }, 0, roster)).files().isEmpty());
+        assertTrue(((DefinitionOwnedPackFilesBridge.Receipt) decode.invoke(null, new Object[] { absence }, 2, List.of())).files().isEmpty());
+        Throwable actual = new IllegalStateException("codec-original-only"); byte[] failure;
+        try (var bytes = new ByteArrayOutputStream(); var out = new DataOutputStream(bytes)) {
+            out.write("MMMMPKR1".getBytes(StandardCharsets.US_ASCII)); out.writeByte(1); out.writeByte(1); out.writeByte(6); out.writeShort(0);
+            failure = bytes.toByteArray();
+        }
+        var thrown = assertThrows(java.lang.reflect.InvocationTargetException.class,
+                () -> decode.invoke(null, new Object[] { failure, actual }, 1, roster));
+        var nativeFailure = assertInstanceOf(DefinitionOwnedPackFilesBridge.NativeFailure.class, thrown.getCause());
+        assertEquals("ORIGINAL_CHECKPOINT", nativeFailure.code()); assertTrue(nativeFailure.effectsMayExist()); assertSame(actual, nativeFailure.getCause());
+    }
+
+    private static ObjectNode privateSourceTransport(boolean pack) {
+        ObjectNode source = ContractJson.newObject(); var entries = source.putArray("entries");
+        List<String> paths = pack ? List.of("data/mmmm_calibration/function/pack/dependency.mcfunction",
+                "data/mmmm_calibration/function/pack/entry.mcfunction", "pack.mcmeta")
+                : java.util.stream.IntStream.range(0, 48).mapToObj(index -> "data/transport/function/" + String.format(java.util.Locale.ROOT, "%03d", index) + ".mcfunction").toList();
+        byte[] raw = new byte[] { 0 };
+        for (String path : paths) entries.addObject().put("path", path).put("rawSha256", ContractJson.sha256(raw)).put("byteLength", 1).put("rawBytesHex", "00");
+        byte[] canonical = ContractJson.canonical(entries); String digest = ContractJson.sha256(canonical); source.put("bundleDigest", digest);
+        source.putObject("rawResource").put("resourceId", "private-transport-test").put("sha256", digest).put("mediaType", "application/json").put("sizeBytes", canonical.length);
+        if (pack) source.put("sourceKind", "pack_case");
+        return source;
+    }
+
     @Test void opaqueSourceReceiptAndBothCausesConsumeTheWholeTargetPrefixBudget() throws Exception {
         // Existing capacity fixtures omit the new opaque trace. Charge its
         // doubled hex and both existing bounded diagnostic graphs before targets.

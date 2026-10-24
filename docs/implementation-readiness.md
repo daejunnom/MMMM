@@ -3128,6 +3128,38 @@ command0·16,420 ms·peak425,193,472 bytes·8 processes·gap108 ms·자연 종�
 외부 helper 준비의 첫 정적 parser 거절은 native 실행 전 실패였고 수정 후 parser0을
 확인했다. 원 Windows106의 실패·export 손실을 성공으로 다시 분류하지 않는다.
 
+PACK 준비의 첫 WIP 소스는 native `calibration-pack-bootstrap-plan`에서 같은 원
+RequestBudget·Store·NativeOwnerWitness·registry를 거쳐 exact-purpose ADMIN completion과
+retained route로 연결한다. 기존 numeric47 v1은 48개 파일·47개 함수·95개 prepare target을
+유지하고, PACK만 별도 purpose/manifest와 `MMMMPK02`의 closed kind2·3개 파일·2개 함수·
+1개 prepare target을 사용한다. native가 원 bytes와 정본을 검증해 retained root에 보관한
+kind로 ARM/current를 선택한다. logical recipe·canonical source bundle·ZIP digest를
+구분하고 JNI/C signature·47/6/4·기존 한도와 일반 source/target admission은 유지한다.
+
+원 PACK action과 인수는 `mmmm:command_execute` 및 정확한
+`function mmmm_calibration:pack/entry`다. 실제 설치/reload/source 관측을 연결했지만
+entry dispatch·독립 marker readback·target profile 발급은 후속이다. 동기 command의
+descriptor에 없는 job이나 가짜 handle을 만들지 않는다. current gate 실패가 먼저면
+그 원인을 보존하고, gate가 유효한 reload 관측 뒤에도 미실행 command는 기존 typed
+`CAPABILITY_UNAVAILABLE`로 중단한다. 받은 원 HostResponse는 원장 CAS에 먼저 보존한
+뒤 후행 owner 실패와 묶는다. Application은 이를 unknown/partial·추가 효과 가능·
+reconciliation과 실제 fence로 유지하며 자동 continuation·재전송·성공을 만들지 않는다.
+Throwable wire는 유한한 type/code/cause/suppressed graph이며 상세 custom fields 전체를
+직렬화한다고 주장하지 않는다. 상세 retained Attempt history는 별도의 fresh successor
+검사 후 CAS하는 경로이며 응답을 못 받았다면 response CAS가 있다고 보지 않는다.
+
+23개 기존 파일의 정적 교차 리뷰 뒤 Windows635에서 정확한 Rust17개를 포맷했다.
+Java6개는 동결 bytes를 유지했다. 원 before/after 입력과 backup은 외부에 보존한다.
+management 모듈 담당자의 최초 편집 전 bytes/hash는 미기록·unknown이며 추정으로
+보충하지 않는다. 이 WIP의 formatter 성공은 compile·검사·실제 ADMIN/PACK 설치·
+source capture·게임 인수 증거가 아니다. 다음 고정 candidate의 실제 검사로 확인한다.
+
+검증 준비의 Windows634는 소유 checks slot이 complete·catalog lease가 없는 상태를
+확인한 뒤, 새 관리 lease와 물리적 cargo-target 경계를 확인하여 Coordinator·compiler의
+재생성 가능한 package 출력만 Cargo로 정리했다. 622 files·약2.7 GiB를 정리해 slot은
+5,506,824,705 bytes·catalog는8,825,014,953 bytes가 됐다. command0·drain/output/export·
+scratch 정리·lease 해제와 감독/정리 오류0이며 제품 DB/CAS·복구·원 증거는 보존한다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

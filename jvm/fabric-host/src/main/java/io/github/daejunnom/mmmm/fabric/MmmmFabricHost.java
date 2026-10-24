@@ -239,7 +239,8 @@ public final class MmmmFabricHost implements ModInitializer {
     private record PendingCalibrationOffer(HostSession paired, HostRuntime runtime, String offerDigest,
                                            String factsDigest, String hostArtifactDigest, long generation, long until) { }
     private record PendingBootstrapOffer(HostSession paired, HostRuntime runtime, String offerDigest,
-                                         String factsDigest, String hostArtifactDigest, long generation, long until) { }
+                                         String factsDigest, String hostArtifactDigest, long generation, long until,
+                                         NativeCalibrationBootstrap.Purpose purpose) { }
 
     /**
      * Trusted out-of-band composition only. The Rust authority supplies approved artifact/action digests,
@@ -715,7 +716,12 @@ public final class MmmmFabricHost implements ModInitializer {
         }
     }
     ObjectNode bootstrapApprovalOffer(UUID playerId, HostSetup setup, String planId, String planHash, Runnable original, long until) {
+        return bootstrapApprovalOffer(playerId, setup, planId, planHash, NativeCalibrationBootstrap.PURPOSE, original, until);
+    }
+
+    ObjectNode bootstrapApprovalOffer(UUID playerId, HostSetup setup, String planId, String planHash, String requestedPurpose, Runnable original, long until) {
         original.run(); requireServerThread(); HostSession paired = requireSession(); HostRuntime actualRuntime = runtime;
+        NativeCalibrationBootstrap.Purpose purpose = NativeCalibrationBootstrap.Purpose.fromWire(requestedPurpose);
         long generation = registryGeneration;
         Runnable current = () -> {
             original.run(); requireServerThread(); paired.checkOpen();
@@ -728,7 +734,7 @@ public final class MmmmFabricHost implements ModInitializer {
                 || !setup.hostArtifactDigest().equals(artifactDigest(container("mmmm_host")))) throw authorityInvalid();
         ObjectNode facts = NativeSourceFacts.observe(server, Long.toString(generation), environment(), current::run); current.run();
         ObjectNode offer = ContractJson.newObject().put("kind", "host_apply_approval_offer").put("protocolVersion", ContractJson.VERSION)
-                .put("nonce", "approve-" + UUID.randomUUID()).put("purpose", NativeCalibrationBootstrap.PURPOSE)
+                .put("nonce", "approve-" + UUID.randomUUID()).put("purpose", purpose.wire())
                 .put("dataRoot", setup.dataRoot().toString()).put("projectId", setup.projectId())
                 .put("principalId", paired.principalRef()).put("playerId", playerId.toString()).put("planId", planId).put("planHash", planHash)
                 .put("hostArtifactDigest", setup.hostArtifactDigest());
@@ -741,7 +747,7 @@ public final class MmmmFabricHost implements ModInitializer {
                 bootstrapOffers.entrySet().removeIf(entry -> entry.getValue().until() - System.nanoTime() <= 0);
                 if (routes.size() >= 8 || bootstrapOffers.size() + calibrationOffers.size() >= 8) throw new ContractException("SESSION_LIMIT", "현재 immutable route 또는 승인 준비 한도가 찼습니다");
                 bootstrapOffers.put(nonce, new PendingBootstrapOffer(paired, actualRuntime, ContractJson.digest(offer),
-                        NativeProfileAdmission.sourceDigest(facts), setup.hostArtifactDigest(), generation, until));
+                        NativeProfileAdmission.sourceDigest(facts), setup.hostArtifactDigest(), generation, until, purpose));
             }
             current.run(); return offer;
         } catch (RuntimeException failure) { releaseBootstrapOffer(nonce); throw failure; }
@@ -759,7 +765,7 @@ public final class MmmmFabricHost implements ModInitializer {
         if (paired == null) throw authorityInvalid();
         NativeCalibrationBootstrap grant = sessionRoute(paired).bootstrap();
         if (!grant.selectionDigest().equals(selectionDigest) || !grant.manifestDigest().equals(manifestDigest)
-                || !NativeCalibrationBootstrap.PURPOSE.equals(offer.path("purpose").asText())
+                || !grant.purpose().wire().equals(offer.path("purpose").asText())
                 || !offer.path("principalId").asText().equals(paired.principalRef())
                 || !offer.path("hostHello").equals(runtime.hello())) throw authorityInvalid();
         String contextId = offer.path("contextIds").get(0).asText();
@@ -783,7 +789,7 @@ public final class MmmmFabricHost implements ModInitializer {
         current.run();
         HostDispatcher.exactFields(authority, Set.of("kind", "protocolVersion", "nonce", "purpose", "contexts", "approvedSources", "approvedActions", "permissions", "manifest"));
         if (!"host_apply_approval_authority".equals(authority.path("kind").asText()) || !ContractJson.VERSION.equals(authority.path("protocolVersion").asText())
-                || !offer.path("nonce").equals(authority.path("nonce")) || !NativeCalibrationBootstrap.PURPOSE.equals(authority.path("purpose").asText())
+                || !offer.path("nonce").equals(authority.path("nonce")) || !pending.purpose().wire().equals(authority.path("purpose").asText())
                 || !offer.path("purpose").equals(authority.path("purpose")) || !offer.path("hostHello").equals(pending.runtime().hello())
                 || !authority.path("contexts").isArray() || authority.path("contexts").size() != installedContexts.size()) throw authorityInvalid();
         List<ObjectNode> contexts = new ArrayList<>(); Set<String> ids = new java.util.HashSet<>();
@@ -803,7 +809,8 @@ public final class MmmmFabricHost implements ModInitializer {
         if (!pending.factsDigest().equals(NativeProfileAdmission.sourceDigest(facts))
                 || !pending.hostArtifactDigest().equals(artifactDigest(container("mmmm_host")))) throw new ContractException("TARGET_DRIFT", "승인 대기 중 원 bootstrap runtime source가 바뀌었습니다");
         ObjectNode manifest = ContractJson.object(authority.path("manifest")), inner = ContractJson.object(manifest.path("plan"));
-        if (!"native_calibration_bootstrap_approval/1".equals(manifest.path("kind").asText())
+        if (!pending.purpose().manifestKind().equals(manifest.path("kind").asText())
+                || !pending.purpose().wire().equals(manifest.path("purpose").asText())
                 || !offer.path("planId").equals(inner.path("planId")) || !offer.path("planHash").equals(inner.path("planHash"))
                 || !offer.path("projectId").equals(inner.path("projectId")) || !offer.path("principalId").equals(inner.path("principalId"))
                 || !inner.path("steps").isArray() || inner.path("steps").size() != 1
@@ -812,7 +819,7 @@ public final class MmmmFabricHost implements ModInitializer {
                 || !Long.toString(pending.generation()).equals(manifest.path("registryGeneration").asText())) throw authorityInvalid();
         JsonNode step = inner.path("steps").get(0);
         ObjectNode descriptor = pending.runtime().describe(step.path("bindingId").asText(), step.path("actionId").asText());
-        if (!NativeCalibrationBootstrap.ACTION_ID.equals(step.path("actionId").asText())
+        if (!pending.purpose().actionId().equals(step.path("actionId").asText())
                 || !pending.hostArtifactDigest().equals(step.path("implementationDigest").asText())
                 || !ContractJson.digest(descriptor).equals(step.path("actionDigest").asText())) throw authorityInvalid();
         HostSession approved = new HostSession(previous.principalRef(), previous.epoch(), previous.gameInstanceId(), previous.side(), playerId, permissions, false);

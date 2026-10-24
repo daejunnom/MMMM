@@ -11,7 +11,7 @@ use crate::{
     ffi::{self, JNIEnv, jmethodID, jobject},
     native_producer,
 };
-use mmmm_compiler::calibration_dispatch::CalibrationDispatchPlan;
+use mmmm_compiler::calibration::CalibrationSourceKind;
 use mmmm_owned_files::{Control, FileFacts, HeldDirectory};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -26,7 +26,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-const PACK: &str = "mmmm-calibration-normative47";
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_FRAME: usize = MAX_BYTES + 48 * 280 + 42;
 const REQUIRED_STATUS: i32 = 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128;
@@ -62,6 +61,7 @@ pub(crate) struct SourceRootObjects {
 }
 #[derive(Clone, Copy)]
 pub(crate) struct SourceRootFacts {
+    pub kind: CalibrationSourceKind,
     pub bundle_digest: [u8; 32],
 }
 
@@ -323,6 +323,11 @@ struct Entry {
     bytes: Vec<u8>,
     sha256: [u8; 32],
 }
+struct DecodedSources {
+    kind: CalibrationSourceKind,
+    bundle_digest: [u8; 32],
+    entries: Vec<Entry>,
+}
 struct Cursor<'a> {
     bytes: &'a [u8],
     offset: usize,
@@ -354,30 +359,32 @@ fn hex(bytes: &[u8]) -> String {
     }
     out
 }
-fn entries(frame: &[u8], checks: &Checks) -> Result<Vec<Entry>> {
+fn entries(frame: &[u8], checks: &Checks) -> Result<DecodedSources> {
     decode_entries(frame, &|| checks.check())
 }
-fn decode_entries(frame: &[u8], check: &impl Fn() -> Result<()>) -> Result<Vec<Entry>> {
+fn decode_entries(frame: &[u8], check: &impl Fn() -> Result<()>) -> Result<DecodedSources> {
     check()?;
     let mut read = Cursor {
         bytes: frame,
         offset: 0,
     };
-    if read.take(8)? != b"MMMMPK01" {
-        return Err(Failure::Invalid);
-    }
+    let kind = match read.take(8)? {
+        b"MMMMPK01" => CalibrationSourceKind::Numeric47,
+        b"MMMMPK02" if read.take(1)? == [2] => CalibrationSourceKind::PackCase,
+        _ => return Err(Failure::Invalid),
+    };
     let digest: [u8; 32] = read.take(32)?.try_into().map_err(|_| Failure::Invalid)?;
-    if read.u16()? != 48 {
+    if read.u16()? != kind.entry_count() {
         return Err(Failure::Invalid);
     }
-    let expected = CalibrationDispatchPlan::normative47().map_err(|_| Failure::Invalid)?;
-    if expected.source_entries().len() != 48 {
+    let expected = kind.source_entries().map_err(|_| Failure::Invalid)?;
+    if expected.len() != kind.entry_count() {
         return Err(Failure::Invalid);
     }
     let mut total = 0usize;
-    let mut result = Vec::with_capacity(48);
-    let mut canonical = Vec::<Value>::with_capacity(48);
-    for (expected_path, expected_bytes) in expected.source_entries() {
+    let mut result = Vec::with_capacity(kind.entry_count());
+    let mut canonical = Vec::<Value>::with_capacity(kind.entry_count());
+    for (expected_path, expected_bytes) in &expected {
         check()?;
         let length = read.u16()?;
         if length == 0 || length > 240 {
@@ -420,7 +427,11 @@ fn decode_entries(frame: &[u8], check: &impl Fn() -> Result<()>) -> Result<Vec<E
         return Err(Failure::Invalid);
     }
     check()?;
-    Ok(result)
+    Ok(DecodedSources {
+        kind,
+        bundle_digest: digest,
+        entries: result,
+    })
 }
 
 fn path(units: Vec<u16>) -> Result<PathBuf> {
@@ -441,22 +452,22 @@ fn path(units: Vec<u16>) -> Result<PathBuf> {
 }
 fn create(
     root: &HeldDirectory,
-    entries: &[Entry],
+    source: &DecodedSources,
     checks: &Checks,
     bindings: &roots::Bindings,
-    bundle: &[u8; 32],
 ) -> Result<Vec<(String, FileFacts)>> {
     // All acquired children are consumed/closed in reverse dependency order.
     // Failed or partial creations are preserved; Drop never deletes a child.
-    let reservation = roots::Reservation::reserve(checks, bindings, bundle)?;
+    let reservation =
+        roots::Reservation::reserve(checks, bindings, source.kind, &source.bundle_digest)?;
     checks.check()?;
     checks.effects.set(true);
-    let created = root.create_directory_new(OsStr::new(PACK), checks)?;
+    let created = root.create_directory_new(OsStr::new(source.kind.root_basename()), checks)?;
     let pack = reservation.install(created, checks, bindings)?;
     let mut directories = BTreeMap::<String, HeldDirectory>::new();
-    let mut facts = Vec::with_capacity(48);
+    let mut facts = Vec::with_capacity(source.entries.len());
     let result = (|| {
-        for entry in entries {
+        for entry in &source.entries {
             checks.check()?;
             let components = entry.path.split('/').collect::<Vec<_>>();
             let mut parent = String::new();
@@ -725,7 +736,7 @@ pub(crate) fn with_current_source_root<R, E: CurrentRootError>(
                     return Err(Failure::Changed);
                 }
                 let actual = roots::observe_source_root(&checks, objects, Some(&selected))?;
-                if actual.bundle_digest != facts.bundle_digest {
+                if actual.kind != facts.kind || actual.bundle_digest != facts.bundle_digest {
                     return Err(Failure::Changed);
                 }
                 Ok(())
@@ -761,29 +772,31 @@ fn run(
         checks.check()?;
         let data =
             unsafe { ffi::whole_byte_array(env, frame, MAX_FRAME) }.map_err(|e| checks.ffi(e))?;
-        let entries = if operation == 2 {
+        let source = if operation == 2 {
             if !data.is_empty() {
                 return Err(Failure::Invalid);
             }
-            Vec::new()
+            None
         } else {
-            entries(&data, &checks)?
+            Some(entries(&data, &checks)?)
         };
         let selected = path(checks.text(root_method)?)?;
         let relative =
             String::from_utf16(&checks.text(relative_method)?).map_err(|_| Failure::Invalid)?;
-        if operation != 2 && relative != PACK {
+        if source
+            .as_ref()
+            .is_some_and(|source| relative != source.kind.root_basename())
+        {
             return Err(Failure::Invalid);
         }
         let root = HeldDirectory::open_root(&selected, &checks)?;
         let result = if operation == 1 {
             match roots::Bindings::load(&checks) {
                 Ok(bindings) => {
-                    let created = (|| {
-                        let bundle: [u8; 32] =
-                            data[8..40].try_into().map_err(|_| Failure::Invalid)?;
-                        create(&root, &entries, &checks, &bindings, &bundle)
-                    })();
+                    let created = source
+                        .as_ref()
+                        .ok_or(Failure::Invalid)
+                        .and_then(|source| create(&root, source, &checks, &bindings));
                     finish(created, bindings.close(&checks))
                 }
                 Err(error) => Err(error),
@@ -1050,18 +1063,33 @@ mod tests {
     // Reuses the actual sealed compiler recipe. This is a pure transport test,
     // not an installed JVM, game, path authority or filesystem effect fixture.
     fn source_frame() -> Vec<u8> {
-        let plan = CalibrationDispatchPlan::normative47().expect("sealed recipe");
-        let projection = Value::Array(plan.source_entries().iter().map(|(path, bytes)| {
+        source_frame_for(CalibrationSourceKind::Numeric47)
+    }
+    fn source_frame_for(kind: CalibrationSourceKind) -> Vec<u8> {
+        frame_for_entries(kind, &kind.source_entries().expect("sealed recipe"))
+    }
+    fn frame_for_entries(
+        kind: CalibrationSourceKind,
+        entries: &BTreeMap<String, Vec<u8>>,
+    ) -> Vec<u8> {
+        let projection = Value::Array(entries.iter().map(|(path, bytes)| {
             json!({"path":path,"rawSha256":hex(&Sha256::digest(bytes)),"byteLength":bytes.len(),"rawBytesHex":hex(bytes)})
         }).collect());
-        let mut frame = b"MMMMPK01".to_vec();
+        let mut frame = match kind {
+            CalibrationSourceKind::Numeric47 => b"MMMMPK01".to_vec(),
+            CalibrationSourceKind::PackCase => {
+                let mut prefix = b"MMMMPK02".to_vec();
+                prefix.push(2);
+                prefix
+            }
+        };
         frame.extend_from_slice(
             &mmmm_contracts::canonical_digest(&projection)
                 .expect("canonical entries")
                 .to_bytes(),
         );
-        frame.extend_from_slice(&48u16.to_be_bytes());
-        for (path, bytes) in plan.source_entries() {
+        frame.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+        for (path, bytes) in entries {
             frame.extend_from_slice(&(path.len() as u16).to_be_bytes());
             frame.extend_from_slice(path.as_bytes());
             frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
@@ -1075,9 +1103,12 @@ mod tests {
         let frame = source_frame();
         let entries =
             decode_entries(&frame, &|| Ok(())).unwrap_or_else(|_| panic!("original sealed frame"));
-        let plan = CalibrationDispatchPlan::normative47().expect("sealed recipe");
-        assert_eq!(entries.len(), 48);
-        for (actual, (path, bytes)) in entries.iter().zip(plan.source_entries()) {
+        let expected = CalibrationSourceKind::Numeric47
+            .source_entries()
+            .expect("sealed recipe");
+        assert_eq!(entries.kind, CalibrationSourceKind::Numeric47);
+        assert_eq!(entries.entries.len(), 48);
+        for (actual, (path, bytes)) in entries.entries.iter().zip(&expected) {
             assert_eq!(&actual.path, path);
             assert_eq!(&actual.bytes, bytes);
         }
@@ -1093,6 +1124,79 @@ mod tests {
             decode_entries(&extra, &|| Ok(())),
             Err(Failure::Invalid)
         ));
+    }
+    #[test]
+    fn pack_frame_is_closed_to_three_original_entries_and_kind_two() {
+        let kind = CalibrationSourceKind::PackCase;
+        let frame = source_frame_for(kind);
+        let decoded =
+            decode_entries(&frame, &|| Ok(())).unwrap_or_else(|_| panic!("sealed PACK frame"));
+        assert_eq!(decoded.kind, kind);
+        assert_eq!(decoded.entries.len(), 3);
+        assert_eq!(decoded.bundle_digest.as_slice(), &frame[9..41]);
+        for invalid_kind in [0, 1, 3, u8::MAX] {
+            let mut changed = frame.clone();
+            changed[8] = invalid_kind;
+            assert!(matches!(
+                decode_entries(&changed, &|| Ok(())),
+                Err(Failure::Invalid)
+            ));
+        }
+        for length in [0, 8, 9, 41, 42, frame.len() - 1] {
+            assert!(matches!(
+                decode_entries(&frame[..length], &|| Ok(())),
+                Err(Failure::Invalid)
+            ));
+        }
+        let mut trailing = frame.clone();
+        trailing.push(0);
+        assert!(matches!(
+            decode_entries(&trailing, &|| Ok(())),
+            Err(Failure::Invalid)
+        ));
+        let mut numeric_v1 = frame.clone();
+        numeric_v1.drain(8..9);
+        numeric_v1[..8].copy_from_slice(b"MMMMPK01");
+        assert!(matches!(
+            decode_entries(&numeric_v1, &|| Ok(())),
+            Err(Failure::Invalid)
+        ));
+        let numeric = source_frame();
+        let mut mixed_digest = frame;
+        mixed_digest[9..41].copy_from_slice(&numeric[8..40]);
+        assert!(matches!(
+            decode_entries(&mixed_digest, &|| Ok(())),
+            Err(Failure::Invalid)
+        ));
+        let numeric_entries = CalibrationSourceKind::Numeric47
+            .source_entries()
+            .expect("numeric recipe");
+        let mixed_entries = frame_for_entries(kind, &numeric_entries);
+        assert!(matches!(
+            decode_entries(&mixed_entries, &|| Ok(())),
+            Err(Failure::Invalid)
+        ));
+    }
+    #[test]
+    fn recomputed_pack_bundle_digest_does_not_admit_changed_recipe_bytes_or_paths() {
+        let kind = CalibrationSourceKind::PackCase;
+        for change_path in [false, true] {
+            let mut entries = kind.source_entries().expect("PACK recipe");
+            let path = "data/mmmm_calibration/function/pack/dependency.mcfunction";
+            if change_path {
+                let bytes = entries.remove(path).expect("dependency");
+                entries.insert(
+                    "data/mmmm_calibration/function/pack/other.mcfunction".into(),
+                    bytes,
+                );
+            } else {
+                entries.get_mut(path).expect("dependency").push(b'\n');
+            }
+            assert!(matches!(
+                decode_entries(&frame_for_entries(kind, &entries), &|| Ok(())),
+                Err(Failure::Invalid)
+            ));
+        }
     }
     #[test]
     fn changed_digest_roster_source_and_oversize_do_not_receive_facts() {

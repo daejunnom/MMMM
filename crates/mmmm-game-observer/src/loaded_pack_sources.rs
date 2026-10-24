@@ -8,7 +8,10 @@
 //! 참조 번호만 비교하는 것은 JNI 발급자의 실제 객체 join을 대체하지 않는다.
 //! 완성된 기록도 historical source facts이며 target/쓰기/SourceAdmission이 아니다.
 
-use mmmm_compiler::calibration_dispatch::CalibrationDispatchPlan;
+use mmmm_compiler::{
+    calibration::{CalibrationPackProgram, CalibrationSourceKind},
+    calibration_dispatch::CalibrationDispatchPlan,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -84,6 +87,8 @@ pub(crate) struct CaptureBinding {
     pub bundle: ObjectId,
     pub root_anchor: ObjectId,
     pub selection: ObjectId,
+    /// Issued by the native-held completed root; never selected by a Java DTO.
+    pub source_kind: CalibrationSourceKind,
     /// Read from the native-held original root record, not Java JSON. This
     /// binds the complete paths/pack.mcmeta/bytes canonical bundle to the same
     /// compiler dispatch recipe used by the original owned-file consumer.
@@ -121,13 +126,21 @@ struct ExpectedFunction {
 }
 
 /// Only the existing Rust normative constructor populates this expected set.
-/// It is a comparison input, never an observation. Numeric47 is NOT PACK_CASE.
+/// It is a comparison input, never an observation. Each closed kind has its
+/// own exact corpus; numeric47 source is never treated as PACK_CASE source.
 #[derive(Clone, Debug)]
 pub(crate) struct ExpectedSources {
+    kind: CalibrationSourceKind,
     functions: BTreeMap<String, ExpectedFunction>,
     bundle_digest: [u8; 32],
 }
 impl ExpectedSources {
+    pub(crate) fn for_kind(kind: CalibrationSourceKind) -> Result<Self, Failure> {
+        match kind {
+            CalibrationSourceKind::Numeric47 => Self::numeric47(),
+            CalibrationSourceKind::PackCase => Self::pack_case(),
+        }
+    }
     pub(crate) fn numeric47() -> Result<Self, Failure> {
         let suite = CalibrationDispatchPlan::normative47().map_err(|_| Failure::SourceMismatch)?;
         if suite.programs().len() != MAX_FUNCTIONS
@@ -169,6 +182,7 @@ impl ExpectedSources {
             }
         }
         let result = Self {
+            kind: CalibrationSourceKind::Numeric47,
             functions,
             bundle_digest,
         };
@@ -177,6 +191,62 @@ impl ExpectedSources {
             return Err(Failure::SourceMismatch);
         }
         Ok(result)
+    }
+    pub(crate) fn pack_case() -> Result<Self, Failure> {
+        let kind = CalibrationSourceKind::PackCase;
+        let program = CalibrationPackProgram::java_26_3().map_err(|_| Failure::SourceMismatch)?;
+        if program.source_entries().len() != kind.entry_count()
+            || program.function_ids().len() != kind.function_count()
+        {
+            return Err(Failure::SourceMismatch);
+        }
+        let mut canonical = Vec::with_capacity(kind.entry_count());
+        let mut total = 0usize;
+        for (path, bytes) in program.source_entries() {
+            total = total
+                .checked_add(bytes.len())
+                .ok_or(Failure::ResourceLimit)?;
+            if total > MAX_TOTAL_SOURCE_BYTES || bytes.is_empty() || bytes.len() > MAX_SOURCE_BYTES
+            {
+                return Err(Failure::ResourceLimit);
+            }
+            canonical.push(json!({"path":path,"rawSha256":hex(&Sha256::digest(bytes)),
+                "byteLength":bytes.len(),"rawBytesHex":hex(bytes)}));
+        }
+        let bundle_digest = mmmm_contracts::canonical_digest(&Value::Array(canonical))
+            .map_err(|_| Failure::SourceMismatch)?
+            .to_bytes();
+        let mut functions = BTreeMap::new();
+        for identifier in program.function_ids() {
+            let (namespace, function) =
+                identifier.split_once(':').ok_or(Failure::SourceMismatch)?;
+            let path = format!("data/{namespace}/function/{function}.mcfunction");
+            let bytes = program
+                .source_entries()
+                .get(&path)
+                .ok_or(Failure::SourceMismatch)?;
+            let expected = ExpectedFunction {
+                resource: format!("{namespace}:function/{function}.mcfunction"),
+                bytes: bytes.clone(),
+                sha256: Sha256::digest(bytes).into(),
+            };
+            if functions.insert(identifier.clone(), expected).is_some() {
+                return Err(Failure::Duplicate);
+            }
+        }
+        let result = Self {
+            kind,
+            functions,
+            bundle_digest,
+        };
+        result.validate()?;
+        Ok(result)
+    }
+    pub(crate) fn selected_resources(&self) -> BTreeMap<String, String> {
+        self.functions
+            .iter()
+            .map(|(identifier, source)| (identifier.clone(), source.resource.clone()))
+            .collect()
     }
     fn validate(&self) -> Result<(), Failure> {
         if self.functions.is_empty() || self.functions.len() > MAX_FUNCTIONS {
@@ -273,6 +343,7 @@ pub(crate) struct FunctionFacts {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CaptureFacts {
+    pub source_kind: CalibrationSourceKind,
     pub numeric47_bootstrap: bool,
     pub original_bundle_digest: [u8; 32],
     pub functions: Vec<FunctionFacts>,
@@ -340,7 +411,7 @@ impl RecordingCore {
         if let Err(failure) = expected.validate() {
             return self.reject_arm(failure, binding.generation);
         }
-        if binding.bundle_digest != expected.bundle_digest {
+        if binding.source_kind != expected.kind || binding.bundle_digest != expected.bundle_digest {
             return self.reject_arm(Failure::SourceMismatch, binding.generation);
         }
         if binding.generation == 0 || binding.deadline_ms <= binding.started_ms {
@@ -1014,7 +1085,8 @@ impl RecordingCore {
         }
         functions.sort_by(|left, right| left.function_id.cmp(&right.function_id));
         Ok(CaptureFacts {
-            numeric47_bootstrap: true,
+            source_kind: capture.expected.kind,
+            numeric47_bootstrap: capture.expected.kind == CalibrationSourceKind::Numeric47,
             original_bundle_digest: capture.binding.bundle_digest,
             functions,
             expected_functions: capture.expected.functions.len(),
@@ -1148,6 +1220,7 @@ mod tests {
     fn expected() -> ExpectedSources {
         let bytes = b"return 1\n".to_vec();
         ExpectedSources {
+            kind: CalibrationSourceKind::Numeric47,
             functions: BTreeMap::from([(
                 "mmmm_calibration:test".into(),
                 ExpectedFunction {
@@ -1168,6 +1241,7 @@ mod tests {
                 bundle: object(4 + offset),
                 root_anchor: object(5 + offset),
                 selection: object(6 + offset),
+                source_kind: CalibrationSourceKind::Numeric47,
                 bundle_digest: [7; 32],
                 generation: 1,
                 started_ms: 0,
@@ -1251,12 +1325,59 @@ mod tests {
     #[test]
     fn normative_expected_set_is_comparison_data_and_not_pack_case() {
         let expected = ExpectedSources::numeric47().unwrap();
+        assert_eq!(expected.kind, CalibrationSourceKind::Numeric47);
         assert_eq!(expected.functions.len(), 47);
         assert!(
             !expected
                 .functions
                 .contains_key("mmmm_calibration:pack/entry")
         );
+    }
+    #[test]
+    fn pack_comparison_has_two_functions_and_never_claims_numeric_bootstrap() {
+        let expected = ExpectedSources::pack_case().unwrap();
+        assert_eq!(expected.kind, CalibrationSourceKind::PackCase);
+        assert_eq!(expected.functions.len(), 2);
+        assert_eq!(
+            expected.selected_resources(),
+            BTreeMap::from([
+                (
+                    "mmmm_calibration:pack/entry".into(),
+                    "mmmm_calibration:function/pack/entry.mcfunction".into()
+                ),
+                (
+                    "mmmm_calibration:pack/dependency".into(),
+                    "mmmm_calibration:function/pack/dependency.mcfunction".into()
+                ),
+            ])
+        );
+        let binding = CaptureBinding {
+            server: object(1),
+            attempt: object(2),
+            invocation: object(3),
+            bundle: object(4),
+            root_anchor: object(5),
+            selection: object(6),
+            source_kind: CalibrationSourceKind::PackCase,
+            bundle_digest: expected.bundle_digest,
+            generation: 1,
+            started_ms: 0,
+            deadline_ms: 100,
+        };
+        let mut mismatch = binding.clone();
+        mismatch.source_kind = CalibrationSourceKind::Numeric47;
+        let mut core = RecordingCore::new();
+        assert_eq!(
+            core.arm(mismatch, expected.clone()),
+            Err(Failure::SourceMismatch)
+        );
+        let id = core.arm(binding, expected).unwrap();
+        let facts = core.facts(id).unwrap();
+        assert_eq!(facts.source_kind, CalibrationSourceKind::PackCase);
+        assert!(!facts.numeric47_bootstrap);
+        assert_eq!(facts.expected_functions, 2);
+        assert_eq!(facts.published_functions, 0);
+        assert!(!facts.consumed_parse_publication_observed);
     }
     #[test]
     fn early_supplier_result_and_complete_identity_chain_are_recorded_as_facts_only() {
@@ -1409,6 +1530,7 @@ mod tests {
             bundle: object(1004),
             root_anchor: object(1005),
             selection: object(1006),
+            source_kind: CalibrationSourceKind::Numeric47,
             bundle_digest: [7; 32],
             generation: 1,
             started_ms: 0,

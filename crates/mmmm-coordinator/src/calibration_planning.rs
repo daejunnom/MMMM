@@ -12,7 +12,9 @@ use crate::{
 use mmmm_application::{
     AppError, AppResult, Application, PreparedPlan, ProviderPort, SetupPlanningPort, SetupSelection,
 };
-use mmmm_compiler::calibration_dispatch::CalibrationDispatchPlan;
+use mmmm_compiler::{
+    calibration::CalibrationSourceKind, calibration_dispatch::CalibrationDispatchPlan,
+};
 use mmmm_contracts::{
     BindingId, PlanId, PrincipalId, Sha256Digest, TargetId, canonical_digest, raw_digest,
 };
@@ -48,7 +50,15 @@ pub(crate) fn prepare_normative47_plan(
     hosts: &HostBridge,
     selection: &SetupSelection,
 ) -> AppResult<CalibrationPlanReceipt> {
-    prepare_selected_plan(app, request, owner, hosts, selection, None)
+    prepare_selected_plan(
+        app,
+        request,
+        owner,
+        hosts,
+        selection,
+        None,
+        CalibrationSourceKind::Numeric47,
+    )
 }
 
 pub(crate) fn prepare_bootstrap_plan(
@@ -59,7 +69,34 @@ pub(crate) fn prepare_bootstrap_plan(
     selection: &SetupSelection,
     registry: &BootstrapRegistry,
 ) -> AppResult<CalibrationPlanReceipt> {
-    prepare_selected_plan(app, request, owner, hosts, selection, Some(registry))
+    prepare_selected_plan(
+        app,
+        request,
+        owner,
+        hosts,
+        selection,
+        Some(registry),
+        CalibrationSourceKind::Numeric47,
+    )
+}
+
+pub(crate) fn prepare_pack_bootstrap_plan(
+    app: &mut Application<'_>,
+    request: &RequestContextWitness,
+    owner: &NativeOwnerWitness,
+    hosts: &HostBridge,
+    selection: &SetupSelection,
+    registry: &BootstrapRegistry,
+) -> AppResult<CalibrationPlanReceipt> {
+    prepare_selected_plan(
+        app,
+        request,
+        owner,
+        hosts,
+        selection,
+        Some(registry),
+        CalibrationSourceKind::PackCase,
+    )
 }
 
 fn prepare_selected_plan(
@@ -69,6 +106,7 @@ fn prepare_selected_plan(
     hosts: &HostBridge,
     selection: &SetupSelection,
     bootstrap: Option<&BootstrapRegistry>,
+    source_kind: CalibrationSourceKind,
 ) -> AppResult<CalibrationPlanReceipt> {
     request_check(request, owner)?;
     if !request
@@ -134,6 +172,7 @@ fn prepare_selected_plan(
         time_budget_ms: options.time_budget_ms,
         prepared: false,
         bootstrap,
+        source_kind,
         staged: None,
     };
     let plan = app.prepare_setup(owner.principal(), selection, &mut creator)?;
@@ -173,6 +212,7 @@ struct Creator<'a> {
     time_budget_ms: u64,
     prepared: bool,
     bootstrap: Option<&'a BootstrapRegistry>,
+    source_kind: CalibrationSourceKind,
     staged: Option<Rc<BootstrapSource>>,
 }
 impl Creator<'_> {
@@ -218,7 +258,7 @@ impl Creator<'_> {
         context: &Value,
     ) -> AppResult<(BindingId, Value, Value)> {
         let action_id = if self.bootstrap.is_some() {
-            crate::calibration_bootstrap::ACTION
+            crate::calibration_bootstrap::action_for_kind(self.source_kind)
         } else {
             "mmmm:calibration_command_execute"
         };
@@ -340,13 +380,22 @@ impl SetupPlanningPort for Creator<'_> {
         }
         let (binding, descriptor, dependency) = self.observed_action(store, context)?;
         if self.bootstrap.is_some() {
-            let source = crate::calibration_bootstrap::stage_source(
-                store,
-                self.request,
-                self.owner,
-                selection,
-                &self.sealed,
-            )?;
+            let source = match self.source_kind {
+                CalibrationSourceKind::Numeric47 => crate::calibration_bootstrap::stage_source(
+                    store,
+                    self.request,
+                    self.owner,
+                    selection,
+                    &self.sealed,
+                )?,
+                CalibrationSourceKind::PackCase => crate::calibration_bootstrap::stage_pack_source(
+                    store,
+                    self.request,
+                    self.owner,
+                    selection,
+                    &self.sealed,
+                )?,
+            };
             let targets = source.targets();
             let scope = WriteScope {
                 project_id: selection.project_id.clone(),
@@ -357,9 +406,9 @@ impl SetupPlanningPort for Creator<'_> {
             };
             scope.validate().map_err(storage)?;
             let action_digest = canonical_digest(&descriptor).map_err(|_| invalid())?;
-            let step = json!({"stepId":"calibration-bootstrap","bindingId":binding,"actionId":crate::calibration_bootstrap::ACTION,
+            let step = json!({"stepId":if self.source_kind == CalibrationSourceKind::Numeric47 {"calibration-bootstrap"} else {"calibration-pack-bootstrap"},"bindingId":binding,"actionId":crate::calibration_bootstrap::action_for_kind(self.source_kind),
                 "actionContractVersion":descriptor["contractVersion"],"actionDigest":action_digest,
-                "arguments":{"sourceBundleDigest":source.digest()},"dependsOn":[],"effect":descriptor["effect"],
+                "arguments":source.arguments(),"dependsOn":[],"effect":descriptor["effect"],
                 "completion":descriptor["completion"],"recovery":descriptor["recovery"],"resourcesRead":targets,
                 "resourcesWritten":targets,"verificationRequirement":descriptor["verificationRequirement"],
                 "contextId":context["contextId"],"implementationDigest":descriptor["implementationDigest"],"resultBindings":[]});

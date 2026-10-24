@@ -4,6 +4,7 @@
 use super::*;
 use crate::host::{CompletedPairingWitness, HostBridge};
 use mmmm_application::ReadbackEvidence;
+use mmmm_compiler::calibration::{CalibrationPackProgram, CalibrationSourceKind};
 use mmmm_contracts::{ContractValidator, encode_json};
 use mmmm_runtime::storage::{DispatchEvidence, EffectEvidence};
 
@@ -61,7 +62,7 @@ impl SuccessorObservation {
 }
 
 impl BootstrapRegistry {
-    /// Only the exact private bootstrap action can select this boundary. A
+    /// Only an exact retained private bootstrap can select this boundary. A
     /// matching but invalid original or missing required successor is an error.
     /// A still-current, fully revalidated original generation keeps its ordinary
     /// exact-environment observation. No request/owner/pairing token is retained.
@@ -73,7 +74,7 @@ impl BootstrapRegistry {
         hosts: &HostBridge,
         original: &Value,
     ) -> AppResult<Option<SuccessorObservation>> {
-        if original["actionId"] != ACTION {
+        if !self.handles_original(original)? {
             return Ok(None);
         }
         request.check_local().map_err(request_error)?;
@@ -249,7 +250,7 @@ impl EnteredSuccessor<'_> {
             .try_borrow()
             .map_err(|_| unavailable())?
             .get(key.as_str())
-            .is_none_or(|images| images.len() != 95)
+            .is_none_or(|images| images.len() != self.entry.source.targets.len())
         {
             return Err(unavailable());
         }
@@ -286,7 +287,7 @@ fn validate_payload(
     {
         return Err(denied());
     }
-    validate_history(&payload["history"])?;
+    validate_history_for_kind(&payload["history"], entered.entry.source.kind)?;
     let facts = &payload["history"]["fileFacts"];
     if !facts.is_null() {
         if facts["sourceBundleDigest"] != *entered.entry.source.digest() {
@@ -314,7 +315,12 @@ fn validate_payload(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_history(history: &Value) -> AppResult<()> {
+    validate_history_for_kind(history, CalibrationSourceKind::Numeric47)
+}
+
+fn validate_history_for_kind(history: &Value, kind: CalibrationSourceKind) -> AppResult<()> {
     exact(
         history,
         &[
@@ -358,13 +364,17 @@ fn validate_history(history: &Value) -> AppResult<()> {
     {
         return Err(unavailable());
     }
+    let maximum_initializations = match kind {
+        CalibrationSourceKind::Numeric47 => 47,
+        CalibrationSourceKind::PackCase => 0,
+    };
     let returns = history["initializationReturns"]
         .as_array()
-        .filter(|rows| rows.len() <= 47)
+        .filter(|rows| rows.len() <= maximum_initializations)
         .ok_or_else(unavailable)?;
     let attempted = history["initializationAttemptedCount"]
         .as_u64()
-        .filter(|value| *value <= 47)
+        .filter(|value| *value <= maximum_initializations as u64)
         .ok_or_else(unavailable)?;
     if attempted < returns.len() as u64
         || returns.iter().any(|value| {
@@ -390,6 +400,18 @@ fn validate_history(history: &Value) -> AppResult<()> {
             .map_err(|_| unavailable())?
             .validate("ProviderResult", &history["originalResult"])
             .map_err(|_| unavailable())?;
+        if kind == CalibrationSourceKind::PackCase {
+            // The synchronous command descriptor has no issued polling job.
+            // This first slice preserves actual failure/unknown effects and
+            // cannot describe a completed command or invent a job handle.
+            let result = &history["originalResult"];
+            if result["status"] != "failed"
+                || result["effects"] != "unknown"
+                || result.get("jobHandle").is_some()
+            {
+                return Err(unavailable());
+            }
+        }
     }
     if !history["originalFailure"].is_null() && !terminal {
         return Err(unavailable());
@@ -405,9 +427,9 @@ fn validate_history(history: &Value) -> AppResult<()> {
         exact(facts, &["sourceBundleDigest", "verifiedFileCount", "files"])?;
         let rows = facts["files"]
             .as_array()
-            .filter(|rows| rows.len() == 48)
+            .filter(|rows| rows.len() == kind.entry_count())
             .ok_or_else(unavailable)?;
-        if facts["verifiedFileCount"] != 48
+        if facts["verifiedFileCount"] != json!(kind.entry_count())
             || Sha256Digest::new(
                 facts["sourceBundleDigest"]
                     .as_str()
@@ -753,20 +775,44 @@ fn validate_observation(value: &Value, source: &BootstrapSource) -> AppResult<()
     if loaded["causalLink"] != "unproven" {
         return Err(unavailable());
     }
+    let expected_count = source.kind.function_count();
     let functions = loaded["functions"]
         .as_array()
-        .filter(|rows| rows.len() <= 47)
+        .filter(|rows| rows.len() <= expected_count)
         .ok_or_else(unavailable)?;
-    validate_status(&loaded["status"], functions.len(), 47)?;
+    validate_status(&loaded["status"], functions.len(), expected_count)?;
     validate_failure(&loaded["failure"])?;
     if loaded["status"] == "known" && !loaded["failure"].is_null() {
         return Err(unavailable());
     }
-    let expected = source
-        .programs
-        .as_array()
-        .filter(|programs| programs.len() == 47)
-        .ok_or_else(unavailable)?;
+    let expected: BTreeSet<String> = match source.kind {
+        CalibrationSourceKind::Numeric47 => source
+            .programs
+            .as_array()
+            .filter(|programs| programs.len() == expected_count)
+            .ok_or_else(unavailable)?
+            .iter()
+            .map(|program| {
+                program["functionId"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(unavailable)
+            })
+            .collect::<AppResult<_>>()?,
+        CalibrationSourceKind::PackCase => {
+            if !source.programs.as_array().is_some_and(Vec::is_empty) {
+                return Err(unavailable());
+            }
+            CalibrationPackProgram::java_26_3()
+                .map_err(|_| unavailable())?
+                .function_ids()
+                .clone()
+        }
+    };
+    if expected.len() != expected_count {
+        return Err(unavailable());
+    }
+    let source_pack_id = format!("file/{}", source.kind.root_basename());
     let mut seen = BTreeSet::new();
     for function in functions {
         exact(
@@ -780,9 +826,7 @@ fn validate_observation(value: &Value, source: &BootstrapSource) -> AppResult<()
             ],
         )?;
         let id = function["functionId"].as_str().ok_or_else(unavailable)?;
-        if !seen.insert(id)
-            || !expected.iter().any(|program| program["functionId"] == id)
-            || function["sourcePackId"] != "file/mmmm-calibration-normative47"
+        if !seen.insert(id) || !expected.contains(id) || function["sourcePackId"] != source_pack_id
         {
             return Err(unavailable());
         }
@@ -806,6 +850,15 @@ fn validate_observation(value: &Value, source: &BootstrapSource) -> AppResult<()
     }
     let targets = &value["targetImages"];
     exact(targets, &["status", "targets", "failure"])?;
+    if source.kind == CalibrationSourceKind::PackCase {
+        if targets["status"] != "unknown"
+            || !targets["targets"].as_array().is_some_and(Vec::is_empty)
+            || !targets["failure"].is_null()
+        {
+            return Err(unavailable());
+        }
+        return Ok(());
+    }
     let images = targets["targets"]
         .as_array()
         .filter(|rows| rows.len() <= 94)
@@ -955,6 +1008,63 @@ mod tests {
         history["reloadOutcome"] = json!("completed");
         history["reloadFailure"] = json!({"type":"unit-syntax-only"});
         assert!(validate_history(&history).is_err());
+    }
+
+    #[test]
+    fn pack_history_keeps_three_files_and_zero_initialization_without_command_completion() {
+        // Existing numeric history has no three-entry PACK grammar or failure
+        // after reload. These syntax values issue no native run or authority.
+        let bundle = json!("a".repeat(64));
+        let mut history = json!({"originalResult":null,"originalFailure":null,"resultTerminal":false,
+            "effectPhase":"accepted","fileFacts":null,"initializationAttemptedCount":0,
+            "initializationReturns":[],"reloadOutcome":"not_attempted","reloadFailure":null,
+            "rootAnchorReserved":false,"rootAnchorRecorded":false,"rootRetirement":null,"rootRetirementFailure":null});
+        assert!(validate_history_for_kind(&history, CalibrationSourceKind::PackCase).is_ok());
+        history["initializationAttemptedCount"] = json!(1);
+        assert!(validate_history_for_kind(&history, CalibrationSourceKind::PackCase).is_err());
+        history["initializationAttemptedCount"] = json!(0);
+        history["initializationReturns"] = json!([1]);
+        assert!(validate_history_for_kind(&history, CalibrationSourceKind::PackCase).is_err());
+        history["initializationReturns"] = json!([]);
+        history["fileFacts"] = json!({"sourceBundleDigest":bundle,"verifiedFileCount":3,
+            "files":[
+                {"path":"pack.mcmeta","byteLength":1,"rawSha256":"b".repeat(64)},
+                {"path":"data/mmmm_calibration/function/pack/entry.mcfunction","byteLength":1,"rawSha256":"c".repeat(64)},
+                {"path":"data/mmmm_calibration/function/pack/dependency.mcfunction","byteLength":1,"rawSha256":"d".repeat(64)}]});
+        assert!(validate_history_for_kind(&history, CalibrationSourceKind::PackCase).is_ok());
+        assert!(validate_history(&history).is_err());
+        history["fileFacts"]["verifiedFileCount"] = json!(48);
+        assert!(validate_history_for_kind(&history, CalibrationSourceKind::PackCase).is_err());
+        history["fileFacts"]["verifiedFileCount"] = json!(3);
+        history["resultTerminal"] = json!(true);
+        history["reloadOutcome"] = json!("completed");
+        history["effectPhase"] = json!("pack_reload_observed_command_not_dispatched");
+        history["originalFailure"] = json!({"type":"io.github.daejunnom.mmmm.sdk.ContractException",
+            "code":"CAPABILITY_UNAVAILABLE","cause":null,"suppressed":[],"truncated":false});
+        assert!(validate_history_for_kind(&history, CalibrationSourceKind::PackCase).is_ok());
+        history["resultTerminal"] = json!(false);
+        assert!(validate_history_for_kind(&history, CalibrationSourceKind::PackCase).is_err());
+        history["resultTerminal"] = json!(true);
+        history["originalFailure"] = Value::Null;
+        history["originalResult"] = json!({"contractVersion":"0.2.0","status":"failed",
+            "effects":"unknown","data":{},"diagnostics":[],"artifacts":[]});
+        assert!(validate_history_for_kind(&history, CalibrationSourceKind::PackCase).is_ok());
+        for status in ["complete", "job_accepted"] {
+            let mut forged = history.clone();
+            forged["originalResult"]["status"] = json!(status);
+            if status == "job_accepted" {
+                forged["originalResult"]["jobHandle"] = json!("pack-original");
+            }
+            assert!(validate_history_for_kind(&forged, CalibrationSourceKind::PackCase).is_err());
+        }
+        let mut handle = history.clone();
+        handle["originalResult"]["jobHandle"] = json!("invented-pack-handle");
+        assert!(validate_history_for_kind(&handle, CalibrationSourceKind::PackCase).is_err());
+        for effects in ["none", "recorded"] {
+            let mut forged = history.clone();
+            forged["originalResult"]["effects"] = json!(effects);
+            assert!(validate_history_for_kind(&forged, CalibrationSourceKind::PackCase).is_err());
+        }
     }
 
     #[test]

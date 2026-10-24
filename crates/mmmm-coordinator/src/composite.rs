@@ -1141,7 +1141,7 @@ impl ProviderPort for CompositeProvider {
         principal: &PrincipalId,
         original: &Value,
     ) -> AppResult<Option<Value>> {
-        if original["actionId"] != crate::calibration_bootstrap::ACTION {
+        if !self.shared.bootstrap.handles_original(original)? {
             return Ok(None);
         }
         let request = self.shared.calibration_request()?;
@@ -1595,7 +1595,7 @@ impl ProviderPort for CompositeProvider {
         receipt: Option<&str>,
     ) -> AppResult<Option<Value>> {
         let request = self.shared.calibration_request()?;
-        if invocation["actionId"] == crate::calibration_bootstrap::ACTION
+        if self.shared.bootstrap.handles_original(invocation)?
             && request.method() == "operation.reconcile"
             && let Some(observed) = self.shared.bootstrap.observe_successor(
                 store,
@@ -2010,7 +2010,7 @@ impl IndependentObserverPort for CompositeObserver {
         scope: &WriteScope,
         target: &str,
     ) -> AppResult<()> {
-        if invocation["actionId"] == crate::calibration_bootstrap::ACTION {
+        if self.shared.bootstrap.handles_original(invocation)? {
             let request = self.shared.calibration_request()?;
             return self.shared.bootstrap.validate_capture_target(
                 &request,
@@ -2139,7 +2139,7 @@ impl IndependentObserverPort for CompositeObserver {
         scope: &WriteScope,
     ) -> AppResult<ReadbackEvidence> {
         let request = self.shared.calibration_request()?;
-        if invocation["actionId"] == crate::calibration_bootstrap::ACTION
+        if self.shared.bootstrap.handles_original(invocation)?
             && request.method() == "operation.reconcile"
         {
             let operation: OperationId = decode(&invocation["operationId"])?;

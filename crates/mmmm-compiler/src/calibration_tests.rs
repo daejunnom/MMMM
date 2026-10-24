@@ -3,7 +3,10 @@
 //! VerifiedTarget and cannot detect a calibration program that skips its
 //! named experiment, substitutes an expected constant, or observes cleanup.
 
-use super::{CalibrationCase, CalibrationPackProgram, CalibrationProgram, CalibrationScalar};
+use super::{
+    CalibrationCase, CalibrationPackProgram, CalibrationProgram, CalibrationScalar,
+    CalibrationSourceKind,
+};
 use crate::BindingAddress;
 use mmmm_contracts::{Sha256Digest, raw_digest};
 use serde_json::json;
@@ -537,6 +540,39 @@ fn preseed_evaluation_observation_and_failure_cleanup_have_required_order() {
     assert!(later.commands()[failing_read].contains("path:\"invocation.n1\""));
 }
 
+#[test]
+fn private_source_kinds_keep_numeric_and_pack_recipes_separate() {
+    let numeric = CalibrationSourceKind::Numeric47;
+    let pack = CalibrationSourceKind::PackCase;
+    assert_eq!(
+        (
+            numeric.name(),
+            numeric.entry_count(),
+            numeric.function_count()
+        ),
+        ("numeric47", 48, 47)
+    );
+    assert_eq!(
+        (pack.name(), pack.entry_count(), pack.function_count()),
+        ("pack_case", 3, 2)
+    );
+    assert_eq!(numeric.root_basename(), "mmmm-calibration-normative47");
+    assert_eq!(pack.root_basename(), "mmmm-calibration-pack-case");
+    let numeric_entries = numeric.source_entries().unwrap();
+    let pack_entries = pack.source_entries().unwrap();
+    assert_eq!(numeric_entries.len(), numeric.entry_count());
+    assert_eq!(pack_entries.len(), pack.entry_count());
+    assert_eq!(
+        pack_entries,
+        *CalibrationPackProgram::java_26_3()
+            .unwrap()
+            .source_entries()
+    );
+    assert!(!numeric_entries.contains_key("data/mmmm_calibration/function/pack/entry.mcfunction"));
+    assert!(pack_entries.contains_key("data/mmmm_calibration/function/pack/entry.mcfunction"));
+    assert_ne!(numeric_entries, pack_entries);
+}
+
 fn logical_pack_digest(entries: &BTreeMap<String, Vec<u8>>) -> Sha256Digest {
     let mut framed = Vec::new();
     for (path, bytes) in entries {
@@ -552,6 +588,14 @@ fn logical_pack_digest(entries: &BTreeMap<String, Vec<u8>>) -> Sha256Digest {
 fn pack_program_has_native_pair_codec_singular_paths_and_complete_owned_dispatch() {
     let built = CalibrationPackProgram::java_26_3().unwrap();
     let again = CalibrationPackProgram::java_26_3().unwrap();
+    assert_eq!(
+        raw_digest(built.canonical_recipe_bytes()),
+        *built.program_digest()
+    );
+    assert_eq!(
+        built.canonical_recipe_bytes(),
+        again.canonical_recipe_bytes()
+    );
     let paths: BTreeSet<_> = built.source_entries().keys().map(String::as_str).collect();
     assert_eq!(
         paths,

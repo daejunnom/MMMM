@@ -11,6 +11,7 @@ use crate::{
     workspace_bootstrap::NativeOwnerWitness,
 };
 use mmmm_application::{Access, AppError, AppResult, AuthorityPort, ProviderPort};
+use mmmm_compiler::calibration::CalibrationSourceKind;
 use mmmm_contracts::{
     ActionId, BindingId, ContextId, ContractValidator, InvocationId, OperationId, PrincipalId,
     ProjectId, Sha256Digest, StepId, canonical_digest, encode_json, raw_digest,
@@ -257,10 +258,14 @@ pub(crate) struct BootstrapHostRoute {
     read_owner: HostContextWitness,
     generation: [u8; 16],
     expires: Instant,
+    kind: CalibrationSourceKind,
 }
 impl BootstrapHostRoute {
     pub(crate) fn context(&self) -> &Value {
         self.read_owner.context()
+    }
+    pub(crate) fn kind(&self) -> CalibrationSourceKind {
+        self.kind
     }
     pub(crate) fn lease_expires(&self) -> Instant {
         self.expires
@@ -393,7 +398,7 @@ impl BootstrapHostRoute {
     }
     fn validate_original(&self, original: &Value) -> AppResult<()> {
         validate("Invocation", original)?;
-        if original["actionId"] != crate::calibration_bootstrap::ACTION
+        if bootstrap_original_kind(original) != Some(self.kind)
             || original["context"] != self.read_owner.context
             || original["contextDigest"] != self.read_owner.context["contextDigest"]
         {
@@ -1545,6 +1550,7 @@ impl HostBridge {
         context: Value,
         hello: Value,
         lease_expires: Instant,
+        kind: CalibrationSourceKind,
         budget: BootstrapRouteBudget<'_>,
     ) -> AppResult<BootstrapHostRoute> {
         let BootstrapRouteBudget {
@@ -1618,6 +1624,7 @@ impl HostBridge {
             read_owner,
             generation,
             expires,
+            kind,
         };
         route.check_bootstrap_current_until(budget, deadline)?;
         Ok(route)
@@ -3057,12 +3064,9 @@ fn bootstrap_successor_original(
         .check_local()
         .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
     if request.method() != "operation.reconcile"
-        || original["actionId"] != crate::calibration_bootstrap::ACTION
+        || bootstrap_original_kind(original).is_none()
         || original["context"]["principalRef"] != request.authenticated().principal().as_str()
         || original["contextDigest"] != original["context"]["contextDigest"]
-        || original["arguments"].as_object().is_none_or(|arguments| {
-            arguments.len() != 1 || !arguments.contains_key("sourceBundleDigest")
-        })
     {
         return Err(error(
             "PERMISSION_REQUIRED",
@@ -3073,15 +3077,6 @@ fn bootstrap_successor_original(
         error(
             "STALE_CONTEXT",
             "Original bootstrap context digest is invalid",
-        )
-    })?;
-    let _: Sha256Digest = serde_json::from_value(
-        original["arguments"]["sourceBundleDigest"].clone(),
-    )
-    .map_err(|_| {
-        error(
-            "INVALID_INPUT",
-            "Original bootstrap source bundle is invalid",
         )
     })?;
     let key = durable_invocation_key(store, original, request.budget().deadline())?;
@@ -3106,6 +3101,23 @@ fn bootstrap_successor_original(
         .check_local()
         .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
     Ok((key, record))
+}
+/// Shape filtering only. A PACK command becomes a private bootstrap call only
+/// after the registry selects its actual retained plan and the durable original
+/// bytes, operation owner and current request are independently checked.
+fn bootstrap_original_kind(original: &Value) -> Option<CalibrationSourceKind> {
+    use crate::calibration_bootstrap::{PACK_COMMAND, action_for_kind};
+    if original["actionId"] == action_for_kind(CalibrationSourceKind::Numeric47) {
+        let arguments = original["arguments"].as_object()?;
+        return (arguments.len() == 1
+            && arguments.contains_key("sourceBundleDigest")
+            && serde_json::from_value::<Sha256Digest>(arguments["sourceBundleDigest"].clone())
+                .is_ok())
+        .then_some(CalibrationSourceKind::Numeric47);
+    }
+    (original["actionId"] == action_for_kind(CalibrationSourceKind::PackCase)
+        && original["arguments"] == json!({"command": PACK_COMMAND}))
+    .then_some(CalibrationSourceKind::PackCase)
 }
 fn bootstrap_successor_environment(original: &Value, successor: &Value) -> bool {
     if original["kind"] != "game"
@@ -3132,6 +3144,12 @@ fn bootstrap_successor_environment(original: &Value, successor: &Value) -> bool 
     original == successor
 }
 fn validate_bootstrap_successor_selector(selector: &Value, original: &Value) -> AppResult<()> {
+    let kind = bootstrap_original_kind(original).ok_or_else(|| {
+        error(
+            "INVALID_INPUT",
+            "Original bootstrap action or arguments are invalid",
+        )
+    })?;
     let fields = [
         "kind",
         "invocationId",
@@ -3147,15 +3165,19 @@ fn validate_bootstrap_successor_selector(selector: &Value, original: &Value) -> 
             != canonical_digest(original)
                 .map_err(|_| error("INVALID_INPUT", "Original bootstrap digest is invalid"))?
                 .as_str()
-        || selector["sourceBundleDigest"] != original["arguments"]["sourceBundleDigest"]
+        || (kind == CalibrationSourceKind::Numeric47
+            && selector["sourceBundleDigest"] != original["arguments"]["sourceBundleDigest"])
     {
         return Err(error(
             "INVALID_INPUT",
             "Successor selector differs from the exact original bootstrap invocation",
         ));
     }
-    // The source registry owns the actual frozen manifest, and checks this pin
-    // in the mandatory callback. A syntactically valid digest creates no right.
+    // PACK's original arguments contain only the exact command. The trusted
+    // registry constructs both pins from its retained source and manifest; its
+    // mandatory callback revalidates that entry. Valid digest syntax grants no right.
+    let _: Sha256Digest = serde_json::from_value(selector["sourceBundleDigest"].clone())
+        .map_err(|_| error("INVALID_INPUT", "Bootstrap source bundle digest is invalid"))?;
     let _: Sha256Digest = serde_json::from_value(selector["frozenManifestDigest"].clone())
         .map_err(|_| {
             error(
@@ -3612,6 +3634,61 @@ mod tests {
             .unwrap()
             .remove("frozenManifestDigest");
         assert!(validate_bootstrap_successor_selector(&changed, &original).is_err());
+        // PACK has no source digest in its original command arguments. This
+        // accepts only the transport shape; the trusted same-Store registry
+        // constructs the actual pins and supplies the mandatory current check.
+        let mut pack = original;
+        pack["actionId"] = json!(crate::calibration_bootstrap::PACK_ACTION);
+        pack["arguments"] = json!({"command":crate::calibration_bootstrap::PACK_COMMAND});
+        let mut pack_selector = json!({"kind":"calibration_bootstrap_successor",
+            "invocationId":pack["invocationId"],
+            "invocationDigest":canonical_digest(&pack).unwrap(),
+            "sourceBundleDigest":raw_digest(b"pack-source-bundle"),
+            "frozenManifestDigest":raw_digest(b"pack-frozen-manifest")});
+        validate_bootstrap_successor_selector(&pack_selector, &pack).unwrap();
+        pack_selector["sourceBundleDigest"] = json!("invalid-digest");
+        assert!(validate_bootstrap_successor_selector(&pack_selector, &pack).is_err());
+    }
+    #[test]
+    fn bootstrap_route_kind_rejects_changed_action_or_argument_shape_before_io() {
+        // Local shape filtering cannot create an approval, retained original,
+        // dispatch or source observation. It only fences these private routes.
+        let (bridge, witness) = local_route_witness();
+        let host = bridge.state.lock().unwrap().hosts[&witness.context_id].clone();
+        let numeric_route = BootstrapHostRoute {
+            generation: host.generation,
+            expires: host.expires,
+            host: Arc::new(Mutex::new(Some(host))),
+            attempts: Arc::new(Mutex::new(BTreeSet::new())),
+            read_owner: witness,
+            kind: CalibrationSourceKind::Numeric47,
+        };
+        let mut numeric = route_fixture_invocation();
+        numeric["context"] = numeric_route.context().clone();
+        numeric["contextDigest"] = numeric["context"]["contextDigest"].clone();
+        numeric["actionId"] = json!(crate::calibration_bootstrap::ACTION);
+        numeric["arguments"] = json!({"sourceBundleDigest":raw_digest(b"numeric-source-bundle")});
+        numeric_route.validate_original(&numeric).unwrap();
+        let mut pack_route = numeric_route.clone();
+        pack_route.kind = CalibrationSourceKind::PackCase;
+        assert!(pack_route.validate_original(&numeric).is_err());
+        let mut pack = numeric.clone();
+        pack["actionId"] = json!(crate::calibration_bootstrap::PACK_ACTION);
+        pack["arguments"] = json!({"command":crate::calibration_bootstrap::PACK_COMMAND});
+        pack_route.validate_original(&pack).unwrap();
+        assert!(numeric_route.validate_original(&pack).is_err());
+        for arguments in [
+            json!({"command":"function mmmm_calibration:pack/dependency"}),
+            json!({"command":"function mmmm_calibration:pack/entry "}),
+            json!({"command":crate::calibration_bootstrap::PACK_COMMAND,"sourceKind":"pack_case"}),
+            numeric["arguments"].clone(),
+        ] {
+            let mut changed = pack.clone();
+            changed["arguments"] = arguments;
+            assert!(pack_route.validate_original(&changed).is_err());
+        }
+        numeric["arguments"]["sourceBundleDigest"] = json!("invalid-digest");
+        assert!(numeric_route.validate_original(&numeric).is_err());
     }
     #[test]
     fn completed_pairing_provenance_keeps_host_bridge_send_and_sync() {
@@ -3630,6 +3707,7 @@ mod tests {
             host: Arc::new(Mutex::new(Some(host))),
             attempts: Arc::new(Mutex::new(BTreeSet::new())),
             read_owner: witness,
+            kind: CalibrationSourceKind::Numeric47,
         };
         let budget = BootstrapBudget::new();
         let original_deadline = budget.deadline();

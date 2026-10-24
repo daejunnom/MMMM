@@ -621,7 +621,9 @@ impl HostBootstrapProcessor {
                     return Err(ManagementError::Deadline);
                 }
                 if offer.public().value()["kind"] == "host_apply_approval_offer"
-                    && offer.public().value()["purpose"] == crate::calibration_bootstrap::PURPOSE
+                    && offer.public().value()["purpose"]
+                        .as_str()
+                        .is_some_and(crate::calibration_bootstrap::is_purpose)
                 {
                     self.bootstrap_offer(store, offer, budget, reply_deadline)
                         .map(Some)

@@ -8,7 +8,10 @@ use crate::{
     service::RequestContextWitness, workspace_bootstrap::NativeOwnerWitness,
 };
 use mmmm_application::{Access, AppError, AppResult, AuthorityPort, BeforeCapture, BeforeImage};
-use mmmm_compiler::calibration_dispatch::CalibrationDispatchPlan;
+use mmmm_compiler::{
+    calibration::{CalibrationPackProgram, CalibrationSourceKind},
+    calibration_dispatch::CalibrationDispatchPlan,
+};
 use mmmm_contracts::{
     OperationId, PlanId, PrincipalId, ProjectId, Sha256Digest, StepId, TargetId, canonical_bytes,
     canonical_digest, raw_digest, verify_projected_digest,
@@ -30,6 +33,50 @@ pub(crate) const ACTION: &str = "mmmm:calibration_bootstrap_execute";
 pub(crate) const PURPOSE: &str = "numeric_calibration_bootstrap/1";
 pub(crate) const MANIFEST_KIND: &str = "native_calibration_bootstrap_approval/1";
 pub(crate) const PACK_TARGET: &str = "calibration-bootstrap-pack";
+pub(crate) const PACK_PURPOSE: &str = "pack_calibration_bootstrap/1";
+pub(crate) const PACK_MANIFEST_KIND: &str = "native_pack_calibration_bootstrap_approval/1";
+pub(crate) const PACK_ACTION: &str = "mmmm:command_execute";
+pub(crate) const PACK_COMMAND: &str = "function mmmm_calibration:pack/entry";
+pub(crate) const PACK_CASE_TARGET: &str = "calibration-pack-case-pack";
+pub(crate) fn kind_for_purpose(value: &str) -> Option<CalibrationSourceKind> {
+    match value {
+        PURPOSE => Some(CalibrationSourceKind::Numeric47),
+        PACK_PURPOSE => Some(CalibrationSourceKind::PackCase),
+        _ => None,
+    }
+}
+pub(crate) fn is_purpose(value: &str) -> bool {
+    kind_for_purpose(value).is_some()
+}
+pub(crate) fn purpose_for_kind(kind: CalibrationSourceKind) -> &'static str {
+    match kind {
+        CalibrationSourceKind::Numeric47 => PURPOSE,
+        CalibrationSourceKind::PackCase => PACK_PURPOSE,
+    }
+}
+pub(crate) fn manifest_kind_for_kind(kind: CalibrationSourceKind) -> &'static str {
+    match kind {
+        CalibrationSourceKind::Numeric47 => MANIFEST_KIND,
+        CalibrationSourceKind::PackCase => PACK_MANIFEST_KIND,
+    }
+}
+pub(crate) fn action_for_kind(kind: CalibrationSourceKind) -> &'static str {
+    match kind {
+        CalibrationSourceKind::Numeric47 => ACTION,
+        CalibrationSourceKind::PackCase => PACK_ACTION,
+    }
+}
+pub(crate) fn pack_target_for_kind(kind: CalibrationSourceKind) -> &'static str {
+    match kind {
+        CalibrationSourceKind::Numeric47 => PACK_TARGET,
+        CalibrationSourceKind::PackCase => PACK_CASE_TARGET,
+    }
+}
+pub(crate) fn is_candidate(original: &Value) -> bool {
+    original["actionId"] == ACTION
+        || (original["actionId"] == PACK_ACTION
+            && original["arguments"] == json!({"command":PACK_COMMAND}))
+}
 const MAX_ENTRIES: usize = 8;
 const MAX_BUNDLE_BYTES: u64 = 3 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 1024 * 1024;
@@ -54,6 +101,7 @@ pub(crate) struct BootstrapPreflight<'a> {
 }
 
 pub(crate) struct BootstrapSource {
+    pub(crate) kind: CalibrationSourceKind,
     bundle: Value,
     blob: BlobRef,
     recipe: BlobRef,
@@ -70,6 +118,12 @@ impl BootstrapSource {
     }
     pub(crate) fn targets(&self) -> &[TargetId] {
         &self.targets
+    }
+    pub(crate) fn arguments(&self) -> Value {
+        match self.kind {
+            CalibrationSourceKind::Numeric47 => json!({"sourceBundleDigest":self.digest()}),
+            CalibrationSourceKind::PackCase => json!({"command":PACK_COMMAND}),
+        }
     }
     pub(crate) fn preconditions(&self) -> Vec<Value> {
         self.expected
@@ -105,6 +159,41 @@ pub(crate) fn stage_source(
     selection: &mmmm_application::SetupSelection,
     suite: &CalibrationDispatchPlan,
 ) -> AppResult<Rc<BootstrapSource>> {
+    stage_source_kind(
+        store,
+        request,
+        owner,
+        selection,
+        suite,
+        CalibrationSourceKind::Numeric47,
+    )
+}
+
+pub(crate) fn stage_pack_source(
+    store: &mut DurableStore,
+    request: &RequestContextWitness,
+    owner: &NativeOwnerWitness,
+    selection: &mmmm_application::SetupSelection,
+    suite: &CalibrationDispatchPlan,
+) -> AppResult<Rc<BootstrapSource>> {
+    stage_source_kind(
+        store,
+        request,
+        owner,
+        selection,
+        suite,
+        CalibrationSourceKind::PackCase,
+    )
+}
+
+fn stage_source_kind(
+    store: &mut DurableStore,
+    request: &RequestContextWitness,
+    owner: &NativeOwnerWitness,
+    selection: &mmmm_application::SetupSelection,
+    suite: &CalibrationDispatchPlan,
+    kind: CalibrationSourceKind,
+) -> AppResult<Rc<BootstrapSource>> {
     let check = |store: &DurableStore| {
         request.check_local().map_err(request_error)?;
         owner
@@ -120,7 +209,7 @@ pub(crate) fn stage_source(
         Ok(())
     };
     check(store)?;
-    let entries = render_source_entries(suite, &|| check(store))?;
+    let entries = render_source_entries_for_kind(kind, suite, &|| check(store))?;
     let bytes = canonical_bytes(&entries).map_err(|_| unavailable())?;
     if bytes.len() as u64 > MAX_BUNDLE_BYTES {
         return Err(unavailable());
@@ -144,23 +233,38 @@ pub(crate) fn stage_source(
         )
     })?;
     check(store)?;
-    let recipe = store
-        .put_blob(suite.canonical_recipe_bytes())
-        .map_err(storage)?;
+    let recipe_bytes = match kind {
+        CalibrationSourceKind::Numeric47 => suite.canonical_recipe_bytes().to_vec(),
+        CalibrationSourceKind::PackCase => {
+            let pack = CalibrationPackProgram::java_26_3().map_err(|_| unavailable())?;
+            if raw_digest(pack.canonical_recipe_bytes()) != *pack.program_digest() {
+                return Err(unavailable());
+            }
+            pack.canonical_recipe_bytes().to_vec()
+        }
+    };
+    let recipe = store.put_blob(&recipe_bytes).map_err(storage)?;
     let recipe_identity =
         canonical_digest(&json!({"projectId":selection.project_id,"recipe":recipe.digest}))
             .map_err(|_| unavailable())?;
     register_resource_with_diagnostics(store,&json!({"resourceId":format!("bootstrap-recipe-{recipe_identity}"),
-        "sha256":recipe.digest,"sizeBytes":recipe.byte_length,"mediaType":"application/vnd.mmmm.calibration-recipe+json"}),
+        "sha256":recipe.digest,"sizeBytes":recipe.byte_length,"mediaType":match kind { CalibrationSourceKind::Numeric47 => "application/vnd.mmmm.calibration-recipe+json", CalibrationSourceKind::PackCase => "application/vnd.mmmm.calibration-pack-recipe" }}),
         ResourceOwner::Project(selection.project_id.clone())).map_err(|cause|AppError::caused_by(
             "BOOTSTRAP_SOURCE_UNAVAILABLE","Original sealed bootstrap recipe could not be retained",cause))?;
-    let targets = validated_bootstrap_target_ids(suite)?;
+    let targets = match kind {
+        CalibrationSourceKind::Numeric47 => validated_bootstrap_target_ids(suite)?,
+        CalibrationSourceKind::PackCase => {
+            vec![TargetId::new(PACK_CASE_TARGET).map_err(|_| unavailable())?]
+        }
+    };
     let mut programs = Vec::with_capacity(47);
-    for program in suite.programs() {
-        programs.push(render_program(program)?);
+    if kind == CalibrationSourceKind::Numeric47 {
+        for program in suite.programs() {
+            programs.push(render_program(program)?);
+        }
     }
     check(store)?;
-    let requirements = absence_requirements(suite, &json!(digest));
+    let requirements = absence_requirements_for_kind(kind, &json!(digest))?;
     let mut expected = Vec::with_capacity(95);
     for requirement in requirements {
         check(store)?;
@@ -194,8 +298,13 @@ pub(crate) fn stage_source(
         ));
     }
     check(store)?;
+    let mut bundle = json!({"bundleDigest":digest,"rawResource":resource,"entries":entries});
+    if kind == CalibrationSourceKind::PackCase {
+        bundle["sourceKind"] = json!(kind.name());
+    }
     Ok(Rc::new(BootstrapSource {
-        bundle: json!({"bundleDigest":digest,"rawResource":resource,"entries":entries}),
+        kind,
+        bundle,
         blob,
         recipe,
         programs: Value::Array(programs),
@@ -287,9 +396,29 @@ fn render_program(program: &mmmm_compiler::calibration::CalibrationProgram) -> A
     )
 }
 
+fn render_source_entries_for_kind(
+    kind: CalibrationSourceKind,
+    suite: &CalibrationDispatchPlan,
+    check: &dyn Fn() -> AppResult<()>,
+) -> AppResult<Value> {
+    if kind == CalibrationSourceKind::Numeric47 {
+        return render_source_entries(suite, check);
+    }
+    let mut rows = Vec::with_capacity(kind.entry_count());
+    for (path, bytes) in kind.source_entries().map_err(|_| unavailable())? {
+        check()?;
+        rows.push(json!({"path":path,"rawSha256":raw_digest(&bytes),"byteLength":bytes.len(),"rawBytesHex":encode_hex(&bytes)}));
+    }
+    if rows.len() != kind.entry_count() {
+        return Err(unavailable());
+    }
+    Ok(Value::Array(rows))
+}
+
 /// Rendering owns no Store, owner, ADMIN receipt or route. Capacity tests can
 /// exercise the full current wire projection without issuing an approval.
 struct ManifestRendering<'a> {
+    kind: CalibrationSourceKind,
     plan: &'a Value,
     context: &'a Value,
     bundle: &'a Value,
@@ -301,6 +430,7 @@ struct ManifestRendering<'a> {
 }
 fn render_manifest(input: ManifestRendering<'_>) -> AppResult<Value> {
     let ManifestRendering {
+        kind,
         plan,
         context,
         bundle,
@@ -311,10 +441,11 @@ fn render_manifest(input: ManifestRendering<'_>) -> AppResult<Value> {
         source_facts_digest,
     } = input;
     let step = &plan["steps"][0];
-    let selection=canonical_digest(&json!({"purpose":PURPOSE,"principal":principal,
+    let purpose = purpose_for_kind(kind);
+    let selection=canonical_digest(&json!({"purpose":purpose,"principal":principal,
         "planId":plan["planId"],"planHash":plan["planHash"],"sourceBundleDigest":bundle["bundleDigest"]})).map_err(|_|unavailable())?;
     Ok(
-        json!({"kind":MANIFEST_KIND,"purpose":PURPOSE,"selectionDigest":selection,
+        json!({"kind":manifest_kind_for_kind(kind),"purpose":purpose,"selectionDigest":selection,
         "hostEpoch":context["environment"]["sessionEpoch"],"registryGeneration":generation,
         "runtimeSourceFactsDigest":source_facts_digest,"suiteDigest":recipe,"recipeSha256":recipe,
         "sourceBundle":bundle,"programs":programs,
@@ -348,6 +479,23 @@ pub(crate) fn absence_requirements(suite: &CalibrationDispatchPlan, digest: &Val
             "captureScope":"native_bootstrap_cache_and_backing_absence","selector":{"kind":"owned_storage","storage":program.scope().storage(),"ownedSubtrees":["inputs","invocation"]}}));
     }
     result
+}
+
+pub(crate) fn absence_requirements_for_kind(
+    kind: CalibrationSourceKind,
+    digest: &Value,
+) -> AppResult<Vec<Value>> {
+    match kind {
+        CalibrationSourceKind::Numeric47 => Ok(absence_requirements(
+            &CalibrationDispatchPlan::normative47().map_err(|_| unavailable())?,
+            digest,
+        )),
+        CalibrationSourceKind::PackCase => Ok(vec![
+            json!({"format":"mmmm.native.calibration-bootstrap-absence/1",
+            "targetId":PACK_CASE_TARGET,"status":"known","presence":"absent","coverage":"full_target",
+            "captureScope":"native_bootstrap_pack_directory_absence","selector":{"kind":"calibration_pack","sourceBundleDigest":digest}}),
+        ]),
+    }
 }
 
 impl BootstrapRegistry {
@@ -418,6 +566,26 @@ impl BootstrapRegistry {
         let entries = self.entries.try_borrow().map_err(|_| unavailable())?;
         Ok(entries.values().any(|entry| entry.plan == *plan))
     }
+    /// A routing decision only. Actual source, Store, request and authority
+    /// checks still occur in enter/observe_successor. A plain command match
+    /// cannot select the private PACK route without its retained exact plan.
+    pub(crate) fn handles_original(&self, original: &Value) -> AppResult<bool> {
+        if original["actionId"] == ACTION {
+            return Ok(true);
+        }
+        if !is_candidate(original) {
+            return Ok(false);
+        }
+        let entries = self.entries.try_borrow().map_err(|_| unavailable())?;
+        Ok(entries.values().any(|entry| {
+            entry.source.kind == CalibrationSourceKind::PackCase
+                && entry.plan["steps"][0]["stepId"] == original["stepId"]
+                && entry.plan["steps"][0]["bindingId"] == original["bindingId"]
+                && entry.plan["steps"][0]["actionDigest"] == original["actionDigest"]
+                && entry.plan["steps"][0]["arguments"] == original["arguments"]
+                && entry.plan["contextPins"][0]["contextDigest"] == original["contextDigest"]
+        }))
+    }
     pub(crate) fn check_source(
         &self,
         store: &DurableStore,
@@ -455,7 +623,14 @@ impl BootstrapRegistry {
                 check,
             )
             .map_err(storage)?;
-        if recipe != suite.canonical_recipe_bytes() {
+        let expected_recipe = match entry.source.kind {
+            CalibrationSourceKind::Numeric47 => suite.canonical_recipe_bytes().to_vec(),
+            CalibrationSourceKind::PackCase => CalibrationPackProgram::java_26_3()
+                .map_err(|_| unavailable())?
+                .canonical_recipe_bytes()
+                .to_vec(),
+        };
+        if recipe != expected_recipe {
             return Err(unavailable());
         }
         finish_native_observation(Ok(()), current())
@@ -520,6 +695,7 @@ impl BootstrapRegistry {
         }
         crate::catalog_source::validate_source_facts(facts, context)?;
         render_manifest(ManifestRendering {
+            kind: source.kind,
             plan,
             context,
             bundle: &source.bundle,
@@ -538,6 +714,8 @@ impl BootstrapRegistry {
     ) -> AppResult<()> {
         let entry = self.prepared(store, plan)?;
         if !confirmation.completion.delivered()
+            || confirmation.route.kind() != entry.source.kind
+            || confirmation.manifest["purpose"] != purpose_for_kind(entry.source.kind)
             || confirmation.manifest["plan"]["planId"] != plan["planId"]
             || confirmation.manifest["plan"]["planHash"] != plan["planHash"]
             || confirmation.manifest["sourceBundle"] != entry.source.bundle
@@ -663,7 +841,7 @@ impl BootstrapRegistry {
         original: &Value,
         access: BootstrapAccess,
     ) -> AppResult<Option<EnteredBootstrap<'a>>> {
-        if original["actionId"] != ACTION {
+        if !self.handles_original(original)? {
             return Ok(None);
         }
         let operation_id: OperationId = decode(&original["operationId"])?;
@@ -910,7 +1088,7 @@ impl EnteredBootstrap<'_> {
             .map_err(|_| unavailable())?;
         let retained = captures
             .get(&key)
-            .filter(|v| v.len() == 95)
+            .filter(|v| v.len() == self.entry.source.targets.len())
             .ok_or_else(unavailable)?;
         for (image, (target, blob)) in images.iter().zip(retained) {
             if image.target != *target
@@ -1016,7 +1194,7 @@ impl EnteredBootstrap<'_> {
             .try_borrow()
             .map_err(|_| unavailable())?
             .get(original_digest.as_str())
-            .is_none_or(|images| images.len() != 95)
+            .is_none_or(|images| images.len() != self.entry.source.targets.len())
         {
             return Err(unavailable());
         }
@@ -1072,7 +1250,11 @@ fn validate_precondition_batch(
     frozen: &[Value],
     targets: &[TargetId],
 ) -> AppResult<()> {
-    if conditions.len() != 95 || frozen.len() != 95 || targets.len() != 95 {
+    if !matches!(targets.len(), 1 | 95)
+        || (targets.len() == 1 && targets[0].as_str() != PACK_CASE_TARGET)
+        || conditions.len() != targets.len()
+        || frozen.len() != targets.len()
+    {
         return Err(denied());
     }
     let mut subjects = BTreeSet::new();
@@ -1159,19 +1341,20 @@ fn decode_preflight_target_images(
     {
         return Err(unavailable());
     }
-    if targets.len() != 95
+    if !matches!(targets.len(), 1 | 95)
+        || (targets.len() == 1 && targets[0].as_str() != PACK_CASE_TARGET)
         || targets
             .iter()
             .map(TargetId::as_str)
             .collect::<BTreeSet<_>>()
             .len()
-            != 95
+            != targets.len()
     {
         return Err(unavailable());
     }
     let values = envelope["targets"]
         .as_array()
-        .filter(|v| v.len() == 95)
+        .filter(|v| v.len() == targets.len())
         .ok_or_else(unavailable)?;
     let mut total = 0usize;
     values
@@ -1206,8 +1389,8 @@ pub(crate) fn validate_plan(plan: &Value, source: &BootstrapSource) -> AppResult
         || plan["atomicity"] != "none"
         || plan["contextPins"].as_array().is_none_or(|v| v.len() != 1)
         || plan["preconditions"] != json!(source.preconditions())
-        || step["actionId"] != ACTION
-        || step["arguments"] != json!({"sourceBundleDigest":source.digest()})
+        || step["actionId"] != action_for_kind(source.kind)
+        || step["arguments"] != source.arguments()
         || step["recovery"] != "none"
         || step["completion"] != "synchronous"
         || step["verificationRequirement"] != "independent_readback"
@@ -1296,6 +1479,38 @@ impl std::error::Error for RetainedFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pack_source_recipe_and_empty_registry_do_not_issue_a_private_route() {
+        // Existing numeric capacity fixtures cannot represent this separate
+        // closed recipe. Pure bytes and matching command names issue no owner.
+        let numeric = CalibrationDispatchPlan::normative47().unwrap();
+        let pack = CalibrationPackProgram::java_26_3().unwrap();
+        let entries =
+            render_source_entries_for_kind(CalibrationSourceKind::PackCase, &numeric, &|| Ok(()))
+                .unwrap();
+        assert_eq!(entries.as_array().unwrap().len(), 3);
+        assert_eq!(
+            raw_digest(pack.canonical_recipe_bytes()),
+            *pack.program_digest()
+        );
+        assert_ne!(canonical_digest(&entries).unwrap(), *pack.program_digest());
+        let requirements = absence_requirements_for_kind(
+            CalibrationSourceKind::PackCase,
+            &json!(canonical_digest(&entries).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0]["targetId"], PACK_CASE_TARGET);
+        assert!(kind_for_purpose("pack_calibration_bootstrap/2").is_none());
+        assert!(
+            !BootstrapRegistry::default()
+                .handles_original(
+                    &json!({"actionId":PACK_ACTION,"arguments":{"command":PACK_COMMAND}})
+                )
+                .unwrap()
+        );
+    }
     use mmmm_contracts::{
         ContractValidator, JsonLimits, encode_json, parse_json_with_limits, projected_digest,
     };
@@ -1568,6 +1783,7 @@ mod tests {
                 "actionId":ACTION,"actionDigest":digest,"implementationDigest":digest,"contextId":context["contextId"],
                 "arguments":{"sourceBundleDigest":bundle_digest},"resourcesRead":targets,"resourcesWritten":targets}]});
         let manifest = render_manifest(ManifestRendering {
+            kind: CalibrationSourceKind::Numeric47,
             plan: &plan,
             context: &context,
             bundle: &bundle,

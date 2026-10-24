@@ -18,6 +18,7 @@ use crate::{
     },
     owned_pack_files::{self, SourceRootObjects},
 };
+use mmmm_compiler::calibration::CalibrationSourceKind;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -1538,7 +1539,7 @@ fn arm(locals: &mut Locals, index: usize, frame: &Frame, token: &SourceCaptureTo
     if !token.is_current() {
         return Err(Failure::GenerationChanged.into());
     }
-    let expected = ExpectedSources::numeric47()?;
+    let expected = ExpectedSources::for_kind(root.kind)?;
     let mut registry = state()?;
     let started_ms = registry.captures[index].started_ms;
     let binding = CaptureBinding {
@@ -1548,6 +1549,7 @@ fn arm(locals: &mut Locals, index: usize, frame: &Frame, token: &SourceCaptureTo
         bundle: original[3],
         root_anchor: original[4],
         selection: original[5],
+        source_kind: root.kind,
         bundle_digest: root.bundle_digest,
         generation: token.generation(),
         started_ms,
@@ -1562,6 +1564,13 @@ fn arm(locals: &mut Locals, index: usize, frame: &Frame, token: &SourceCaptureTo
 fn capture_id(index: usize) -> Result<CaptureId> {
     state()?.captures[index]
         .id
+        .ok_or(Error::Gap("original_arm_incomplete"))
+}
+fn source_kind(index: usize) -> Result<CalibrationSourceKind> {
+    state()?.captures[index]
+        .binding
+        .as_ref()
+        .map(|binding| binding.source_kind)
         .ok_or(Error::Gap("original_arm_incomplete"))
 }
 fn ticket(index: usize, identifier: ObjectId) -> Result<FunctionTicket> {
@@ -1791,28 +1800,18 @@ fn fact(result: std::result::Result<(), Failure>) -> Result<()> {
         Err(error) => Err(error.into()),
     }
 }
-fn selected_function(name: &str) -> Result<bool> {
-    Ok(normative_resources()?.contains_key(name))
+fn selected_function(kind: CalibrationSourceKind, name: &str) -> Result<bool> {
+    Ok(normative_resources(kind)?.contains_key(name))
 }
-fn normative_resources() -> Result<&'static BTreeMap<String, String>> {
-    static EXPECTED: OnceLock<std::result::Result<BTreeMap<String, String>, Failure>> =
+fn normative_resources(kind: CalibrationSourceKind) -> Result<&'static BTreeMap<String, String>> {
+    static NUMERIC: OnceLock<std::result::Result<BTreeMap<String, String>, Failure>> =
         OnceLock::new();
-    let expected = EXPECTED.get_or_init(|| {
-        let suite = mmmm_compiler::calibration_dispatch::CalibrationDispatchPlan::normative47()
-            .map_err(|_| Failure::SourceMismatch)?;
-        let functions = suite
-            .loaded_source_expectations()
-            .map_err(|_| Failure::SourceMismatch)?;
-        Ok(functions
-            .iter()
-            .map(|function| {
-                (
-                    function.function_id().as_str().to_owned(),
-                    function.resource_id().as_str().to_owned(),
-                )
-            })
-            .collect())
-    });
+    static PACK: OnceLock<std::result::Result<BTreeMap<String, String>, Failure>> = OnceLock::new();
+    let expected = match kind {
+        CalibrationSourceKind::Numeric47 => &NUMERIC,
+        CalibrationSourceKind::PackCase => &PACK,
+    }
+    .get_or_init(|| Ok(ExpectedSources::for_kind(kind)?.selected_resources()));
     match expected {
         Ok(expected) => Ok(expected),
         Err(failure) => Err((*failure).into()),
@@ -1862,8 +1861,9 @@ fn resource_join(
     }
     let source_id = locals.required_zero(resource, c"sourcePackId", c"()Ljava/lang/String;")?;
     let pack_id = locals.required_zero(source, c"packId", c"()Ljava/lang/String;")?;
-    if locals.text(source_id, 1024)? != "mmmm-calibration-normative47"
-        || locals.text(pack_id, 1024)? != "mmmm-calibration-normative47"
+    let kind = source_kind(index)?;
+    if locals.text(source_id, 1024)? != kind.root_basename()
+        || locals.text(pack_id, 1024)? != kind.root_basename()
     {
         return Err(Failure::SourceMismatch.into());
     }
@@ -1924,8 +1924,8 @@ fn resource_join(
             .binding
             .as_ref()
             .ok_or(Failure::Identity)?
-            .bundle_digest;
-        if roots.bundle_digest != expected {
+            .clone();
+        if roots.kind != expected.source_kind || roots.bundle_digest != expected.bundle_digest {
             return Err(Failure::SourceMismatch.into());
         }
         if !token.is_current() {
@@ -1961,8 +1961,14 @@ fn selected_entries(
 ) -> Result<Vec<(String, ObjectId)>> {
     let keys = {
         let registry = state()?;
-        let functions = &registry.captures[index].functions;
-        if functions.len() != FUNCTIONS {
+        let capture = &registry.captures[index];
+        let functions = &capture.functions;
+        let kind = capture
+            .binding
+            .as_ref()
+            .ok_or(Failure::Identity)?
+            .source_kind;
+        if functions.len() != kind.function_count() {
             return Err(Failure::MissingFunction.into());
         }
         functions
@@ -1972,7 +1978,7 @@ fn selected_entries(
     };
     let mut entries = Vec::new();
     entries
-        .try_reserve_exact(FUNCTIONS)
+        .try_reserve_exact(keys.len())
         .map_err(|_| Failure::ResourceLimit)?;
     for (name, key) in &keys {
         let key = state()?.reference(*key)?;
@@ -2171,7 +2177,8 @@ fn select_entry(
 ) -> Result<u8> {
     let actual_function = frame.object(Field::FunctionId)?;
     let name = locals.identifier(actual_function, token)?;
-    let expected_resource = match normative_resources()?.get(&name) {
+    let kind = source_kind(index)?;
+    let expected_resource = match normative_resources(kind)?.get(&name) {
         Some(resource) => resource,
         None => return Ok(0),
     };
@@ -2203,7 +2210,7 @@ fn select_entry(
         if !prep.entered || prep.terminal {
             return Err(Failure::UnexpectedOrder.into());
         }
-        if capture.selected.len() == FUNCTIONS {
+        if capture.selected.len() >= kind.function_count() {
             return Err(Failure::ResourceLimit.into());
         }
         if capture.selected.iter().any(|entry| entry.name == name) {
@@ -2266,7 +2273,7 @@ fn dispatch(
     let selected = match frame.optional(Field::FunctionId) {
         Some(actual) => {
             let name = locals.identifier(actual, token)?;
-            if !selected_function(&name)? {
+            if !selected_function(source_kind(index)?, &name)? {
                 return Ok(());
             }
             Some((name, intern(locals, index, actual)?))
@@ -3013,7 +3020,8 @@ fn observe_current(
                     .binding
                     .clone()
                     .ok_or(Failure::Identity)?;
-                if facts.bundle_digest != binding.bundle_digest {
+                if facts.kind != binding.source_kind || facts.bundle_digest != binding.bundle_digest
+                {
                     return Err(Failure::SourceMismatch.into());
                 }
                 state()?.captures[index].current_root_observed = true;
@@ -3029,7 +3037,7 @@ fn observe_current(
                     return Err(Failure::Identity.into());
                 }
                 capture.current_resources_observed = true;
-                if actual.entries.len() != FUNCTIONS
+                if actual.entries.len() != binding.source_kind.function_count()
                     || actual.entries.iter().any(|(name, function)| {
                         !capture
                             .functions
@@ -3112,7 +3120,7 @@ fn capture_json(facts: core::CaptureFacts) -> Value {
         "readBytes":fact.read_bytes,"eofObserved":fact.eof_observed,"closeAttempted":fact.close_attempted,
         "closeCompleted":fact.close_completed,"parsed":fact.parsed,"entryCompleted":fact.entry_completed,
         "entryFailed":fact.entry_failed})).collect::<Vec<_>>();
-    json!({"numeric47Bootstrap":facts.numeric47_bootstrap,"originalBundleDigest":hex(&facts.original_bundle_digest),
+    json!({"sourceKind":facts.source_kind.name(),"numeric47Bootstrap":facts.numeric47_bootstrap,"originalBundleDigest":hex(&facts.original_bundle_digest),
         "functions":functions,"expectedFunctions":facts.expected_functions,"publishedFunctions":facts.published_functions,
         "serverInstalled":facts.server_installed,"reloadOutcome":facts.reload_outcome.map(|outcome|match outcome {
             ReloadOutcome::Completed=>"completed",ReloadOutcome::Failed=>"failed"}),
@@ -3399,16 +3407,34 @@ mod tests {
 
     #[test]
     fn selection_uses_compiler_function_ids_and_ignores_unrelated_ids() {
-        let expected =
-            normative_resources().unwrap_or_else(|_| panic!("normative47 source contract"));
-        assert_eq!(expected.len(), FUNCTIONS);
-        for (function, resource) in expected {
-            assert!(selected_function(function).unwrap_or(false));
-            assert!(!selected_function(resource).unwrap_or(true));
+        for kind in [
+            CalibrationSourceKind::Numeric47,
+            CalibrationSourceKind::PackCase,
+        ] {
+            let expected =
+                normative_resources(kind).unwrap_or_else(|_| panic!("closed source contract"));
+            assert_eq!(expected.len(), kind.function_count());
+            for (function, resource) in expected {
+                assert!(selected_function(kind, function).unwrap_or(false));
+                assert!(!selected_function(kind, resource).unwrap_or(true));
+            }
+            for unrelated in ["other:load", "minecraft:tick", "mmmm:unrelated", ""] {
+                assert!(!selected_function(kind, unrelated).unwrap_or(true));
+            }
         }
-        for unrelated in ["other:load", "minecraft:tick", "mmmm:unrelated", ""] {
-            assert!(!selected_function(unrelated).unwrap_or(true));
-        }
+        assert!(
+            !selected_function(
+                CalibrationSourceKind::Numeric47,
+                "mmmm_calibration:pack/entry"
+            )
+            .unwrap()
+        );
+        let numeric = normative_resources(CalibrationSourceKind::Numeric47).unwrap();
+        assert!(
+            numeric
+                .keys()
+                .all(|name| !selected_function(CalibrationSourceKind::PackCase, name).unwrap())
+        );
     }
 
     #[test]

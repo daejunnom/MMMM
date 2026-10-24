@@ -365,11 +365,25 @@ impl HostManagement {
                 )
             })?;
             let hosts = self.processor.calibration_planning_hosts();
-            if purpose == crate::calibration_bootstrap::PURPOSE {
-                let registry = self.processor.bootstrap_planning_registry();
-                service.prepare_bootstrap_plan(&principal, &selection, &request, &hosts, &registry)
-            } else {
-                service.prepare_calibration_plan(&principal, &selection, &request, &hosts)
+            match purpose {
+                crate::peer_management::CALIBRATION_PLAN_PURPOSE => {
+                    service.prepare_calibration_plan(&principal, &selection, &request, &hosts)
+                }
+                crate::calibration_bootstrap::PURPOSE => {
+                    let registry = self.processor.bootstrap_planning_registry();
+                    service
+                        .prepare_bootstrap_plan(&principal, &selection, &request, &hosts, &registry)
+                }
+                crate::calibration_bootstrap::PACK_PURPOSE => {
+                    let registry = self.processor.bootstrap_planning_registry();
+                    service.prepare_pack_bootstrap_plan(
+                        &principal, &selection, &request, &hosts, &registry,
+                    )
+                }
+                _ => Err(ServiceError::new(
+                    "INVALID_INPUT",
+                    "Native calibration planning purpose is unsupported",
+                )),
             }
         })();
         let (committed, failure) = match result {

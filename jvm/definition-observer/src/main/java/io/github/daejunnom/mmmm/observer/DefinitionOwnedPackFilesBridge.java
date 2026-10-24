@@ -60,12 +60,16 @@ public final class DefinitionOwnedPackFilesBridge {
     private static Receipt call(Object port, byte[] bundle, int operation) {
         requirePort(port); Objects.requireNonNull(bundle);
         if (bundle.length > MAX_FRAME) throw invalid();
+        // One bounded snapshot supplies both the expected response roster and
+        // native input. Caller mutation cannot switch the frame between them.
+        byte[] original = bundle.clone();
+        List<FileFact> expected = sourceRoster(original, operation);
         int status = DefinitionObserverBridge.observedStatus();
         if (status < 0 || (status & REQUIRED) != REQUIRED) throw new NativeFailure("NATIVE_UNAVAILABLE", null, false, null);
         Throwable primary = null;
         Receipt completed = null;
         try {
-            completed = decode(nativeCall(port, bundle, operation), operation);
+            completed = decode(nativeCall(port, original, operation), operation, expected);
             return completed;
         } catch (RuntimeException | Error failure) { primary = failure; throw failure; }
         finally {
@@ -129,7 +133,51 @@ public final class DefinitionOwnedPackFilesBridge {
         }
     }
 
+    /** Descriptive transport preflight. Rust still validates the canonical recipe before I/O. */
+    private static List<FileFact> sourceRoster(byte[] frame, int operation) {
+        if (operation == 2) {
+            if (frame.length != 0) throw invalid();
+            return List.of();
+        }
+        if (operation != 0 && operation != 1 || frame.length > MAX_FRAME) throw invalid();
+        try (DataInputStream input = new DataInputStream(new ByteArrayInputStream(frame))) {
+            byte[] version = input.readNBytes(8);
+            boolean pack;
+            if (Arrays.equals(version, "MMMMPK01".getBytes(StandardCharsets.US_ASCII))) pack = false;
+            else if (Arrays.equals(version, "MMMMPK02".getBytes(StandardCharsets.US_ASCII))) {
+                if (input.readUnsignedByte() != 2) throw invalid();
+                pack = true;
+            } else throw invalid();
+            if (input.readNBytes(32).length != 32) throw invalid();
+            int count = input.readUnsignedShort();
+            if (count != (pack ? 3 : 48)) throw invalid();
+            List<FileFact> roster = new ArrayList<>(count); String previous = ""; long total = 0;
+            for (int index = 0; index < count; index++) {
+                int size = input.readUnsignedShort();
+                if (size < 1 || size > 240) throw invalid();
+                byte[] bytes = input.readNBytes(size);
+                if (bytes.length != size) throw invalid();
+                for (byte value : bytes) if (value < 32 || value > 126) throw invalid();
+                String path = new String(bytes, StandardCharsets.US_ASCII);
+                if (!path.matches("[a-z0-9_./-]+") || path.compareTo(previous) <= 0) throw invalid();
+                if (pack && !List.of("pack.mcmeta", "data/mmmm_calibration/function/pack/entry.mcfunction",
+                        "data/mmmm_calibration/function/pack/dependency.mcfunction").contains(path)) throw invalid();
+                int length = input.readInt(); byte[] sha = input.readNBytes(32);
+                if (length < 1 || length > 65536 || sha.length != 32) throw invalid();
+                total = Math.addExact(total, length);
+                if (total > 1024 * 1024 || input.readNBytes(length).length != length) throw invalid();
+                roster.add(new FileFact(path, length, HexFormat.of().formatHex(sha))); previous = path;
+            }
+            if (input.read() != -1) throw invalid();
+            return List.copyOf(roster);
+        } catch (IOException | ArithmeticException failure) { throw new IllegalStateException("Invalid native owned-file source frame", failure); }
+    }
+
+    /** Legacy codec entry retained for the existing numeric receipt checks. */
     private static Receipt decode(Object[] result, int operation) {
+        return decode(result, operation, null);
+    }
+    private static Receipt decode(Object[] result, int operation, List<FileFact> expected) {
         if (result == null || result.length < 1 || result.length > 257 || !(result[0] instanceof byte[] frame)
                 || frame.length > 64 * 1024) throw invalid();
         try (DataInputStream input = new DataInputStream(new ByteArrayInputStream(frame))) {
@@ -142,7 +190,9 @@ public final class DefinitionOwnedPackFilesBridge {
                 throw failure;
             }
             int count = input.readUnsignedShort();
-            if (count != (operation == 1 ? 48 : 0) || effect != (operation == 1 ? 1 : 0) || result.length != 1) throw invalid();
+            int expectedCount = expected == null ? 48 : expected.size();
+            if (expected != null && (operation == 2 ? expectedCount != 0 : expectedCount != 3 && expectedCount != 48)) throw invalid();
+            if (count != (operation == 1 ? expectedCount : 0) || effect != (operation == 1 ? 1 : 0) || result.length != 1) throw invalid();
             List<FileFact> files = new ArrayList<>(count);
             String previous = "";
             long total = 0;
@@ -157,7 +207,9 @@ public final class DefinitionOwnedPackFilesBridge {
                 if (path.compareTo(previous) <= 0 || length < 1 || length > 65536 || sha.length != 32) throw invalid();
                 total = Math.addExact(total, length);
                 if (total > 1024 * 1024) throw invalid();
-                files.add(new FileFact(path, length, HexFormat.of().formatHex(sha))); previous = path;
+                FileFact fact = new FileFact(path, length, HexFormat.of().formatHex(sha));
+                if (expected != null && !fact.equals(expected.get(index))) throw invalid();
+                files.add(fact); previous = path;
             }
             if (input.read() != -1) throw invalid();
             return new Receipt(files);

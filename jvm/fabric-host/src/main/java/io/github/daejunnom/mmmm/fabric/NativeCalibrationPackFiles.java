@@ -24,29 +24,45 @@ import net.minecraft.world.level.storage.LevelResource;
 
 /** Platform path issuer only. Rust owns the sealed roster and all physical I/O. */
 final class NativeCalibrationPackFiles {
-    private static final String BASENAME = "mmmm-calibration-normative47";
-    private static final String TARGET = "calibration-bootstrap-pack";
     private NativeCalibrationPackFiles() { }
 
     /** A bounded snapshot of received private Rust bytes, never Java-generated sources. */
     static final class SealedFiles {
         private final String digest;
         private final byte[] frame;
-        private SealedFiles(String digest, byte[] frame) { this.digest = digest; this.frame = frame; }
+        private final NativeCalibrationBootstrap.Purpose purpose;
+        private SealedFiles(String digest, byte[] frame, NativeCalibrationBootstrap.Purpose purpose) {
+            this.digest = digest; this.frame = frame; this.purpose = purpose;
+        }
         static SealedFiles fromPrivateRustBundle(ObjectNode source) {
-            HostDispatcher.exactFields(source, Set.of("bundleDigest", "rawResource", "entries"));
+            return fromPrivateRustBundle(source, NativeCalibrationBootstrap.Purpose.NUMERIC47);
+        }
+        static SealedFiles fromPrivateRustBundle(ObjectNode source, NativeCalibrationBootstrap.Purpose purpose) {
+            Objects.requireNonNull(purpose);
+            HostDispatcher.exactFields(source, purpose == NativeCalibrationBootstrap.Purpose.NUMERIC47
+                    ? Set.of("bundleDigest", "rawResource", "entries")
+                    : Set.of("bundleDigest", "rawResource", "entries", "sourceKind"));
+            if (purpose == NativeCalibrationBootstrap.Purpose.PACK_CASE
+                    && !"pack_case".equals(text(source, "sourceKind"))) throw failure("CALIBRATION_SOURCE_BUNDLE_INVALID");
             String digest = digest(source, "bundleDigest");
             JsonNode entries = source.get("entries");
-            if (!(entries instanceof ArrayNode) || entries.size() != 48) throw failure("CALIBRATION_SOURCE_BUNDLE_INVALID");
+            if (!(entries instanceof ArrayNode) || entries.size() != purpose.entryCount()) throw failure("CALIBRATION_SOURCE_BUNDLE_INVALID");
             long total = 0; String previous = "";
             try {
                 ByteArrayOutputStream bytes = new ByteArrayOutputStream();
                 try (DataOutputStream out = new DataOutputStream(bytes)) {
-                    out.write("MMMMPK01".getBytes(StandardCharsets.US_ASCII)); out.write(HexFormat.of().parseHex(digest)); out.writeShort(48);
+                    if (purpose == NativeCalibrationBootstrap.Purpose.NUMERIC47) out.write("MMMMPK01".getBytes(StandardCharsets.US_ASCII));
+                    else { out.write("MMMMPK02".getBytes(StandardCharsets.US_ASCII)); out.writeByte(2); }
+                    out.write(HexFormat.of().parseHex(digest)); out.writeShort(purpose.entryCount());
                     for (JsonNode value : entries) {
                         ObjectNode entry = ContractJson.object(value);
                         HostDispatcher.exactFields(entry, Set.of("path", "rawSha256", "byteLength", "rawBytesHex"));
                         String path = text(entry, "path"); String sha = digest(entry, "rawSha256");
+                        if (purpose == NativeCalibrationBootstrap.Purpose.PACK_CASE && !Set.of("pack.mcmeta",
+                                "data/mmmm_calibration/function/pack/entry.mcfunction",
+                                "data/mmmm_calibration/function/pack/dependency.mcfunction").contains(path)) {
+                            throw failure("CALIBRATION_SOURCE_BUNDLE_INVALID");
+                        }
                         if (path.length() < 1 || path.length() > 240 || !path.matches("[a-z0-9_./-]+")
                                 || path.compareTo(previous) <= 0 || !entry.path("byteLength").isIntegralNumber()
                                 || !entry.path("byteLength").canConvertToInt()) throw failure("CALIBRATION_SOURCE_BUNDLE_INVALID");
@@ -70,10 +86,11 @@ final class NativeCalibrationPackFiles {
                         || !resource.path("sizeBytes").canConvertToLong() || resource.path("sizeBytes").longValue() != canonical.length) {
                     throw failure("CALIBRATION_SOURCE_BUNDLE_INVALID");
                 }
-                return new SealedFiles(digest, bytes.toByteArray());
+                return new SealedFiles(digest, bytes.toByteArray(), purpose);
             } catch (IOException impossible) { throw new IllegalStateException("In-memory source frame failed", impossible); }
         }
         String bundleDigest() { return digest; }
+        String repositoryId() { return "file/" + purpose.basename(); }
     }
 
     static PreparedFiles prepare(MinecraftServer server, ServerLevel level, HostSession owner, ObjectNode context,
@@ -105,12 +122,12 @@ final class NativeCalibrationPackFiles {
             });
         }
         ObjectNode beforeTargets() {
-            ObjectNode raw = object(); raw.put("format", "mmmm.native.calibration-bootstrap-absence/1"); raw.put("targetId", TARGET);
+            ObjectNode raw = object(); raw.put("format", "mmmm.native.calibration-bootstrap-absence/1"); raw.put("targetId", sealed.purpose.targetId());
             raw.put("status", "known"); raw.put("presence", "absent"); raw.put("coverage", "full_target");
             raw.put("captureScope", "native_bootstrap_pack_directory_absence");
             ObjectNode selector = raw.putObject("selector"); selector.put("kind", "calibration_pack"); selector.put("sourceBundleDigest", sealed.digest);
             byte[] bytes = ContractJson.canonical(raw);
-            ObjectNode target = object(); target.put("targetId", TARGET); target.put("rawBytesHex", HexFormat.of().formatHex(bytes));
+            ObjectNode target = object(); target.put("targetId", sealed.purpose.targetId()); target.put("rawBytesHex", HexFormat.of().formatHex(bytes));
             target.put("rawSha256", ContractJson.sha256(bytes)); return target;
         }
         FileFacts execute(NativeCalibrationBootstrap.Attempt attempt, Runnable current) {
@@ -118,18 +135,18 @@ final class NativeCalibrationPackFiles {
             attempt.requireActualServer(server);
             Invocation invocation = attempt.original();
             if (attempt.sourceFiles() != sealed) throw failure("CALIBRATION_PACK_INVOCATION_MISMATCH");
-            if (attempted || !invocation.context().equals(context) || !"mmmm:calibration_bootstrap_execute".equals(invocation.actionId())) {
+            if (attempted || !invocation.context().equals(context) || attempt.purpose() != sealed.purpose
+                    || !sealed.purpose.actionId().equals(invocation.actionId())) {
                 throw failure("CALIBRATION_PACK_INVOCATION_MISMATCH");
             }
-            HostDispatcher.exactFields(invocation.arguments(), Set.of("sourceBundleDigest"));
-            if (!sealed.digest.equals(text(invocation.arguments(), "sourceBundleDigest"))) throw failure("CALIBRATION_PACK_INVOCATION_MISMATCH");
+            if (!NativeCalibrationBootstrap.arguments(sealed.purpose, sealed.digest).equals(invocation.arguments())) throw failure("CALIBRATION_PACK_INVOCATION_MISMATCH");
             return NativeCalibrationStateReader.currentContext(server, level, owner, context, current::run, (actual, checkpoint) -> {
                 NativeCall port = packCall(this, attempt, checkpoint::check);
                 // Sticky before the first CreateNew. Any uncertain partial effect
                 // stays preserved and this prepared capability cannot retry.
                 if (attempted) throw failure("CALIBRATION_PACK_ALREADY_ATTEMPTED"); attempted = true;
                 DefinitionOwnedPackFilesBridge.Receipt receipt = DefinitionOwnedPackFilesBridge.createNew(port, sealed.frame);
-                return new FileFacts(root.resolve(BASENAME), sealed.digest, receipt);
+                return new FileFacts(root.resolve(sealed.purpose.basename()), sealed.digest, sealed.repositoryId(), receipt);
             });
         }
     }
@@ -174,11 +191,12 @@ final class NativeCalibrationPackFiles {
     static final class FileFacts {
         private final Path root;
         private final String bundleDigest;
+        private final String repositoryId;
         private final DefinitionOwnedPackFilesBridge.Receipt receipt;
-        private FileFacts(Path root, String bundleDigest, DefinitionOwnedPackFilesBridge.Receipt receipt) {
-            this.root = root; this.bundleDigest = bundleDigest; this.receipt = receipt;
+        private FileFacts(Path root, String bundleDigest, String repositoryId, DefinitionOwnedPackFilesBridge.Receipt receipt) {
+            this.root = root; this.bundleDigest = bundleDigest; this.repositoryId = repositoryId; this.receipt = receipt;
         }
-        String repositoryId() { return "file/" + BASENAME; }
+        String repositoryId() { return repositoryId; }
         Path createdPackRoot() { return root; }
         ObjectNode toWire() {
             ObjectNode result = object(); result.put("sourceBundleDigest", bundleDigest); result.put("verifiedFileCount", receipt.files().size());
@@ -234,7 +252,7 @@ final class NativeCalibrationPackFiles {
         }
     }
     private static NativeCall packCall(PreparedFiles prepared, Runnable current) {
-        return new NativeCall(prepared.root, BASENAME, packCheck(prepared, current));
+        return new NativeCall(prepared.root, prepared.sealed.purpose.basename(), packCheck(prepared, current));
     }
     private static NativeCall packCall(PreparedFiles prepared, NativeCalibrationBootstrap.Attempt attempt, Runnable current) {
         attempt.requireActualServer(prepared.server);
@@ -244,7 +262,7 @@ final class NativeCalibrationPackFiles {
         // Keep this authority-free locator even if native root registration
         // succeeds but its publication callback or later checkpoint fails.
         attempt.reserveRootAnchor(anchor);
-        return new NativeCall(prepared.server, attempt, anchor, prepared.root, BASENAME, check);
+        return new NativeCall(prepared.server, attempt, anchor, prepared.root, prepared.sealed.purpose.basename(), check);
     }
     private static Runnable packCheck(PreparedFiles prepared, Runnable current) {
         Runnable check = () -> {

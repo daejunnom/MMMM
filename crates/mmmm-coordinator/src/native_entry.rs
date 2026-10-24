@@ -234,6 +234,31 @@ impl std::error::Error for EntryError {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CalibrationPlanKind {
+    NumericRun,
+    NumericBootstrap,
+    PackBootstrap,
+}
+
+impl CalibrationPlanKind {
+    fn purpose(self) -> &'static str {
+        match self {
+            Self::NumericRun => crate::peer_management::CALIBRATION_PLAN_PURPOSE,
+            Self::NumericBootstrap => crate::calibration_bootstrap::PURPOSE,
+            Self::PackBootstrap => crate::calibration_bootstrap::PACK_PURPOSE,
+        }
+    }
+
+    fn result_kind(self) -> &'static str {
+        match self {
+            Self::NumericRun => "calibration_plan_prepared",
+            Self::NumericBootstrap => "calibration_bootstrap_plan_prepared",
+            Self::PackBootstrap => "calibration_pack_bootstrap_plan_prepared",
+        }
+    }
+}
+
 enum Command {
     ManualImport {
         root: PathBuf,
@@ -289,7 +314,7 @@ enum Command {
     CalibrationPlan {
         root: PathBuf,
         selection: mmmm_application::SetupSelection,
-        bootstrap: bool,
+        kind: CalibrationPlanKind,
     },
     HostBridge {
         approval: bool,
@@ -400,7 +425,7 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
         Command::CalibrationPlan {
             root,
             selection,
-            bootstrap,
+            kind,
         } => {
             use crate::{
                 credential::CredentialRef,
@@ -412,11 +437,7 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
             let endpoint = host_relay::ExistingCoordinator
                 .ensure_endpoint(&root, &selection.project_id, deadline)
                 .map_err(EntryError::Relay)?;
-            let purpose = if bootstrap {
-                crate::calibration_bootstrap::PURPOSE
-            } else {
-                crate::peer_management::CALIBRATION_PLAN_PURPOSE
-            };
+            let purpose = kind.purpose();
             let nonce = format!("calibration-plan-{}", mmmm_contracts::canonical_digest(&json!({
                 "purpose":purpose,"projectId":selection.project_id,"expectedRevision":selection.expected_revision,"contextId":selection.context_id
             })).map_err(|_| EntryError::Arguments)?);
@@ -457,7 +478,7 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
             )
             .map_err(|_| EntryError::OutputInvalid)?;
             let checkpoint_failed = prepared.value()["outcome"] == "committed_checkpoint_failed";
-            let result = json!({"kind":if bootstrap {"calibration_bootstrap_plan_prepared"} else {"calibration_plan_prepared"},
+            let result = json!({"kind":kind.result_kind(),
                 "purpose":purpose,"projectId":selection.project_id,
                 "planId":plan,"planHash":hash,"outcome":prepared.value()["outcome"]});
             let delivery = pending
@@ -933,12 +954,16 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
             | "calibration-approve"
             | "calibration-plan"
             | "calibration-bootstrap-plan"
+            | "calibration-pack-bootstrap-plan"
     ) {
         return Ok(None);
     }
     if matches!(
         command,
-        "calibration-approve" | "calibration-plan" | "calibration-bootstrap-plan"
+        "calibration-approve"
+            | "calibration-plan"
+            | "calibration-bootstrap-plan"
+            | "calibration-pack-bootstrap-plan"
     ) && (args.len() != 9 || args.iter().any(|arg| arg.len() > 4096))
     {
         return Err(EntryError::Arguments);
@@ -1040,26 +1065,33 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
         return Err(EntryError::Arguments);
     }
     let parsed = match command {
-        "calibration-plan" | "calibration-bootstrap-plan" => Command::CalibrationPlan {
-            root,
-            bootstrap: command == "calibration-bootstrap-plan",
-            selection: mmmm_application::SetupSelection {
-                project_id: ProjectId::new(
-                    options.remove("--project").ok_or(EntryError::Arguments)?,
-                )
-                .map_err(|_| EntryError::Arguments)?,
-                expected_revision: Sha256Digest::new(
-                    options
-                        .remove("--expected-revision")
-                        .ok_or(EntryError::Arguments)?,
-                )
-                .map_err(|_| EntryError::Arguments)?,
-                context_id: ContextId::new(
-                    options.remove("--context").ok_or(EntryError::Arguments)?,
-                )
-                .map_err(|_| EntryError::Arguments)?,
-            },
-        },
+        "calibration-plan" | "calibration-bootstrap-plan" | "calibration-pack-bootstrap-plan" => {
+            Command::CalibrationPlan {
+                root,
+                kind: match command {
+                    "calibration-plan" => CalibrationPlanKind::NumericRun,
+                    "calibration-bootstrap-plan" => CalibrationPlanKind::NumericBootstrap,
+                    "calibration-pack-bootstrap-plan" => CalibrationPlanKind::PackBootstrap,
+                    _ => return Err(EntryError::Arguments),
+                },
+                selection: mmmm_application::SetupSelection {
+                    project_id: ProjectId::new(
+                        options.remove("--project").ok_or(EntryError::Arguments)?,
+                    )
+                    .map_err(|_| EntryError::Arguments)?,
+                    expected_revision: Sha256Digest::new(
+                        options
+                            .remove("--expected-revision")
+                            .ok_or(EntryError::Arguments)?,
+                    )
+                    .map_err(|_| EntryError::Arguments)?,
+                    context_id: ContextId::new(
+                        options.remove("--context").ok_or(EntryError::Arguments)?,
+                    )
+                    .map_err(|_| EntryError::Arguments)?,
+                },
+            }
+        }
         "calibration-approve" => Command::CalibrationApprove {
             root,
             project: ProjectId::new(options.remove("--project").ok_or(EntryError::Arguments)?)
@@ -1815,7 +1847,7 @@ mod tests {
         assert!(matches!(
             parse(&planning),
             Ok(Some(Command::CalibrationPlan {
-                bootstrap: false,
+                kind: CalibrationPlanKind::NumericRun,
                 ..
             }))
         ));
@@ -1824,17 +1856,29 @@ mod tests {
         assert!(matches!(
             parse(&bootstrap_planning),
             Ok(Some(Command::CalibrationPlan {
-                bootstrap: true,
+                kind: CalibrationPlanKind::NumericBootstrap,
+                ..
+            }))
+        ));
+        let mut pack_planning = planning.clone();
+        pack_planning[0] = "calibration-pack-bootstrap-plan".into();
+        assert!(matches!(
+            parse(&pack_planning),
+            Ok(Some(Command::CalibrationPlan {
+                kind: CalibrationPlanKind::PackBootstrap,
                 ..
             }))
         ));
         for extra in [
             ["--purpose", "numeric_calibration_bootstrap/1"],
+            ["--purpose", "pack_calibration_bootstrap/1"],
             ["--admin", "true"],
         ] {
-            let mut forged = bootstrap_planning.clone();
-            forged.extend(args(&extra));
-            assert!(parse(&forged).is_err());
+            for original in [&bootstrap_planning, &pack_planning] {
+                let mut forged = (*original).clone();
+                forged.extend(args(&extra));
+                assert!(parse(&forged).is_err());
+            }
         }
         for (position, replacement) in [
             (1, "--principal"),
@@ -1858,6 +1902,9 @@ mod tests {
             parse(&duplicate_bootstrap),
             Err(EntryError::Arguments)
         ));
+        let mut duplicate_pack = pack_planning;
+        duplicate_pack[7] = "--project".into();
+        assert!(matches!(parse(&duplicate_pack), Err(EntryError::Arguments)));
         let calibration = args(&[
             "calibration-approve",
             "--data-root",

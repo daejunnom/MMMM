@@ -508,6 +508,12 @@ fn builtin_method(method: &str) -> bool {
     )
 }
 
+enum CalibrationPlanningMode<'a> {
+    NumericRun,
+    NumericBootstrap(&'a crate::calibration_bootstrap::BootstrapRegistry),
+    PackBootstrap(&'a crate::calibration_bootstrap::BootstrapRegistry),
+}
+
 /// Exactly one store opens and holds the native data-root lock for this service's
 /// lifetime. Facades do not receive access to it or construct another Application.
 pub struct ApplicationService {
@@ -630,7 +636,13 @@ impl ApplicationService {
         budget: &RequestBudget,
         hosts: &crate::host::HostBridge,
     ) -> Result<crate::calibration_planning::CalibrationPlanReceipt, ServiceError> {
-        self.prepare_selected_calibration_plan(principal, selection, budget, hosts, None)
+        self.prepare_selected_calibration_plan(
+            principal,
+            selection,
+            budget,
+            hosts,
+            CalibrationPlanningMode::NumericRun,
+        )
     }
     pub(crate) fn prepare_bootstrap_plan(
         &mut self,
@@ -640,7 +652,29 @@ impl ApplicationService {
         hosts: &crate::host::HostBridge,
         registry: &crate::calibration_bootstrap::BootstrapRegistry,
     ) -> Result<crate::calibration_planning::CalibrationPlanReceipt, ServiceError> {
-        self.prepare_selected_calibration_plan(principal, selection, budget, hosts, Some(registry))
+        self.prepare_selected_calibration_plan(
+            principal,
+            selection,
+            budget,
+            hosts,
+            CalibrationPlanningMode::NumericBootstrap(registry),
+        )
+    }
+    pub(crate) fn prepare_pack_bootstrap_plan(
+        &mut self,
+        principal: &AuthenticatedPrincipal,
+        selection: &mmmm_application::SetupSelection,
+        budget: &RequestBudget,
+        hosts: &crate::host::HostBridge,
+        registry: &crate::calibration_bootstrap::BootstrapRegistry,
+    ) -> Result<crate::calibration_planning::CalibrationPlanReceipt, ServiceError> {
+        self.prepare_selected_calibration_plan(
+            principal,
+            selection,
+            budget,
+            hosts,
+            CalibrationPlanningMode::PackBootstrap(registry),
+        )
     }
     fn prepare_selected_calibration_plan(
         &mut self,
@@ -648,7 +682,7 @@ impl ApplicationService {
         selection: &mmmm_application::SetupSelection,
         budget: &RequestBudget,
         hosts: &crate::host::HostBridge,
-        bootstrap: Option<&crate::calibration_bootstrap::BootstrapRegistry>,
+        mode: CalibrationPlanningMode<'_>,
     ) -> Result<crate::calibration_planning::CalibrationPlanReceipt, ServiceError> {
         budget.check()?;
         if crate::peer::fatal_stop_requested() {
@@ -701,22 +735,36 @@ impl ApplicationService {
             ids: self.ports.ids.as_mut(),
             clock: self.ports.clock.as_ref(),
         };
-        match bootstrap {
-            Some(registry) => crate::calibration_planning::prepare_bootstrap_plan(
-                &mut application,
-                &request,
-                &owner,
-                hosts,
-                selection,
-                registry,
-            ),
-            None => crate::calibration_planning::prepare_normative47_plan(
-                &mut application,
-                &request,
-                &owner,
-                hosts,
-                selection,
-            ),
+        match mode {
+            CalibrationPlanningMode::NumericBootstrap(registry) => {
+                crate::calibration_planning::prepare_bootstrap_plan(
+                    &mut application,
+                    &request,
+                    &owner,
+                    hosts,
+                    selection,
+                    registry,
+                )
+            }
+            CalibrationPlanningMode::PackBootstrap(registry) => {
+                crate::calibration_planning::prepare_pack_bootstrap_plan(
+                    &mut application,
+                    &request,
+                    &owner,
+                    hosts,
+                    selection,
+                    registry,
+                )
+            }
+            CalibrationPlanningMode::NumericRun => {
+                crate::calibration_planning::prepare_normative47_plan(
+                    &mut application,
+                    &request,
+                    &owner,
+                    hosts,
+                    selection,
+                )
+            }
         }
         .map_err(|cause| ServiceError::caused_by(cause.code, cause.message, cause))
     }

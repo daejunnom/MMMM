@@ -49,6 +49,7 @@ struct Record {
     serial: u64,
     anchor: usize,
     class: (u64, u64),
+    kind: mmmm_compiler::calibration::CalibrationSourceKind,
     correlation: [[u8; 32]; 3],
     root: Option<Arc<HeldDirectory>>,
     facts: HeldFacts,
@@ -386,7 +387,15 @@ pub(super) fn observe_source_root(
                 .entries
                 .iter()
                 .filter(|entry| entry.anchor != 0)
-                .map(|entry| (entry.serial, entry.anchor, entry.class, entry.correlation))
+                .map(|entry| {
+                    (
+                        entry.serial,
+                        entry.anchor,
+                        entry.class,
+                        entry.kind,
+                        entry.correlation,
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         let mut matched = None;
@@ -400,7 +409,7 @@ pub(super) fn observe_source_root(
                 matched = Some(candidate);
             }
         }
-        let (serial, anchor, class, correlation) = matched.ok_or(Failure::Unavailable)?;
+        let (serial, anchor, class, kind, correlation) = matched.ok_or(Failure::Unavailable)?;
         let root = {
             let state = ROOTS.lock().map_err(|_| Failure::Unavailable)?;
             if state.closed || state.active != 1 {
@@ -413,6 +422,7 @@ pub(super) fn observe_source_root(
                 .ok_or(Failure::Unavailable)?;
             if record.anchor != anchor
                 || record.class != class
+                || record.kind != kind
                 || record.correlation != correlation
                 || record.facts.state != 4
             {
@@ -469,6 +479,7 @@ pub(super) fn observe_source_root(
                 .ok_or(Failure::Unavailable)?;
             if record.anchor != anchor
                 || record.class != class
+                || record.kind != kind
                 || record.correlation != correlation
                 || record.facts.state != 4
                 || !record
@@ -482,6 +493,7 @@ pub(super) fn observe_source_root(
         })();
         finish(joined, stable)?;
         Ok(SourceRootFacts {
+            kind,
             bundle_digest: correlation[1],
         })
     })();
@@ -494,7 +506,12 @@ pub(super) struct Reservation {
     serial: u64,
 }
 impl Reservation {
-    pub fn reserve(checks: &Checks, bindings: &Bindings, bundle: &[u8; 32]) -> Result<Self> {
+    pub fn reserve(
+        checks: &Checks,
+        bindings: &Bindings,
+        kind: mmmm_compiler::calibration::CalibrationSourceKind,
+        bundle: &[u8; 32],
+    ) -> Result<Self> {
         if &bindings.correlation[1] != bundle {
             return Err(Failure::Changed);
         }
@@ -512,6 +529,7 @@ impl Reservation {
                 serial,
                 anchor: 0,
                 class: bindings.class,
+                kind,
                 correlation: bindings.correlation,
                 root: None,
                 facts: HeldFacts {

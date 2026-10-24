@@ -342,10 +342,10 @@ fn validate_public(value: &Value) -> Result<ManagementKind, ManagementError> {
                     "contextId",
                 ],
             )?;
-            if !matches!(
-                text(value, "purpose")?,
-                CALIBRATION_PLAN_PURPOSE | crate::calibration_bootstrap::PURPOSE
-            ) {
+            let purpose = text(value, "purpose")?;
+            if purpose != CALIBRATION_PLAN_PURPOSE
+                && !crate::calibration_bootstrap::is_purpose(purpose)
+            {
                 return Err(ManagementError::InvalidFrame);
             }
             let root = text(value, "dataRoot")?;
@@ -374,13 +374,14 @@ fn validate_public(value: &Value) -> Result<ManagementKind, ManagementError> {
                     "outcome",
                 ],
             )?;
-            if !matches!(
-                text(value, "purpose")?,
-                CALIBRATION_PLAN_PURPOSE | crate::calibration_bootstrap::PURPOSE
-            ) || !matches!(
-                text(value, "outcome")?,
-                "prepared" | "committed_checkpoint_failed"
-            ) {
+            let purpose = text(value, "purpose")?;
+            if (purpose != CALIBRATION_PLAN_PURPOSE
+                && !crate::calibration_bootstrap::is_purpose(purpose))
+                || !matches!(
+                    text(value, "outcome")?,
+                    "prepared" | "committed_checkpoint_failed"
+                )
+            {
                 return Err(ManagementError::InvalidFrame);
             }
             ProjectId::new(text(value, "projectId")?).map_err(|_| ManagementError::InvalidFrame)?;
@@ -394,7 +395,10 @@ fn validate_public(value: &Value) -> Result<ManagementKind, ManagementError> {
         | "host_apply_approval_authority"
         | "host_apply_approval_installed"
         | "host_apply_approval_complete" => {
-            if value["purpose"] == crate::calibration_bootstrap::PURPOSE {
+            if value["purpose"]
+                .as_str()
+                .is_some_and(crate::calibration_bootstrap::is_purpose)
+            {
                 crate::bootstrap::calibration_bootstrap_management::validate_frame(value, validator)
             } else {
                 crate::bootstrap::calibration_approval::validate_frame(value, validator)
@@ -1207,58 +1211,66 @@ mod tests {
 
     #[test]
     fn calibration_owner_selection_has_closed_locator_grammar_and_no_host_token() {
-        let planning = json!({"kind":"native_calibration_plan_offer","protocolVersion":"0.2.0","nonce":"plan-calibration",
-            "purpose":CALIBRATION_PLAN_PURPOSE,"dataRoot":std::env::temp_dir(),"projectId":"project-fixture",
+        for purpose in [
+            CALIBRATION_PLAN_PURPOSE,
+            crate::calibration_bootstrap::PURPOSE,
+            crate::calibration_bootstrap::PACK_PURPOSE,
+        ] {
+            let planning = json!({"kind":"native_calibration_plan_offer","protocolVersion":"0.2.0","nonce":"plan-calibration",
+            "purpose":purpose,"dataRoot":std::env::temp_dir(),"projectId":"project-fixture",
             "expectedRevision":"a".repeat(64),"contextId":"context-fixture"});
-        let plan_offer =
-            HostOffer::calibration_plan(PublicFrame::from_value(planning.clone()).unwrap())
-                .unwrap();
-        assert!(plan_offer.into_parts().1.is_none());
-        assert!(
-            HostOffer::new(
-                PublicFrame::from_value(planning.clone()).unwrap(),
-                SecretToken::generate().unwrap()
-            )
-            .is_err()
-        );
-        assert!(
-            HostOffer::owner_selection(PublicFrame::from_value(planning.clone()).unwrap()).is_err()
-        );
-        for field in [
-            "principalId",
-            "admin",
-            "plan",
-            "recipe",
-            "sources",
-            "expectedValues",
-            "verifiedWriteProfile",
-        ] {
-            let mut forged = planning.clone();
-            forged[field] = json!(true);
-            assert!(PublicFrame::from_value(forged).is_err());
+            let plan_offer =
+                HostOffer::calibration_plan(PublicFrame::from_value(planning.clone()).unwrap())
+                    .unwrap();
+            assert!(plan_offer.into_parts().1.is_none());
+            assert!(
+                HostOffer::new(
+                    PublicFrame::from_value(planning.clone()).unwrap(),
+                    SecretToken::generate().unwrap()
+                )
+                .is_err()
+            );
+            assert!(
+                HostOffer::owner_selection(PublicFrame::from_value(planning.clone()).unwrap())
+                    .is_err()
+            );
+            for field in [
+                "principalId",
+                "admin",
+                "plan",
+                "recipe",
+                "sources",
+                "expectedValues",
+                "verifiedWriteProfile",
+            ] {
+                let mut forged = planning.clone();
+                forged[field] = json!(true);
+                assert!(PublicFrame::from_value(forged).is_err());
+            }
+            for (field, replacement) in [
+                ("purpose", json!("world_write")),
+                ("purpose", json!("pack_calibration_bootstrap/2")),
+                ("expectedRevision", json!("A".repeat(64))),
+                ("dataRoot", json!("relative")),
+                ("contextId", json!("")),
+                ("protocolVersion", json!("0.1.0")),
+            ] {
+                let mut forged = planning.clone();
+                forged[field] = replacement;
+                assert!(PublicFrame::from_value(forged).is_err());
+            }
+            let mut prepared = json!({"kind":"native_calibration_plan_prepared","protocolVersion":"0.2.0","nonce":"plan-calibration",
+            "purpose":purpose,"projectId":"project-fixture","planId":"plan-fixture","planHash":"b".repeat(64),"outcome":"prepared"});
+            assert!(
+                PublicFrame::from_value(prepared.clone())
+                    .unwrap()
+                    .is_calibration_plan()
+            );
+            prepared["outcome"] = json!("committed_checkpoint_failed");
+            assert!(PublicFrame::from_value(prepared.clone()).is_ok());
+            prepared["outcome"] = json!("rollback_complete");
+            assert!(PublicFrame::from_value(prepared).is_err());
         }
-        for (field, replacement) in [
-            ("purpose", json!("world_write")),
-            ("expectedRevision", json!("A".repeat(64))),
-            ("dataRoot", json!("relative")),
-            ("contextId", json!("")),
-            ("protocolVersion", json!("0.1.0")),
-        ] {
-            let mut forged = planning.clone();
-            forged[field] = replacement;
-            assert!(PublicFrame::from_value(forged).is_err());
-        }
-        let mut prepared = json!({"kind":"native_calibration_plan_prepared","protocolVersion":"0.2.0","nonce":"plan-calibration",
-            "purpose":CALIBRATION_PLAN_PURPOSE,"projectId":"project-fixture","planId":"plan-fixture","planHash":"b".repeat(64),"outcome":"prepared"});
-        assert!(
-            PublicFrame::from_value(prepared.clone())
-                .unwrap()
-                .is_calibration_plan()
-        );
-        prepared["outcome"] = json!("committed_checkpoint_failed");
-        assert!(PublicFrame::from_value(prepared.clone()).is_ok());
-        prepared["outcome"] = json!("rollback_complete");
-        assert!(PublicFrame::from_value(prepared).is_err());
         let value = json!({"kind":"native_calibration_owner_offer","protocolVersion":"0.2.0","nonce":"owner-calibration",
             "purpose":crate::bootstrap::calibration_approval::PURPOSE,"dataRoot":std::env::temp_dir(),
             "projectId":"project-fixture","planId":"plan-fixture","planHash":"a".repeat(64)});

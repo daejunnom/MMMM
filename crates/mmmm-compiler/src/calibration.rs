@@ -21,6 +21,53 @@ const MAX_COMMANDS: usize = 128;
 const MAX_COMMAND_BYTES: usize = 8192;
 const MAX_PROGRAM_BYTES: usize = 64 * 1024;
 
+/// Closed comparison recipes for the private calibration installer. Selecting
+/// one does not establish an installed root, loaded source, or run authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalibrationSourceKind {
+    Numeric47,
+    PackCase,
+}
+
+impl CalibrationSourceKind {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Numeric47 => "numeric47",
+            Self::PackCase => "pack_case",
+        }
+    }
+    pub const fn root_basename(self) -> &'static str {
+        match self {
+            Self::Numeric47 => "mmmm-calibration-normative47",
+            Self::PackCase => "mmmm-calibration-pack-case",
+        }
+    }
+    pub const fn entry_count(self) -> usize {
+        match self {
+            Self::Numeric47 => 48,
+            Self::PackCase => 3,
+        }
+    }
+    pub const fn function_count(self) -> usize {
+        match self {
+            Self::Numeric47 => 47,
+            Self::PackCase => 2,
+        }
+    }
+    pub fn source_entries(self) -> Result<BTreeMap<String, Vec<u8>>, DomainError> {
+        match self {
+            Self::Numeric47 => Ok(
+                crate::calibration_dispatch::CalibrationDispatchPlan::normative47()?
+                    .source_entries()
+                    .clone(),
+            ),
+            Self::PackCase => Ok(CalibrationPackProgram::java_26_3()?
+                .source_entries()
+                .clone()),
+        }
+    }
+}
+
 macro_rules! calibration_cases {
     ($($variant:ident => $name:literal),+ $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -228,6 +275,7 @@ impl CalibrationProgram {
 #[derive(Debug, Clone)]
 pub struct CalibrationPackProgram {
     entries: BTreeMap<String, Vec<u8>>,
+    recipe_bytes: Vec<u8>,
     digest: Sha256Digest,
     commands: Vec<String>,
     invocation_command: String,
@@ -278,6 +326,7 @@ impl CalibrationPackProgram {
         let digest = raw_digest(&identity);
         Ok(Self {
             entries,
+            recipe_bytes: identity,
             digest,
             commands,
             invocation_command: format!("function {root}"),
@@ -299,6 +348,11 @@ impl CalibrationPackProgram {
     /// Digest of length-framed ordered logical entries, not of a ZIP archive.
     pub fn program_digest(&self) -> &Sha256Digest {
         &self.digest
+    }
+    /// The original length-framed logical recipe bytes hashed by program_digest.
+    /// These are neither the canonical source-bundle JSON nor ZIP bytes.
+    pub fn canonical_recipe_bytes(&self) -> &[u8] {
+        &self.recipe_bytes
     }
     pub fn commands(&self) -> &[String] {
         &self.commands

@@ -72,7 +72,8 @@ final class ManualHostConnection {
                                             }); return 1;
                                         }))))
                         .then(calibrationCommand())
-                        .then(bootstrapCommand())));
+                        .then(bootstrapCommand())
+                        .then(bootstrapCommand("calibration-pack-bootstrap", NativeCalibrationBootstrap.Purpose.PACK_CASE))));
     }
 
     private LiteralArgumentBuilder<CommandSourceStack> calibrationCommand() {
@@ -98,7 +99,11 @@ final class ManualHostConnection {
     }
 
     private LiteralArgumentBuilder<CommandSourceStack> bootstrapCommand() {
-        return LiteralArgumentBuilder.<CommandSourceStack>literal("calibration-bootstrap")
+        return bootstrapCommand("calibration-bootstrap", NativeCalibrationBootstrap.Purpose.NUMERIC47);
+    }
+
+    private LiteralArgumentBuilder<CommandSourceStack> bootstrapCommand(String commandName, NativeCalibrationBootstrap.Purpose purpose) {
+        return LiteralArgumentBuilder.<CommandSourceStack>literal(commandName)
                 .then(LiteralArgumentBuilder.<CommandSourceStack>literal("approve")
                         .then(RequiredArgumentBuilder.<CommandSourceStack, String>argument("planId", StringArgumentType.word())
                                 .then(RequiredArgumentBuilder.<CommandSourceStack, String>argument("planHash", StringArgumentType.word()).executes(command -> {
@@ -107,7 +112,7 @@ final class ManualHostConnection {
                                     UUID playerId = player.getUUID(); String planId = StringArgumentType.getString(command, "planId");
                                     String planHash = StringArgumentType.getString(command, "planHash");
                                     var worker = Executors.newSingleThreadExecutor(task -> { Thread thread = new Thread(task, "mmmm-bootstrap-approval"); thread.setDaemon(true); return thread; });
-                                    CompletableFuture.runAsync(() -> approveBootstrap(playerId, planId, planHash), worker).whenComplete((value, failure) -> {
+                                    CompletableFuture.runAsync(() -> approveBootstrap(playerId, planId, planHash, purpose), worker).whenComplete((value, failure) -> {
                                         connecting.set(false); worker.shutdown();
                                         host.gameTask(() -> {
                                             var current = host.pairedCandidate(playerId);
@@ -119,7 +124,7 @@ final class ManualHostConnection {
                                 }))));
     }
 
-    private void approveBootstrap(UUID playerId, String planId, String planHash) {
+    private void approveBootstrap(UUID playerId, String planId, String planHash, NativeCalibrationBootstrap.Purpose purpose) {
         long started = System.nanoTime(), until = started + java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
         byte[] raw = new byte[32]; new SecureRandom().nextBytes(raw); AtomicBoolean cancelled = new AtomicBoolean();
         Runnable control = () -> {
@@ -133,7 +138,7 @@ final class ManualHostConnection {
         try {
             control.run(); HostSetup setup = HostSetup.read(contracts, FabricLoader.getInstance().getGameDir().resolve("config/mmmm-host.json")); control.run();
             ObjectNode offer = host.gameTask(() -> {
-                control.run(); ObjectNode actual = host.bootstrapApprovalOffer(playerId, setup, planId, planHash, control, until);
+                control.run(); ObjectNode actual = host.bootstrapApprovalOffer(playerId, setup, planId, planHash, purpose.wire(), control, until);
                 nonce.set(actual.path("nonce").asText()); control.run(); return actual;
             }).toCompletableFuture().orTimeout(Math.max(1, Math.min(java.util.concurrent.TimeUnit.SECONDS.toNanos(10), until - System.nanoTime())), java.util.concurrent.TimeUnit.NANOSECONDS).join();
             control.run();
@@ -157,7 +162,7 @@ final class ManualHostConnection {
                                 installedSelection.set(manifest.path("selectionDigest").asText()); installedManifest.set(ContractJson.digest(manifest));
                                 var uri = java.net.URI.create(installed);
                                 ObjectNode frame = ContractJson.newObject().put("kind", "host_apply_approval_installed").put("protocolVersion", ContractJson.VERSION)
-                                        .put("nonce", offer.path("nonce").asText()).put("purpose", NativeCalibrationBootstrap.PURPOSE)
+                                        .put("nonce", offer.path("nonce").asText()).put("purpose", purpose.wire())
                                         .put("selectionDigest", installedSelection.get()).put("manifestDigest", installedManifest.get());
                                 frame.putObject("hostEndpoint").put("address", "127.0.0.1:" + uri.getPort()).put("path", "/rpc")
                                         .put("hostEpoch", offer.path("hostHello").path("environment").path("sessionEpoch").asText());
@@ -175,10 +180,10 @@ final class ManualHostConnection {
     }
 
     static void validateBootstrapCompletion(ObjectNode offer, ObjectNode completed, String selectionDigest, String manifestDigest) {
+        NativeCalibrationBootstrap.Purpose purpose = NativeCalibrationBootstrap.Purpose.fromWire(offer.path("purpose").asText());
         HostDispatcher.exactFields(completed, Set.of("kind", "protocolVersion", "nonce", "ready", "coordinatorEpoch", "hostEpoch", "contextId", "purpose", "selectionDigest", "manifestDigest"));
         if (!"host_apply_approval_complete".equals(completed.path("kind").asText()) || !ContractJson.VERSION.equals(completed.path("protocolVersion").asText())
-                || !offer.path("nonce").equals(completed.path("nonce")) || !NativeCalibrationBootstrap.PURPOSE.equals(completed.path("purpose").asText())
-                || !NativeCalibrationBootstrap.PURPOSE.equals(offer.path("purpose").asText())
+                || !offer.path("nonce").equals(completed.path("nonce")) || !purpose.wire().equals(completed.path("purpose").asText())
                 || !completed.path("ready").isBoolean() || !completed.path("ready").asBoolean()
                 || selectionDigest == null || manifestDigest == null || !selectionDigest.matches("[a-f0-9]{64}") || !manifestDigest.matches("[a-f0-9]{64}")
                 || !completed.path("selectionDigest").isTextual() || !completed.path("manifestDigest").isTextual()
