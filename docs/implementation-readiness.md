@@ -3069,6 +3069,65 @@ Linux105의 후속 후보는 test profile debug 한 값만 `line-tables-only`로
 기록했다. source 수정과 OOM 해결을 구분하고 실제 3개 OS 결과는 다음 고정 SHA에서
 확인한다. 이 변경 뒤 로컬 전체 workspace 재컴파일은 아직 수행하지 않았다.
 
+고정 `5a590c4fa2ab59657f1cc356fe94f39f0773aee9`의
+[Rust106](https://github.com/daejunnom/MMMM/actions/runs/40050684832)은 macOS 성공,
+Windows·Linux test 실패·lint skipped metadata다. Windows 원 ZIP 12,651 bytes·SHA
+`07db8df4a5e70ad4257d7a13ad8e8c7052db02581e8e8acf70213b696f03ed40`에서 확인 가능한
+최초 감독 실패는 `observation_failure`와 `walk_limit`이다. command124·573,037 ms이며
+timeout으로 기록되지 않았다. Job 상한/readback 2 GiB·peak1,717,121,024 bytes·9 processes·
+gap149 ms·drain/output complete true다. 후행 evidence export도 같은 walk limit으로
+실패해 `evidence_exported=false`다. test 하위에는 process/finalization/retries만 있고,
+원 stdout/stderr와 finish는 없다. 실제 compile/assertion 내부 최초 오류, JNI86 실행,
+scratch 정리·lease 해제는 이 ZIP으로 확인하지 못했다. 원 관측·증거 손실을 보존한다.
+
+Linux106 ZIP 17,689 bytes·SHA
+`1bafa95ebac0ea99251462b9855fe62b09b6ce55439133d24dc8038fc2e4aa5b`는 실제
+`rustc --test -C debuginfo=1`의 Coordinator libtest LLVM OOM·SIGABRT6·Cargo101이다.
+stdout0·test 실행 근거 없음, command101·80,725 ms·process별 AS2 GiB·6 processes·gap152 ms,
+drain/output/export·scratch 정리·lease 해제와 감독/정리 오류0이다. 이 원 실패들은
+이후 `a23212f`의 profile 변경 결과가 아니다. 같은 5a590c4의
+[JVM97](https://github.com/daejunnom/MMMM/actions/runs/40050684827)은 세 OS 집계 성공
+metadata이며 실제 loaded-source/JNI 전체 경로나 게임 인수로 확대하지 않는다.
+
+고정 `a23212f70201c3f6fc3fc8fd9512701d680715da`의
+[Rust108](https://github.com/daejunnom/MMMM/actions/runs/40051194897)은 세 OS의
+tests/lint와 집계 최종 성공 metadata를 확인했다. Linux 원 ZIP
+83,474 bytes·SHA `3088737add66dc05ee5db2477223073f7bb97641abf629cbc726d5f9d7e1927a`의
+원 ci-context는 actual/expected/PR head가 위 SHA와 일치한다. 실제 Coordinator test
+rustc 인자에서 `-C debuginfo=line-tables-only`를 확인했다. 원 stdout143,187 bytes·SHA
+`269ae8e37387530d995354bc5468288a31d83c940d6cd34accaf720f17c4b548`에서 Coordinator395,
+observer86과 그 JNI 모듈의 순수 경계 검사9개·display4개 검사의 실제 `ok`를 확인했다. 전체 workspace에는
+별도 native child fixture·JVM 격리 quota 증명 등 기존 ignored4개가 있으며 전부 실행한
+것으로 표시하지 않는다. 원 stderr400,400 bytes·SHA
+`fc57274d948aa5752c5ef4208601df17e03270dda60dd7a53e2620eb9a8cc8bf`도 보존한다.
+command0·232,370 ms·자연 종료·process별 AS2 GiB soft/hard readback·최대6 processes·
+gap161 ms이며 drain/output/export·scratch 정리·lease 해제와 감독/정리 오류0이다.
+이 실행에서 OOM은 재발하지 않았지만 메모리 절감량이나 이전 OOM 직접 원인을
+확정한 것은 아니다. 원 ZIP 전후 digest를 대조했고 raw 로그는 저장소 밖에 보존한다.
+같은 SHA의 [JVM99](https://github.com/daejunnom/MMMM/actions/runs/40051194779)는 세 OS의
+JVM/native/header/startup 단계와 집계 성공 metadata이며 원 artifact 세부 감사는 별개다.
+
+기존 storage 깊이 경계 fixture는 managed TMP 안에 실제 65단계 디렉터리를 만들어,
+같은 64단계 한도의 부모 감독기가 관측하는 시점에 따라 실패할 수 있는 구조였다.
+Windows106 원 기록에는 실패 경로가 없어 이 fixture가 직접 원인이라고 단정하지 않는다.
+생산 한도64/100,000과 모든 소유권·경로·secret/link·재관측·checkpoint·byte 집계를
+유지하고 같은 private walker에만 내부 한도를 전달하도록 분리했다. 기존 검사는
+작은 한도4의 허용 깊이와 초과5를 확인하며, sentinel·owner/lease 원 bytes 보존과
+기본 생산 한도의 measure·정상 finish까지 검증한다. config·환경·public 한도 포트나
+새 fixture 파일을 만들지 않았고 전체 감독기의 한도도 늘리지 않았다.
+
+Windows630의 정확한 두 파일 포맷 뒤, 631의 고정 a23212f blob snapshot에 그 두 소스만
+덮어쓴 검사에서 storage51 PASS·ignored0·기타201 filtered를 확인했다. 632의 xtask
+lib/tests strict Clippy도 PASS다. 입력547개·12,713,332 bytes의 전후 manifest SHA는
+`6bfa3c188ed5040975853d096daa718621d67911430dce154d62a1fa5d45150d`로 같았다.
+dirty policy·동시 PACK cohort·보호 draft를 포함하지 않았다. 631은 command0·51,963 ms·
+peak527,265,792 bytes·7 processes·gap148 ms·owned tail 정리 후 drain, 632는
+command0·16,420 ms·peak425,193,472 bytes·8 processes·gap108 ms·자연 종료다.
+각각 output/export·scratch 정리·lease 해제와 감독/정리 오류0을 확인했다. 내부 helper의
+260초는 협력적 검사이며 실제 강제300초와 drain·정리는 외부 관리 감독이 담당한다.
+외부 helper 준비의 첫 정적 parser 거절은 native 실행 전 실패였고 수정 후 parser0을
+확인했다. 원 Windows106의 실패·export 손실을 성공으로 다시 분류하지 않는다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

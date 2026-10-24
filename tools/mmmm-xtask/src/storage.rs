@@ -22,6 +22,17 @@ const MAX_RETRY_WAIT: Duration = Duration::from_millis(32);
 const MAX_RETRY_WALL: Duration = Duration::from_millis(100);
 static TOKEN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy)]
+struct WalkLimits {
+    max_depth: usize,
+    max_entries: usize,
+}
+
+const MANAGED_WALK_LIMITS: WalkLimits = WalkLimits {
+    max_depth: MAX_DEPTH,
+    max_entries: MAX_ENTRIES,
+};
+
 #[derive(Clone, Debug)]
 pub struct Budgets {
     pub slot_bytes: u64,
@@ -2442,9 +2453,29 @@ fn tree_bytes_observed_with_retry(
     path: &Path,
     boundary: &Path,
     ephemeral_roots: &[PathBuf],
+    before_metadata: impl FnMut(&Path),
+    progress: &mut dyn FnMut() -> Result<(), String>,
+    retry: Option<&mut MetadataReobservation<'_>>,
+) -> Result<u64, StorageError> {
+    tree_bytes_observed_with_retry_and_limits(
+        path,
+        boundary,
+        ephemeral_roots,
+        before_metadata,
+        progress,
+        retry,
+        MANAGED_WALK_LIMITS,
+    )
+}
+
+fn tree_bytes_observed_with_retry_and_limits(
+    path: &Path,
+    boundary: &Path,
+    ephemeral_roots: &[PathBuf],
     mut before_metadata: impl FnMut(&Path),
     progress: &mut dyn FnMut() -> Result<(), String>,
     mut retry: Option<&mut MetadataReobservation<'_>>,
+    limits: WalkLimits,
 ) -> Result<u64, StorageError> {
     observation_checkpoint(progress)?;
     let boundary =
@@ -2456,7 +2487,7 @@ fn tree_bytes_observed_with_retry(
     while let Some((path, depth)) = pending.pop() {
         observation_checkpoint(progress)?;
         entries += 1;
-        if depth > MAX_DEPTH || entries > MAX_ENTRIES {
+        if depth > limits.max_depth || entries > limits.max_entries {
             return Err(StorageError::new(
                 "walk_limit",
                 "managed tree depth or entry limit exceeded",
@@ -2524,7 +2555,7 @@ fn tree_bytes_observed_with_retry(
                 let entry = directory.next();
                 observation_checkpoint(progress)?;
                 let Some(entry) = entry else { break };
-                if pending.len() + entries >= MAX_ENTRIES {
+                if pending.len() + entries >= limits.max_entries {
                     return Err(StorageError::new(
                         "walk_limit",
                         "managed tree entry limit exceeded",

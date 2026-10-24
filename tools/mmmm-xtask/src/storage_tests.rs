@@ -1440,13 +1440,46 @@ fn retry_rejects_reparse_leaf_even_after_a_successful_metadata_call() {
 fn bounded_walk_rejects_overdeep_tree_without_removing_it() {
     let fixture = Fixture::new("depth");
     let build = fixture.acquire();
-    let mut deepest = build.paths().scratch.clone();
-    for _ in 0..MAX_DEPTH + 1 {
+    let paths = build.paths().clone();
+    let owner = paths.slot.join("owner.json");
+    let lease = paths.catalog.join("lease.json");
+    let owner_before = fs::read(&owner).unwrap();
+    let lease_before = fs::read(&lease).unwrap();
+    let sentinel = paths.scratch.join("preserve");
+    let sentinel_bytes = b"owned depth sentinel";
+    fs::write(&sentinel, sentinel_bytes).unwrap();
+    let limits = WalkLimits {
+        max_depth: 4,
+        ..MANAGED_WALK_LIMITS
+    };
+    let mut deepest = paths.scratch.clone();
+    for _ in 0..limits.max_depth {
         deepest.push("d");
         fs::create_dir(&deepest).unwrap();
     }
-    assert_eq!(error_kind(build.measure()), "walk_limit");
+    let measure_with_limits = || {
+        tree_bytes_observed_with_retry_and_limits(
+            &paths.scratch,
+            &paths.scratch,
+            &[],
+            |_| {},
+            &mut || Ok(()),
+            None,
+            limits,
+        )
+    };
+    assert_eq!(measure_with_limits().unwrap(), sentinel_bytes.len() as u64);
+    deepest.push("d");
+    fs::create_dir(&deepest).unwrap();
+    assert_eq!(error_kind(measure_with_limits()), "walk_limit");
     assert!(deepest.is_dir());
+    assert_eq!(fs::read(&sentinel).unwrap(), sentinel_bytes);
+    assert!(build.measure().unwrap().within_budget);
+    assert_eq!(fs::read(&owner).unwrap(), owner_before);
+    assert_eq!(fs::read(&lease).unwrap(), lease_before);
+    let receipt = build.finish(outcome(0)).unwrap();
+    assert!(receipt.scratch_removed && receipt.lease_released);
+    assert!(receipt.cleanup_errors.is_empty());
 }
 
 #[test]
