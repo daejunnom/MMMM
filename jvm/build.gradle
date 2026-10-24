@@ -8,6 +8,263 @@ allprojects {
     repositories { mavenCentral() }
 }
 
+// This opt-in task observes development artifacts; the managed runner owns their admission.
+tasks.register('mmmmDevelopmentJars') {
+    group = 'verification'
+    description = 'Observe freshly executed development JAR producers for the managed runner'
+    dependsOn ':fabric-host:assemble', ':definition-observer:jar', ':provider-sdk:jar'
+
+    doLast {
+        def reject = { String reason ->
+            throw new GradleException("Development JAR observation rejected: ${reason}")
+        }
+        def sourceSha = System.getProperty('mmmm.ci.sourceSha', '')
+        def target = System.getProperty('mmmm.developmentJars.target', '')
+        def evidenceValue = System.getProperty('mmmm.developmentJars.evidence', '')
+        if (!(sourceSha ==~ /[0-9a-f]{40}/)) {
+            reject('invalid source SHA')
+        }
+        if (!(target in ['windows-x64', 'linux-x64', 'macos-arm64'])) {
+            reject('invalid target')
+        }
+        if (evidenceValue.isEmpty() || evidenceValue.length() > 4096) {
+            reject('invalid evidence directory')
+        }
+        def noFollow = [java.nio.file.LinkOption.NOFOLLOW_LINKS] as java.nio.file.LinkOption[]
+        def physical = { java.nio.file.Path input, boolean directory ->
+            if (!input.isAbsolute() || input.toString().length() > 4096 || input.nameCount > 128) {
+                reject('invalid physical path')
+            }
+            def path = input.normalize()
+            def cursor = path.root
+            def leaf = java.nio.file.Files.readAttributes(cursor,
+                java.nio.file.attribute.BasicFileAttributes, noFollow)
+            if (!leaf.isDirectory() || leaf.isSymbolicLink() || leaf.isOther()) {
+                reject('unsafe filesystem root')
+            }
+            for (def segment : path) {
+                cursor = cursor.resolve(segment)
+                leaf = java.nio.file.Files.readAttributes(cursor,
+                    java.nio.file.attribute.BasicFileAttributes, noFollow)
+                if (leaf.isSymbolicLink() || leaf.isOther()
+                    || (cursor != path && !leaf.isDirectory())) {
+                    reject('link or non-directory ancestor')
+                }
+            }
+            if ((directory && !leaf.isDirectory()) || (!directory && !leaf.isRegularFile())) {
+                reject('unexpected physical file kind')
+            }
+            def real = path.toRealPath()
+            if (real != path.toRealPath(noFollow) || leaf.fileKey() == null) {
+                reject('unproven physical identity')
+            }
+            [path: path, real: real, attributes: leaf]
+        }
+        def sameDirectory = { before, after ->
+            before.real == after.real && before.attributes.fileKey() == after.attributes.fileKey()
+        }
+        def sameFile = { before, after ->
+            (sameDirectory(before, after)
+                && before.attributes.size() == after.attributes.size()
+                && before.attributes.lastModifiedTime() == after.attributes.lastModifiedTime()
+                && before.attributes.creationTime() == after.attributes.creationTime())
+        }
+        def cacheValue = System.getenv('GRADLE_USER_HOME')
+        if (cacheValue == null || cacheValue.isEmpty()) {
+            reject('missing managed Gradle directory')
+        }
+        def cachePath = java.nio.file.Path.of(cacheValue)
+        if (!cachePath.isAbsolute() || cachePath.parent == null) {
+            reject('invalid managed Gradle directory')
+        }
+        def buildRoot = physical(cachePath.parent.resolve('gradle-build'), true)
+        def evidenceRoot = physical(java.nio.file.Path.of(evidenceValue), true)
+        def checkout = rootProject.projectDir.parentFile.toPath().toAbsolutePath().normalize()
+        if (evidenceRoot.path.startsWith(checkout) || evidenceRoot.real.startsWith(checkout)
+            || evidenceRoot.path.startsWith(buildRoot.path)
+            || evidenceRoot.real.startsWith(buildRoot.real)) {
+            reject('evidence directory is not external to source and build output')
+        }
+
+        def graphTasks = gradle.taskGraph.allTasks
+        if (graphTasks.isEmpty() || graphTasks.size() > 512) {
+            reject('task graph exceeds its bound')
+        }
+        def graph = new LinkedHashSet(graphTasks)
+        def dependencyClosure = { Collection seeds ->
+            def visited = new LinkedHashSet()
+            def pending = new ArrayDeque()
+            seeds.each { pending.addLast(it) }
+            while (!pending.isEmpty()) {
+                def item = pending.removeFirst()
+                if (visited.add(item)) {
+                    if (visited.size() > 512) {
+                        reject('dependency closure exceeds its bound')
+                    }
+                    def dependencies = item.taskDependencies.getDependencies(item)
+                    if (dependencies.size() > 512) {
+                        reject('dependency edge set exceeds its bound')
+                    }
+                    dependencies.each { dependency ->
+                        if (!visited.contains(dependency)) {
+                            pending.addLast(dependency)
+                        }
+                    }
+                }
+            }
+            visited
+        }
+        def unclassifiedJar = { producer ->
+            (producer instanceof AbstractArchiveTask
+                && producer.archiveExtension.getOrElse('') == 'jar'
+                && producer.archiveClassifier.getOrElse('') == '')
+        }
+        def executedArchive = { producer ->
+            def state = producer.state
+            if (!graph.contains(producer) || !unclassifiedJar(producer)
+                || !state.executed || !state.didWork || state.upToDate
+                || state.skipped || state.noSource || state.failure != null) {
+                reject('archive producer was not freshly executed successfully')
+            }
+        }
+        def fabricProject = project(':fabric-host')
+        def assemble = fabricProject.tasks.named('assemble').get()
+        def assembleClosure = dependencyClosure([assemble])
+        def candidates = assembleClosure.findAll { producer ->
+            graph.contains(producer) && producer.project == fabricProject && unclassifiedJar(producer)
+        }
+        def terminals = candidates.findAll { candidate ->
+            !candidates.any { other ->
+                other != candidate && dependencyClosure([other]).contains(candidate)
+            }
+        }
+        if (terminals.size() != 1) {
+            reject('Fabric assemble does not identify one terminal archive producer')
+        }
+        def fabric = terminals.first()
+        executedArchive(fabric)
+        def fabricFile = physical(fabric.archiveFile.get().asFile.toPath(), false)
+        def runtime = fabricProject.configurations.getByName('runtimeElements')
+        def runtimeJars = runtime.outgoing.artifacts.findAll { artifact ->
+            artifact.extension == 'jar' && (artifact.classifier ?: '') == ''
+        }
+        if (runtimeJars.size() != 1) {
+            reject('Fabric runtimeElements does not expose one unclassified JAR')
+        }
+        def runtimeArtifact = runtimeJars.first()
+        def runtimeFile = physical(runtimeArtifact.file.toPath(), false)
+        if (!sameFile(fabricFile, runtimeFile)) {
+            reject('Fabric outgoing artifact does not match the selected archive')
+        }
+        def runtimeSeeds = runtimeArtifact.buildDependencies.getDependencies(fabric)
+        if (runtimeSeeds.size() > 512) {
+            reject('outgoing build dependency set exceeds its bound')
+        }
+        def runtimeClosure = dependencyClosure(runtimeSeeds)
+        def sameOutputOwners = graph.findAll { producer ->
+            (producer instanceof AbstractArchiveTask
+                && producer.archiveFile.get().asFile.toPath().toAbsolutePath().normalize() == fabricFile.path)
+        }
+        if (!runtimeClosure.contains(fabric) || sameOutputOwners.size() != 1
+            || sameOutputOwners.first() != fabric) {
+            reject('Fabric outgoing archive producer ownership is ambiguous')
+        }
+
+        def selections = [
+            [role: 'fabric_host', producer: fabric],
+            [role: 'definition_observer', producer: project(':definition-observer').tasks.named('jar').get()],
+            [role: 'provider_sdk', producer: project(':provider-sdk').tasks.named('jar').get()]
+        ]
+        def artifacts = []
+        def selectedPaths = new LinkedHashSet()
+        long totalBytes = 0
+        long fileLimit = 64L * 1024 * 1024
+        for (def selection : selections) {
+            def producer = selection.producer
+            executedArchive(producer)
+            def before = physical(producer.archiveFile.get().asFile.toPath(), false)
+            if (!before.path.startsWith(buildRoot.path) || !before.real.startsWith(buildRoot.real)
+                || !selectedPaths.add(before.real) || before.attributes.size() <= 0
+                || before.attributes.size() > fileLimit) {
+                reject('archive path, uniqueness, or byte bound failed')
+            }
+            def digest = java.security.MessageDigest.getInstance('SHA-256')
+            long observed = 0
+            def options = [java.nio.file.StandardOpenOption.READ,
+                java.nio.file.LinkOption.NOFOLLOW_LINKS] as java.nio.file.OpenOption[]
+            java.nio.channels.FileChannel.open(before.path, options).withCloseable { channel ->
+                if (channel.size() != before.attributes.size()
+                    || !sameFile(before, physical(before.path, false))) {
+                    reject('archive identity changed before reading')
+                }
+                def buffer = java.nio.ByteBuffer.allocate(65536)
+                while (true) {
+                    int count = channel.read(buffer)
+                    if (count < 0) {
+                        break
+                    }
+                    if (count == 0) {
+                        reject('archive read made no progress')
+                    }
+                    observed += count
+                    if (observed > fileLimit || observed > before.attributes.size()) {
+                        reject('archive stream exceeded its byte bound')
+                    }
+                    buffer.flip()
+                    digest.update(buffer)
+                    buffer.clear()
+                }
+                if (observed != before.attributes.size() || channel.size() != observed
+                    || !sameFile(before, physical(before.path, false))) {
+                    reject('archive identity or size changed while reading')
+                }
+            }
+            totalBytes += observed
+            if (totalBytes > 192L * 1024 * 1024) {
+                reject('combined archives exceed their byte bound')
+            }
+            def relative = buildRoot.path.relativize(before.path).toString().replace('\\', '/')
+            artifacts.add([
+                role: selection.role, project_path: producer.project.path, task_path: producer.path,
+                archive_extension: 'jar', classifier: '', relative_path: relative,
+                bytes: observed, sha256: java.util.HexFormat.of().formatHex(digest.digest()),
+                producer_status: 'executed'
+            ])
+        }
+        if (!sameDirectory(buildRoot, physical(buildRoot.path, true))
+            || !sameDirectory(evidenceRoot, physical(evidenceRoot.path, true))) {
+            reject('managed directory identity changed')
+        }
+        def metadata = [schema: 'mmmm-development-jar-artifacts/1', development_only: true,
+            source_sha: sourceSha, target: target, artifacts: artifacts]
+        byte[] encoded = groovy.json.JsonOutput.toJson(metadata)
+            .getBytes(java.nio.charset.StandardCharsets.UTF_8)
+        if (encoded.length == 0 || encoded.length > 65536) {
+            reject('artifact metadata exceeds its byte bound')
+        }
+        def destination = evidenceRoot.path.resolve('development-jars-artifacts.json')
+        def outputOptions = [java.nio.file.StandardOpenOption.CREATE_NEW,
+            java.nio.file.StandardOpenOption.WRITE,
+            java.nio.file.LinkOption.NOFOLLOW_LINKS] as java.nio.file.OpenOption[]
+        java.nio.channels.FileChannel.open(destination, outputOptions).withCloseable { channel ->
+            def buffer = java.nio.ByteBuffer.wrap(encoded)
+            while (buffer.hasRemaining()) {
+                if (channel.write(buffer) <= 0) {
+                    reject('metadata write made no progress')
+                }
+            }
+            channel.force(true)
+            if (channel.size() != encoded.length) {
+                reject('metadata write length mismatch')
+            }
+        }
+        if (!sameDirectory(evidenceRoot, physical(evidenceRoot.path, true))
+            || physical(destination, false).attributes.size() != encoded.length) {
+            reject('metadata destination identity or size changed')
+        }
+    }
+}
+
 subprojects {
     apply plugin: 'java-library'
     java {

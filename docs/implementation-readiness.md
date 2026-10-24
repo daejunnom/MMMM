@@ -3436,6 +3436,36 @@ drain/output/export·scratch 정리·lease 해제·감독/정리 오류0이다. 
 인증 문제로 클라이언트 로그인·ADMIN pairing·시각 검증은 not_run이다. 해당 경계를
 우회하지 않으며 독립적으로 진행 가능한 구현·검증과 별도로 남긴다.
 
+### Development JAR producer 소스
+
+별도 후속 단위로 `jvm/build.gradle`, `tools/bootstrap/jvm-ci.ps1`,
+`.github/workflows/jvm.yml` 세 파일에서 실제 JAR packaging 경로를 연결했다. 기존11개
+task·7개 test module 판정과 원 `jvm-result.json` 저장을 먼저 완료하고, opt-in
+`-DevelopmentJars`일 때만 같은 managed 실행 안에서 별도 Gradle launch를 수행한다.
+새 init/VM/task/artifact/result 파일을 사용하며 packaging 실패로 원 검증 결과를 다시
+쓰거나 실패 exit를 무시하지 않는다. 원 시간·출력·자원·slot/catalog 상한을 유지한다.
+
+root `:mmmmDevelopmentJars`는 실제 Fabric assemble, definition-observer jar와
+provider-sdk jar task를 소비한다. Fabric의 실제 graph/assemble closure와 outgoing
+runtime artifact가 같은 유일한 최종 unclassified archive를 가리켜야 한다. task명이나
+basename을 추측하지 않으며 모호하면 실패한다. agent/SDK도 실제 archiveFile을 선택한다.
+파일당64 MiB·합계192 MiB·graph512개·metadata64 KiB 경계에서 실제 bytes·EOF·SHA와
+물리 identity를 대조하고 새 evidence payload에 복사한다. source·선택 toolchain·init·
+원 검증 결과와 archive facts를 재검사한 뒤에만 development 결과를 발급한다.
+
+workflow_dispatch의 `development_jars=true`에서만 이 producer를 요청한다. 원 JVM
+검증과 실제 managed exit·별도 packaging 결과를 구분하며 기본 opt-out을 유지한다.
+결과는 `scope=development`, product proof/source admission/SDK 공개 형식 검증 false,
+game/release not_run이다. SDK 최종 공개 형식·rights/license와 전체 제품 release bundle
+조립을 이 JAR 생성 경로로 대신하지 않는다.
+
+세 파일의 독립 source review와 Root의 freeze hash 대조·PowerShell parser0을 확인했다.
+실제 Loom 최종 outgoing archive 연결·Windows fileKey identity·JAR 생성/복사·3OS runtime은
+아직 미실행이다. 정적 opt-out 역변환에서 원 Gradle2,001 bytes·SHA
+`f76b5e1966afae7410524cf1504a6c780d01ccf133d4f2ca070c0c5a3ea66e02`와 원 runner41,300 bytes·
+SHA `19675d6c95637da452f87a69d8c69feac79f203edce00a9696b6cf7cf7ce454d`가 복원됨을 독립
+리뷰했다. 새 task와 opt-in branch의 실제 실행 성공을 이 정적 동일성으로 표시하지 않는다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

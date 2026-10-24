@@ -6,7 +6,8 @@ param(
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedSourceSha,
     [Parameter(Mandatory)][ValidateSet('windows-x64','linux-x64','macos-arm64')][string]$Target,
     [Parameter(Mandatory)][string]$Python,
-    [ValidatePattern('(?-i)^[0-9a-f]{40}$')][string]$ToolchainGeneration
+    [ValidatePattern('(?-i)^[0-9a-f]{40}$')][string]$ToolchainGeneration,
+    [switch]$DevelopmentJars
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,6 +16,7 @@ $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
 $pathComparison = if ($IsWindows) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
 $phase = 'preflight'
 $operation = 'managed_paths'
+$developmentClock = if ($DevelopmentJars) { [System.Diagnostics.Stopwatch]::StartNew() } else { $null }
 $testModules = @('provider-sdk', 'host-core', 'public-java-adapter', 'fabric-host',
     'definition-observer', 'fixture-legacy', 'fixture-provider')
 $tasks = @(':provider-sdk:test', ':host-core:test', ':public-java-adapter:test', ':fabric-host:compileJava', ':fabric-host:test',
@@ -257,6 +259,336 @@ function Export-TestSummary([string]$Module, [string]$ResultRoot) {
         passed=($totalTests -gt $totalSkipped -and $totalFailures -eq 0 -and $totalErrors -eq 0) }
     Write-NewJson (Join-Path $evidence "$Module-tests.json") $summary
     return $summary
+}
+
+# Development packaging consumes the completed verification in this same owned
+# invocation. None of these helpers writes the original verification record.
+function Assert-DevelopmentTime {
+    if ($null -eq $developmentClock -or $developmentClock.Elapsed.TotalSeconds -ge 1200) { throw 'DEVELOPMENT_JARS_DEADLINE' }
+}
+
+function Get-DevelopmentPin([string]$Path, [long]$Limit, $Failures, [switch]$AllowEmpty) {
+    Assert-DevelopmentTime
+    $full = Get-NativePath $Path $false
+    $before = [System.IO.FileInfo]::new($full)
+    $length = $before.Length; $modified = $before.LastWriteTimeUtc.Ticks; $created = $before.CreationTimeUtc.Ticks
+    if ($length -lt 0 -or (-not $AllowEmpty -and $length -eq 0) -or $length -gt $Limit) { throw 'DEVELOPMENT_FILE_BUDGET' }
+    $stream = $null; $hash = $null; $failure = $null; $pin = $null
+    try {
+        $stream = [System.IO.File]::Open($full, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        if ($stream.Length -ne $length) { throw 'DEVELOPMENT_FILE_SIZE_CHANGED' }
+        $hash = [System.Security.Cryptography.IncrementalHash]::CreateHash([System.Security.Cryptography.HashAlgorithmName]::SHA256)
+        $buffer = [byte[]]::new(65536); $observed = 0L
+        while ($true) {
+            Assert-DevelopmentTime
+            $count = $stream.Read($buffer, 0, [int][System.Math]::Min($buffer.Length, $length - $observed + 1))
+            if ($count -eq 0) { break }
+            $observed += $count
+            if ($observed -gt $length) { throw 'DEVELOPMENT_FILE_SIZE_CHANGED' }
+            $hash.AppendData($buffer, 0, $count)
+        }
+        $after = [System.IO.FileInfo]::new((Get-NativePath $full $false))
+        if ($observed -ne $length -or $stream.Length -ne $length -or $after.Length -ne $length -or
+            $after.LastWriteTimeUtc.Ticks -ne $modified -or $after.CreationTimeUtc.Ticks -ne $created) { throw 'DEVELOPMENT_FILE_CHANGED' }
+        $pin = [ordered]@{ bytes=$length; sha256=[System.Convert]::ToHexString($hash.GetHashAndReset()).ToLowerInvariant(); modified=$modified; created=$created }
+    } catch { $failure = $_ }
+    foreach ($resource in @(@{value=$hash; stage='development_hash_close'}, @{value=$stream; stage='development_stream_close'})) {
+        if ($null -eq $resource.value) { continue }
+        try { $resource.value.Dispose() } catch {
+            $Failures.Add((Get-SafeFailureRecord $_ $resource.stage))
+            if ($null -eq $failure) { $failure = $_ }
+        }
+    }
+    if ($null -ne $failure) { throw $failure }
+    return $pin
+}
+
+function Assert-DevelopmentPin($Expected, $Actual) {
+    foreach ($field in @('bytes','sha256','modified','created')) {
+        if ($Expected[$field] -cne $Actual[$field]) { throw 'DEVELOPMENT_SELECTED_INPUT_CHANGED' }
+    }
+}
+
+function Read-DevelopmentBytes([string]$Path, [int]$Limit, $Failures) {
+    $full = Get-NativePath $Path $false
+    $stream = $null; $failure = $null; $answer = $null
+    try {
+        $stream = [System.IO.File]::Open($full, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $length = $stream.Length
+        if ($length -lt 0 -or $length -gt $Limit) { throw 'DEVELOPMENT_METADATA_BUDGET' }
+        Get-NativePath $full $false | Out-Null
+        if ($stream.Length -ne $length) { throw 'DEVELOPMENT_METADATA_CHANGED' }
+        $answer = [byte[]]::new([int]$length); $observed = 0
+        while ($observed -lt $answer.Length) {
+            Assert-DevelopmentTime
+            $count = $stream.Read($answer, $observed, $answer.Length-$observed)
+            if ($count -le 0) { throw 'DEVELOPMENT_METADATA_CHANGED' }
+            $observed += $count
+        }
+        if ($stream.ReadByte() -ne -1 -or $stream.Length -ne $length) { throw 'DEVELOPMENT_METADATA_CHANGED' }
+    } catch { $failure = $_ }
+    if ($null -ne $stream) {
+        try { $stream.Dispose() } catch {
+            $Failures.Add((Get-SafeFailureRecord $_ 'development_metadata_close'))
+            if ($null -eq $failure) { $failure = $_ }
+        }
+    }
+    if ($null -ne $failure) { throw $failure }
+    return ,$answer
+}
+
+function Assert-DevelopmentSources($Inputs, $Failures) {
+    Assert-DevelopmentTime
+    $actual = @(& git -C $checkoutRoot rev-parse HEAD)
+    if ($LASTEXITCODE -ne 0 -or $actual.Count -ne 1 -or $actual[0] -cne $ExpectedSourceSha) { throw 'DEVELOPMENT_SOURCE_SHA_CHANGED' }
+    & git -C $checkoutRoot diff --quiet HEAD -- jvm contracts examples tests/example-index.json tests/digest-fixtures.json tools/bootstrap/jvm-ci.ps1 tools/bootstrap/jvm-runtime-probe.ps1 tools/bootstrap/jvm-archive.py .github/workflows/jvm.yml tools/bootstrap/WindowsBootstrap.cs
+    if ($LASTEXITCODE -ne 0) { throw 'DEVELOPMENT_SOURCE_CHANGED' }
+    foreach ($input in $Inputs) {
+        $pin = Get-DevelopmentPin (Join-Path $checkoutRoot $input.path) 10MB $Failures -AllowEmpty
+        if ($pin.bytes -ne $input.bytes -or $pin.sha256 -cne $input.sha256) { throw 'DEVELOPMENT_SOURCE_INPUT_CHANGED' }
+    }
+}
+
+function Copy-DevelopmentJar([string]$Source, [string]$Destination, $Artifact, $Failures) {
+    $full = Get-NativePath $Source $false
+    $before = [System.IO.FileInfo]::new($full)
+    if ($before.Length -ne $Artifact.bytes -or $before.Length -le 0 -or $before.Length -gt 64MB) { throw 'DEVELOPMENT_JAR_BUDGET' }
+    $length = $before.Length; $modified = $before.LastWriteTimeUtc.Ticks; $created = $before.CreationTimeUtc.Ticks
+    $sourceStream = $null; $outputStream = $null; $hash = $null; $failure = $null; $observed = 0L
+    try {
+        $sourceStream = [System.IO.File]::Open($full, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        if ($sourceStream.Length -ne $length) { throw 'DEVELOPMENT_JAR_CHANGED' }
+        $outputStream = [System.IO.File]::Open($Destination, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $hash = [System.Security.Cryptography.IncrementalHash]::CreateHash([System.Security.Cryptography.HashAlgorithmName]::SHA256)
+        $buffer = [byte[]]::new(65536)
+        while ($true) {
+            Assert-DevelopmentTime
+            $count = $sourceStream.Read($buffer, 0, [int][System.Math]::Min($buffer.Length, $length-$observed+1))
+            if ($count -eq 0) { break }
+            $observed += $count
+            if ($observed -gt $length -or $observed -gt 64MB) { throw 'DEVELOPMENT_JAR_CHANGED' }
+            $hash.AppendData($buffer, 0, $count); $outputStream.Write($buffer, 0, $count)
+        }
+        $after = [System.IO.FileInfo]::new((Get-NativePath $full $false))
+        if ($observed -ne $length -or $sourceStream.Length -ne $length -or $after.Length -ne $length -or
+            $after.LastWriteTimeUtc.Ticks -ne $modified -or $after.CreationTimeUtc.Ticks -ne $created -or
+            [System.Convert]::ToHexString($hash.GetHashAndReset()).ToLowerInvariant() -cne $Artifact.sha256) { throw 'DEVELOPMENT_JAR_CHANGED' }
+        $outputStream.Flush($true)
+    } catch { $failure = $_ }
+    foreach ($resource in @(@{value=$hash;stage='development_copy_hash_close'}, @{value=$outputStream;stage='development_copy_output_close'}, @{value=$sourceStream;stage='development_copy_input_close'})) {
+        if ($null -eq $resource.value) { continue }
+        try { $resource.value.Dispose() } catch {
+            $Failures.Add((Get-SafeFailureRecord $_ $resource.stage))
+            if ($null -eq $failure) { $failure = $_ }
+        }
+    }
+    if ($null -ne $failure) { throw $failure }
+    $copied = Get-DevelopmentPin $Destination 64MB $Failures
+    if ($copied.bytes -ne $Artifact.bytes -or $copied.sha256 -cne $Artifact.sha256) { throw 'DEVELOPMENT_JAR_COPY_CHANGED' }
+    return $copied
+}
+
+function Write-DevelopmentResult([string]$Root, $Value, $Failures) {
+    $raw = $utf8.GetBytes((ConvertTo-Json -InputObject $Value -Depth 12 -Compress))
+    if ($raw.Length -gt 65536) { throw 'DEVELOPMENT_RESULT_BUDGET' }
+    $pending = Join-Path $Root 'development-jars-result.pending.json'
+    $stream = $null; $failure = $null
+    try {
+        $stream = [System.IO.File]::Open($pending, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $stream.Write($raw,0,$raw.Length); $stream.Flush($true)
+    } catch { $failure = $_ }
+    if ($null -ne $stream) {
+        try { $stream.Dispose() } catch {
+            $Failures.Add((Get-SafeFailureRecord $_ 'development_result_stream_close'))
+            if ($null -eq $failure) { $failure = $_ }
+        }
+    }
+    if ($null -ne $failure) { throw $failure }
+    $pin = Get-DevelopmentPin $pending 65536 $Failures
+    if ($pin.bytes -ne $raw.Length -or $pin.sha256 -cne [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($raw)).ToLowerInvariant()) { throw 'DEVELOPMENT_RESULT_CHANGED' }
+    # Publish only the fully written, closed and verified record. Failure keeps
+    # the pending evidence; no failed export publishes a provisional success.
+    [System.IO.File]::Move($pending, (Join-Path $Root 'development-jars-result.json'))
+}
+
+function Invoke-DevelopmentJars {
+    $savedPhase = $phase; $savedOperation = $operation
+    $failures = [System.Collections.Generic.List[object]]::new()
+    $package = [ordered]@{ schema='mmmm-jvm-development-jars-result/1'; scope='development'; source_sha=$ExpectedSourceSha;
+        target=$Target; status='not_run'; phase='preflight'; gradle_exit=$null; source_post_checked=$false;
+        selected_files_post_checked=$false; product_proof_issued=$false; source_admission_granted=$false;
+        sdk_public_format_verified=$false; game_verification='not_run'; release_verification='not_run';
+        artifacts=@(); failure_details=@(); whole_toolchain_image_verified=$false }
+    $packageRoot = $null; $success = $false
+    try {
+        $phase = 'development_jars'; $operation = 'development_preflight'
+        Assert-DevelopmentTime
+        $packageRootPath = Join-Path $evidence 'development-jars'
+        if (Test-Path -LiteralPath $packageRootPath) { throw 'DEVELOPMENT_OUTPUT_ALREADY_EXISTS' }
+        $packageRoot = Get-NativePath (New-PhysicalDirectory $packageRootPath) $true
+        if (-not (Is-Inside $packageRoot $evidence) -or (Is-Inside $packageRoot $slot) -or (Is-Inside $packageRoot $checkoutRoot)) { throw 'DEVELOPMENT_OUTPUT_BOUNDARY' }
+        $verificationPin = Get-DevelopmentPin (Join-Path $evidence 'jvm-result.json') 1MB $failures
+        $package.verification_result_sha256 = $verificationPin.sha256
+        $package.source_inputs_sha256 = $record.source_inputs_sha256
+        $package.toolchain_generation = $generation
+        Assert-DevelopmentSources $inputRecords $failures
+        $selected = [ordered]@{ java=$java; jdk_release=$releaseFile; jdk_modules=(Join-Path $javaHome 'lib/modules');
+            gradle_main=$gradleMain; gradle_agent=$gradleAgent; helper=$PSCommandPath }
+        $selected['jdk_vm'] = Join-Path $javaHome $(if ($IsWindows) { 'bin/server/jvm.dll' } elseif ($IsMacOS) { 'lib/server/libjvm.dylib' } else { 'lib/server/libjvm.so' })
+        foreach ($profile in $profiles) { $selected['archive_'+$profile.name] = Join-Path $toolchains $profile.file }
+        $pins = [ordered]@{}
+        foreach ($name in $selected.Keys) { $pins[$name] = Get-DevelopmentPin $selected[$name] 512MB $failures }
+        if ($pins.gradle_agent.sha256 -cne $agentPin.sha256 -or $pins.gradle_agent.bytes -ne $agentPin.bytes) { throw 'DEVELOPMENT_AGENT_BINDING_CHANGED' }
+        if ($pins.jdk_release.sha256 -cne $record.jdk_release_sha256) { throw 'DEVELOPMENT_JDK_RELEASE_CHANGED' }
+        foreach ($profile in $profiles) {
+            if ($pins['archive_'+$profile.name].sha256 -cne $profile.sha) { throw 'DEVELOPMENT_ARCHIVE_PIN_CHANGED' }
+        }
+        $package.selected_files_before = $pins
+        $packageInit = Join-Path $scratch 'jvm-development-jars.init.gradle'
+        $packageInitText = @'
+import groovy.json.JsonOutput
+def output = new File(System.getProperty('mmmm.developmentJars.evidence'))
+def sourceSha = System.getProperty('mmmm.ci.sourceSha')
+def target = System.getProperty('mmmm.developmentJars.target')
+def expectedNumeric = __MMMM_FIXED_NUMERIC_ARGS__
+def actualArgs = java.lang.management.ManagementFactory.runtimeMXBean.inputArguments
+if (actualArgs.size() > 64 || actualArgs.any { it.getBytes('UTF-8').length > 4096 } || actualArgs.sum { it.getBytes('UTF-8').length } > 16384) throw new GradleException('DEVELOPMENT_VM_ARGUMENT_BUDGET')
+def numeric = actualArgs.findAll { it.startsWith('-Xms') || it.startsWith('-Xmx') || it.startsWith('-XX:MaxMetaspaceSize=') }
+def facts = [schema:'mmmm-jvm-development-build-vm/1', source_sha:sourceSha, target:target,
+    gradle_version:org.gradle.util.GradleVersion.current().version, max_heap_bytes:Runtime.runtime.maxMemory(),
+    input_argument_count:actualArgs.size(), fixed_numeric_arg_shape_matches:numeric.size() == expectedNumeric.size() && expectedNumeric.every { expected -> numeric.count { it == expected } == 1 },
+    file_encoding_utf8:java.nio.charset.Charset.defaultCharset().name() == 'UTF-8']
+def bytes = JsonOutput.toJson(facts).getBytes('UTF-8')
+if (bytes.length > 2048) throw new GradleException('DEVELOPMENT_VM_FACT_BUDGET')
+java.nio.file.Files.newOutputStream(new File(output,'development-jars-build-vm.json').toPath(),java.nio.file.StandardOpenOption.CREATE_NEW,java.nio.file.StandardOpenOption.WRITE).withCloseable { it.write(bytes) }
+def events = new File(output,'development-jars-task-events.ndjson')
+int count = 0
+gradle.taskGraph.afterTask { task, state ->
+    count++
+    if (count > 512) throw new GradleException('DEVELOPMENT_TASK_COUNT_BUDGET')
+    def status = state.failure != null ? 'failed' : state.noSource ? 'no_source' : state.upToDate ? 'up_to_date' : state.skipped ? 'skipped' : state.didWork ? 'executed' : 'no_work'
+    def line = JsonOutput.toJson([source_sha:sourceSha,target:target,task:task.path,status:status]) + '\n'
+    if (line.getBytes('UTF-8').length > 4096 || events.length()+line.getBytes('UTF-8').length > 65536) throw new GradleException('DEVELOPMENT_TASK_EVENT_BUDGET')
+    events.append(line,'UTF-8')
+}
+'@
+        $packageInitText = $packageInitText.Replace('__MMMM_FIXED_NUMERIC_ARGS__', (ConvertTo-Json -InputObject $numericArgs -Compress))
+        $initStream = $null; $initFailure = $null
+        try {
+            $initStream = [System.IO.File]::Open($packageInit, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            $initBytes = $utf8.GetBytes($packageInitText)
+            if ($initBytes.Length -gt 65536) { throw 'DEVELOPMENT_INIT_BUDGET' }
+            $initStream.Write($initBytes,0,$initBytes.Length); $initStream.Flush($true)
+        } catch { $initFailure = $_ }
+        if ($null -ne $initStream) {
+            try { $initStream.Dispose() } catch {
+                $failures.Add((Get-SafeFailureRecord $_ 'development_init_stream_close'))
+                if ($null -eq $initFailure) { $initFailure = $_ }
+            }
+        }
+        if ($null -ne $initFailure) { throw $initFailure }
+        $packageInitPin = Get-DevelopmentPin $packageInit 64KB $failures
+        $package.init_script_sha256 = $packageInitPin.sha256
+        $operation = 'development_gradle_launch'; $package.phase = 'gradle_tasks'
+        $packageArguments = $fixedJvmArgs + @("-javaagent:$gradleAgent",'-cp',$gradleMain,'org.gradle.launcher.GradleMain',
+            '--project-dir',(Join-Path $checkoutRoot 'jvm'),'--project-cache-dir',$projectCache,'--init-script',$packageInit,
+            '--console=plain','--no-daemon','--no-parallel','--max-workers=2','--no-build-cache','--no-configuration-cache','--rerun-tasks',
+            "-Dmmmm.ci.sourceSha=$ExpectedSourceSha","-Dmmmm.developmentJars.target=$Target","-Dmmmm.developmentJars.evidence=$packageRoot",
+            '-Dorg.gradle.java.installations.auto-download=false','-Dorg.gradle.java.installations.auto-detect=false',
+            "-Dorg.gradle.java.installations.paths=$javaHome","-Dorg.gradle.jvmargs=$buildJvmArgs",':mmmmDevelopmentJars')
+        # Gradle text remains console output; it must not become this function's
+        # success return value or an artifact selection input.
+        & $java @packageArguments | ForEach-Object { [System.Console]::Out.WriteLine([string]$_) }
+        $package.gradle_exit = $LASTEXITCODE
+        Assert-DevelopmentTime
+        $operation = 'development_postcheck'; $package.phase = 'postcheck'
+        Assert-DevelopmentSources $inputRecords $failures
+        $package.source_post_checked = $true
+        foreach ($name in $selected.Keys) { Assert-DevelopmentPin $pins[$name] (Get-DevelopmentPin $selected[$name] 512MB $failures) }
+        $package.selected_files_post_checked = $true
+        Assert-DevelopmentPin $packageInitPin (Get-DevelopmentPin $packageInit 64KB $failures)
+        Assert-DevelopmentPin $verificationPin (Get-DevelopmentPin (Join-Path $evidence 'jvm-result.json') 1MB $failures)
+        if ($package.gradle_exit -ne 0) { throw 'DEVELOPMENT_GRADLE_FAILED' }
+        $vm = ConvertFrom-Json -InputObject ($utf8.GetString((Read-DevelopmentBytes (Join-Path $packageRoot 'development-jars-build-vm.json') 2048 $failures))) -NoEnumerate
+        if ($vm -isnot [System.Management.Automation.PSCustomObject] -or $vm.schema -isnot [string] -or $vm.schema -cne 'mmmm-jvm-development-build-vm/1' -or
+            $vm.source_sha -isnot [string] -or $vm.source_sha -cne $ExpectedSourceSha -or $vm.target -isnot [string] -or $vm.target -cne $Target -or
+            $vm.gradle_version -isnot [string] -or $vm.gradle_version -cne '9.6.0' -or
+            $vm.fixed_numeric_arg_shape_matches -isnot [bool] -or $vm.fixed_numeric_arg_shape_matches -ne $true -or
+            $vm.file_encoding_utf8 -isnot [bool] -or $vm.file_encoding_utf8 -ne $true -or
+            $vm.max_heap_bytes -isnot [long] -or $vm.input_argument_count -isnot [long] -or
+            $vm.max_heap_bytes -le 64MB -or $vm.max_heap_bytes -gt 1GB -or $vm.input_argument_count -lt 19 -or $vm.input_argument_count -gt 64) { throw 'DEVELOPMENT_VM_FACT_INVALID' }
+        $package.build_vm = $vm
+        $factsRaw = Read-DevelopmentBytes (Join-Path $packageRoot 'development-jars-artifacts.json') 65536 $failures
+        $package.archive_facts_sha256 = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($factsRaw)).ToLowerInvariant()
+        $factsPin = Get-DevelopmentPin (Join-Path $packageRoot 'development-jars-artifacts.json') 65536 $failures
+        if ($factsPin.sha256 -cne $package.archive_facts_sha256) { throw 'DEVELOPMENT_ARCHIVE_FACT_CHANGED' }
+        $facts = ConvertFrom-Json -InputObject ($utf8.GetString($factsRaw)) -NoEnumerate
+        if ($facts -isnot [System.Management.Automation.PSCustomObject] -or $facts.schema -isnot [string] -or $facts.schema -cne 'mmmm-development-jar-artifacts/1' -or
+            $facts.source_sha -isnot [string] -or $facts.source_sha -cne $ExpectedSourceSha -or $facts.target -isnot [string] -or $facts.target -cne $Target -or
+            $facts.development_only -isnot [bool] -or $facts.development_only -ne $true -or $facts.artifacts -isnot [array] -or @($facts.artifacts).Count -ne 3) { throw 'DEVELOPMENT_ARCHIVE_FACT_INVALID' }
+        $roles = @{fabric_host=':fabric-host';definition_observer=':definition-observer';provider_sdk=':provider-sdk'}
+        $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        $pathComparer = if ($IsWindows) { [System.StringComparer]::OrdinalIgnoreCase } else { [System.StringComparer]::Ordinal }
+        $paths = [System.Collections.Generic.HashSet[string]]::new($pathComparer)
+        $products = [System.Collections.Generic.List[object]]::new(); $total = 0L
+        $payloadRoot = Get-NativePath (New-PhysicalDirectory (Join-Path $packageRoot 'payloads')) $true
+        foreach ($artifact in $facts.artifacts) {
+            if ($artifact -isnot [System.Management.Automation.PSCustomObject] -or $artifact.role -isnot [string] -or
+                $artifact.role -cnotin @('fabric_host','definition_observer','provider_sdk') -or -not $seen.Add($artifact.role) -or
+                $artifact.project_path -isnot [string] -or $artifact.project_path -cne $roles[$artifact.role] -or
+                $artifact.task_path -isnot [string] -or $artifact.task_path -cnotmatch '^:[A-Za-z0-9_-]+:[A-Za-z0-9_-]+$' -or
+                $artifact.archive_extension -isnot [string] -or $artifact.archive_extension -cne 'jar' -or
+                $artifact.classifier -isnot [string] -or $artifact.classifier -cne '' -or
+                $artifact.producer_status -isnot [string] -or $artifact.producer_status -cne 'executed' -or
+                $artifact.bytes -isnot [long] -or $artifact.bytes -le 0 -or $artifact.bytes -gt 64MB -or $artifact.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+                $artifact.sha256 -isnot [string] -or $artifact.relative_path -isnot [string] -or
+                $artifact.relative_path -cnotmatch '^[A-Za-z0-9_./$+-]+[.]jar$' -or $artifact.relative_path.StartsWith('/') -or
+                $artifact.relative_path.Split('/') -contains '..' -or $artifact.relative_path.Split('/') -contains '.') { throw 'DEVELOPMENT_ARCHIVE_ROLE_INVALID' }
+            if ($artifact.role -cne 'fabric_host' -and $artifact.task_path -cne ($roles[$artifact.role]+':jar')) { throw 'DEVELOPMENT_EXACT_JAR_TASK_REQUIRED' }
+            if (-not $artifact.task_path.StartsWith($roles[$artifact.role]+':',[System.StringComparison]::Ordinal) -or
+                -not $artifact.relative_path.StartsWith($roles[$artifact.role].Substring(1)+'/',[System.StringComparison]::Ordinal)) { throw 'DEVELOPMENT_ARCHIVE_PROJECT_MISMATCH' }
+            $source = Get-NativePath (Join-Path $gradleBuild $artifact.relative_path) $false
+            if (-not (Is-Inside $source $gradleBuild) -or -not $paths.Add($source)) { throw 'DEVELOPMENT_ARCHIVE_PATH_INVALID' }
+            $total += $artifact.bytes
+            if ($total -gt 192MB) { throw 'DEVELOPMENT_ARCHIVE_AGGREGATE_BUDGET' }
+            $roleRoot = Get-NativePath (New-PhysicalDirectory (Join-Path $payloadRoot $artifact.role)) $true
+            $name = [System.IO.Path]::GetFileName($source)
+            $copy = Copy-DevelopmentJar $source (Join-Path $roleRoot $name) $artifact $failures
+            $products.Add([ordered]@{role=$artifact.role;producer_task=$artifact.task_path;path=('payloads/'+$artifact.role+'/'+$name);bytes=$copy.bytes;sha256=$copy.sha256})
+        }
+        if ($seen.Count -ne 3) { throw 'DEVELOPMENT_ARCHIVE_ROLES_INCOMPLETE' }
+        $package.artifacts = $products.ToArray()
+        $package.task_events_sha256 = (Get-DevelopmentPin (Join-Path $packageRoot 'development-jars-task-events.ndjson') 65536 $failures).sha256
+        Assert-DevelopmentSources $inputRecords $failures
+        foreach ($name in $selected.Keys) { Assert-DevelopmentPin $pins[$name] (Get-DevelopmentPin $selected[$name] 512MB $failures) }
+        Assert-DevelopmentPin $packageInitPin (Get-DevelopmentPin $packageInit 64KB $failures)
+        Assert-DevelopmentPin $verificationPin (Get-DevelopmentPin (Join-Path $evidence 'jvm-result.json') 1MB $failures)
+        Assert-DevelopmentPin $factsPin (Get-DevelopmentPin (Join-Path $packageRoot 'development-jars-artifacts.json') 65536 $failures)
+        $package.phase = 'complete'; $package.status = 'passed'; $success = $true
+    } catch {
+        $package.status = 'failed'; $package.failure_details = @((Get-SafeFailureRecord $_ $operation))
+        [System.Console]::Error.WriteLine('DEVELOPMENT_JARS_FAILED')
+        $primaryJson = ConvertTo-Json -InputObject $package.failure_details[0] -Depth 8 -Compress
+        if ($utf8.GetByteCount($primaryJson) -le 4096) { [System.Console]::Error.WriteLine($primaryJson) }
+    } finally {
+        $package.failure_details += $failures.ToArray()
+        if ($null -ne $packageRoot) {
+            $exportFailureStart = $failures.Count
+            try { Write-DevelopmentResult $packageRoot $package $failures }
+            catch {
+                $success = $false
+                [System.Console]::Error.WriteLine('DEVELOPMENT_JARS_RESULT_EXPORT_FAILED')
+                $failureBytes = $utf8.GetBytes((ConvertTo-Json -InputObject (Get-SafeFailureRecord $_ 'development_result_export') -Depth 8 -Compress))
+                if ($failureBytes.Length -le 4096) { [System.Console]::Error.WriteLine($utf8.GetString($failureBytes)) }
+                for ($index = $exportFailureStart; $index -lt [System.Math]::Min($failures.Count,$exportFailureStart+8); $index++) {
+                    $secondary = ConvertTo-Json -InputObject $failures[$index] -Depth 8 -Compress
+                    if ($utf8.GetByteCount($secondary) -le 4096) { [System.Console]::Error.WriteLine($secondary) }
+                }
+            }
+        }
+        $phase = $savedPhase; $operation = $savedOperation
+    }
+    return $success
 }
 
 try {
@@ -533,6 +865,7 @@ gradle.taskGraph.afterTask { task, state ->
     $record.phase = $phase
     Write-NewJson (Join-Path $evidence 'jvm-result.json') $record 1MB
     if ($record.status -cne 'passed') { exit 1 }
+    if ($DevelopmentJars -and -not (Invoke-DevelopmentJars)) { exit 1 }
     exit 0
 } catch {
     $jvmFailure = $_

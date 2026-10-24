@@ -6,6 +6,12 @@ on:
   push:
     branches: [develop, main]
   workflow_dispatch:
+    inputs:
+      development_jars:
+        description: Build development JARs after the existing JVM verification
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -175,6 +181,7 @@ jobs:
         env:
           EXPECTED_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           MATRIX_TARGET: ${{ matrix.target }}
+          DEVELOPMENT_JARS: ${{ github.event_name == 'workflow_dispatch' && inputs.development_jars && 'true' || 'false' }}
         run: |
           $ErrorActionPreference = 'Stop'
           $pythonName = if ($IsWindows) { 'python' } else { 'python3' }
@@ -193,8 +200,11 @@ jobs:
           if ($probeBytes.Length -gt 16384) { throw 'Runtime probe evidence exceeded its fixed budget.' }
           $probeStream = [System.IO.File]::Open((Join-Path $evidence 'jvm-runtime-outside.json'), [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
           try { $probeStream.Write($probeBytes, 0, $probeBytes.Length); $probeStream.Flush($true) } finally { $probeStream.Dispose() }
-          & $env:MMMM_XTASK run --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root (Join-Path $env:MMMM_EVIDENCE_ROOT 'managed') --purpose jvm --timeout-seconds 1200 --owned-tail-policy terminate-build -- $pwsh -NoProfile -File (Join-Path $env:GITHUB_WORKSPACE 'tools/bootstrap/jvm-ci.ps1') -Checkout $env:GITHUB_WORKSPACE -EvidenceRoot $evidence -ExpectedSourceSha $env:EXPECTED_SOURCE_SHA -Target $env:MATRIX_TARGET -Python $python
+          $jvmArguments = @('run', '--checkout', $env:GITHUB_WORKSPACE, '--output-root', $env:MMMM_OUTPUT_ROOT, '--evidence-root', (Join-Path $env:MMMM_EVIDENCE_ROOT 'managed'), '--purpose', 'jvm', '--timeout-seconds', '1200', '--owned-tail-policy', 'terminate-build', '--', $pwsh, '-NoProfile', '-File', (Join-Path $env:GITHUB_WORKSPACE 'tools/bootstrap/jvm-ci.ps1'), '-Checkout', $env:GITHUB_WORKSPACE, '-EvidenceRoot', $evidence, '-ExpectedSourceSha', $env:EXPECTED_SOURCE_SHA, '-Target', $env:MATRIX_TARGET, '-Python', $python)
+          if ($env:DEVELOPMENT_JARS -ceq 'true') { $jvmArguments += '-DevelopmentJars' }
+          & $env:MMMM_XTASK @jvmArguments
           $managedExit = $LASTEXITCODE
+          "managed_exit=$managedExit" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
           if ($managedExit -ne 0) { throw 'Managed JVM verification failed. Exported individual outcomes remain separate.' }
           $result = Get-Content -LiteralPath (Join-Path $evidence 'jvm-result.json') -Raw | ConvertFrom-Json
           if ($result.schema -cne 'mmmm-jvm-ci-result/1' -or $result.source_sha -cne $env:EXPECTED_SOURCE_SHA -or $result.status -cne 'passed' -or $result.gradle_exit -ne 0) { throw 'JVM verification result does not establish success for this source.' }
@@ -223,18 +233,130 @@ jobs:
           RUST_OUTCOME: ${{ steps.rust.outcome }}
           BOOTSTRAP_OUTCOME: ${{ steps.bootstrap.outcome }}
           VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          MANAGED_JVM_EXIT: ${{ steps.verify.outputs.managed_exit || '' }}
           OBSERVER_OUTCOME: ${{ steps.observer.outcome }}
+          EXPECTED_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          MATRIX_TARGET: ${{ matrix.target }}
+          DEVELOPMENT_JARS: ${{ github.event_name == 'workflow_dispatch' && inputs.development_jars && 'true' || 'false' }}
         run: |
           $ErrorActionPreference = 'Stop'
           $evidence = Join-Path $env:RUNNER_TEMP 'MMMM/evidence/jvm'
           [System.IO.Directory]::CreateDirectory($evidence) | Out-Null
+          function Assert-PhysicalEvidenceFile([string]$Path) {
+            $fullPath = [System.IO.Path]::GetFullPath($Path)
+            $volumeRoot = [System.IO.Path]::GetPathRoot($fullPath)
+            $cursor = $volumeRoot
+            $segments = @($fullPath.Substring($volumeRoot.Length) -split '[/\\]' | Where-Object { $_.Length -gt 0 })
+            for ($index = 0; $index -lt $segments.Count; $index++) {
+              $cursor = Join-Path $cursor $segments[$index]
+              $item = Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
+              if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $null -ne $item.LinkTarget) { throw 'Evidence path contains a link or reparse point.' }
+              if ($index -eq $segments.Count - 1) {
+                if ($item -isnot [System.IO.FileInfo] -or ($item.Attributes -band [System.IO.FileAttributes]::Device) -ne 0) { throw 'Evidence result is not a physical regular file.' }
+              } elseif ($item -isnot [System.IO.DirectoryInfo]) { throw 'Evidence ancestor is not a physical directory.' }
+            }
+          }
+          function Read-BoundedResult([string]$RelativePath) {
+            $read = [ordered]@{ state = 'missing'; bytes = $null; sha256 = $null; error_type = $null; cleanup_error_type = $null; value = $null }
+            $stream = $null
+            try {
+              $limit = if ($RelativePath -ceq 'verification/jvm-result.json') { 1048576 } elseif ($RelativePath -ceq 'verification/development-jars/development-jars-result.json') { 65536 } else { throw 'Unknown workflow result path.' }
+              $root = [System.IO.Path]::GetFullPath($evidence)
+              $path = [System.IO.Path]::GetFullPath((Join-Path $root $RelativePath))
+              $comparison = if ($IsWindows) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
+              if (-not $path.StartsWith(($root.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar), $comparison)) { throw 'Workflow result leaves the evidence root.' }
+              Assert-PhysicalEvidenceFile $path
+              $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+              $length = $stream.Length
+              if ($length -lt 1 -or $length -gt $limit) { throw 'Workflow result exceeds its fixed read budget.' }
+              Assert-PhysicalEvidenceFile $path
+              $bytes = [byte[]]::new([int]$length)
+              $offset = 0
+              while ($offset -lt $bytes.Length) {
+                $count = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+                if ($count -eq 0) { throw 'Workflow result ended during its bounded read.' }
+                $offset += $count
+              }
+              if ($stream.ReadByte() -ne -1 -or $stream.Length -ne $bytes.Length) { throw 'Workflow result changed during its bounded read.' }
+              Assert-PhysicalEvidenceFile $path
+              $read.bytes = $bytes.Length
+              $read.sha256 = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+              $value = [System.Text.UTF8Encoding]::new($false, $true).GetString($bytes) | ConvertFrom-Json -Depth 16 -NoEnumerate
+              if ($value -isnot [pscustomobject]) { throw 'Workflow result must be a JSON object.' }
+              $read.value = $value
+              $read.state = 'read'
+            } catch [System.Management.Automation.ItemNotFoundException] {
+              $read.state = 'missing'
+              $read.error_type = $_.Exception.GetType().FullName
+            } catch {
+              $read.state = 'invalid'
+              $read.error_type = $_.Exception.GetType().FullName
+            } finally {
+              if ($null -ne $stream) {
+                try { $stream.Dispose() } catch {
+                  $read.state = 'invalid'
+                  $read.cleanup_error_type = $_.Exception.GetType().FullName
+                  $read.value = $null
+                }
+              }
+            }
+            return $read
+          }
+          $managedStatus = 'not_run'
+          $managedExitValue = $null
+          if ($env:MANAGED_JVM_EXIT -ne '') {
+            $exitValue = 0
+            if ($env:MANAGED_JVM_EXIT -cmatch '^-?[0-9]{1,10}$' -and [int]::TryParse($env:MANAGED_JVM_EXIT, [ref]$exitValue)) {
+              $managedExitValue = $exitValue
+              $managedStatus = if ($exitValue -eq 0) { 'succeeded' } else { 'failed' }
+            } else { $managedStatus = 'failed' }
+          }
+          $identityValid = $env:EXPECTED_SOURCE_SHA -cmatch '^[0-9a-f]{40}$' -and $env:MATRIX_TARGET -cin @('windows-x64', 'linux-x64', 'macos-arm64')
+          $jvmRead = Read-BoundedResult 'verification/jvm-result.json'
+          $actualJvm = 'not_run'
+          if ($jvmRead.state -ceq 'read') {
+            $result = $jvmRead.value
+            $stringsValid = $true
+            foreach ($property in @('schema', 'source_sha', 'target', 'status')) { if ($result.$property -isnot [string]) { $stringsValid = $false } }
+            if (-not $identityValid -or -not $stringsValid -or $result.schema -cne 'mmmm-jvm-ci-result/1' -or $result.source_sha -cne $env:EXPECTED_SOURCE_SHA -or $result.target -cne $env:MATRIX_TARGET -or $result.status -cnotin @('passed', 'failed')) {
+              $jvmRead.state = 'invalid'
+            } else {
+              $jvmRead.state = 'valid'
+              $actualJvm = if ($result.status -ceq 'passed' -and ($result.gradle_exit -is [int] -or $result.gradle_exit -is [long]) -and $result.gradle_exit -eq 0) { 'succeeded' } else { 'failed' }
+            }
+          }
+          if ($jvmRead.state -ceq 'invalid') { $actualJvm = 'failed' }
+          $developmentRequested = $env:DEVELOPMENT_JARS -ceq 'true'
+          $developmentRead = [ordered]@{ state = 'not_requested'; bytes = $null; sha256 = $null; error_type = $null; cleanup_error_type = $null; value = $null }
+          $developmentStatus = 'not_run'
+          if ($developmentRequested) {
+            $developmentRead = Read-BoundedResult 'verification/development-jars/development-jars-result.json'
+            if ($developmentRead.state -ceq 'read') {
+              $result = $developmentRead.value
+              $stringsValid = $true
+              foreach ($property in @('schema', 'scope', 'source_sha', 'target', 'status', 'game_verification', 'release_verification')) { if ($result.$property -isnot [string]) { $stringsValid = $false } }
+              if (-not $identityValid -or -not $stringsValid -or $result.schema -cne 'mmmm-jvm-development-jars-result/1' -or $result.scope -cne 'development' -or $result.source_sha -cne $env:EXPECTED_SOURCE_SHA -or $result.target -cne $env:MATRIX_TARGET -or $result.status -cnotin @('passed', 'failed') -or $result.product_proof_issued -isnot [bool] -or $result.product_proof_issued -ne $false -or $result.source_admission_granted -isnot [bool] -or $result.source_admission_granted -ne $false -or $result.game_verification -cne 'not_run' -or $result.release_verification -cne 'not_run') {
+                $developmentRead.state = 'invalid'
+              } else {
+                $developmentRead.state = 'valid'
+                $developmentStatus = if ($result.status -ceq 'passed' -and $actualJvm -ceq 'succeeded') { 'succeeded' } else { 'failed' }
+              }
+            }
+            if ($developmentRead.state -ceq 'invalid') { $developmentStatus = 'failed' }
+          }
           $record = [ordered]@{
             schema = 'mmmm-jvm-workflow-outcomes/1'; source = $env:SOURCE_OUTCOME; rust_install = $env:RUST_OUTCOME;
+            source_sha = $env:EXPECTED_SOURCE_SHA; target = $env:MATRIX_TARGET; result_identity_valid = $identityValid;
             bootstrap = $env:BOOTSTRAP_OUTCOME; jvm_verification = $env:VERIFY_OUTCOME;
             observer_verification = $env:OBSERVER_OUTCOME;
+            jvm_managed_command_outcome = $managedStatus; jvm_managed_command_exit = $managedExitValue;
+            actual_jvm_verification = [ordered]@{ status = $actualJvm; result_state = $jvmRead.state; bytes = $jvmRead.bytes; sha256 = $jvmRead.sha256; error_type = $jvmRead.error_type; cleanup_error_type = $jvmRead.cleanup_error_type };
+            development_jars_requested = $developmentRequested;
+            development_jars = [ordered]@{ status = $developmentStatus; result_state = $developmentRead.state; bytes = $developmentRead.bytes; sha256 = $developmentRead.sha256; error_type = $developmentRead.error_type; cleanup_error_type = $developmentRead.cleanup_error_type };
             game_verification = 'not_run'; release_verification = 'not_run'
           }
-          $record | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $evidence 'workflow-outcomes.json') -Encoding utf8NoBOM
+          $record | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $evidence 'workflow-outcomes.json') -Encoding utf8NoBOM
+          if ($env:VERIFY_OUTCOME -ceq 'success' -and ($managedStatus -cne 'succeeded' -or $actualJvm -cne 'succeeded' -or ($developmentRequested -and $developmentStatus -cne 'succeeded'))) { throw 'Managed command success lacks matching valid result evidence.' }
 
       - name: Export JVM evidence
         if: always()
