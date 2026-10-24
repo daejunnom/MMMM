@@ -3659,6 +3659,63 @@ Windows667은 의도한9개 파일만 stage한 index에서554 files·정책 blob
 command0·정상 drain/export/scratch 제거/lease 해제를 확인했다. 관련 없는 dirty source,
 보호된 미추적 초안과 다른 worktree는 포함하거나 정리하지 않았다.
 
+### Rust117의 실제 결과와 Linux 미완결 관측
+
+고정 `81760407499f89adf2861a1cf4efe23886198b26`의
+[Rust117](https://github.com/daejunnom/MMMM/actions/runs/40067805126)은 3OS test step이
+성공했으나 strict·집계가 실패했다. Linux 원 ZIP88,868 bytes·SHA
+`0e8b125043f7ba74e8f6a5732e47665497e4eb6e6acf9a327211819769e8b254`를 API와 대조했다.
+새 planning method/role, Darwin confirmation과 실패 capture, 작은 walk 진단·원 lease 보존
+검사의 실제 ok를 확인했다. Coordinator420·tool library270 PASS와 기존 tool ignored4를
+구분한다. Linux strict의 실제 오류는 `LeaderObservation::Pending(LeaderDiagnostic)`의
+224-byte `large_enum_variant`다. 다른 OS의 strict 실패는 관측했으나 원 진단을 동일하다고
+추정하지 않는다. 후속 소스는 confirmation을 닫힌 Copy enum으로 저장하고 기존5-field
+JSON/Display를 같은 projection으로 보존한다. 사실 삭제·boxing·광역 lint 허용은 하지
+않는다. 기존 inline 검사에 8/200-byte 경계와 None/false/전체u32 projection을 보강했으며,
+새 레이아웃의 실제 크기·strict 성공은 후속 검증 대상이다.
+
+같은 입력의 [JVM111](https://github.com/daejunnom/MMMM/actions/runs/40067805311)은 Windows·
+macOS가 성공하고 Linux·집계가 실패했다. Linux 원 JVM 검증은 passed였지만 header-managed
+감독은1,276 ms에 RSS rollup open ESRCH·같은 원 identity의 R1·pidfd not_ready를 관측해
+observation_failure/signal9/command_exit null이 됐다. peak RSS294,178,816 bytes이며
+timeout/OOM으로 재분류하지 않는다. native build passed·definition startup not_run을
+보존한다. 원 ZIP11,609,146 bytes·SHA
+`df7c9786809f180d4e7b97e3af6f5e8e1410cbe1f511e0c4c4f392dd5dae3fe7`와 source를 대조했다.
+새 diagnostic 보존은 원 empty capture 두 개의 길이/digest와 preserved를 기록했고, 이후
+독립 storage observed·drain/export와 scratch 제거·lease 해제도 확인했다. 이 보존 성공은
+원 command·observer 검증 성공이 아니다. 원 실패를 재실행해 대체하지 않았다.
+
+후속 Linux 소스는 기존 owned member의 양쪽 native stat이 R1·PF_EXITING이며 전체
+PID/start/group/session이 원본과 같고, 현재 leader reservation·실제 bound whole-group
+pidfd의 정확한 NotReady·Open ESRCH가 확인된 경우만 추가로 검사한다. 보유 member와
+leader의 directory/stat 네 File의 실제 inode owner metadata를 geteuid 전후값과 대조한다.
+leader File 누락·불일치·오류는 최초 RSS 오류를 유지한 채 실패한다. reserved leader와
+새 enumerated candidate는 이 분기를 사용할 수 없다. raw UID/flags/PID/path는 진단에
+출력하지 않고 flags는 엄격한 unsigned u32 범위로 읽어 필요한 boolean만 보존한다.
+
+새 분기는 기존 Pending으로 미완결 RSS를 보유할 뿐이다. live=true·rss=None과 두 관측의 VM
+최댓값을 유지하며 RSS0·exit·complete·drain을 발급하지 않는다. 마지막 실제 complete부터
+1,000 ms·prior complete 부재 시 실패·원래 deadline/cancel·재관측 주기·완료 차단과 기존
+Z2/Z3/Z4/leader 정책은 바꾸지 않는다. 순수 조건 검사와 실제 native cfg·기존 fixture를
+보강했으며 새 분기의 실행 성공이나 과거110/111의 해결을 아직 주장하지 않는다.
+
+근거는 Linux v6.8의 [proc stat field9](https://github.com/torvalds/linux/blob/v6.8/fs/proc/array.c),
+[PF_EXITING 정의](https://github.com/torvalds/linux/blob/v6.8/include/linux/sched.h),
+[종료 처리](https://github.com/torvalds/linux/blob/v6.8/kernel/exit.c)와
+[whole-group pidfd](https://github.com/torvalds/linux/blob/v6.8/kernel/fork.c)다. state/flags는
+원자적 snapshot이 아니며, 해당 버전의 no-mm는 smaps_rollup open 성공 뒤 read ESRCH일 수
+있어 이번 open ESRCH의 원인을 exit_mm로 단정하지 않는다. 정확한 CI kernel release와
+과거 flags도 미기록이므로 원 실패가 새 분기에 해당했는지는 미확정이다.
+
+Windows668은 외부에 고정한 Rust4개를 빈 owned cwd의 stdin으로 포맷하고 사후 hash를
+확인했다. after manifest SHA는
+`26915a8cd5c2d1539c1402c3940b8399838b786ea2a98bd5ba22f8cccec7c850`이며 command0·정상
+drain/export/scratch 제거/lease 해제다. 원 source·helper·manifest와 실패 CI 자료는 별도
+보존한다. 실제 새 layout·Pending 분기와 전체 strict/게임 성공은 후속 검증으로 구분한다.
+Windows669는 의도한5개 staged 파일의 index554 files·정책 blob1·violations0과 command0·
+정상 drain/export/scratch 제거/lease 해제를 확인했다. 사후 source4개 hash와 index/worktree
+blob5개 일치·추가 줄의 공개 경로 정책·diff check도 확인했으며 다른 변경은 포함하지 않았다.
+
 ### PACK 본문 증명의 다음 연결
 
 실제 instantiation Mixin은 Sponge `@Redirect`이며 원 instantiate 호출을 감싸는 handler와

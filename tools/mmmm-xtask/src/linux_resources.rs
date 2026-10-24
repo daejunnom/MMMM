@@ -105,6 +105,7 @@ struct Stat {
     state: u8,
     threads: u64,
     virtual_bytes: u64,
+    exiting: bool,
 }
 
 impl Stat {
@@ -188,10 +189,12 @@ pub(super) struct StatDiagnostic {
     role: ProcessRole,
     before_state: Option<StatState>,
     before_threads: Option<u64>,
+    before_exiting: Option<bool>,
     before_original_identity_match: Option<bool>,
     before_identity_matches: Option<IdentityMatches>,
     after_state: Option<StatState>,
     after_threads: Option<u64>,
+    after_exiting: Option<bool>,
     after_original_identity_match: Option<bool>,
     after_identity_matches: Option<IdentityMatches>,
     after_group_detached_sentinel: Option<bool>,
@@ -199,6 +202,7 @@ pub(super) struct StatDiagnostic {
     pidfd_binding: PidfdBindingState,
     pidfd_binding_observation: Option<PidfdDiagnostic>,
     pidfd_terminal_observation: Option<PidfdDiagnostic>,
+    pending_owner_uid_match: Option<bool>,
 }
 
 impl StatDiagnostic {
@@ -213,11 +217,13 @@ impl StatDiagnostic {
             role,
             before_state: before.and_then(|stat| StatState::observed(stat.state)),
             before_threads: before.map(|stat| stat.threads),
+            before_exiting: before.map(|stat| stat.exiting),
             before_original_identity_match: before.map(|stat| stat.identity == original),
             before_identity_matches: before
                 .map(|stat| IdentityMatches::observed(original, stat.identity)),
             after_state: after.and_then(|stat| StatState::observed(stat.state)),
             after_threads: after.map(|stat| stat.threads),
+            after_exiting: after.map(|stat| stat.exiting),
             after_original_identity_match: after.map(|stat| stat.identity == original),
             after_identity_matches: after
                 .map(|stat| IdentityMatches::observed(original, stat.identity)),
@@ -230,6 +236,7 @@ impl StatDiagnostic {
             },
             pidfd_binding_observation: None,
             pidfd_terminal_observation: None,
+            pending_owner_uid_match: None,
         }
     }
 
@@ -240,6 +247,7 @@ impl StatDiagnostic {
             pidfd_binding: self.pidfd_binding,
             pidfd_binding_observation: self.pidfd_binding_observation,
             pidfd_terminal_observation: self.pidfd_terminal_observation,
+            pending_owner_uid_match: self.pending_owner_uid_match,
             ..Self::observed(
                 self.role,
                 original,
@@ -255,19 +263,22 @@ impl fmt::Display for StatDiagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "linux_stat_observation(process_role={}; before_state={:?}; before_threads={:?}; before_original_identity_match={:?}; before_identity_matches={:?}; after_state={:?}; after_threads={:?}; after_original_identity_match={:?}; after_identity_matches={:?}; after_group_detached_sentinel={:?}; after_session_detached_sentinel={:?}; pidfd_binding={:?}",
+            "linux_stat_observation(process_role={}; before_state={:?}; before_threads={:?}; before_exiting={:?}; before_original_identity_match={:?}; before_identity_matches={:?}; after_state={:?}; after_threads={:?}; after_exiting={:?}; after_original_identity_match={:?}; after_identity_matches={:?}; after_group_detached_sentinel={:?}; after_session_detached_sentinel={:?}; pidfd_binding={:?}; pending_owner_uid_match={:?}",
             self.role.label(),
             self.before_state,
             self.before_threads,
+            self.before_exiting,
             self.before_original_identity_match,
             self.before_identity_matches,
             self.after_state,
             self.after_threads,
+            self.after_exiting,
             self.after_original_identity_match,
             self.after_identity_matches,
             self.after_group_detached_sentinel,
             self.after_session_detached_sentinel,
             self.pidfd_binding,
+            self.pending_owner_uid_match,
         )?;
         for (label, observation) in [
             ("pidfd_binding_observation", self.pidfd_binding_observation),
@@ -799,6 +810,50 @@ fn pending_exit_transition(
         && failure.open_esrch()
 }
 
+// PF_EXITING is an observed task flag, not a terminal witness. In particular,
+// procfs emits state and flags at different times. A matching R1 sandwich may
+// only retain an incomplete sample under the existing tracker gap; it never
+// authorizes an exit, RSS zero, a completed sample or physical drain.
+fn running_exit_transition(
+    original: Identity,
+    before: Stat,
+    after: Option<Stat>,
+    failure: &RssFailure,
+    conditions: PendingConditions,
+) -> bool {
+    let leader = conditions.owner.leader;
+    let role_matches_anchor = match conditions.role {
+        ProcessRole::OwnedMember => {
+            original.pid > 0
+                && original.pid != leader.pid
+                && original.group == leader.group
+                && original.session == leader.session
+        }
+        ProcessRole::ReservedLeader | ProcessRole::EnumeratedCandidate => false,
+    };
+    conditions.owner.reservation_valid
+        && leader.pid > 0
+        && leader.group == leader.pid
+        && leader.session == leader.pid
+        && role_matches_anchor
+        && conditions.bound_validated
+        && conditions
+            .terminal
+            .is_some_and(PidfdDiagnostic::terminal_not_ready)
+        && before.identity == original
+        && before.state == b'R'
+        && before.threads == 1
+        && before.exiting
+        && after.is_some_and(|after| {
+            after.identity == original && after.state == b'R' && after.threads == 1 && after.exiting
+        })
+        && failure.open_esrch()
+}
+
+fn pending_running_exit_transition(candidate: bool, owner_uid_match: Option<bool>) -> bool {
+    candidate && owner_uid_match == Some(true)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct MemberSample {
     live: bool,
@@ -1032,6 +1087,7 @@ enum NumericField {
     DirectoryPid,
     ProcessGroup,
     Session,
+    ProcessFlags,
     ThreadCount,
     StartTicks,
     VirtualBytes,
@@ -1045,6 +1101,7 @@ impl NumericField {
             Self::DirectoryPid => "directory_pid",
             Self::ProcessGroup => "process_group",
             Self::Session => "session",
+            Self::ProcessFlags => "process_flags",
             Self::ThreadCount => "thread_count",
             Self::StartTicks => "start_ticks",
             Self::VirtualBytes => "virtual_bytes",
@@ -1109,13 +1166,15 @@ fn parse_stat(bytes: &[u8], expected_pid: i32) -> Result<Stat, ProcessError> {
         .split(|byte| byte.is_ascii_whitespace())
         .filter(|field| !field.is_empty())
         .collect();
-    // Indices start at field 3 (state): num_threads is 20, starttime is 22,
+    // Indices start at field 3 (state): flags is 9, num_threads is 20, starttime is 22,
     // and vsize is 23. RSS field 24 is deliberately not used as precise RSS.
     if fields.len() < 21 || fields[0].len() != 1 || !b"RSDZTXxtKWPI".contains(&fields[0][0]) {
         return Err(metadata(
             "native process stat fields are incomplete or invalid",
         ));
     }
+    let flags = u32::try_from(unsigned(fields[6], NumericField::ProcessFlags)?)
+        .map_err(|_| numeric_error(NumericField::ProcessFlags, NumericFailure::Overflow))?;
     let stat = Stat {
         identity: Identity {
             pid,
@@ -1126,6 +1185,9 @@ fn parse_stat(bytes: &[u8], expected_pid: i32) -> Result<Stat, ProcessError> {
         state: fields[0][0],
         threads: unsigned(fields[17], NumericField::ThreadCount)?,
         virtual_bytes: unsigned(fields[20], NumericField::VirtualBytes)?,
+        // Linux PF_EXITING is 0x4. Retain only its observed boolean, never raw
+        // flags or a claim that procfs produced an atomic state snapshot.
+        exiting: flags & 0x4 != 0,
     };
     if !stat.definitely_exited() && stat.threads == 0 {
         return Err(metadata("live native process has no thread count"));
@@ -1291,6 +1353,7 @@ mod native {
     use std::fs::File;
     use std::io::{Read, Seek};
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+    use std::os::unix::fs::MetadataExt;
     use std::ptr::NonNull;
 
     const PROC_MAGIC: libc::c_long = 0x9fa0;
@@ -1333,6 +1396,9 @@ mod native {
         include_rss: bool,
         is_leader: bool,
         owner: OwnerContext,
+        // Only owned members can use the new R1 Pending branch. Its UID guard
+        // requires both original held leader files and never reopens paths.
+        leader_owner_files: Option<(&'a File, &'a File)>,
         retained: Option<&'a mut MemberLifetime>,
         control: &'a mut ObservationControl<'control>,
         scan_sequence: u64,
@@ -1540,6 +1606,7 @@ mod native {
                     include_rss,
                     is_leader: true,
                     owner,
+                    leader_owner_files: None,
                     retained: Some(&mut self.leader_lifetime),
                     control,
                     scan_sequence: self.scan_sequence,
@@ -1567,6 +1634,7 @@ mod native {
                         include_rss,
                         is_leader: false,
                         owner,
+                        leader_owner_files: Some((&self.leader.directory, &self.leader.stat)),
                         retained: Some(&mut member.lifetime),
                         control,
                         scan_sequence: self.scan_sequence,
@@ -1690,6 +1758,7 @@ mod native {
                             include_rss: read_rss,
                             is_leader: false,
                             owner,
+                            leader_owner_files: Some((&self.leader.directory, &self.leader.stat)),
                             retained: Some(&mut member.lifetime),
                             control,
                             scan_sequence: self.scan_sequence,
@@ -2017,6 +2086,33 @@ mod native {
         if polls_terminal && let Err(post) = context.control.check("rss_terminal_poll") {
             return Err(rss_post_error(memory, role, post));
         }
+        let running_exit_candidate = memory.as_ref().is_some_and(|result| match result {
+            Err(failure) => running_exit_transition(
+                process.initial.identity,
+                before,
+                after,
+                failure,
+                PendingConditions {
+                    role,
+                    owner,
+                    bound_validated: bound.is_some(),
+                    terminal: diagnostic.pidfd_terminal_observation,
+                },
+            ),
+            Ok(_) => false,
+        });
+        if running_exit_candidate {
+            diagnostic.pending_owner_uid_match = Some(
+                match pending_owner_uid_matches(
+                    process,
+                    context.leader_owner_files,
+                    context.control,
+                ) {
+                    Ok(matches) => matches,
+                    Err(post) => return Err(rss_post_error(memory, role, post)),
+                },
+            );
+        }
         let memory = match memory {
             Some(Err(failure))
                 if pending_exit_transition(
@@ -2030,6 +2126,9 @@ mod native {
                         bound_validated: bound.is_some(),
                         terminal: diagnostic.pidfd_terminal_observation,
                     },
+                ) || pending_running_exit_transition(
+                    running_exit_candidate,
+                    diagnostic.pending_owner_uid_match,
                 ) =>
             {
                 let error = failure.into_process_error(role);
@@ -2077,6 +2176,46 @@ mod native {
                 _ => error,
             }
         })
+    }
+
+    fn pending_owner_uid_matches(
+        process: &ProcDirectory,
+        leader_files: Option<(&File, &File)>,
+        control: &mut ObservationControl<'_>,
+    ) -> Result<bool, ProcessError> {
+        // These are actual proc-inode owner checks, not serialized UID claims
+        // or a replacement for full stat/pidfd identity. Dumpability or a
+        // namespace/credential change can conservatively reject this branch.
+        control.check("pending_owner_uid_before")?;
+        let before_uid = unsafe { libc::geteuid() };
+        let Some((leader_directory, leader_stat)) = leader_files else {
+            return control.finish(Ok(false), "pending_owner_uid_missing_leader");
+        };
+        let mut matches = true;
+        for file in [
+            &process.directory,
+            &process.stat,
+            leader_directory,
+            leader_stat,
+        ] {
+            let observed = control
+                .io("pending_owner_uid_metadata", || file.metadata())?
+                .map_err(|error| {
+                    ProcessError::new(
+                        "resource_observation",
+                        format!(
+                            "linux_native_query(phase=pending_owner_uid_metadata; native_errno={:?})",
+                            error.raw_os_error(),
+                        ),
+                    )
+                })?;
+            matches &= observed.uid() == before_uid;
+        }
+        let after_uid = unsafe { libc::geteuid() };
+        control.finish(
+            Ok(matches && before_uid == after_uid),
+            "pending_owner_uid_after",
+        )
     }
 
     fn unavailable_member(is_leader: bool) -> Result<Option<MemberSample>, ProcessError> {
@@ -2773,6 +2912,190 @@ pub(super) mod tests {
         let original = before.identity;
         let failure = RssFailure::Open(std::io::Error::from_raw_os_error(3));
         let conditions = pending_conditions();
+        // Extend the existing parsed fixture only. PF_EXITING is not an exit
+        // witness, and the native owner check remains a separate required fact.
+        let mut running_fields = stat_fields('R', 1);
+        running_fields[6] = "4".to_owned();
+        let running = parse_stat(&render_stat("123", &running_fields), 123).unwrap();
+        assert!(!running.definitely_exited());
+        assert!(!running_exit_transition(
+            running.identity,
+            running,
+            Some(running),
+            &failure,
+            conditions,
+        ));
+        {
+            let running = Stat {
+                identity: Identity {
+                    pid: 124,
+                    ..running.identity
+                },
+                ..running
+            };
+            let role = ProcessRole::OwnedMember;
+            let conditions = PendingConditions { role, ..conditions };
+            let candidate = running_exit_transition(
+                running.identity,
+                running,
+                Some(running),
+                &failure,
+                conditions,
+            );
+            assert!(candidate);
+            assert!(pending_running_exit_transition(candidate, Some(true)));
+            assert!(!pending_running_exit_transition(candidate, Some(false)));
+            assert!(!pending_running_exit_transition(candidate, None));
+            assert!(!pending_running_exit_transition(false, Some(true)));
+            assert!(
+                settle_member(
+                    running,
+                    Some(running),
+                    Some(Err(pending_observation().original_error())),
+                    false,
+                )
+                .is_err()
+            );
+            for changed in [
+                Stat {
+                    exiting: false,
+                    ..running
+                },
+                Stat {
+                    state: b'S',
+                    ..running
+                },
+                Stat {
+                    state: b'Z',
+                    ..running
+                },
+                Stat {
+                    threads: 2,
+                    ..running
+                },
+            ] {
+                assert!(!running_exit_transition(
+                    running.identity,
+                    changed,
+                    Some(running),
+                    &failure,
+                    conditions
+                ));
+                assert!(!running_exit_transition(
+                    running.identity,
+                    running,
+                    Some(changed),
+                    &failure,
+                    conditions
+                ));
+            }
+            for identity in [
+                Identity {
+                    pid: running.identity.pid + 1,
+                    ..running.identity
+                },
+                Identity {
+                    start_ticks: running.identity.start_ticks + 1,
+                    ..running.identity
+                },
+                Identity {
+                    group: running.identity.group + 1,
+                    ..running.identity
+                },
+                Identity {
+                    session: running.identity.session + 1,
+                    ..running.identity
+                },
+            ] {
+                let changed = Stat {
+                    identity,
+                    ..running
+                };
+                assert!(!running_exit_transition(
+                    running.identity,
+                    changed,
+                    Some(running),
+                    &failure,
+                    conditions
+                ));
+                assert!(!running_exit_transition(
+                    running.identity,
+                    running,
+                    Some(changed),
+                    &failure,
+                    conditions
+                ));
+            }
+            assert!(!running_exit_transition(
+                running.identity,
+                running,
+                None,
+                &failure,
+                conditions
+            ));
+            for denied in [
+                PendingConditions {
+                    role: ProcessRole::ReservedLeader,
+                    ..conditions
+                },
+                PendingConditions {
+                    role: ProcessRole::EnumeratedCandidate,
+                    ..conditions
+                },
+                PendingConditions {
+                    owner: OwnerContext {
+                        reservation_valid: false,
+                        ..conditions.owner
+                    },
+                    ..conditions
+                },
+                PendingConditions {
+                    bound_validated: false,
+                    ..conditions
+                },
+                PendingConditions {
+                    terminal: None,
+                    ..conditions
+                },
+                PendingConditions {
+                    terminal: Some(PidfdDiagnostic::new(
+                        pidfd::DiagnosticPhase::TerminalPoll,
+                        pidfd::DiagnosticCategory::Terminal,
+                        None,
+                    )),
+                    ..conditions
+                },
+                PendingConditions {
+                    terminal: Some(PidfdDiagnostic::new(
+                        pidfd::DiagnosticPhase::TerminalPoll,
+                        pidfd::DiagnosticCategory::NotReady,
+                        Some(3),
+                    )),
+                    ..conditions
+                },
+            ] {
+                assert!(!running_exit_transition(
+                    running.identity,
+                    running,
+                    Some(running),
+                    &failure,
+                    denied
+                ));
+            }
+            for failed_read in [
+                RssFailure::Open(std::io::Error::from_raw_os_error(2)),
+                RssFailure::Read(std::io::Error::from_raw_os_error(3)),
+                RssFailure::Parse(pending_observation().original_error()),
+            ] {
+                assert!(!running_exit_transition(
+                    running.identity,
+                    running,
+                    Some(running),
+                    &failed_read,
+                    conditions
+                ));
+            }
+        }
         assert!(pending_exit_transition(
             original,
             before,
@@ -3329,23 +3652,27 @@ pub(super) mod tests {
         );
         assert_eq!(diagnostic.before_state, Some(StatState::Sleeping));
         assert_eq!(diagnostic.before_threads, Some(5));
+        assert_eq!(diagnostic.before_exiting, Some(false));
         assert_eq!(diagnostic.before_original_identity_match, Some(true));
         assert_eq!(diagnostic.after_state, Some(StatState::Zombie));
         assert_eq!(diagnostic.after_threads, Some(2));
+        assert_eq!(diagnostic.after_exiting, Some(false));
         assert_eq!(diagnostic.after_original_identity_match, Some(true));
         assert_eq!(
             diagnostic.to_string(),
-            "linux_stat_observation(process_role=reserved_leader; before_state=Some(Sleeping); before_threads=Some(5); before_original_identity_match=Some(true); before_identity_matches=Some(IdentityMatches { pid: true, start_ticks: true, group: true, session: true }); after_state=Some(Zombie); after_threads=Some(2); after_original_identity_match=Some(true); after_identity_matches=Some(IdentityMatches { pid: true, start_ticks: true, group: true, session: true }); after_group_detached_sentinel=Some(false); after_session_detached_sentinel=Some(false); pidfd_binding=NotRequiredBySample; pidfd_binding_observation=None; pidfd_terminal_observation=None)",
+            "linux_stat_observation(process_role=reserved_leader; before_state=Some(Sleeping); before_threads=Some(5); before_exiting=Some(false); before_original_identity_match=Some(true); before_identity_matches=Some(IdentityMatches { pid: true, start_ticks: true, group: true, session: true }); after_state=Some(Zombie); after_threads=Some(2); after_exiting=Some(false); after_original_identity_match=Some(true); after_identity_matches=Some(IdentityMatches { pid: true, start_ticks: true, group: true, session: true }); after_group_detached_sentinel=Some(false); after_session_detached_sentinel=Some(false); pidfd_binding=NotRequiredBySample; pending_owner_uid_match=None; pidfd_binding_observation=None; pidfd_terminal_observation=None)",
         );
 
         let missing =
             StatDiagnostic::observed(ProcessRole::OwnedMember, before.identity, None, None, false);
         assert_eq!(missing.before_state, None);
         assert_eq!(missing.before_threads, None);
+        assert_eq!(missing.before_exiting, None);
         assert_eq!(missing.before_original_identity_match, None);
         assert_eq!(missing.before_identity_matches, None);
         assert_eq!(missing.after_state, None);
         assert_eq!(missing.after_threads, None);
+        assert_eq!(missing.after_exiting, None);
         assert_eq!(missing.after_original_identity_match, None);
         assert_eq!(missing.after_identity_matches, None);
         assert_eq!(missing.after_group_detached_sentinel, None);
@@ -3356,6 +3683,7 @@ pub(super) mod tests {
         );
         assert_eq!(missing.pidfd_binding_observation, None);
         assert_eq!(missing.pidfd_terminal_observation, None);
+        assert_eq!(missing.pending_owner_uid_match, None);
         assert!(missing.to_string().contains("process_role=owned_member;"));
     }
 
@@ -3563,10 +3891,12 @@ pub(super) mod tests {
             recorded.pidfd_binding = state;
             recorded.pidfd_binding_observation = binding;
             recorded.pidfd_terminal_observation = terminal;
+            recorded.pending_owner_uid_match = Some(false);
             recorded.record_stats(before.identity, Some(before), Some(after));
             assert_eq!(recorded.pidfd_binding, state);
             assert_eq!(recorded.pidfd_binding_observation, binding);
             assert_eq!(recorded.pidfd_terminal_observation, terminal);
+            assert_eq!(recorded.pending_owner_uid_match, Some(false));
             assert_eq!(recorded.after_original_identity_match, Some(true));
         }
     }
@@ -4021,7 +4351,29 @@ pub(super) mod tests {
         assert_eq!(actual.identity.session, 123);
         assert_eq!(actual.threads, 5);
         assert_eq!(actual.virtual_bytes, 987654);
+        assert!(!actual.exiting);
         assert!(!actual.definitely_exited());
+        let mut fields = stat_fields('R', 1);
+        for (flags, expected) in [
+            ("0", false),
+            ("4", true),
+            ("4194308", true),
+            ("4294967295", true),
+        ] {
+            fields[6] = flags.to_owned();
+            assert_eq!(
+                parse_stat(&render_stat("123", &fields), 123)
+                    .unwrap()
+                    .exiting,
+                expected
+            );
+        }
+        for invalid in ["-1", "+4", "x4", "4294967296", "18446744073709551616"] {
+            fields[6] = invalid.to_owned();
+            let error = parse_stat(&render_stat("123", &fields), 123).unwrap_err();
+            assert!(error.message.contains("process_flags"));
+            assert!(!error.message.contains(invalid));
+        }
     }
 
     #[test]

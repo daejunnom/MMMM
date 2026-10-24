@@ -345,6 +345,7 @@ fn same_stat(left: Stat, right: Stat) -> bool {
         && left.state == right.state
         && left.threads == right.threads
         && left.virtual_bytes == right.virtual_bytes
+        && left.exiting == right.exiting
 }
 
 #[cfg(target_os = "linux")]

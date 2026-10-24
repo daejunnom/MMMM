@@ -18,6 +18,7 @@ fn stat() -> Stat {
         state: b'R',
         threads: 2,
         virtual_bytes: 8192,
+        exiting: false,
     }
 }
 

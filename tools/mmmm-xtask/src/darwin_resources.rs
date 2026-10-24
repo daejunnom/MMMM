@@ -84,13 +84,67 @@ struct RusageTimestamps {
     start_observed: bool,
     exit_observed: bool,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-struct MemoryExitConfirmation {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemoryExitConfirmation {
+    QueryError,
+    MissingEsrch {
+        current_uid_match: bool,
+    },
+    Observed {
+        status: u32,
+        inexit: bool,
+        identity_match: bool,
+        current_uid_match: bool,
+    },
+}
+#[derive(Serialize)]
+#[serde(rename = "MemoryExitConfirmation")]
+struct MemoryExitConfirmationProjection {
     kind: &'static str,
     status: Option<u32>,
     inexit: Option<bool>,
     identity_match: Option<bool>,
     current_uid_match: Option<bool>,
+}
+impl MemoryExitConfirmation {
+    fn projection(self) -> MemoryExitConfirmationProjection {
+        match self {
+            Self::QueryError => MemoryExitConfirmationProjection {
+                kind: "query_error",
+                status: None,
+                inexit: None,
+                identity_match: None,
+                current_uid_match: None,
+            },
+            Self::MissingEsrch { current_uid_match } => MemoryExitConfirmationProjection {
+                kind: "missing_esrch",
+                status: None,
+                inexit: None,
+                identity_match: None,
+                current_uid_match: Some(current_uid_match),
+            },
+            Self::Observed {
+                status,
+                inexit,
+                identity_match,
+                current_uid_match,
+            } => MemoryExitConfirmationProjection {
+                kind: "observed",
+                status: Some(status),
+                inexit: Some(inexit),
+                identity_match: Some(identity_match),
+                current_uid_match: Some(current_uid_match),
+            },
+        }
+    }
+}
+impl Serialize for MemoryExitConfirmation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.projection().serialize(serializer)
+    }
 }
 /// Kept only for bounded scan deduplication; identity never enters a report.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -286,6 +340,7 @@ impl fmt::Display for LeaderDiagnostic {
             )?;
         }
         if let Some(confirmation) = self.memory_exit_confirmation {
+            let confirmation = confirmation.projection();
             write!(
                 f,
                 ",memory_confirmation_kind={},memory_confirmation_status={:?},memory_confirmation_inexit={:?},memory_confirmation_identity_match={:?},memory_confirmation_current_uid_match={:?}",
@@ -723,26 +778,20 @@ pub(super) fn confirm_member_memory_exit(
     let (confirmed, current_uid) = match confirm() {
         Ok(observation) => observation,
         Err(error) => {
-            diagnostic.memory_exit_confirmation = Some(MemoryExitConfirmation {
-                kind: "query_error",
-                status: None,
-                inexit: None,
-                identity_match: None,
-                current_uid_match: None,
-            });
+            diagnostic.memory_exit_confirmation = Some(MemoryExitConfirmation::QueryError);
             return Err(diagnostic.attach(error));
         }
     };
-    diagnostic.memory_exit_confirmation = Some(MemoryExitConfirmation {
-        kind: if confirmed.is_some() {
-            "observed"
-        } else {
-            "missing_esrch"
+    diagnostic.memory_exit_confirmation = Some(match confirmed {
+        Some(info) => MemoryExitConfirmation::Observed {
+            status: info.status,
+            inexit: info.flags & PROC_FLAG_INEXIT != 0,
+            identity_match: info.identity == before.identity,
+            current_uid_match: current_uid == before.identity.uid,
         },
-        status: confirmed.map(|info| info.status),
-        inexit: confirmed.map(|info| info.flags & PROC_FLAG_INEXIT != 0),
-        identity_match: confirmed.map(|info| info.identity == before.identity),
-        current_uid_match: Some(current_uid == before.identity.uid),
+        None => MemoryExitConfirmation::MissingEsrch {
+            current_uid_match: current_uid == before.identity.uid,
+        },
     });
     if current_uid == before.identity.uid
         && matches!(
@@ -2623,6 +2672,8 @@ mod tests {
     }
     #[test]
     fn member_exit_transition_needs_one_actual_same_identity_zombie_confirmation() {
+        assert!(std::mem::size_of::<Option<MemoryExitConfirmation>>() <= 8);
+        assert!(std::mem::size_of::<LeaderDiagnostic>() <= 200);
         let before = LeaderBsd {
             identity: LeaderIdentity {
                 pid: 18,
@@ -2654,11 +2705,59 @@ mod tests {
         assert_eq!(diagnostic.after_status, Some(2));
         assert!(!diagnostic.before_inexit && diagnostic.after_inexit);
         assert_eq!(diagnostic.memory_error, Some(native.native.into()));
-        let confirmation = diagnostic.memory_exit_confirmation.unwrap();
+        let confirmation = diagnostic.memory_exit_confirmation.unwrap().projection();
         assert_eq!(confirmation.kind, "observed");
         assert_eq!(confirmation.status, Some(SZOMB));
         assert_eq!(confirmation.identity_match, Some(true));
         assert_eq!(confirmation.current_uid_match, Some(true));
+        for (stored, expected) in [
+            (
+                diagnostic.memory_exit_confirmation.unwrap(),
+                serde_json::json!({
+                    "kind": "observed", "status": SZOMB, "inexit": true,
+                    "identity_match": true, "current_uid_match": true,
+                }),
+            ),
+            (
+                MemoryExitConfirmation::QueryError,
+                serde_json::json!({
+                    "kind": "query_error", "status": null, "inexit": null,
+                    "identity_match": null, "current_uid_match": null,
+                }),
+            ),
+            (
+                MemoryExitConfirmation::MissingEsrch {
+                    current_uid_match: true,
+                },
+                serde_json::json!({
+                    "kind": "missing_esrch", "status": null, "inexit": null,
+                    "identity_match": null, "current_uid_match": true,
+                }),
+            ),
+            (
+                MemoryExitConfirmation::MissingEsrch {
+                    current_uid_match: false,
+                },
+                serde_json::json!({
+                    "kind": "missing_esrch", "status": null, "inexit": null,
+                    "identity_match": null, "current_uid_match": false,
+                }),
+            ),
+            (
+                MemoryExitConfirmation::Observed {
+                    status: u32::MAX,
+                    inexit: false,
+                    identity_match: false,
+                    current_uid_match: false,
+                },
+                serde_json::json!({
+                    "kind": "observed", "status": u32::MAX, "inexit": false,
+                    "identity_match": false, "current_uid_match": false,
+                }),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(stored).unwrap(), expected);
+        }
 
         let mut confirmations = vec![None, Some(first_after)];
         confirmations.extend([0, 1, 2, 3, 4, 6, u32::MAX].map(|status| {
