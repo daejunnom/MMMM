@@ -3051,6 +3051,24 @@ source binding을 unproven으로 둔다. 원 ErrorRecord·phase·operation을 �
 별도로 확인한다. 선택 toolchain origin과 candidate source는 구분하며 전체 toolchain
 tree 동일성·게임·릴리스는 입증하지 않는다.
 
+고정 `2810e5331057ded8e48ba206753818a828058d49`의 Windows628은 외부 v3로
+Gradle0·required 11 tasks 모두 executed·7 모듈의 428 tests/37 reports 통과를 확인했다.
+failure/error/skipped와 evidence/failure detail은 모두 0이다. source 사후 inventory와
+선택 8개 toolchain 입력·agent의 전후 pin이 통과했으며, source manifest SHA는
+`c4dd08f92be719ad44664281765edff3db88c7842c6244e23d9af7e6e1c26392`다. 사후 source
+불변을 확인했으므로 617의 source 경로 로그 생성 실패가 이 실행에서 재발하지 않았다.
+첫 logger의 독립 식별이나 v3의 실패 진단 분기 실제 실행을 입증한 것은 아니다.
+command0·68,190 ms·Job peak 1,280,851,968 bytes·5 processes·gap145 ms·자연 종료이며
+drain·output/export·scratch 정리·lease 해제와 감독/정리 오류 0을 확인했다. 원 v1/v2와
+607/617 실패를 보존하고 새 성공과 구분한다. CI generation·전체 toolchain tree·실제
+JNI/게임·클라이언트 인수·릴리스는 이 JVM 검사 범위 밖이다.
+
+Linux105의 후속 후보는 test profile debug 한 값만 `line-tables-only`로 바꾸고, CI의
+동일한 전체 test 명령에 `--verbose`를 추가해 실제 rustc 인자를 보존한다. 검사·자원
+상한은 유지하며 근거는 [빌드 정책](build-system.md#rust-기반-ci-소스와-최초-컴파일)에
+기록했다. source 수정과 OOM 해결을 구분하고 실제 3개 OS 결과는 다음 고정 SHA에서
+확인한다. 이 변경 뒤 로컬 전체 workspace 재컴파일은 아직 수행하지 않았다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

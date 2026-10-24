@@ -43,7 +43,7 @@ unsafe_op_in_unsafe_fn = "deny"
 debug = 1
 
 [profile.test]
-debug = 1
+debug = "line-tables-only"
 
 # Full input/image SHA remains inside each original finite request budget.
 # Keep the existing algorithm and pin checks while optimizing its compression

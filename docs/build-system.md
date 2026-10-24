@@ -373,6 +373,18 @@ release profile 및 나머지 crate의 debug·overflow 검사를 바꾸지 않�
 설정은 [Cargo profile override](https://doc.rust-lang.org/cargo/reference/profiles.html#overrides)를
 따르며 실제 native 실행과 digest 검사를 별도로 확인한다.
 
+고정 `4183123`의 Linux Rust105는 실제 test 시작 전 Coordinator libtest의 LLVM OOM으로
+실패했다. 원 실패와 기존 2 GiB process별 AS 상한을 보존하며, test profile의 `debug`만
+`1`에서 `line-tables-only`로 줄인다. dev/release, assertions·overflow·최적화, 전체
+workspace·locked·jobs·test threads·timeout·출력 및 자원 상한은 유지한다. test profile은
+그 profile로 빌드하는 라이브러리와 의존성에도 적용되며 단일 EXE에만 국한되지 않는다.
+[고정 Cargo 1.96.0 문서](https://raw.githubusercontent.com/rust-lang/cargo/rust-1.96.0/src/doc/src/reference/profiles.md)의
+지원 값으로 파일·행 backtrace용 최소 정보를 남긴다. CI test 명령의 `--verbose`는 실제
+rustc debug 인자를 원 출력에 보존하기 위한 진단이다. 완전한 inline backtrace 복원이나
+OOM 회피·메모리 절감량을 보장하지 않으며 host 메모리와 AS 상한 중 직접 원인은 미확정이다.
+후속 3개 OS CI의 실제 컴파일·test 결과를 별도로 확인한다. 재실패 시 상한이나 worker를
+자동 변경하지 않는다.
+
 최초 Cargo 실행은 Windows의 `tools/bootstrap/bootstrap.ps1` 또는 Unix의
 `tools/bootstrap/bootstrap-unix.py`가 맡는다. Unix launcher의 Python 코드는
 첫 Rust 도구를 만들기 위한 build infrastructure에만 사용한다. 제품 계약 처리,

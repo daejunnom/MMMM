@@ -182,7 +182,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           # Keep the existing Job budget: concurrent Windows rustc instances exceeded it locally.
           $cargoJobs = if ($IsWindows) { 1 } else { 2 }
-          & $env:MMMM_XTASK run --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root (Join-Path $env:MMMM_EVIDENCE_ROOT 'test') --purpose ci-checks --timeout-seconds 1200 --owned-tail-policy terminate-build -- $env:MMMM_CARGO test --jobs $cargoJobs --workspace --target $env:MMMM_RUST_TARGET --locked -- --test-threads=2
+          & $env:MMMM_XTASK run --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root (Join-Path $env:MMMM_EVIDENCE_ROOT 'test') --purpose ci-checks --timeout-seconds 1200 --owned-tail-policy terminate-build -- $env:MMMM_CARGO test --verbose --jobs $cargoJobs --workspace --target $env:MMMM_RUST_TARGET --locked -- --test-threads=2
           if ($LASTEXITCODE -ne 0) { throw 'Rust workspace tests failed.' }
 
       - name: Check Rust lints
