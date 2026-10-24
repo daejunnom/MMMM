@@ -735,9 +735,70 @@ impl Process {
                 return Ok(());
             }
         }
-        if unsafe { libc::kill(-self.pid, libc::SIGKILL) } == -1 {
+        let signal_result = unsafe { libc::kill(-self.pid, libc::SIGKILL) };
+        if signal_result == -1 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ESRCH) {
+                #[cfg(target_os = "macos")]
+                if let Some(native_errno) = error.raw_os_error()
+                    && native_errno == libc::EPERM
+                {
+                    let original = StdioError::io("native_terminate", error);
+                    let identity = self.identity;
+                    let pid = self.pid;
+                    let owner_confirmed = self.reserved
+                        && !self.reaped
+                        && self.child.is_some()
+                        && identity.is_some()
+                        && !self.identity_uncertain
+                        && !self.resource_identity_uncertain;
+                    let mut failure = DarwinStdioSignalFailure {
+                        signal_result,
+                        native_errno,
+                        postcheck: DarwinStdioSignalPostcheck::NotAttempted,
+                    };
+                    let terminal_scope = mac_signal_failure_terminal_scope(
+                        &mut failure,
+                        owner_confirmed,
+                        || {
+                            identity.is_some_and(|identity| {
+                                identity.uid == unsafe { libc::geteuid() }
+                                    && identity.ruid == unsafe { libc::getuid() }
+                            })
+                        },
+                        || {
+                            verify_mac_identity(
+                                pid,
+                                identity
+                                    .ok_or_else(|| StdioError::new("native_resource_identity"))?,
+                                MacDeadline::Instant(deadline),
+                            )
+                        },
+                        || {
+                            super::deadline_check(deadline)?;
+                            let exited = self.exit_code()?;
+                            super::deadline_check(deadline)?;
+                            let empty = if exited.is_some() {
+                                self.scope_empty(deadline)?
+                            } else {
+                                false
+                            };
+                            super::deadline_check(deadline)?;
+                            Ok((exited, empty))
+                        },
+                        || super::deadline_check(deadline),
+                    );
+                    if failure.postcheck.requires_identity_uncertainty() {
+                        self.identity_uncertain = true;
+                    }
+                    self.resources.evidence.0.parent_last_signal_failure = Some(failure);
+                    if terminal_scope {
+                        // The signal still failed. No further signal is needed;
+                        // the original stable drain and reap remain required.
+                        return Ok(());
+                    }
+                    return Err(original.with_resources(self.resource_evidence()));
+                }
                 return Err(StdioError::io("native_terminate", error));
             }
         }
@@ -1051,6 +1112,7 @@ pub struct DarwinStdioResourceFacts {
     pub parent_last_resource_failure: Option<&'static str>,
     pub parent_last_resource_error: Option<mmmm_native_process::darwin::NativeResourceError>,
     pub parent_terminal_identity_query_errno: Option<i32>,
+    pub parent_last_signal_failure: Option<DarwinStdioSignalFailure>,
     pub child_admitted: bool,
     pub child_as_soft_bytes: Option<u64>,
     pub child_as_hard_bytes: Option<u64>,
@@ -1094,6 +1156,7 @@ impl DarwinStdioResources {
             parent_last_resource_failure: None,
             parent_last_resource_error: None,
             parent_terminal_identity_query_errno: None,
+            parent_last_signal_failure: None,
             child_admitted: false,
             child_as_soft_bytes: None,
             child_as_hard_bytes: None,
@@ -1109,6 +1172,53 @@ impl DarwinStdioResources {
             child_samples_after_admission_unobserved: true,
             child_watchdog_gap_detection_may_be_delayed: true,
         }))
+    }
+}
+
+/// Signal failure and its subsequent bounded observations are separate facts.
+/// A confirmed terminal scope does not claim signal success or completed drain.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DarwinStdioSignalFailure {
+    pub signal_result: i32,
+    pub native_errno: i32,
+    pub postcheck: DarwinStdioSignalPostcheck,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DarwinStdioSignalPostcheck {
+    NotAttempted,
+    Started,
+    OwnerUnconfirmed,
+    UidBeforeMismatch,
+    IdentityNotTerminal {
+        status: u32,
+        exit_pending: bool,
+        terminal_query_errno: Option<i32>,
+    },
+    ChildNotExited,
+    ScopeNotEmpty,
+    UidAfterMismatch,
+    ConfirmedTerminalScope {
+        exit_code: i32,
+    },
+    ObservationFailed {
+        phase: &'static str,
+        code: &'static str,
+        native_code: Option<i32>,
+        native_code_unknown: bool,
+    },
+}
+
+#[cfg(target_os = "macos")]
+impl DarwinStdioSignalPostcheck {
+    fn requires_identity_uncertainty(&self) -> bool {
+        match self {
+            Self::UidBeforeMismatch | Self::UidAfterMismatch => true,
+            Self::ObservationFailed { code, .. } => *code != "deadline",
+            _ => false,
+        }
     }
 }
 
@@ -1213,6 +1323,88 @@ fn mac_terminal_scope_is_empty(
     // A confirmed same-identity zombie alone cannot account for descendants.
     // Both facts must come from fresh observations under the original bound.
     Ok(exited.is_some() && empty)
+}
+
+#[cfg(target_os = "macos")]
+fn mac_signal_failure_terminal_scope(
+    failure: &mut DarwinStdioSignalFailure,
+    owner_confirmed: bool,
+    mut current_uid_matches: impl FnMut() -> bool,
+    verify_identity: impl FnOnce() -> Result<VerifiedMacIdentity, StdioError>,
+    observe_scope: impl FnOnce() -> Result<(Option<i32>, bool), StdioError>,
+    mut checkpoint: impl FnMut() -> Result<(), StdioError>,
+) -> bool {
+    if failure.signal_result != -1 || failure.native_errno != libc::EPERM {
+        return false;
+    }
+    failure.postcheck = DarwinStdioSignalPostcheck::Started;
+    let mut phase = "initial_deadline";
+    let result = (|| {
+        checkpoint()?;
+        if !owner_confirmed {
+            failure.postcheck = DarwinStdioSignalPostcheck::OwnerUnconfirmed;
+            return Ok(false);
+        }
+        phase = "uid_before";
+        checkpoint()?;
+        if !current_uid_matches() {
+            failure.postcheck = DarwinStdioSignalPostcheck::UidBeforeMismatch;
+            return Ok(false);
+        }
+        phase = "identity";
+        checkpoint()?;
+        let verified = verify_identity()?;
+        if verified.status != 5 || verified.exit_pending {
+            failure.postcheck = DarwinStdioSignalPostcheck::IdentityNotTerminal {
+                status: verified.status,
+                exit_pending: verified.exit_pending,
+                terminal_query_errno: verified.terminal_query_errno,
+            };
+            return Ok(false);
+        }
+        phase = "terminal_scope";
+        checkpoint()?;
+        let mut observed = None;
+        let terminal_scope = mac_terminal_scope_is_empty(&verified, || {
+            let actual = observe_scope()?;
+            observed = Some(actual);
+            Ok(actual)
+        })?;
+        let exit_code = match observed {
+            Some((Some(exit_code), true)) if terminal_scope => exit_code,
+            Some((None, _)) => {
+                failure.postcheck = DarwinStdioSignalPostcheck::ChildNotExited;
+                return Ok(false);
+            }
+            Some((Some(_), false)) => {
+                failure.postcheck = DarwinStdioSignalPostcheck::ScopeNotEmpty;
+                return Ok(false);
+            }
+            _ => return Err(StdioError::new("native_resource_identity")),
+        };
+        phase = "uid_after";
+        checkpoint()?;
+        if !current_uid_matches() {
+            failure.postcheck = DarwinStdioSignalPostcheck::UidAfterMismatch;
+            return Ok(false);
+        }
+        phase = "final_deadline";
+        checkpoint()?;
+        failure.postcheck = DarwinStdioSignalPostcheck::ConfirmedTerminalScope { exit_code };
+        Ok(true)
+    })();
+    match result {
+        Ok(terminal_scope) => terminal_scope,
+        Err(error) => {
+            failure.postcheck = DarwinStdioSignalPostcheck::ObservationFailed {
+                phase,
+                code: error.code,
+                native_code: error.native_code,
+                native_code_unknown: error.native_code_unknown,
+            };
+            false
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2156,6 +2348,16 @@ mod resource_policy_tests {
             terminal_query_errno: None,
             exit_pending: false,
         };
+        let signal_failure = |native_errno| DarwinStdioSignalFailure {
+            signal_result: -1,
+            native_errno,
+            postcheck: DarwinStdioSignalPostcheck::NotAttempted,
+        };
+        let terminal_identity = || VerifiedMacIdentity {
+            status: verified.status,
+            terminal_query_errno: verified.terminal_query_errno,
+            exit_pending: verified.exit_pending,
+        };
         for (exited, empty, expected) in [
             (Some(0), true, true),
             (Some(101), true, true),
@@ -2199,6 +2401,222 @@ mod resource_policy_tests {
                 mac_terminal_scope_is_empty(&verified, || Err(error.clone())).unwrap_err(),
                 error
             );
+            for failure_at_identity in [true, false] {
+                let mut failure = signal_failure(libc::EPERM);
+                assert!(!mac_signal_failure_terminal_scope(
+                    &mut failure,
+                    true,
+                    || true,
+                    || if failure_at_identity {
+                        Err(error.clone())
+                    } else {
+                        Ok(terminal_identity())
+                    },
+                    || Err(error.clone()),
+                    || Ok(()),
+                ));
+                assert_eq!(failure.signal_result, -1);
+                assert_eq!(failure.native_errno, libc::EPERM);
+                assert_eq!(
+                    failure.postcheck.requires_identity_uncertainty(),
+                    error.code != "deadline"
+                );
+                assert_eq!(
+                    failure.postcheck,
+                    DarwinStdioSignalPostcheck::ObservationFailed {
+                        phase: if failure_at_identity {
+                            "identity"
+                        } else {
+                            "terminal_scope"
+                        },
+                        code: error.code,
+                        native_code: error.native_code,
+                        native_code_unknown: error.native_code_unknown,
+                    }
+                );
+            }
+        }
+        for native_errno in [0, libc::ESRCH, libc::EACCES, libc::EINVAL] {
+            let mut failure = signal_failure(native_errno);
+            assert!(!mac_signal_failure_terminal_scope(
+                &mut failure,
+                true,
+                || panic!("another signal error cannot query UID"),
+                || panic!("another signal error cannot query identity"),
+                || panic!("another signal error cannot query scope"),
+                || panic!("another signal error cannot start postcheck"),
+            ));
+            assert_eq!(failure.postcheck, DarwinStdioSignalPostcheck::NotAttempted);
+        }
+        let mut failure = signal_failure(libc::EPERM);
+        assert!(!mac_signal_failure_terminal_scope(
+            &mut failure,
+            false,
+            || panic!("an unconfirmed owner cannot query UID"),
+            || panic!("an unconfirmed owner cannot query identity"),
+            || panic!("an unconfirmed owner cannot query scope"),
+            || Ok(()),
+        ));
+        assert_eq!(
+            failure.postcheck,
+            DarwinStdioSignalPostcheck::OwnerUnconfirmed
+        );
+        for exit_code in [0, 101, -9] {
+            let mut failure = signal_failure(libc::EPERM);
+            let mut uid_checks = 0;
+            let mut identity_checks = 0;
+            let mut scope_checks = 0;
+            assert!(mac_signal_failure_terminal_scope(
+                &mut failure,
+                true,
+                || {
+                    uid_checks += 1;
+                    true
+                },
+                || {
+                    identity_checks += 1;
+                    Ok(terminal_identity())
+                },
+                || {
+                    scope_checks += 1;
+                    Ok((Some(exit_code), true))
+                },
+                || Ok(()),
+            ));
+            assert_eq!((uid_checks, identity_checks, scope_checks), (2, 1, 1));
+            assert_eq!(failure.signal_result, -1);
+            assert_eq!(failure.native_errno, libc::EPERM);
+            assert_eq!(
+                failure.postcheck,
+                DarwinStdioSignalPostcheck::ConfirmedTerminalScope { exit_code }
+            );
+            assert!(!failure.postcheck.requires_identity_uncertainty());
+        }
+        for (status, exit_pending) in [
+            (0, false),
+            (2, false),
+            (2, true),
+            (5, true),
+            (u32::MAX, false),
+        ] {
+            let mut failure = signal_failure(libc::EPERM);
+            assert!(!mac_signal_failure_terminal_scope(
+                &mut failure,
+                true,
+                || true,
+                || Ok(VerifiedMacIdentity {
+                    status,
+                    exit_pending,
+                    terminal_query_errno: Some(libc::ESRCH)
+                }),
+                || panic!("non-terminal identity cannot query exit or scope"),
+                || Ok(()),
+            ));
+            assert_eq!(
+                failure.postcheck,
+                DarwinStdioSignalPostcheck::IdentityNotTerminal {
+                    status,
+                    exit_pending,
+                    terminal_query_errno: Some(libc::ESRCH),
+                }
+            );
+            assert!(!failure.postcheck.requires_identity_uncertainty());
+        }
+        for mismatch_after in [false, true] {
+            let mut failure = signal_failure(libc::EPERM);
+            let mut uid_checks = 0;
+            assert!(!mac_signal_failure_terminal_scope(
+                &mut failure,
+                true,
+                || {
+                    uid_checks += 1;
+                    mismatch_after && uid_checks == 1
+                },
+                || {
+                    assert!(mismatch_after);
+                    Ok(terminal_identity())
+                },
+                || {
+                    assert!(mismatch_after);
+                    Ok((Some(0), true))
+                },
+                || Ok(()),
+            ));
+            assert_eq!(
+                failure.postcheck,
+                if mismatch_after {
+                    DarwinStdioSignalPostcheck::UidAfterMismatch
+                } else {
+                    DarwinStdioSignalPostcheck::UidBeforeMismatch
+                }
+            );
+            assert!(failure.postcheck.requires_identity_uncertainty());
+        }
+        for (exited, empty) in [(None, true), (None, false), (Some(0), false)] {
+            let mut failure = signal_failure(libc::EPERM);
+            let mut uid_checks = 0;
+            assert!(!mac_signal_failure_terminal_scope(
+                &mut failure,
+                true,
+                || {
+                    uid_checks += 1;
+                    true
+                },
+                || Ok(terminal_identity()),
+                || Ok((exited, empty)),
+                || Ok(()),
+            ));
+            assert_eq!(uid_checks, 1);
+            assert_eq!(
+                failure.postcheck,
+                if exited.is_none() {
+                    DarwinStdioSignalPostcheck::ChildNotExited
+                } else {
+                    DarwinStdioSignalPostcheck::ScopeNotEmpty
+                }
+            );
+            assert!(!failure.postcheck.requires_identity_uncertainty());
+        }
+        for (fail_at, phase) in [
+            "initial_deadline",
+            "uid_before",
+            "identity",
+            "terminal_scope",
+            "uid_after",
+            "final_deadline",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut failure = signal_failure(libc::EPERM);
+            let mut checkpoints = 0;
+            assert!(!mac_signal_failure_terminal_scope(
+                &mut failure,
+                true,
+                || true,
+                || Ok(terminal_identity()),
+                || Ok((Some(0), true)),
+                || {
+                    let current = checkpoints;
+                    checkpoints += 1;
+                    if current == fail_at {
+                        Err(StdioError::new("deadline"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            ));
+            assert_eq!(failure.native_errno, libc::EPERM);
+            assert_eq!(
+                failure.postcheck,
+                DarwinStdioSignalPostcheck::ObservationFailed {
+                    phase,
+                    code: "deadline",
+                    native_code: None,
+                    native_code_unknown: false,
+                }
+            );
+            assert!(!failure.postcheck.requires_identity_uncertainty());
         }
     }
 

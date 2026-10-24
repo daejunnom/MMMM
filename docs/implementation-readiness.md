@@ -3856,6 +3856,32 @@ Windows674는 의도한7개 staged 파일의 index554 files·정책 blob1·viola
 정상 drain/output/export·scratch 제거·lease 해제·감독/정리 오류0을 확인했다. 사후 source6개
 pin·index/worktree blob7개·추가 줄의 공개 경로 정책·diff check도 확인했고 다른 변경은 제외했다.
 
+### macOS stdio 신호 실패 뒤의 제한 확인
+
+후속 stdio 소스는 실제 소유 그룹 SIGKILL의 `-1/EPERM` 뒤에만 원 finite deadline에서
+추가 확인한다. 원 reserved·unreaped Child·고정 identity와 두 uncertainty fence가 남아
+있어야 하며, 현재 euid/ruid 전후 일치·새 same-identity 실제 zombie·pending 아님·실제
+WNOWAIT 종료·전체 소유 scope의 no-live를 모두 요구한다. 이 경우에도 신호 자체는 실패로
+남고 기존 두 안정된 drain 관측과 실제 최종 reap 전에 drained를 발급하지 않는다.
+
+어느 조건이든 거절되면 원 native_terminate·EPERM을 primary로 유지한다. 원 signal_result/
+errno와 후행 확인의 단계·판정·별도 native 오류는 `parent_last_signal_failure`에 보존한다.
+UID 전후 불일치나 deadline 이외의 관측 실패에는 identity_uncertain을 추가 설정한다.
+기존 owner/resource flag를 해제하지 않으며 deadline·확인된 live identity·잔존 scope를 새
+identity 오류로 단정하지 않는다. 기존 resource 실패와 원119 실패 자료도 그대로 남긴다.
+기존 순수 terminal fixture의 성공/오류/UID·owner·state·scope·여섯 deadline 경계와 원 오류
+보존을 보강했으며 실제 과거 경합을 재현한 검사로 표시하지 않는다. 다른 OS 경로는 유지한다.
+
+Windows675는 고정 source 한 개의 empty-cwd stdin 포맷과 사후104,104 bytes·SHA
+`55fba37a755aa8c416b9b57eb914d359fa836bcd71f23d5b8f3939d8413e89df`를 확인했다.
+count1 after manifest는 단일 object·SHA
+`dd2d8f354db88134f41017c774e1af169c2c6e4509308324a11b128a56de9095`다. command0·정상
+drain/output/export·scratch 제거·lease 해제·감독/정리 오류0이며 helper·원 source·manifest는
+외부 보존한다. 독립 소스 리뷰와 포맷 완료를 실제 macOS 통합 검사 성공으로 확대하지 않는다.
+Windows676은 의도한2개 staged 파일의 index554 files·정책 blob1·violations0과 command0·
+정상 drain/output/export·scratch 제거·lease 해제·감독/정리 오류0을 확인했다. 최종 source pin·
+index/worktree blob2개·추가 줄의 공개 경로 정책·diff check도 확인했으며 다른 변경은 제외했다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.
