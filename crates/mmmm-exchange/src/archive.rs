@@ -808,15 +808,38 @@ pub fn write_zip(
 pub fn write_zip_with_cancel(
     members: &BTreeMap<String, Vec<u8>>,
     limits: ArchiveLimits,
+    cancelled: impl FnMut() -> bool,
+) -> ExchangeResult<Vec<u8>> {
+    write_zip_with_required_root_and_cancel(members, limits, MANIFEST, cancelled)
+}
+
+/// Trusted codecs select their exact required root (for example, pack.mcmeta).
+/// It must be one bounded portable NFC file name, with literal case matching.
+/// The same deterministic writer preserves the caller's exact member bytes;
+/// choosing a root does not approve member contents or authorize source use.
+pub fn write_zip_with_required_root_and_cancel(
+    members: &BTreeMap<String, Vec<u8>>,
+    limits: ArchiveLimits,
+    required_root: &str,
     mut cancelled: impl FnMut() -> bool,
 ) -> ExchangeResult<Vec<u8>> {
     limits.validate()?;
     check_cancel(&mut cancelled)?;
+    validate_member_path(required_root, limits)?;
+    if required_root.contains('/') || !required_root.nfc().eq(required_root.chars()) {
+        return Err(invalid(
+            "Required ZIP root must be one canonical portable file name",
+        ));
+    }
     if members.is_empty() || members.len() > limits.max_members {
         return Err(limit("ZIP member count is outside its budget"));
     }
-    if !members.contains_key(MANIFEST) {
-        return Err(invalid("ZIP root exchange manifest is missing"));
+    if !members.contains_key(required_root) {
+        return Err(invalid(if required_root == MANIFEST {
+            "ZIP root exchange manifest is missing"
+        } else {
+            "ZIP required root file is missing"
+        }));
     }
     let mut names = Names::default();
     let mut predicted = 22usize;
@@ -1073,6 +1096,126 @@ mod tests {
         let root_central = directory(&archive) + 46 + metadata[0].name.len();
         archive[root_central + 46] = b'M';
         rejected(&archive);
+    }
+
+    // These three in-memory members exercise the trusted pack-root writer.
+    // Their bytes are codec fixtures, not admitted game sources.
+    #[test]
+    fn required_root_writer_preserves_exact_members_and_default_boundary() {
+        let data = BTreeMap::from([
+            (
+                "pack.mcmeta".into(),
+                br#"{"pack":{"pack_format":1}}"#.to_vec(),
+            ),
+            (
+                "data/mmmm_calibration/function/pack/entry.mcfunction".into(),
+                b"function mmmm_calibration:pack/child\n".to_vec(),
+            ),
+            (
+                "data/mmmm_calibration/function/pack/child.mcfunction".into(),
+                b"scoreboard players set #marker mcalpack 1337\n".to_vec(),
+            ),
+        ]);
+        let limits = ArchiveLimits::default();
+        let archive =
+            write_zip_with_required_root_and_cancel(&data, limits, "pack.mcmeta", || false)
+                .unwrap_or_else(|cause| panic!("{}: {}", cause.code, cause.message));
+        assert_eq!(
+            archive,
+            write_zip_with_required_root_and_cancel(&data, limits, "pack.mcmeta", || false)
+                .unwrap_or_else(|cause| panic!("{}: {}", cause.code, cause.message))
+        );
+        assert_eq!(
+            read_zip_with_required_root(&archive, limits, "pack.mcmeta", || false)
+                .unwrap_or_else(|cause| panic!("{}: {}", cause.code, cause.message)),
+            data
+        );
+        let metadata = preflight_with_required_root(&archive, limits, "pack.mcmeta", &mut || false)
+            .unwrap_or_else(|cause| panic!("{}: {}", cause.code, cause.message));
+        assert_eq!(metadata.len(), 3);
+        assert_eq!(
+            metadata
+                .iter()
+                .map(|member| &member.name)
+                .collect::<Vec<_>>(),
+            data.keys().collect::<Vec<_>>()
+        );
+        assert!(metadata.iter().all(|member| member.method == 0));
+        assert_eq!(
+            write_zip(&data, limits).unwrap_err().code,
+            "ARCHIVE_INVALID"
+        );
+        assert_eq!(
+            read_zip(&archive, limits).unwrap_err().code,
+            "ARCHIVE_INVALID"
+        );
+        let exchange = members();
+        assert_eq!(
+            write_zip_with_cancel(&exchange, limits, || false)
+                .unwrap_or_else(|cause| panic!("{}: {}", cause.code, cause.message)),
+            write_zip_with_required_root_and_cancel(&exchange, limits, MANIFEST, || false)
+                .unwrap_or_else(|cause| panic!("{}: {}", cause.code, cause.message))
+        );
+    }
+
+    #[test]
+    fn required_root_writer_reuses_cancellation_limits_and_exact_root_checks() {
+        let data = BTreeMap::from([("pack.mcmeta".to_owned(), vec![1, 2, 3])]);
+        let limits = ArchiveLimits::default();
+        assert_eq!(
+            write_zip_with_required_root_and_cancel(&data, limits, "pack.mcmeta", || true)
+                .unwrap_err()
+                .code,
+            "CANCELLED"
+        );
+        assert_eq!(
+            write_zip_with_required_root_and_cancel(
+                &data,
+                ArchiveLimits {
+                    max_archive_bytes: 22,
+                    ..limits
+                },
+                "pack.mcmeta",
+                || false
+            )
+            .unwrap_err()
+            .code,
+            "BUDGET_EXCEEDED"
+        );
+        for required in [
+            "packs/pack.mcmeta",
+            "../pack.mcmeta",
+            "pack.mcmeta/",
+            "PACK.MCMETA",
+            "e\u{301}.json",
+        ] {
+            assert_eq!(
+                write_zip_with_required_root_and_cancel(&data, limits, required, || false)
+                    .unwrap_err()
+                    .code,
+                "ARCHIVE_INVALID"
+            );
+        }
+        let oversized = "a".repeat(limits.max_path_bytes + 1);
+        for required in ["", oversized.as_str()] {
+            assert_eq!(
+                write_zip_with_required_root_and_cancel(&data, limits, required, || false)
+                    .unwrap_err()
+                    .code,
+                "BUDGET_EXCEEDED"
+            );
+        }
+        for name in ["mmmm-exchange.json", "PACK.MCMETA", "packs/pack.mcmeta"] {
+            let wrong_root = BTreeMap::from([(name.to_owned(), vec![1, 2, 3])]);
+            assert_eq!(
+                write_zip_with_required_root_and_cancel(&wrong_root, limits, "pack.mcmeta", || {
+                    false
+                })
+                .unwrap_err()
+                .code,
+                "ARCHIVE_INVALID"
+            );
+        }
     }
 
     // Existing exchange fixtures intentionally require mmmm-exchange.json.

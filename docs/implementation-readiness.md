@@ -3221,6 +3221,54 @@ ContinuationTask·원 entry binding·queue 관계를 구분할 수 있는 callsi
 서버·installer·game main은 실행하지 않았다. 전체 JDK 인증·mapped Loom JAR 동등성·
 actual Mixin 적중·dependency 실행·SourceAdmission·게임 인수 증거가 아니다.
 
+고정 `59924159c26aab7e0526d57e0509ed7e126e7e80`의
+[Rust112](https://github.com/daejunnom/MMMM/actions/runs/40055681348)와
+[JVM103](https://github.com/daejunnom/MMMM/actions/runs/40055681247)은 세 OS의 필수 단계와
+집계까지 최종 success metadata를 확인했다. Windows Rust112 ZIP83,475 bytes·SHA
+`f1dec62c1031c632b3936bc37518741cbae32d33f8dcaff64269e4705ffec612`를 API 기록과 대조했고
+ci-context actual/expected/PR head가 위 SHA와 같다. 33 entries·확장555,391 bytes를
+제한된 경로/중복/크기 검사 뒤 메모리에서 읽었으며 원 ZIP은 외부에 그대로 보존했다.
+compiler90·observer89·Coordinator401/기존ignored1 및 PACK 정본·frame/kind·변조·selector·
+purpose·partial/미발급 경계10개 검사에서 실제 ok를 확인했다. 전체 Windows workspace의
+기존 ignored2개는 별도 unconfirmed-drain/process child fixture로 전부 실행했다고
+표시하지 않는다. test/Clippy는 command0·325,094/108,321 ms·Job peak
+1,717,268,480/1,020,301,312 bytes·9/7 processes·gap150/145 ms·소유 tail 정리 뒤
+drain/output/export·scratch 정리·lease 해제와 감독/정리 오류0이다. 원 test stdout142,077
+bytes·SHA `e20e1c9ebf4e2e2de253787e15c88d4de97bbb6807e8a56deab2c3cf49dbbaf5`를
+보존한다. 로컬637/638의 never-executed를 이 다른 환경의 성공으로 다시 분류하지 않는다.
+
+앞선9b20e4f Linux111 원 감사에서는 compiler90·observer89·Coordinator400/각ignored0과
+새 PACK 경계의 실제 ok를 확인했다. 전체 Linux workspace의 기존 xtask ignored4개는
+별도 child fixture·격리 quota 증명으로 유지된다. test는 command0·150,820 ms, lint는
+원 단일 오류로 command101·29,798 ms이며 두 실행 모두 drain/output/export·scratch 정리·
+lease 해제와 감독/정리 오류0이다. 이 고정 Rust/JVM 검사는 새 PACK 실제 entry·nested
+closure·독립 marker readback·issuer 연결의 후속 소스나 실제 게임/배포 인수를 포함하지 않는다.
+
+PACK source ZIP의 독립 kernel 변경은 기존 `write_zip_with_cancel`을 같은 writer의
+`required_root="mmmm-exchange.json"`으로 delegate하고, 신뢰된 codec만 정확한 portable
+NFC root를 지정하는 `write_zip_with_required_root_and_cancel`을 추가한다. PACK stager는
+`pack.mcmeta`를 사용할 수 있으며 root 선택이 member 내용·SourceAdmission을 승인하지
+않는다. 원 bytes·정렬·Stored/CRC·취소·크기·경로·secret guard는 유지한다. 별도 실제
+게임 source로 쓰지 않는 in-memory codec 입력으로 정본 root 분리·exact member bytes·
+결정성 및 default·case/NFC/path·budget·cancel 거절을 검사하는 기존 inline 검사를
+보완했다. 독립 소스 리뷰 후 Windows645에서 이 파일 하나만 포맷했고 64,582 bytes·SHA
+`fd2e1d8f118ca74eabea2b856c2372b464cb6626788f3a514d4f737903c29908`로 동결했다.
+
+Windows646/647은 위5992415의 Git blob snapshot에 정확한 archive overlay 하나만 넣어
+`mmmm-exchange --lib` test와 별도 `--lib --tests -D warnings` Clippy를 시도했다.
+두 검사는 명시적 `x86_64-pc-windows-msvc`·jobs1·locked/offline이며 test threads2,
+원 2 GiB/32-process Job·8/12 GiB·외부600초 상한을 유지했다. 각각 `proc-macro2`의 서로
+다른 test/dev build script가 SAC/WDAC4551로 never executed되어 Cargo101로 실패했고,
+archive test 실행과 strict 소스 검증에는 도달하지 못했다. snapshot547개·12,802,697 bytes의 manifest SHA
+`01cede1e28fdee268e85332e65294959f5fb7f6a2938a700aefed3734c74602b`는 전후 같았다.
+진행 중인 다른 PACK 소스·dirty policy·보호 draft는 읽거나 overlay에 넣지 않았다.
+command1·19,744/27,145 ms·Job peak297,824,256/312,152,064 bytes·7/10 processes·gap130/124 ms,
+소유 tail 정리 뒤 drain·완전한 출력·export·scratch 정리·lease 해제와 감독/정리 오류0을
+확인했다. 원 실패·helper·backup·source pin은 외부 보존하며 보안 정책을 바꾸지 않았다.
+원637에서 파생한 새 helper는 Root 정적 검토/parser0을 확인했으나 agent thread 한도로
+새 독립 helper 리뷰는 미수행이다. archive 코드 자체의 독립 리뷰와 구분한다. 수정본의
+실제 검사는 새 고정 CI에서 확인하며5992415의 이전 성공으로 대체하지 않는다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.
