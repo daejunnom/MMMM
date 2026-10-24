@@ -3194,6 +3194,33 @@ production 오류형·JNI 경로와 선택 알고리즘은 바꾸지 않았다. 
 Windows639에서 정확한 소스 하나를 포맷했으며 실제 수정본 compile/test 결과는 다음 고정
 candidate에서 별도로 확인한다. 포맷 성공과 게임·source admission·배포 인수를 구분한다.
 
+고정 `9b20e4ffa431a26bbf4caf8b74530c08ed96afec`의
+[JVM102](https://github.com/daejunnom/MMMM/actions/runs/40054898198)는 최종 success
+metadata다. [Rust111](https://github.com/daejunnom/MMMM/actions/runs/40054898197)의
+Linux·macOS 실제 test 단계는 success였으나 lint가 실패했고 Windows는 관측 시 test
+진행 중이었다. Linux 원 ZIP84,252 bytes·SHA
+`afb04083071cac7c4200926706135b13af0ff7f6e19b423e09c1ab32d689ebf7`를 API 기록과 대조했으며
+ci-context actual/expected/PR head는 위 SHA와 같다. 원 lint의 유일한 오류는 typed kind
+추가 뒤 `prepare_bootstrap_route`의 인자8/7 경계다. 해당 함수에만 각 독립 transport·
+principal·승인 context/host·유한 lease·typed kind·원 budget의 이유를 적은 scoped allow를
+추가한다. 전역 lint 기준이나 런타임 동작은 바꾸지 않는다. 독립 소스 리뷰와
+Windows643의 정확한 파일 포맷 뒤, 수정본의 실제 strict 결과는 새 고정 candidate에서
+확인한다. Linux lint는 command101·29,798 ms·자연 종료·drain/output/export·scratch 정리·
+lease 해제와 감독/정리 오류0이며 원 실패를 보존한다.
+
+다음 PACK 실행 경로의 ABI를 확인한 Windows641/642는 원 공식 26.3 bundle에서
+정확한 nested game JAR만 소유 scratch로 추출해 선택 JDK의 javap로 6개/9개 클래스의
+선언과 bytecode를 관측했다. 실제 CallFunction의 함수 인스턴스·parent/child Frame·
+ContinuationTask·원 entry binding·queue 관계를 구분할 수 있는 callsite를 확인했다.
+원 bundle·추출 game JAR·선택 javap/modules/JVM/archive의 6 inputs와 retained owner는
+각각 전후 같았다. 두 실행은 command0·4,111/2,853 ms·Job peak209,051,648/205,918,208 bytes·
+3 processes·gap101 ms·자연 종료이며 drain·output/export·scratch 정리·lease 해제와
+감독/정리 오류0이다. 원 stdout는92,019/34,121 bytes·SHA
+`a1dae02920a25d8f5b9ef23e3e940514d43f7f00e7af12462f76839a3a8ff9bf`와
+`be312ba10e66a6aca82cdaec7ec951fe7b17a0dbca4ede6e84fdea5a4e6c2fb9`로 외부 보존한다.
+서버·installer·game main은 실행하지 않았다. 전체 JDK 인증·mapped Loom JAR 동등성·
+actual Mixin 적중·dependency 실행·SourceAdmission·게임 인수 증거가 아니다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

@@ -1543,6 +1543,10 @@ impl HostContextWitness {
 impl HostBridge {
     /// A completed bootstrap purpose receives a separate private transport.
     /// Creation preserves the current ordinary read owner and grants no effect.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Transport, principal, approved context and host identity, finite lease, typed source kind and original request budget are independent authority inputs"
+    )]
     pub(crate) fn prepare_bootstrap_route(
         &self,
         client: HostRpcClient,
