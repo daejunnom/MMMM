@@ -3943,6 +3943,64 @@ bytes·최대3 process·gap101 ms, 정상 drain/output/export·scratch 제거·l
 오류0을 확인했다. 원 source·doc·helper·manifest는 외부 보존한다. 이 문단은 포맷 이후 별도로
 추가한 실행 기록이며 새8개 검사의 컴파일·실행 성공으로 취급하지 않는다.
 
+### 후속43d1bf7의 실제 검사와 효과 순서
+
+고정 `43d1bf757d4ec8154069e28cab8c9ffac12c29a9`의
+[JVM115](https://github.com/daejunnom/MMMM/actions/runs/40073849538)는 3OS 필수 job과 집계가
+성공했다. [Rust121](https://github.com/daejunnom/MMMM/actions/runs/40073849530)도3OS의 실제
+test·strict·export와 집계가 모두 성공했다. optional 개발 JAR는 다시 dispatch하지 않았다.
+
+macOS 원 ZIP91,012 bytes·SHA
+`5d5aba28a940d3bee523da44e9247c1bfed0784dd2634bee9ee6b045d6d5725b`를 API digest·실제 source·
+target·run과 대조하고 열린 ZIP에서 필요한 member의 실제 길이·EOF·digest를 확인했다.
+observer128 PASS에 위 새8개 검사가 각각 실제 ok였고 Coordinator423·tools263 PASS와 tools의
+1 ignored를 구분했다. test260,758 ms·strict80,883 ms·각 command0이며 두 단계의 원 로그
+진단 보존·drain/output·storage observed·export·scratch 제거·lease 해제·감독/정리 오류0을
+확인했다. 실제 두 callback 도달·현재 게임 변환 적합성·전체 PACK proof를 발급한 결과는 아니다.
+
+Windows678은 의도한5개 staged 파일의 index554 files·정책 blob1·violations0과 command0·
+정상 drain/output/export·scratch 제거·lease 해제·감독/정리 오류0을 확인했다. 최종 Rust4개
+pin·index/worktree blob5개·추가 줄의 공개 경로 정책·diff check도 확인했다. 다른 dirty source·
+초안·worktree와 제품 DB/CAS/journal·복구 자료는 검사나 정리 대상에 넣지 않았다.
+
+실제 Java 순서를 추가 추적한 결과 offset0는 StageHooks의 actualCall.instantiate가 끝난 뒤
+finally의 functionInstantiated에서 발급되는 후관측이다. 원 offset0 거절로 앞선 transformed
+handler나 instantiate의 선행 효과가 차단됐다고 해석하지 않는다. 현재 전체 objective/init·
+seed·entry dispatch와 게임 쓰기 이전 차단은 별도 Rust prewrite 상수 거절이다.
+StageHooks entry가 actual plain/source/control과 실제 Supplier·entries Function·instantiate
+callback 세 객체를 처음 함께 받는 지점이며, 이곳의 국소 pre-instantiation 확인과 전체 init·
+seed 이전 code-readiness 취득은 다른 경계다. phase49·controlled startup·실제 approved host
+exchange를 구현하지 않고 국소 확인을 전체 권한으로 승격하지 않는다.
+
+릴리스 source도 실제 production 경로를 확인했다. LocalFeatureSources는 현재 request·budget·
+owner·Store journal을 검사한 뒤 인증된 frozen evidence 부재를 None으로 보존한다. 실제
+archive/inventory producer와 같은 Store/current request에 결속한 authenticated evidence
+adapter는 별도 미구현이다. policy의 verified evaluator와82개·3OS/game/client·vanilla·rights·
+unknown gate를 완화하지 않는다. 최종 archive digest를 포함하는 inventory/binding/proof
+sidecar는 그 self-hashed archive 밖에 보존해야 한다. SDK 전용 role/kind는 현재 정책에서
+확인되지 않았으며 새로운 role이나 인수 항목을 임의로 추가하지 않는다.
+
+### PACK instantiate 직전의 국소 거절
+
+후속 Java 소스는 StageHooks가 actualCall의 try/finally에 들어가기 전에 실제 plain/source/
+control과 세 callback의 원 reference를 listener에 전달한다. callback을 조회 목적으로 실행하거나
+저장·전송하지 않는다. PACK Trace는 기존 checkpoint의 원 요청·취소·기한·현재 readiness를
+먼저 확인하고 step·실제 plain/source 관계와 reference 부재를 검사한 뒤 현재 code-readiness
+미구현에 대해 기존 내부 CAPABILITY_UNAVAILABLE로 거절한다. 기존 numeric listener는 default
+동작을 유지한다. prehook 거절은 원 instantiate 시도나 후관측이 아니므로 nativeStarted·
+event0·slot·새 receipt나 원장을 합성하지 않는다.
+
+기존 StageHooks fixture로 추가한2개 검사는 세 callback의 동일 reference와 거절 시
+instantiate·parent supplier·entries·후관측 호출0, default listener의 정상 반환과 원 예외·
+실제 후행 suppressed 오류 보존을 다룬다. 독립 source/type 검토를 완료했으며 새 커밋의 실제
+컴파일·JUnit 실행 결과와 구분한다. 새 fixture·phase49 frame·성공 authority는 추가하지 않았다.
+
+이 gate는 해당 instantiate 앞의 국소 negative gate이며 그 handler 자체의 선행 효과나
+전체 objective/init·seed 앞의 증명을 대신하지 않는다. 원 offset0는 계속 instantiate
+후관측이다. Rust prewrite 상수 거절·controlled startup·별도49·실제 approved host exchange와
+request-scoped 취득의 미구현 상태를 유지한다. 실제 클라이언트 인증·pairing·시각 검증도
+`not_run`이다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

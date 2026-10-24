@@ -572,6 +572,20 @@ final class NativePackCalibrationRun implements HostDispatcher.PurposeRoute, Aut
             }
         }
         private RuntimeException interrupted() { return new InterruptedRun(original, snapshot()); }
+        @Override public void beforeFunctionInstantiation(Object plain, Object source, Object actualControl,
+                Object actualParentFrameCallback, Object actualEntriesCallback, Object actualCallCallback) {
+            checkpoint();
+            if (step != 2) throw failure("PACK_CALIBRATION_UNEXPECTED_FUNCTION");
+            if (plain != readiness.entryFunction() && plain != readiness.dependencyFunction())
+                throw failure("PACK_CALIBRATION_FUNCTION_CHANGED");
+            actualSource(source);
+            if (actualControl == null || actualParentFrameCallback == null || actualEntriesCallback == null || actualCallCallback == null)
+                throw failure("PACK_CALIBRATION_INSTANTIATION_UNCONFIRMED");
+            // This local negative gate precedes only this actual instantiate.
+            // It issues no phase49 approval and does not replace the separate
+            // prewrite code-readiness/startup gate before objective/init/seed.
+            throw new ContractException("CAPABILITY_UNAVAILABLE", "Actual PACK instantiation code-readiness is unavailable");
+        }
         @Override public void functionInstantiated(Object plain, Object actual, Object source, Object actualControl,
                                                    Object actualParent, List<?> actualEntries, Throwable failure) {
             checkpoint();

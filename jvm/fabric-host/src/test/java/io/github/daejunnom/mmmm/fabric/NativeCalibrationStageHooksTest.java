@@ -2,7 +2,10 @@ package io.github.daejunnom.mmmm.fabric;
 
 import com.mojang.brigadier.context.CommandContext;
 import io.github.daejunnom.mmmm.sdk.ContractException;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
+import java.util.function.Supplier;
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -66,6 +69,60 @@ final class NativeCalibrationStageHooksTest {
             assertSame(denied, assertThrows(ContractException.class, () -> NativeCalibrationStageHooks.nativeHandler(context -> calls.incrementAndGet(), null)));
         }
         assertEquals(0, calls.get());
+    }
+    @Test void instantiationPrecheckReceivesActualCallbacksAndRejectsBeforeAnyInvocation() {
+        Object plain = new Object(), source = new Object(), control = new Object();
+        AtomicInteger originalCalls = new AtomicInteger(), parentCalls = new AtomicInteger(), entriesCalls = new AtomicInteger(), postCalls = new AtomicInteger();
+        Supplier<Object> parent = () -> { parentCalls.incrementAndGet(); return new Object(); };
+        Function<Object, List<?>> entries = actual -> { entriesCalls.incrementAndGet(); return List.of(); };
+        NativeCalibrationStageHooks.FunctionInstantiation<Object> original = () -> { originalCalls.incrementAndGet(); return new Object(); };
+        ContractException denied = new ContractException("CAPABILITY_UNAVAILABLE", "fixture");
+        var listener = new Listener() {
+            @Override public void beforeFunctionInstantiation(Object actualPlain, Object actualSource, Object actualControl,
+                    Object actualParent, Object actualEntries, Object actualCall) {
+                assertSame(plain, actualPlain); assertSame(source, actualSource); assertSame(control, actualControl);
+                assertSame(parent, actualParent); assertSame(entries, actualEntries); assertSame(original, actualCall);
+                throw denied;
+            }
+            @Override public void functionInstantiated(Object actualPlain, Object actual, Object actualSource,
+                    Object actualControl, Object actualParent, List<?> actualEntries, Throwable failure) { postCalls.incrementAndGet(); }
+        };
+        var scope = NativeCalibrationStageHooks.open(listener);
+        try (scope) {
+            assertSame(denied, assertThrows(ContractException.class,
+                    () -> NativeCalibrationStageHooks.nativeFunctionInstantiation(plain, source, control, parent, entries, original)));
+        }
+        assertEquals(0, originalCalls.get()); assertEquals(0, parentCalls.get()); assertEquals(0, entriesCalls.get()); assertEquals(0, postCalls.get());
+        assertEquals(0, denied.getSuppressed().length);
+    }
+    @Test void defaultInstantiationPrecheckPreservesReturnAndOriginalFailureGraph() throws Exception {
+        Object plain = new Object(), source = new Object(), control = new Object(), returned = new Object(), parentFrame = new Object();
+        List<?> actualEntries = List.of(new Object());
+        AtomicInteger originalCalls = new AtomicInteger(), parentCalls = new AtomicInteger(), entriesCalls = new AtomicInteger(), postCalls = new AtomicInteger();
+        RuntimeException primary = new IllegalStateException("original"); Error post = new AssertionError("post");
+        Supplier<Object> parent = () -> { parentCalls.incrementAndGet(); return parentFrame; };
+        Function<Object, List<?>> entries = actual -> { entriesCalls.incrementAndGet(); assertSame(returned, actual); return actualEntries; };
+        var listener = new Listener() {
+            @Override public void functionInstantiated(Object actualPlain, Object actual, Object actualSource,
+                    Object actualControl, Object actualParent, List<?> observedEntries, Throwable failure) {
+                postCalls.incrementAndGet();
+                assertSame(plain, actualPlain); assertSame(source, actualSource); assertSame(control, actualControl);
+                if (failure != null) {
+                    assertSame(primary, failure); assertNull(actual); assertNull(actualParent); assertNull(observedEntries); throw post;
+                }
+                assertSame(returned, actual); assertSame(parentFrame, actualParent); assertSame(actualEntries, observedEntries);
+            }
+        };
+        var scope = NativeCalibrationStageHooks.open(listener);
+        try (scope) {
+            assertSame(returned, NativeCalibrationStageHooks.nativeFunctionInstantiation(plain, source, control, parent, entries,
+                    () -> { originalCalls.incrementAndGet(); return returned; }));
+            assertSame(primary, assertThrows(RuntimeException.class,
+                    () -> NativeCalibrationStageHooks.nativeFunctionInstantiation(plain, source, control, parent, entries,
+                            () -> { originalCalls.incrementAndGet(); throw primary; })));
+        }
+        assertEquals(2, originalCalls.get()); assertEquals(1, parentCalls.get()); assertEquals(1, entriesCalls.get()); assertEquals(2, postCalls.get());
+        assertArrayEquals(new Throwable[] {post}, primary.getSuppressed());
     }
     private static class Listener implements NativeCalibrationStageHooks.Listener {
         @Override public void beforeEntry(Object entry, Object source, Object context, Object frame) { }

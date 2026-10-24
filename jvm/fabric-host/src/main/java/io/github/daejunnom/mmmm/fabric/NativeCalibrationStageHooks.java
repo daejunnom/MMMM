@@ -33,6 +33,8 @@ public final class NativeCalibrationStageHooks {
         default void beforeFrameReturn(Object frame, Integer returned) { }
         default void beforeResultCallback(CommandContext<?> context) { }
         default void afterResultCallback(CommandContext<?> context, Throwable failure) { }
+        default void beforeFunctionInstantiation(Object actualPlain, Object actualSource, Object actualExecutionControl,
+                Object actualParentFrameCallback, Object actualEntriesCallback, Object actualCallCallback) { }
         default void functionInstantiated(Object actualPlain, Object actualInstantiated, Object actualSource,
                 Object actualExecutionControl, Object actualParentFrame, List<?> actualEntries, Throwable actualFailure) { }
         default void functionCall(Object call, Object function, Object source, Object context, Object parentFrame) { }
@@ -77,6 +79,10 @@ public final class NativeCalibrationStageHooks {
             throws FunctionInstantiationException {
         Listener current = ACTIVE.get();
         if (current == null) return actualCall.instantiate();
+        // A rejected precheck is not an attempted original call or a post-call
+        // observation. Pass the actual callbacks without invoking any of them.
+        current.beforeFunctionInstantiation(actualPlain, actualSource, actualExecutionControl,
+                actualParentFrame, actualEntries, actualCall);
         T returned = null;
         Throwable primary = null;
         try {
