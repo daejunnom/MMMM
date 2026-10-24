@@ -68,6 +68,88 @@ fn ready_ordinary(core: &mut RecordingCore, class: u64) {
         .unwrap();
 }
 
+fn ready_ordinary_source(core: &mut RecordingCore, class: u64) {
+    let token = ordinary(core, THREAD, b"sample/A");
+    core.terminal_hook(THREAD, LOADER, Some(b"sample/A"), vec![0xca, 0xfe])
+        .unwrap();
+    core.class_load(THREAD, class, LOADER, b"sample.A".to_vec())
+        .unwrap();
+    core.finish(THREAD, token, Some(class), false).unwrap();
+    core.class_prepare(99, class, LOADER, b"sample.A".to_vec(), Some(snapshot()))
+        .unwrap();
+}
+
+#[test]
+fn ordinary_source_borrows_exact_prepared_record_without_changing_evidence() {
+    let mut core = RecordingCore::new(7);
+    ready_ordinary_source(&mut core, CLASS);
+    let before = core.encode_evidence(CLASS).unwrap();
+    let bytes = core.retained_bytes();
+    let source = core
+        .with_ordinary_source(7, CLASS, 1, LOADER, |source| {
+            assert_eq!(source.identity(), (7, CLASS, 1, LOADER));
+            assert_eq!(source.name_utf8(), b"sample.A");
+            assert_eq!(source.terminal_bytes(), &[0xca, 0xfe]);
+            assert_eq!(source.snapshot(), &snapshot());
+            (
+                source.terminal_bytes().as_ptr() as usize,
+                source.snapshot() as *const ExecutableSnapshot as usize,
+            )
+        })
+        .unwrap();
+    let record = &core.records[&CLASS];
+    assert_eq!(source.0, record.terminal_bytes.as_ptr() as usize);
+    assert_eq!(
+        source.1,
+        record.snapshot.as_ref().unwrap() as *const ExecutableSnapshot as usize
+    );
+    assert_eq!(core.retained_bytes(), bytes);
+    assert_eq!(core.encode_evidence(CLASS).unwrap(), before);
+}
+
+#[test]
+fn ordinary_source_rejects_wrong_stamp_and_unavailable_source_without_calling_matcher() {
+    let mut core = RecordingCore::new(7);
+    ready_ordinary_source(&mut core, CLASS);
+    let before = core.encode_evidence(CLASS).unwrap();
+    for (issuer, class, generation, loader) in [
+        (0, CLASS, 1, LOADER),
+        (8, CLASS, 1, LOADER),
+        (7, CLASS + 1, 1, LOADER),
+        (7, CLASS, 2, LOADER),
+        (7, CLASS, 1, LOADER + 1),
+    ] {
+        assert!(
+            core.with_ordinary_source::<()>(issuer, class, generation, loader, |_| {
+                panic!("a mismatched source must not reach the matcher")
+            })
+            .is_none()
+        );
+    }
+    assert_eq!(core.encode_evidence(CLASS).unwrap(), before);
+    core.invalidate_class(CLASS);
+    assert!(
+        core.with_ordinary_source(7, CLASS, 1, LOADER, |_| ())
+            .is_none()
+    );
+
+    let mut no_snapshot = RecordingCore::new(7);
+    ready_ordinary(&mut no_snapshot, CLASS);
+    assert!(
+        no_snapshot
+            .with_ordinary_source(7, CLASS, 1, LOADER, |_| ())
+            .is_none()
+    );
+    let mut exhausted = RecordingCore::new(7);
+    ready_ordinary_source(&mut exhausted, CLASS);
+    exhausted.exhausted = true;
+    assert!(
+        exhausted
+            .with_ordinary_source(7, CLASS, 1, LOADER, |_| ())
+            .is_none()
+    );
+}
+
 #[test]
 fn ordinary_requires_exact_return_identity_and_prepare_even_after_native_return() {
     let mut core = RecordingCore::new(7);
@@ -79,6 +161,10 @@ fn ordinary_requires_exact_return_identity_and_prepare_even_after_native_return(
     core.finish(THREAD, token, Some(CLASS), false).unwrap();
     assert!(core.contains_class(CLASS));
     assert!(core.needs_snapshot(CLASS));
+    assert!(
+        core.with_ordinary_source(7, CLASS, 1, LOADER, |_| ())
+            .is_none()
+    );
     assert_eq!(
         core.encode_evidence(CLASS),
         Err(RecordingError::NotPrepared)
@@ -537,6 +623,10 @@ fn hidden_context_requires_current_prepared_actual_identity() {
     assert_eq!(core.hidden_context(CLASS), Some((1, 40, LOADER)));
     assert_eq!(core.class_generation(CLASS), Some(1));
     assert_eq!(core.ordinary_generation(CLASS), None);
+    assert!(
+        core.with_ordinary_source(1, CLASS, 1, LOADER, |_| ())
+            .is_none()
+    );
     core.invalidate_class(CLASS);
     assert_eq!(core.hidden_context(CLASS), None);
     assert_eq!(core.class_generation(CLASS), None);

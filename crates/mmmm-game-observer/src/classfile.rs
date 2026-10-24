@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 MMMM contributors
 
-//! Bounded description of a narrow hidden-class forwarding recipe.
+//! Bounded class metadata and narrow hidden-class forwarding recipes.
 //!
 //! This module does not establish that caller-supplied bytes were loaded, issue
 //! definition receipts, or turn a symbolic constant-pool reference into a VM
@@ -11,6 +11,8 @@
 //!
 //! Format: JVMS 25, chapter 4. GetBytecodes/GetConstantPool describe executable
 //! instructions and a corresponding reconstituted pool, not a full classfile.
+//! Preserved bootstrap metadata and exception boundaries do not resolve dynamic
+//! call sites, verify JVM types or approve an ordinary method's semantics.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -25,6 +27,10 @@ const MAX_ATTRIBUTE_NAME_BYTES: usize = 128;
 const MAX_SYMBOLIC_TEXT_BYTES: usize = 4096;
 const MAX_CODE_BYTES: usize = 65_535;
 const MAX_FORWARDER_PARAMETERS: usize = 64;
+const MAX_BOOTSTRAP_METHODS: usize = 256;
+const MAX_BOOTSTRAP_ARGUMENTS: usize = 256;
+const MAX_TOTAL_BOOTSTRAP_ARGUMENTS: usize = 4096;
+const MAX_EXCEPTION_HANDLERS: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ClassfileError {
@@ -84,6 +90,19 @@ pub(crate) struct HiddenForwarder {
     sam_descriptor: String,
     target: MethodSymbol,
     reference_classes: Vec<String>,
+}
+
+/// Describes only the selected returned-receiver body. The native owner must
+/// separately establish terminal input finality and actual Class/loader identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PlainTextInstantiateMatch {
+    method: MethodSymbol,
+}
+
+impl PlainTextInstantiateMatch {
+    pub(crate) fn method(&self) -> &MethodSymbol {
+        &self.method
+    }
 }
 
 impl HiddenForwarder {
@@ -178,8 +197,8 @@ enum PoolEntry {
     NameAndType(u16, u16),
     MethodHandle(u8, u16),
     MethodType(u16),
-    Dynamic(u16),
-    InvokeDynamic(u16),
+    Dynamic(u16, u16),
+    InvokeDynamic(u16, u16),
     Module(u16),
     Package(u16),
 }
@@ -317,7 +336,7 @@ impl Pool {
                         ));
                     }
                 }
-                PoolEntry::Dynamic(name_type) | PoolEntry::InvokeDynamic(name_type)
+                PoolEntry::Dynamic(_, name_type) | PoolEntry::InvokeDynamic(_, name_type)
                     if !matches!(self.entry(*name_type)?, PoolEntry::NameAndType(_, _)) =>
                 {
                     return Err(ClassfileError::Malformed("dynamic reference tag mismatch"));
@@ -334,8 +353,8 @@ impl Pool {
                 entry,
                 PoolEntry::MethodHandle(_, _)
                     | PoolEntry::MethodType(_)
-                    | PoolEntry::Dynamic(_)
-                    | PoolEntry::InvokeDynamic(_)
+                    | PoolEntry::Dynamic(_, _)
+                    | PoolEntry::InvokeDynamic(_, _)
                     | PoolEntry::Module(_)
                     | PoolEntry::Package(_)
             )
@@ -477,16 +496,8 @@ fn read_pool(reader: &mut Reader<'_>, count: usize) -> Result<Pool, ClassfileErr
             12 => PoolEntry::NameAndType(reader.u2()?, reader.u2()?),
             15 => PoolEntry::MethodHandle(reader.u1()?, reader.u2()?),
             16 => PoolEntry::MethodType(reader.u2()?),
-            17 => {
-                // Bootstrap indices are consumed, but dynamic dispatch is
-                // always unsupported here. Keep the checked NameAndType edge.
-                reader.u2()?;
-                PoolEntry::Dynamic(reader.u2()?)
-            }
-            18 => {
-                reader.u2()?;
-                PoolEntry::InvokeDynamic(reader.u2()?)
-            }
+            17 => PoolEntry::Dynamic(reader.u2()?, reader.u2()?),
+            18 => PoolEntry::InvokeDynamic(reader.u2()?, reader.u2()?),
             19 => PoolEntry::Module(reader.u2()?),
             20 => PoolEntry::Package(reader.u2()?),
             _ => return Err(ClassfileError::Malformed("unknown constant-pool tag")),
@@ -525,8 +536,10 @@ fn read_attributes(reader: &mut Reader<'_>, pool: &Pool) -> Result<Vec<Attribute
         if name.len() > MAX_ATTRIBUTE_NAME_BYTES {
             return Err(ClassfileError::Bounds("attribute name length"));
         }
-        if matches!(name.as_str(), "Code" | "SourceFile" | "StackMapTable")
-            && !singletons.insert(name.clone())
+        if matches!(
+            name.as_str(),
+            "Code" | "SourceFile" | "StackMapTable" | "BootstrapMethods"
+        ) && !singletons.insert(name.clone())
         {
             return Err(ClassfileError::Malformed("duplicate singleton attribute"));
         }
@@ -543,13 +556,207 @@ fn read_attributes(reader: &mut Reader<'_>, pool: &Pool) -> Result<Vec<Attribute
     Ok(attributes)
 }
 
+/// Bounded structural metadata only; no bootstrap is resolved or invoked.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BootstrapMethod {
+    pub(crate) method_ref: u16,
+    pub(crate) arguments: Vec<u16>,
+}
+
+impl BootstrapMethod {
+    fn validate(&self, pool: &Pool) -> Result<(), ClassfileError> {
+        if !matches!(pool.entry(self.method_ref)?, PoolEntry::MethodHandle(_, _)) {
+            return Err(ClassfileError::Malformed("bootstrap method handle"));
+        }
+        for argument in &self.arguments {
+            if !matches!(
+                pool.entry(*argument)?,
+                PoolEntry::Integer
+                    | PoolEntry::Float
+                    | PoolEntry::Long
+                    | PoolEntry::Double
+                    | PoolEntry::Class(_)
+                    | PoolEntry::String(_)
+                    | PoolEntry::MethodHandle(_, _)
+                    | PoolEntry::MethodType(_)
+                    | PoolEntry::Dynamic(_, _)
+            ) {
+                return Err(ClassfileError::Malformed("bootstrap argument tag"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn read_bootstrap_methods(
+    attributes: &[Attribute],
+    pool: &Pool,
+) -> Result<Vec<BootstrapMethod>, ClassfileError> {
+    let Some(attribute) = attributes
+        .iter()
+        .find(|item| item.name == "BootstrapMethods")
+    else {
+        return Ok(Vec::new());
+    };
+    let mut reader = Reader::new(&attribute.bytes);
+    let count = usize::from(reader.u2()?);
+    if count > MAX_BOOTSTRAP_METHODS {
+        return Err(ClassfileError::Bounds("bootstrap method count"));
+    }
+    let mut methods = Vec::with_capacity(count);
+    let mut total_arguments = 0usize;
+    for _ in 0..count {
+        let method_ref = reader.u2()?;
+        let argument_count = usize::from(reader.u2()?);
+        total_arguments = total_arguments
+            .checked_add(argument_count)
+            .ok_or(ClassfileError::Bounds("bootstrap argument total"))?;
+        if argument_count > MAX_BOOTSTRAP_ARGUMENTS
+            || total_arguments > MAX_TOTAL_BOOTSTRAP_ARGUMENTS
+        {
+            return Err(ClassfileError::Bounds("bootstrap arguments"));
+        }
+        let mut arguments = Vec::with_capacity(argument_count);
+        for _ in 0..argument_count {
+            arguments.push(reader.u2()?);
+        }
+        let method = BootstrapMethod {
+            method_ref,
+            arguments,
+        };
+        method.validate(pool)?;
+        methods.push(method);
+    }
+    reader.done()?;
+    Ok(methods)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExceptionHandler {
+    pub(crate) start_pc: u16,
+    pub(crate) end_pc: u16,
+    pub(crate) handler_pc: u16,
+    // Zero denotes a catch-all entry; any other value must reference Class.
+    pub(crate) catch_type: u16,
+}
+
 #[derive(Clone, Debug)]
-struct Code {
-    max_stack: u16,
-    max_locals: u16,
-    bytes: Vec<u8>,
-    exception_count: usize,
+pub(crate) struct Code {
+    pub(crate) max_stack: u16,
+    pub(crate) max_locals: u16,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) exception_handlers: Vec<ExceptionHandler>,
     attributes: Vec<Attribute>,
+}
+
+fn instruction_starts(bytes: &[u8]) -> Result<BTreeSet<usize>, ClassfileError> {
+    let mut starts = BTreeSet::new();
+    let mut reader = Reader::new(bytes);
+    while reader.offset < bytes.len() {
+        let offset = reader.offset;
+        starts.insert(offset);
+        let opcode = reader.u1()?;
+        let operands = match opcode {
+            0x00..=0x0f
+            | 0x1a..=0x35
+            | 0x3b..=0x83
+            | 0x85..=0x98
+            | 0xac..=0xb1
+            | 0xbe..=0xbf
+            | 0xc2..=0xc3 => 0,
+            0x10 | 0x12 | 0x15..=0x19 | 0x36..=0x3a | 0xa9 | 0xbc => 1,
+            0x11
+            | 0x13..=0x14
+            | 0x84
+            | 0x99..=0xa8
+            | 0xb2..=0xb8
+            | 0xbb
+            | 0xbd
+            | 0xc0..=0xc1
+            | 0xc6..=0xc7 => 2,
+            0xc5 => 3,
+            0xb9..=0xba | 0xc8..=0xc9 => 4,
+            0xaa | 0xab => {
+                let padding = (4 - reader.offset % 4) % 4;
+                reader.bytes(padding)?;
+                reader.u4()?; // The default target is not resolved here.
+                if opcode == 0xaa {
+                    let low = i32::from_be_bytes(reader.u4()?.to_be_bytes());
+                    let high = i32::from_be_bytes(reader.u4()?.to_be_bytes());
+                    let count = i64::from(high) - i64::from(low) + 1;
+                    let count = usize::try_from(count)
+                        .map_err(|_| ClassfileError::Malformed("tableswitch range"))?;
+                    if count == 0 || count > MAX_CODE_BYTES / 4 {
+                        return Err(ClassfileError::Bounds("tableswitch entries"));
+                    }
+                    reader.bytes(count * 4)?;
+                } else {
+                    let pairs = i32::from_be_bytes(reader.u4()?.to_be_bytes());
+                    let pairs = usize::try_from(pairs)
+                        .map_err(|_| ClassfileError::Malformed("lookupswitch pair count"))?;
+                    if pairs > MAX_CODE_BYTES / 8 {
+                        return Err(ClassfileError::Bounds("lookupswitch entries"));
+                    }
+                    let mut previous = None;
+                    for _ in 0..pairs {
+                        let key = i32::from_be_bytes(reader.u4()?.to_be_bytes());
+                        if previous.is_some_and(|value| key <= value) {
+                            return Err(ClassfileError::Malformed("lookupswitch key order"));
+                        }
+                        previous = Some(key);
+                        reader.u4()?;
+                    }
+                }
+                0
+            }
+            0xc4 => match reader.u1()? {
+                0x15..=0x19 | 0x36..=0x3a | 0xa9 => 2,
+                0x84 => 4,
+                _ => return Err(ClassfileError::Malformed("wide opcode")),
+            },
+            _ => {
+                return Err(ClassfileError::Unsupported(
+                    "exception-table bytecode opcode",
+                ));
+            }
+        };
+        reader.bytes(operands)?;
+    }
+    Ok(starts)
+}
+
+impl Code {
+    fn validate_handlers(&self, pool: &Pool) -> Result<(), ClassfileError> {
+        if self.exception_handlers.is_empty() {
+            return Ok(());
+        }
+        // Only instruction boundaries and Class tags are checked. This is not
+        // operand verification, stack/type checking or exception-flow approval.
+        let starts = instruction_starts(&self.bytes)?;
+        for handler in &self.exception_handlers {
+            let start = usize::from(handler.start_pc);
+            let end = usize::from(handler.end_pc);
+            let target = usize::from(handler.handler_pc);
+            if start >= end
+                || end > self.bytes.len()
+                || !starts.contains(&start)
+                || !starts.contains(&target)
+                || (end != self.bytes.len() && !starts.contains(&end))
+            {
+                return Err(ClassfileError::Malformed(
+                    "invalid Code exception-table boundary",
+                ));
+            }
+            if handler.catch_type != 0
+                && !matches!(pool.entry(handler.catch_type)?, PoolEntry::Class(_))
+            {
+                return Err(ClassfileError::Malformed(
+                    "invalid Code exception catch type",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn read_code(bytes: &[u8], pool: &Pool) -> Result<Code, ClassfileError> {
@@ -563,40 +770,46 @@ fn read_code(bytes: &[u8], pool: &Pool) -> Result<Code, ClassfileError> {
     }
     let code = reader.bytes(length)?.to_vec();
     let exception_count = usize::from(reader.u2()?);
+    if exception_count > MAX_EXCEPTION_HANDLERS {
+        return Err(ClassfileError::Bounds("exception-table count"));
+    }
+    let mut exception_handlers = Vec::with_capacity(exception_count);
     for _ in 0..exception_count {
-        let start = usize::from(reader.u2()?);
-        let end = usize::from(reader.u2()?);
-        let handler = usize::from(reader.u2()?);
-        let catch_type = reader.u2()?;
-        if start >= end || end > length || handler >= length {
-            return Err(ClassfileError::Malformed(
-                "invalid Code exception-table range",
-            ));
-        }
-        if catch_type != 0 && !matches!(pool.entry(catch_type)?, PoolEntry::Class(_)) {
-            return Err(ClassfileError::Malformed(
-                "invalid Code exception catch type",
-            ));
-        }
+        exception_handlers.push(ExceptionHandler {
+            start_pc: reader.u2()?,
+            end_pc: reader.u2()?,
+            handler_pc: reader.u2()?,
+            catch_type: reader.u2()?,
+        });
     }
     let attributes = read_attributes(&mut reader, pool)?;
     reader.done()?;
-    Ok(Code {
+    if attributes
+        .iter()
+        .any(|attribute| attribute.name == "BootstrapMethods")
+    {
+        return Err(ClassfileError::Malformed(
+            "BootstrapMethods outside class attributes",
+        ));
+    }
+    let code = Code {
         max_stack,
         max_locals,
         bytes: code,
-        exception_count,
+        exception_handlers,
         attributes,
-    })
+    };
+    code.validate_handlers(pool)?;
+    Ok(code)
 }
 
 #[derive(Clone, Debug)]
-struct Member {
-    flags: u16,
-    name: String,
-    descriptor: String,
+pub(crate) struct Member {
+    pub(crate) flags: u16,
+    pub(crate) name: String,
+    pub(crate) descriptor: String,
     attributes: Vec<Attribute>,
-    code: Option<Code>,
+    pub(crate) code: Option<Code>,
 }
 
 fn read_members(
@@ -618,6 +831,14 @@ fn read_members(
             return Err(ClassfileError::Malformed("duplicate member signature"));
         }
         let attributes = read_attributes(reader, pool)?;
+        if attributes
+            .iter()
+            .any(|attribute| attribute.name == "BootstrapMethods")
+        {
+            return Err(ClassfileError::Malformed(
+                "BootstrapMethods outside class attributes",
+            ));
+        }
         let mut code = None;
         for attribute in &attributes {
             if attribute.name == "Code" {
@@ -655,6 +876,64 @@ pub(crate) struct ParsedClass {
     fields: Vec<Member>,
     methods: Vec<Member>,
     attributes: Vec<Attribute>,
+    bootstrap_methods: Vec<BootstrapMethod>,
+}
+
+impl ParsedClass {
+    /// Selects existing parsed metadata only. It establishes no loaded identity,
+    /// method semantics, initialization state or right to invoke the method.
+    pub(crate) fn selected_method(
+        &self,
+        name: &str,
+        descriptor: &str,
+    ) -> Result<&Member, ClassfileError> {
+        let mut methods = self
+            .methods
+            .iter()
+            .filter(|method| method.name == name && method.descriptor == descriptor);
+        let selected = methods
+            .next()
+            .ok_or(ClassfileError::Unsupported("selected method absent"))?;
+        if methods.next().is_some() {
+            return Err(ClassfileError::Malformed("duplicate selected method"));
+        }
+        Ok(selected)
+    }
+
+    /// Returns the original zero-based BootstrapMethods index and its bounded
+    /// metadata for one CP Dynamic/InvokeDynamic entry. No bootstrap is resolved.
+    pub(crate) fn bootstrap_for_dynamic(
+        &self,
+        pool_index: u16,
+    ) -> Result<(u16, &BootstrapMethod), ClassfileError> {
+        let bootstrap = match self.pool.entry(pool_index)? {
+            PoolEntry::Dynamic(index, _) | PoolEntry::InvokeDynamic(index, _) => *index,
+            _ => {
+                return Err(ClassfileError::Malformed(
+                    "selected constant is not dynamic",
+                ));
+            }
+        };
+        let method = self
+            .bootstrap_methods
+            .get(usize::from(bootstrap))
+            .ok_or(ClassfileError::Malformed("dynamic bootstrap index"))?;
+        Ok((bootstrap, method))
+    }
+
+    fn validate_bootstrap_references(&self) -> Result<(), ClassfileError> {
+        for (index, entry) in self.pool.entries.iter().enumerate() {
+            if matches!(
+                entry,
+                PoolEntry::Dynamic(_, _) | PoolEntry::InvokeDynamic(_, _)
+            ) {
+                let index = u16::try_from(index)
+                    .map_err(|_| ClassfileError::Bounds("dynamic pool index"))?;
+                self.bootstrap_for_dynamic(index)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Complete bounded structural parse. Unknown attributes retain their bounded
@@ -702,7 +981,8 @@ pub(crate) fn parse_classfile(input: &[u8]) -> Result<ParsedClass, ClassfileErro
     let methods = read_members(&mut reader, &pool, true)?;
     let attributes = read_attributes(&mut reader, &pool)?;
     reader.done()?;
-    Ok(ParsedClass {
+    let bootstrap_methods = read_bootstrap_methods(&attributes, &pool)?;
+    let parsed = ParsedClass {
         pool,
         flags,
         class_name,
@@ -711,7 +991,10 @@ pub(crate) fn parse_classfile(input: &[u8]) -> Result<ParsedClass, ClassfileErro
         fields,
         methods,
         attributes,
-    })
+        bootstrap_methods,
+    };
+    parsed.validate_bootstrap_references()?;
+    Ok(parsed)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -908,7 +1191,7 @@ fn supported_code(member: &Member) -> Result<&Code, ClassfileError> {
         .code
         .as_ref()
         .ok_or(ClassfileError::Malformed("concrete method has no Code"))?;
-    if code.exception_count != 0 {
+    if !code.exception_handlers.is_empty() {
         return Err(ClassfileError::Unsupported("exception handlers"));
     }
     passive_code_attributes(code)?;
@@ -1012,7 +1295,7 @@ fn forwarding_semantics(
     Ok(ForwardingSemantics { target, casts })
 }
 
-fn snapshot_pool(snapshot: &ExecutableSnapshot) -> Result<Pool, ClassfileError> {
+fn snapshot_pool_structure(snapshot: &ExecutableSnapshot) -> Result<Pool, ClassfileError> {
     if snapshot.constant_pool.len() > MAX_CLASSFILE_BYTES || snapshot.methods.len() > MAX_MEMBERS {
         return Err(ClassfileError::Bounds("VM snapshot"));
     }
@@ -1037,6 +1320,11 @@ fn snapshot_pool(snapshot: &ExecutableSnapshot) -> Result<Pool, ClassfileError> 
         .map_err(|_| ClassfileError::Bounds("VM constant-pool count"))?;
     let pool = read_pool(&mut reader, count)?;
     reader.done()?;
+    Ok(pool)
+}
+
+fn snapshot_pool(snapshot: &ExecutableSnapshot) -> Result<Pool, ClassfileError> {
+    let pool = snapshot_pool_structure(snapshot)?;
     pool.reject_dynamic_dispatch()?;
     Ok(pool)
 }
@@ -1089,6 +1377,94 @@ fn collect_references(value_type: &ValueType, classes: &mut BTreeSet<String>) {
             classes.insert(name.clone());
         }
     }
+}
+
+/// Matches the original 26.3 API's single public instantiate method, not the
+/// FunctionCommand redirect, other PACK targets or a complete execution proof.
+/// The pair must already belong to one actual current ordinary definition.
+pub(crate) fn match_plain_text_instantiate(
+    terminal_bytes: &[u8],
+    snapshot: &ExecutableSnapshot,
+) -> Result<PlainTextInstantiateMatch, ClassfileError> {
+    const OWNER: &str = "net/minecraft/commands/functions/PlainTextFunction";
+    const DESCRIPTOR: &str = "(Lnet/minecraft/nbt/CompoundTag;Lcom/mojang/brigadier/CommandDispatcher;)Lnet/minecraft/commands/functions/InstantiatedFunction;";
+    let parsed = parse_classfile(terminal_bytes)?;
+    if parsed.class_name != OWNER {
+        return Err(ClassfileError::Unsupported(
+            "PlainTextFunction declaring class",
+        ));
+    }
+    let method = parsed.selected_method("instantiate", DESCRIPTOR)?;
+    if method.flags != 0x0001 {
+        return Err(ClassfileError::Unsupported(
+            "PlainTextFunction instantiate modifiers",
+        ));
+    }
+    let mut singletons = BTreeSet::new();
+    for attribute in &method.attributes {
+        if !singletons.insert(attribute.name.as_str()) {
+            return Err(ClassfileError::Malformed(
+                "duplicate instantiate method attribute",
+            ));
+        }
+        match attribute.name.as_str() {
+            "Code" => {}
+            "Exceptions" => {
+                let mut reader = Reader::new(&attribute.bytes);
+                let count = usize::from(reader.u2()?);
+                if count > MAX_MEMBERS {
+                    return Err(ClassfileError::Bounds("declared exception count"));
+                }
+                for _ in 0..count {
+                    if !matches!(parsed.pool.entry(reader.u2()?)?, PoolEntry::Class(_)) {
+                        return Err(ClassfileError::Malformed("declared exception Class tag"));
+                    }
+                }
+                reader.done()?;
+            }
+            "Signature" => {
+                let mut reader = Reader::new(&attribute.bytes);
+                parsed.pool.utf8(reader.u2()?)?;
+                reader.done()?;
+            }
+            _ => {
+                return Err(ClassfileError::Unsupported(
+                    "PlainTextFunction method attribute",
+                ));
+            }
+        }
+    }
+    let code = method
+        .code
+        .as_ref()
+        .ok_or(ClassfileError::Malformed("instantiate Code absent"))?;
+    if !code.exception_handlers.is_empty()
+        || code.bytes != [0x2a, 0xb0]
+        || code.max_stack < 1
+        || code.max_locals < 3
+    {
+        return Err(ClassfileError::Unsupported(
+            "instantiate is not returned receiver only",
+        ));
+    }
+    passive_code_attributes(code)?;
+    // Other record methods can use invokedynamic. Their CP is checked for
+    // structure, but it is neither resolved nor given semantic approval here.
+    snapshot_pool_structure(snapshot)?;
+    let actual = snapshot_method(snapshot, method)?;
+    if bytecodes(actual)? != [0x2a, 0xb0] {
+        return Err(ClassfileError::SnapshotMismatch(
+            "instantiate returned receiver body",
+        ));
+    }
+    Ok(PlainTextInstantiateMatch {
+        method: MethodSymbol {
+            owner: parsed.class_name.clone(),
+            name: method.name.clone(),
+            descriptor: method.descriptor.clone(),
+            interface: false,
+        },
+    })
 }
 
 /// Matches a complete original zero-capture recipe against VM executable
@@ -1147,11 +1523,7 @@ pub(crate) fn match_hidden_forwarder(
             .pool
             .utf8(u16::from_be_bytes([attribute.bytes[0], attribute.bytes[1]]))?;
     }
-    let constructor = parsed
-        .methods
-        .iter()
-        .find(|member| member.name == "<init>")
-        .ok_or(ClassfileError::Unsupported("missing constructor"))?;
+    let constructor = parsed.selected_method("<init>", "()V")?;
     if constructor.descriptor != "()V" || constructor.flags != 0x0002 {
         return Err(ClassfileError::Unsupported(
             "capturing or nonprivate constructor",
@@ -1162,6 +1534,7 @@ pub(crate) fn match_hidden_forwarder(
         .iter()
         .find(|member| member.name != "<init>")
         .ok_or(ClassfileError::Unsupported("missing SAM"))?;
+    let sam = parsed.selected_method(&sam.name, &sam.descriptor)?;
     validate_method_name(&sam.name)?;
     if sam.flags != 0x0001 && sam.flags != 0x0011 {
         return Err(ClassfileError::Unsupported("SAM access flags"));
@@ -1210,7 +1583,7 @@ pub(crate) fn match_hidden_forwarder(
         collect_references(value_type, &mut references);
     }
     Ok(HiddenForwarder {
-        class_name: parsed.class_name,
+        class_name: parsed.class_name.clone(),
         interface_name: parsed.interfaces[0].clone(),
         sam_name: sam.name.clone(),
         sam_descriptor: sam.descriptor.clone(),
@@ -1456,6 +1829,7 @@ pub(crate) fn match_pack_captured_forwarder(
         .iter()
         .find(|method| method.name == "<init>")
         .ok_or(ClassfileError::Unsupported("PACK constructor absent"))?;
+    let constructor = parsed.selected_method(&constructor.name, &constructor.descriptor)?;
     let (parameters, result) = method_descriptor(&constructor.descriptor)?;
     let expected_parameters = shape
         .capture_descriptors
@@ -1468,11 +1842,7 @@ pub(crate) fn match_pack_captured_forwarder(
     {
         return Err(ClassfileError::Unsupported("PACK constructor parameters"));
     }
-    let sam = parsed
-        .methods
-        .iter()
-        .find(|method| method.name == shape.sam_name)
-        .ok_or(ClassfileError::Unsupported("PACK SAM absent"))?;
+    let sam = parsed.selected_method(shape.sam_name, shape.sam_descriptor)?;
     if sam.descriptor != shape.sam_descriptor || !matches!(sam.flags & !0x1000, 0x0001 | 0x0011) {
         return Err(ClassfileError::Unsupported("PACK SAM signature"));
     }

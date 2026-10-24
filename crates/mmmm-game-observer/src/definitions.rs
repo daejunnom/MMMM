@@ -130,6 +130,41 @@ struct DefinitionRecord {
     bytes: usize,
 }
 
+/// 현재 prepared ordinary 기록을 core 잠금 안에서만 빌리는 내부 source다.
+/// JNI 참조나 실행 권한을 담지 않으며 terminal 입력과 VM snapshot을 복제하지 않는다.
+pub(crate) struct OrdinarySourceView<'source> {
+    issuer_epoch: u64,
+    class_id: u64,
+    generation: u64,
+    loader_id: u64,
+    name_utf8: &'source [u8],
+    terminal_bytes: &'source [u8],
+    snapshot: &'source ExecutableSnapshot,
+}
+
+impl OrdinarySourceView<'_> {
+    pub(crate) fn identity(&self) -> (u64, u64, u64, u64) {
+        (
+            self.issuer_epoch,
+            self.class_id,
+            self.generation,
+            self.loader_id,
+        )
+    }
+
+    pub(crate) fn name_utf8(&self) -> &[u8] {
+        self.name_utf8
+    }
+
+    pub(crate) fn terminal_bytes(&self) -> &[u8] {
+        self.terminal_bytes
+    }
+
+    pub(crate) fn snapshot(&self) -> &ExecutableSnapshot {
+        self.snapshot
+    }
+}
+
 /// 같은 잠금 안에서 인코딩한 실제 기록에만 결합되는 비공개 발급 표식이다.
 /// 외부 정수나 디코딩한 frame으로 생성하지 않으며 실행 권한을 부여하지 않는다.
 pub(crate) struct EvidenceStamp {
@@ -663,6 +698,41 @@ impl RecordingCore {
         let recipe = record.hidden_recipe.as_ref()?;
         let snapshot = record.snapshot.as_ref()?;
         Some(operation(recipe, snapshot))
+    }
+
+    /// 실제 native stamp의 issuer/class/loader/generation을 모두 비교한다.
+    /// operation은 잠금 안에서 순수 Rust만 실행하며 반환 T는 빌린 source의
+    /// 수명과 독립적이다. source가 없거나 거절되어도 기록을 변경하지 않는다.
+    pub(crate) fn with_ordinary_source<T>(
+        &self,
+        expected_issuer: u64,
+        actual_class_id: u64,
+        expected_generation: u64,
+        expected_loader: u64,
+        operation: impl for<'source> FnOnce(OrdinarySourceView<'source>) -> T,
+    ) -> Option<T> {
+        if expected_issuer == 0 || self.issuer_epoch != expected_issuer {
+            return None;
+        }
+        let record = self.current_record(actual_class_id)?;
+        if record.id != actual_class_id
+            || record.kind != DefinitionKind::Ordinary
+            || record.generation != expected_generation
+            || record.loader_id != expected_loader
+            || record.terminal_bytes.is_empty()
+        {
+            return None;
+        }
+        let snapshot = record.snapshot.as_ref()?;
+        Some(operation(OrdinarySourceView {
+            issuer_epoch: self.issuer_epoch,
+            class_id: record.id,
+            generation: record.generation,
+            loader_id: record.loader_id,
+            name_utf8: &record.name_utf8,
+            terminal_bytes: &record.terminal_bytes,
+            snapshot,
+        }))
     }
 
     fn current_record(&self, actual_class_id: u64) -> Option<&DefinitionRecord> {

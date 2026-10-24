@@ -7,6 +7,7 @@
 //! Receipt bytes describe bounded historical observations; they grant nothing.
 
 use crate::{
+    classfile::ClassfileError,
     ffi::{self, JNIEnv, jclass, jint, jmethodID, jobject},
     library_lifetime,
     loaded_pack_sources::{
@@ -73,6 +74,7 @@ enum Error {
     Ffi(ffi::FfiError),
     Fact(Failure),
     Gap(&'static str),
+    PlainTextBody(ClassfileError),
     Root(owned_pack_files::Failure),
     Post(Box<Error>, Box<Error>),
 }
@@ -164,6 +166,7 @@ enum NativeCause {
     Throwable(Option<ObjectId>),
     Post(Box<NativeCause>, Box<NativeCause>),
     Boundary(&'static str),
+    PlainTextBody(ClassfileError),
     ObservedReason {
         engine: Option<String>,
         observer: Option<String>,
@@ -1830,6 +1833,12 @@ fn error_cause(locals: &mut Locals, index: usize, error: Error, current: bool) -
             }
             NativeCause::Boundary(code)
         }
+        Error::PlainTextBody(error) => {
+            if !current && let Ok(mut registry) = state() {
+                registry.note(index, Failure::Identity, None);
+            }
+            NativeCause::PlainTextBody(error)
+        }
     }
 }
 fn record_error(
@@ -1923,6 +1932,7 @@ fn error_code(error: &Error) -> &'static str {
         Error::Ffi(_) => "jni_observation_failed",
         Error::Fact(failure) => failure_name(*failure),
         Error::Gap(code) => code,
+        Error::PlainTextBody(_) => "pack_plain_text_instantiate_body_unproven",
         Error::Root(_) => "native_root_observation_failed",
         Error::Post(_, _) => "observation_and_post_failed",
     }
@@ -3299,6 +3309,19 @@ fn native_cause_json(cause: &NativeCause) -> Value {
             json!({"kind":"post","primary":native_cause_json(primary),"post":native_cause_json(post)})
         }
         NativeCause::Boundary(kind) => json!({"kind":"root_boundary","failure":kind}),
+        NativeCause::PlainTextBody(error) => {
+            let (kind, reason) = match error {
+                ClassfileError::Malformed(reason) => ("malformed", *reason),
+                ClassfileError::Unsupported(reason) => ("unsupported", *reason),
+                ClassfileError::Bounds(reason) => ("bounds", *reason),
+                ClassfileError::SnapshotMismatch(reason) => ("snapshot_mismatch", *reason),
+            };
+            // Existing diagnostic shape only. Both strings are closed Rust
+            // literals; no class bytes, method names or Java text are emitted.
+            json!({"kind":"root_boundary","failure":format!(
+                "pack_plain_text_instantiate_body_unproven/{kind}:{reason}"
+            )})
+        }
         NativeCause::ObservedReason { engine, observer } => {
             json!({"kind":"observed_reason","engine":engine,"observer":observer})
         }
@@ -3313,6 +3336,40 @@ fn function_pin_json(pin: &PackFunctionPin) -> Value {
 }
 fn pack_reference(id: ObjectId) -> Result<jobject> {
     state()?.reference(id)
+}
+
+fn plain_text_body_native_error(error: native_producer::ProducerError) -> Error {
+    match error {
+        native_producer::ProducerError::Ffi(error) => Error::Ffi(error),
+        native_producer::ProducerError::Core(_)
+        | native_producer::ProducerError::StateUnavailable => {
+            Error::Gap("pack_plain_text_instantiate_metadata_failed")
+        }
+    }
+}
+
+fn plain_text_body_result(observation: native_producer::PlainTextBodyObservation) -> Result<()> {
+    match observation {
+        native_producer::PlainTextBodyObservation::Unavailable => {
+            Err(Error::Gap("pack_plain_text_instantiate_body_unproven"))
+        }
+        native_producer::PlainTextBodyObservation::Matched(matched) => {
+            if matched.method().owner() != "net/minecraft/commands/functions/PlainTextFunction" {
+                return Err(Error::Gap("pack_plain_text_instantiate_body_unproven"));
+            }
+            Ok(())
+        }
+        native_producer::PlainTextBodyObservation::Unproven { error, post } => {
+            let primary = Error::PlainTextBody(error);
+            Err(match post {
+                Some(post) => Error::Post(
+                    Box::new(primary),
+                    Box::new(plain_text_body_native_error(post)),
+                ),
+                None => primary,
+            })
+        }
+    }
 }
 
 fn pack_typed(
@@ -3599,13 +3656,33 @@ fn pack_run_event(
         return Err(Error::Gap("pack_current_observation_failed"));
     }
     if frame.original_offset == 0 {
+        let plain = frame.object(Field::Input)?;
+        locals.exact_class(
+            plain,
+            b"Lnet/minecraft/commands/functions/PlainTextFunction;",
+        )?;
+        let class = stamp_object(
+            locals,
+            index,
+            token,
+            plain,
+            b"Lnet/minecraft/commands/functions/PlainTextFunction;",
+        )?;
+        locals.live()?;
+        let body =
+            unsafe { native_producer::plain_text_instantiate_body(locals.env, token, &class) }
+                .map_err(plain_text_body_native_error)
+                .and_then(plain_text_body_result);
+        // Convert a pure failure before the real Locals post-check, so that
+        // concurrent generation/Java failures cannot replace its first cause.
+        locals.finish(body)?;
         // Named-class/current-generation metadata and a hidden SAM recipe do
-        // not establish the original ordinary method bodies/callsite. Until
-        // native semantic witnesses for FunctionCommand's actual instantiate
-        // call, PlainTextFunction.instantiate and the two forwarding targets
-        // exist, no verified run gate may release the original provider/body
-        // effect. Retain this attempted run and its failure; do not retry it
-        // under a second Invocation or manufacture a completed receipt.
+        // not establish the original ordinary method bodies/callsite. The
+        // partial PlainText instantiate check above does not establish
+        // FunctionCommand's actual call, the forwarding targets, its three
+        // lambdas or the stage hook. No run gate may release the original
+        // provider/body effect. Retain this attempted run and its failure; do
+        // not retry it under a second Invocation or manufacture completion.
         return Err(Error::Gap("pack_original_callsite_body_unproven"));
     }
     let kind = frame.original_offset;
@@ -4553,6 +4630,78 @@ pub(crate) fn on_unload() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_text_body_errors_preserve_closed_causes_without_changing_diagnostic_shape() {
+        for (error, kind, reason) in [
+            (
+                ClassfileError::Malformed("bad_code"),
+                "malformed",
+                "bad_code",
+            ),
+            (
+                ClassfileError::Unsupported("extra_instruction"),
+                "unsupported",
+                "extra_instruction",
+            ),
+            (
+                ClassfileError::Bounds("method_count"),
+                "bounds",
+                "method_count",
+            ),
+            (
+                ClassfileError::SnapshotMismatch("selected_method"),
+                "snapshot_mismatch",
+                "selected_method",
+            ),
+        ] {
+            let result =
+                plain_text_body_result(native_producer::PlainTextBodyObservation::Unproven {
+                    error: error.clone(),
+                    post: None,
+                });
+            match result {
+                Err(Error::PlainTextBody(actual)) => assert_eq!(actual, error),
+                _ => panic!("a pure body failure must remain its original primary cause"),
+            }
+            assert_eq!(
+                error_code(&Error::PlainTextBody(error.clone())),
+                "pack_plain_text_instantiate_body_unproven"
+            );
+            let cause = NativeCause::PlainTextBody(error);
+            assert_eq!(
+                native_cause_json(&cause),
+                json!({
+                    "kind":"root_boundary",
+                    "failure":format!("pack_plain_text_instantiate_body_unproven/{kind}:{reason}"),
+                })
+            );
+        }
+        assert!(matches!(
+            plain_text_body_result(native_producer::PlainTextBodyObservation::Unavailable),
+            Err(Error::Gap("pack_plain_text_instantiate_body_unproven"))
+        ));
+    }
+
+    #[test]
+    fn plain_text_body_error_precedes_an_actual_native_post_failure() {
+        let result = plain_text_body_result(native_producer::PlainTextBodyObservation::Unproven {
+            error: ClassfileError::SnapshotMismatch("selected_method"),
+            post: Some(native_producer::ProducerError::Ffi(
+                ffi::FfiError::PendingException,
+            )),
+        });
+        match result {
+            Err(Error::Post(primary, post)) => {
+                assert!(matches!(
+                    *primary,
+                    Error::PlainTextBody(ClassfileError::SnapshotMismatch("selected_method"))
+                ));
+                assert!(matches!(*post, Error::Ffi(ffi::FfiError::PendingException)));
+            }
+            _ => panic!("a real post failure must preserve the original pure body failure"),
+        }
+    }
 
     fn pack_load_fixture() -> PackLoadFacts {
         PackLoadFacts {

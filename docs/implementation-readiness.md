@@ -3778,6 +3778,84 @@ issuer에 연결한 후에만 proof를 발급한다. 현재 developer definition
 closed launcher가 아니다. 위 연결과 실제 transformed body의 적합성을 아직 구현·실행
 확인하지 않았으므로 기존 prewrite Apply 거절과 native48 원 gap을 유지한다.
 
+### 현재 JVM113과 macOS stdio 종료 실패
+
+고정 `13bcb270fd5a365cb70323285e701dfb2f925a7d`의
+[JVM113](https://github.com/daejunnom/MMMM/actions/runs/40070379963)은 3OS의 필수 JVM·observer·
+export와 집계가 성공했다. optional 개발 JAR를 다시 dispatch하지 않았으며 이 정상 개발
+fixture의 성공을 실제 게임·SourceAdmission·배포 인수로 확대하지 않는다.
+[Rust119](https://github.com/daejunnom/MMMM/actions/runs/40070379962)은 Windows·Linux가 성공하고
+macOS의 test 및 집계가 실패했다. macOS strict는 skipped다.
+
+macOS 원 ZIP65,016 bytes·SHA
+`93430dc6780279c58ed278d58f15cc03c12fc495ac5c8cb14d23d9c5a6062a7d`를 API·source와 대조했다.
+원 cargo는265,356 ms·command101·signal 없음·termination completed·감독 오류0이다.
+peak aggregate RSS2,062,630,912 bytes·footprint1,668,019,840 bytes·gap305 ms이며 이 실패를
+OOM·timeout·감독 관측 실패로 바꾸지 않는다. Coordinator423 PASS 뒤 native stdio의
+`raw_framed_roundtrip_and_capability_eof`에서 `native_terminate`·native_code1·drained false로
+실패했다. 실제 production 경로는 socket shutdown 뒤 같은 소유 그룹의 SIGKILL이며 raw
+errno를 가공 없이 기록한다. 당시 자식의 terminal 상태와 전체 그룹 상태는 미확인이다.
+
+이 명령의 원 stdout68,060 bytes·SHA
+`a12e6c9ce0cf2eacdaabe58bb78afcebbed8360f319481bd458de3cd0f832d26`와 stderr382,003 bytes·SHA
+`4330c9e8e206cc98987109e8e682bad6b325d36315d10e4bc7cebaea32b749ba`의 실제 stream·EOF를 대조했다.
+원 로그의 preserved/write_confirmed와 이후 독립 storage observed·drain·output_complete·
+export·scratch 제거·lease 해제·cleanup0을 확인했다. 이는 바깥 cargo 감독의 완료 사실이며
+실패한 stdio 자식의 drain 성공을 대신하지 않는다. 원 실패를 재실행으로 대체하지 않았다.
+
+Apple 공개 [errno 정의](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/errno.h)와
+[그룹 신호 구현](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sig.c)에서는
+errno1이 EPERM이며 POSIX 그룹 신호의 zombie 제외 뒤 eligible member가 없을 때도 EPERM이
+가능하다. socket EOF에 따른 worker 자연 종료와 앞선 identity 관측 사이 경합은 현재 소스상
+가능하지만 정확한 CI kernel revision과 당시 상태를 대조하지 않아 실제 원인으로 확정하지 않는다.
+
+### ordinary 본문 조회와 첫 제한 검사
+
+후속 소스는 RecordingCore의 현재 prepared Ordinary 기록에서 issuer·actual Class·loader·
+generation을 모두 비교하고 name·terminal bytes·ExecutableSnapshot을 core lock 안에서만
+빌린다. JNI 참조·원 snapshot을 복제하거나 저장 bytes에서 권한을 복원하지 않는다. 실제
+attached source frame과 actual plain 객체의 Class를 기존 held Class에 join한 native 경로가
+이 조회를 소비하며 전후 status·loader·generation·현재 frame을 다시 검사한다.
+
+classfile parser는 원 Dynamic/InvokeDynamic의 BSM index와 bounded BootstrapMethods,
+선택 method, 순서를 유지한 exception handler를 보존한다. BSM256·각 argument256·합계4096·
+handler256의 상한과 기존 classfile/code bound를 적용한다. handler가 있는 Code에서만
+instruction boundary·wide/switch 길이·catch Class 구조를 확인한다. 이 구조 검사는 unknown
+bootstrap 실행·resolve, JVM stack/type 검증·Throwable 계층·분기 의미 승인이 아니다.
+근거 형식은 [JVMS25 chapter4](https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html)다.
+기존 hidden/captured의 global dynamic·handler 거절과 별도 supported-code 정책은 유지한다.
+
+첫 ordinary matcher는 Windows642에서 보존한 원26.3 API 관측을 지원 정책의 근거로 삼는다.
+선택한 PlainTextFunction.instantiate의 정확한 public descriptor와 source/실제 VM snapshot
+양쪽의 `aload_0; areturn`, handler·추가 효과 부재를 요구한다. 이 method의 passive Exceptions/
+Signature와 제한된 code metadata만 별도로 검사한다. 다른 record method의 dynamic CP는
+구조만 보존하며 의미를 승인하지 않는다. 원 vanilla 관측을 현재 transformed 적합성으로
+이전하지 않는다. 기존 authored fixture로 BSM·handler·선택 body 변조와 source/snapshot
+불일치·현재 기록 소유권 거절을 검사하며 새 게임 fixture나 외부 class bytes를 추가하지 않는다.
+
+현재 native48은 actual frame.Input에서 Class를 join해 이 부분 검사를 소비한다. 일부 body의
+일치는 설명 자료이며 전체 PACK proof나 Apply 권한이 아니다. 나머지 forwarding target과
+transformed FunctionCommand·람다3개·stage hook·startup closure가 미완성이므로 통과해도
+원 `pack_original_callsite_body_unproven`을 반환한다. load-only47·원 run 원장 순서·쓰기 전
+Rust Apply 상수 거절·phase49 미구현 상태를 유지한다. 새 소스의 실제 컴파일·테스트·현재 VM
+적합성과 게임 인수는 후속 검증 대상이다.
+
+부분 검사에서 source 부재와 malformed/unsupported/bounds/snapshot mismatch를 구분한다.
+원 ClassfileError를 capture의 private cause로 보관하며 실제 native·Locals 후행 오류가 생기면
+그때만 별도 post cause를 함께 보존한다. 기존 두 필드 root_boundary 진단에 닫힌 static
+kind/reason만 출력하며 새 성공 receipt 형식이나 공개 권한을 추가하지 않는다. 추가한 총13개
+inline 검사는 parser9·record borrowing2·오류 보존2이고 아직 실행 결과와 구분한다.
+
+Windows673은 외부에 고정한 위6개 source를 빈 owned cwd의 stdin으로 포맷하고 전부 사후
+pin을 대조했다. after manifest SHA는
+`cc29f895b7eeebec44645f5218a439fb52648bd4635199fb3f2bf5608ade949c`이며 command0·정상
+drain/output/export·scratch 제거·lease 해제·감독/정리 오류0이다. 사전 helper 리뷰가 발견한
+과거 definitions 제외 조건은 실행 전에 제거했고 old/v2 helper·원 source·manifest를 함께
+외부 보존한다. 이 포맷 결과와 13개 새 inline 검사의 실행 성공은 별개다.
+Windows674는 의도한7개 staged 파일의 index554 files·정책 blob1·violations0과 command0·
+정상 drain/output/export·scratch 제거·lease 해제·감독/정리 오류0을 확인했다. 사후 source6개
+pin·index/worktree blob7개·추가 줄의 공개 경로 정책·diff check도 확인했고 다른 변경은 제외했다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

@@ -40,6 +40,8 @@ enum PoolEntry {
     },
     MethodHandle(u8, usize),
     Dynamic(u16, usize),
+    InvokeDynamic(u16, usize),
+    MethodType(usize),
 }
 
 #[derive(Clone)]
@@ -73,6 +75,7 @@ struct Fixture {
     class_access: u16,
     fields: Vec<(u16, usize, usize)>,
     interfaces: Vec<usize>,
+    class_attributes: Vec<(usize, Vec<u8>)>,
     source_map: Vec<u16>,
     vm_map: Vec<u16>,
     code_length_offsets: Vec<usize>,
@@ -129,6 +132,15 @@ fn pool_encoding(pool: &[PoolEntry], order: &[usize]) -> (Vec<u8>, Vec<u16>) {
                 output.push(17);
                 u16_bytes(&mut output, *bootstrap);
                 u16_bytes(&mut output, mapping[*name_type]);
+            }
+            PoolEntry::InvokeDynamic(bootstrap, name_type) => {
+                output.push(18);
+                u16_bytes(&mut output, *bootstrap);
+                u16_bytes(&mut output, mapping[*name_type]);
+            }
+            PoolEntry::MethodType(descriptor) => {
+                output.push(16);
+                u16_bytes(&mut output, mapping[*descriptor]);
             }
         }
     }
@@ -218,6 +230,7 @@ impl Fixture {
             class_access: 0x1030,
             fields: Vec::new(),
             interfaces: vec![INTERFACE_CLASS],
+            class_attributes: Vec::new(),
             source_map: Vec::new(),
             vm_map: Vec::new(),
             code_length_offsets: Vec::new(),
@@ -229,6 +242,18 @@ impl Fixture {
 
     fn integer() -> Self {
         Self::for_descriptor("(I)I", vec![bytes(&[0x1b]), call(), bytes(&[0xac])])
+    }
+
+    fn clone_for_metadata(&self) -> Self {
+        let mut fixture = Self::integer();
+        fixture.pool = self.pool.clone();
+        fixture.methods = self.methods.clone();
+        fixture.class_access = self.class_access;
+        fixture.fields = self.fields.clone();
+        fixture.interfaces = self.interfaces.clone();
+        fixture.class_attributes = self.class_attributes.clone();
+        fixture.rebuild();
+        fixture
     }
 
     fn rebuild(&mut self) {
@@ -285,7 +310,12 @@ impl Fixture {
                 u16_bytes(&mut input, 0);
             }
         }
-        u16_bytes(&mut input, 0);
+        u16_bytes(&mut input, self.class_attributes.len() as u16);
+        for (name, body) in &self.class_attributes {
+            u16_bytes(&mut input, source_mapping[*name]);
+            u32_bytes(&mut input, body.len() as u32);
+            input.extend_from_slice(body);
+        }
         self.recipe.input = input;
         self.source_map = source_mapping;
 
@@ -776,4 +806,428 @@ fn error_categories_describe_failure_without_issuing_runtime_authority() {
             | ClassfileError::SnapshotMismatch(_)
             | ClassfileError::Unsupported(_)
     ));
+}
+
+// The existing authored encoder is sufficient to check metadata retention,
+// remapping and rejection. These additions do not need external game bytes and
+// do not claim a JVM-valid bootstrap signature or a live ordinary body proof.
+fn bootstrap_fixture() -> (Fixture, usize, usize, usize) {
+    let mut fixture = Fixture::integer();
+    let attribute_name = fixture.pool.len();
+    fixture
+        .pool
+        .push(PoolEntry::Utf8(b"BootstrapMethods".to_vec()));
+    let handle = fixture.pool.len();
+    fixture
+        .pool
+        .push(PoolEntry::MethodHandle(6, TARGET_REFERENCE));
+    let method_type = fixture.pool.len();
+    fixture.pool.push(PoolEntry::MethodType(SAM_DESCRIPTOR));
+    let dynamic = fixture.pool.len();
+    fixture
+        .pool
+        .push(PoolEntry::InvokeDynamic(1, TARGET_NAME_TYPE));
+    fixture.rebuild();
+    let mut body = Vec::new();
+    u16_bytes(&mut body, 2);
+    u16_bytes(&mut body, fixture.source_map[handle]);
+    u16_bytes(&mut body, 0);
+    u16_bytes(&mut body, fixture.source_map[handle]);
+    u16_bytes(&mut body, 2);
+    u16_bytes(&mut body, fixture.source_map[OBJECT_CLASS]);
+    u16_bytes(&mut body, fixture.source_map[method_type]);
+    fixture.class_attributes.push((attribute_name, body));
+    fixture.rebuild();
+    (fixture, dynamic, handle, method_type)
+}
+
+#[test]
+fn selected_method_and_original_bootstrap_index_are_descriptive_metadata() {
+    let (fixture, dynamic, handle, method_type) = bootstrap_fixture();
+    let parsed = parse_classfile(&fixture.recipe.input).unwrap();
+    let selected = parsed.selected_method("apply", "(I)I").unwrap();
+    assert_eq!(selected.flags, 0x11);
+    assert_eq!(selected.code.as_ref().unwrap().bytes[0], 0x1b);
+    assert!(parsed.selected_method("apply", "()V").is_err());
+    let (index, bootstrap) = parsed
+        .bootstrap_for_dynamic(fixture.source_map[dynamic])
+        .unwrap();
+    assert_eq!(index, 1);
+    assert_eq!(bootstrap.method_ref, fixture.source_map[handle]);
+    assert_eq!(
+        bootstrap.arguments,
+        vec![
+            fixture.source_map[OBJECT_CLASS],
+            fixture.source_map[method_type]
+        ]
+    );
+    assert!(
+        parsed
+            .bootstrap_for_dynamic(fixture.source_map[TARGET_REFERENCE])
+            .is_err()
+    );
+    // Structural bootstrap retention never broadens the hidden recipe policy.
+    assert_rejected(&fixture);
+    let mut attribute_only = Fixture::integer();
+    let name = attribute_only.pool.len();
+    attribute_only
+        .pool
+        .push(PoolEntry::Utf8(b"BootstrapMethods".to_vec()));
+    attribute_only.class_attributes.push((name, vec![0, 0]));
+    attribute_only.rebuild();
+    assert!(parse_classfile(&attribute_only.recipe.input).is_ok());
+    assert_rejected(&attribute_only);
+}
+
+#[test]
+fn dynamic_constants_and_loadable_arguments_keep_their_original_edges() {
+    let (mut fixture, _, handle, _) = bootstrap_fixture();
+    let descriptor = fixture.pool.len();
+    fixture.pool.push(PoolEntry::Utf8(b"I".to_vec()));
+    let name_type = fixture.pool.len();
+    fixture
+        .pool
+        .push(PoolEntry::NameAndType(TARGET_METHOD, descriptor));
+    let dynamic = fixture.pool.len();
+    fixture.pool.push(PoolEntry::Dynamic(0, name_type));
+    fixture.rebuild();
+    let mut body = Vec::new();
+    u16_bytes(&mut body, 2);
+    for arguments in [Vec::new(), vec![fixture.source_map[dynamic]]] {
+        u16_bytes(&mut body, fixture.source_map[handle]);
+        u16_bytes(&mut body, arguments.len() as u16);
+        for argument in arguments {
+            u16_bytes(&mut body, argument);
+        }
+    }
+    fixture.class_attributes[0].1 = body;
+    fixture.rebuild();
+    let parsed = parse_classfile(&fixture.recipe.input).unwrap();
+    assert_eq!(
+        parsed
+            .bootstrap_for_dynamic(fixture.source_map[dynamic])
+            .unwrap()
+            .0,
+        0
+    );
+    assert_eq!(
+        parsed.bootstrap_methods[1].arguments,
+        vec![fixture.source_map[dynamic]]
+    );
+    assert_rejected(&fixture);
+}
+
+#[test]
+fn bootstrap_singleton_indices_tags_and_complete_attribute_body_are_checked() {
+    let (fixture, dynamic, handle, _) = bootstrap_fixture();
+    let mut missing = fixture.clone_for_metadata();
+    missing.class_attributes.clear();
+    missing.rebuild();
+    assert!(parse_classfile(&missing.recipe.input).is_err());
+    let mut duplicate = fixture.clone_for_metadata();
+    duplicate
+        .class_attributes
+        .push(duplicate.class_attributes[0].clone());
+    duplicate.rebuild();
+    assert!(parse_classfile(&duplicate.recipe.input).is_err());
+    let mut out_of_range = fixture.clone_for_metadata();
+    out_of_range.pool[dynamic] = PoolEntry::InvokeDynamic(2, TARGET_NAME_TYPE);
+    out_of_range.rebuild();
+    assert!(parse_classfile(&out_of_range.recipe.input).is_err());
+    let mut no_dynamic = fixture.clone_for_metadata();
+    no_dynamic.pool[dynamic] = PoolEntry::Utf8(b"unused".to_vec());
+    no_dynamic.rebuild();
+    assert!(parse_classfile(&no_dynamic.recipe.input).is_ok());
+    for bad_reference in [0, fixture.source_map[TARGET_REFERENCE]] {
+        let mut invalid = fixture.clone_for_metadata();
+        invalid.class_attributes[0].1[2..4].copy_from_slice(&bad_reference.to_be_bytes());
+        invalid.rebuild();
+        assert!(parse_classfile(&invalid.recipe.input).is_err());
+    }
+    for bad_argument in [0, fixture.source_map[SAM_NAME], fixture.source_map[dynamic]] {
+        let mut invalid = fixture.clone_for_metadata();
+        invalid.class_attributes[0].1[10..12].copy_from_slice(&bad_argument.to_be_bytes());
+        invalid.rebuild();
+        assert!(parse_classfile(&invalid.recipe.input).is_err());
+    }
+    let mut truncated = fixture.clone_for_metadata();
+    truncated.class_attributes[0].1.pop();
+    truncated.rebuild();
+    assert!(parse_classfile(&truncated.recipe.input).is_err());
+    let mut trailing = fixture.clone_for_metadata();
+    trailing.class_attributes[0].1.push(0);
+    trailing.rebuild();
+    assert!(parse_classfile(&trailing.recipe.input).is_err());
+    let mut virtual_handle = fixture.clone_for_metadata();
+    virtual_handle.pool[handle] = PoolEntry::MethodHandle(5, TARGET_REFERENCE);
+    virtual_handle.rebuild();
+    assert!(parse_classfile(&virtual_handle.recipe.input).is_ok());
+    assert_rejected(&virtual_handle);
+}
+
+#[test]
+fn bootstrap_allocation_limits_precede_argument_collection() {
+    let (fixture, _, handle, _) = bootstrap_fixture();
+    for body in [
+        ((super::MAX_BOOTSTRAP_METHODS + 1) as u16)
+            .to_be_bytes()
+            .to_vec(),
+        [
+            1u16.to_be_bytes(),
+            fixture.source_map[handle].to_be_bytes(),
+            ((super::MAX_BOOTSTRAP_ARGUMENTS + 1) as u16).to_be_bytes(),
+        ]
+        .concat(),
+    ] {
+        let mut invalid = fixture.clone_for_metadata();
+        invalid.class_attributes[0].1 = body;
+        invalid.rebuild();
+        assert!(matches!(
+            parse_classfile(&invalid.recipe.input),
+            Err(ClassfileError::Bounds(_))
+        ));
+    }
+    let mut total = fixture.clone_for_metadata();
+    let count = super::MAX_TOTAL_BOOTSTRAP_ARGUMENTS / super::MAX_BOOTSTRAP_ARGUMENTS + 1;
+    let mut body = Vec::new();
+    u16_bytes(&mut body, count as u16);
+    for _ in 0..count {
+        u16_bytes(&mut body, fixture.source_map[handle]);
+        u16_bytes(&mut body, super::MAX_BOOTSTRAP_ARGUMENTS as u16);
+        for _ in 0..super::MAX_BOOTSTRAP_ARGUMENTS {
+            u16_bytes(&mut body, fixture.source_map[OBJECT_CLASS]);
+        }
+    }
+    total.class_attributes[0].1 = body;
+    total.rebuild();
+    assert!(matches!(
+        parse_classfile(&total.recipe.input),
+        Err(ClassfileError::Bounds(_))
+    ));
+}
+
+#[test]
+fn ordered_exception_handlers_retain_boundaries_and_catch_all() {
+    let mut fixture = Fixture::integer();
+    fixture.methods[1].handlers = vec![[0, 1, 4, 4], [1, 5, 0, 0]];
+    fixture.rebuild();
+    let parsed = parse_classfile(&fixture.recipe.input).unwrap();
+    let code = parsed
+        .selected_method("apply", "(I)I")
+        .unwrap()
+        .code
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        code.exception_handlers,
+        vec![
+            super::ExceptionHandler {
+                start_pc: 0,
+                end_pc: 1,
+                handler_pc: 4,
+                catch_type: 4
+            },
+            super::ExceptionHandler {
+                start_pc: 1,
+                end_pc: 5,
+                handler_pc: 0,
+                catch_type: 0
+            },
+        ]
+    );
+    assert_rejected(&fixture);
+    for handler in [
+        [2, 4, 4, 0],
+        [0, 2, 4, 0],
+        [0, 1, 2, 0],
+        [0, 5, 5, 0],
+        [0, 1, 4, 1],
+    ] {
+        let mut invalid = Fixture::integer();
+        invalid.methods[1].handlers.push(handler);
+        invalid.rebuild();
+        assert!(parse_classfile(&invalid.recipe.input).is_err());
+    }
+    let mut too_many = Fixture::integer();
+    too_many.methods[1]
+        .handlers
+        .resize(super::MAX_EXCEPTION_HANDLERS + 1, [0, 1, 4, 0]);
+    too_many.rebuild();
+    assert!(matches!(
+        parse_classfile(&too_many.recipe.input),
+        Err(ClassfileError::Bounds(_))
+    ));
+}
+
+#[test]
+fn exception_boundary_scan_handles_wide_switches_and_truncation_without_execution() {
+    let cases = [
+        vec![0xc4, 0x15, 0, 1, 0xb1],
+        vec![0xc4, 0x84, 0, 1, 0, 1, 0xb1],
+        vec![
+            0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0xb1,
+        ],
+        vec![
+            0xab, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 9, 0, 0, 0, 0, 0xb1,
+        ],
+    ];
+    for code in cases {
+        let mut fixture = Fixture::integer();
+        let last = (code.len() - 1) as u16;
+        fixture.methods[1].instructions = Some(vec![bytes(&code)]);
+        fixture.methods[1].handlers = vec![[0, last, last, 0]];
+        fixture.rebuild();
+        assert!(parse_classfile(&fixture.recipe.input).is_ok());
+        fixture.methods[1].handlers = vec![[0, 1, last, 0]];
+        fixture.rebuild();
+        assert!(parse_classfile(&fixture.recipe.input).is_err());
+    }
+    for code in [
+        vec![0xc4, 0xb1],
+        vec![0x11, 0],
+        vec![0xba, 0, 1, 0],
+        vec![0xaa],
+        vec![0xca],
+    ] {
+        let mut fixture = Fixture::integer();
+        fixture.methods[1].instructions = Some(vec![bytes(&code)]);
+        fixture.methods[1].handlers = vec![[0, code.len() as u16, 0, 0]];
+        fixture.rebuild();
+        assert!(parse_classfile(&fixture.recipe.input).is_err());
+    }
+}
+
+fn plain_text_fixture() -> Fixture {
+    let (mut fixture, _, _, _) = bootstrap_fixture();
+    fixture.pool[SELF_NAME] =
+        PoolEntry::Utf8(b"net/minecraft/commands/functions/PlainTextFunction".to_vec());
+    fixture.pool[SAM_NAME] = PoolEntry::Utf8(b"instantiate".to_vec());
+    fixture.pool[SAM_DESCRIPTOR] = PoolEntry::Utf8(b"(Lnet/minecraft/nbt/CompoundTag;Lcom/mojang/brigadier/CommandDispatcher;)Lnet/minecraft/commands/functions/InstantiatedFunction;".to_vec());
+    fixture.methods[1].access = 0x0001;
+    fixture.methods[1].instructions = Some(vec![bytes(&[0x2a, 0xb0])]);
+    fixture.rebuild();
+    fixture
+}
+
+fn append_method_attribute(fixture: &mut Fixture, method: usize, name: usize, body: &[u8]) {
+    let length_offset = fixture.attribute_length_offsets[method];
+    let count_offset = length_offset - 4;
+    let count = u16::from_be_bytes(
+        fixture.recipe.input[count_offset..count_offset + 2]
+            .try_into()
+            .unwrap(),
+    );
+    let code_length = u32::from_be_bytes(
+        fixture.recipe.input[length_offset..length_offset + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let end = length_offset + 4 + code_length;
+    fixture.recipe.input[count_offset..count_offset + 2]
+        .copy_from_slice(&(count + 1).to_be_bytes());
+    let mut attribute = Vec::new();
+    u16_bytes(&mut attribute, fixture.source_map[name]);
+    u32_bytes(&mut attribute, body.len() as u32);
+    attribute.extend_from_slice(body);
+    fixture.recipe.input.splice(end..end, attribute);
+}
+
+#[test]
+fn selected_plain_text_body_matches_both_sources_with_unrelated_dynamic_metadata() {
+    let fixture = plain_text_fixture();
+    let matched =
+        super::match_plain_text_instantiate(&fixture.recipe.input, &fixture.snapshot).unwrap();
+    assert_eq!(
+        matched.method().owner(),
+        "net/minecraft/commands/functions/PlainTextFunction"
+    );
+    assert_eq!(matched.method().name(), "instantiate");
+    assert_eq!(
+        matched.method().descriptor(),
+        "(Lnet/minecraft/nbt/CompoundTag;Lcom/mojang/brigadier/CommandDispatcher;)Lnet/minecraft/commands/functions/InstantiatedFunction;"
+    );
+    assert!(!matched.method().is_interface());
+}
+
+#[test]
+fn plain_text_body_rejects_effects_handlers_modifiers_and_snapshot_mismatch() {
+    let fixture = plain_text_fixture();
+    for flags in [0, 0x0009, 0x0011, 0x0021, 0x0041, 0x0101, 0x0401, 0x1001] {
+        let mut invalid = fixture.clone_for_metadata();
+        invalid.methods[1].access = flags;
+        if flags & (0x0100 | 0x0400) != 0 {
+            invalid.methods[1].instructions = None;
+        }
+        invalid.rebuild();
+        assert!(
+            super::match_plain_text_instantiate(&invalid.recipe.input, &invalid.snapshot).is_err()
+        );
+    }
+    for instructions in [
+        vec![0x2a, 0x00, 0xb0],
+        vec![0x01, 0xb0],
+        vec![0x2b, 0xb0],
+        vec![0xb1],
+    ] {
+        let mut invalid = fixture.clone_for_metadata();
+        invalid.methods[1].instructions = Some(vec![bytes(&instructions)]);
+        invalid.rebuild();
+        assert!(
+            super::match_plain_text_instantiate(&invalid.recipe.input, &invalid.snapshot).is_err()
+        );
+    }
+    let mut handler = fixture.clone_for_metadata();
+    handler.methods[1].handlers = vec![[0, 1, 1, 0]];
+    handler.rebuild();
+    assert!(super::match_plain_text_instantiate(&handler.recipe.input, &handler.snapshot).is_err());
+    let mut changed = plain_text_fixture();
+    changed.snapshot.methods[1].code = MethodCode::Bytecodes(vec![0x01, 0xb0]);
+    assert!(super::match_plain_text_instantiate(&changed.recipe.input, &changed.snapshot).is_err());
+    let mut duplicate = plain_text_fixture();
+    duplicate
+        .snapshot
+        .methods
+        .push(duplicate.snapshot.methods[1].clone());
+    assert!(
+        super::match_plain_text_instantiate(&duplicate.recipe.input, &duplicate.snapshot).is_err()
+    );
+    let mut wrong_descriptor = fixture.clone_for_metadata();
+    wrong_descriptor.pool[SAM_DESCRIPTOR] = PoolEntry::Utf8(b"()Ljava/lang/Object;".to_vec());
+    wrong_descriptor.rebuild();
+    assert!(
+        super::match_plain_text_instantiate(
+            &wrong_descriptor.recipe.input,
+            &wrong_descriptor.snapshot
+        )
+        .is_err()
+    );
+    let mut other_owner = fixture.clone_for_metadata();
+    other_owner.pool[SELF_NAME] = PoolEntry::Utf8(b"fixtures/OtherPlain".to_vec());
+    other_owner.rebuild();
+    assert!(
+        super::match_plain_text_instantiate(&other_owner.recipe.input, &other_owner.snapshot)
+            .is_err()
+    );
+}
+
+#[test]
+fn plain_text_declared_throws_and_signature_are_passive_but_unknown_attributes_are_not() {
+    let mut fixture = plain_text_fixture();
+    let exceptions = fixture.pool.len();
+    fixture.pool.push(PoolEntry::Utf8(b"Exceptions".to_vec()));
+    let signature = fixture.pool.len();
+    fixture.pool.push(PoolEntry::Utf8(b"Signature".to_vec()));
+    fixture.rebuild();
+    let mut body = Vec::new();
+    u16_bytes(&mut body, 1);
+    u16_bytes(&mut body, fixture.source_map[OBJECT_CLASS]);
+    append_method_attribute(&mut fixture, 1, exceptions, &body);
+    let signature_body = fixture.source_map[SAM_DESCRIPTOR].to_be_bytes();
+    append_method_attribute(&mut fixture, 1, signature, &signature_body);
+    assert!(super::match_plain_text_instantiate(&fixture.recipe.input, &fixture.snapshot).is_ok());
+    append_method_attribute(&mut fixture, 1, signature, &signature_body);
+    assert!(super::match_plain_text_instantiate(&fixture.recipe.input, &fixture.snapshot).is_err());
+    let mut unknown = plain_text_fixture();
+    append_method_attribute(&mut unknown, 1, SAM_NAME, &[]);
+    assert!(super::match_plain_text_instantiate(&unknown.recipe.input, &unknown.snapshot).is_err());
 }

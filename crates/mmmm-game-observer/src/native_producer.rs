@@ -18,7 +18,8 @@ use std::sync::{Mutex, OnceLock};
 
 pub(crate) use crate::classfile::PackCapturedRecipeKind;
 use crate::classfile::{
-    CaptureField, HiddenForwarder, match_hidden_forwarder, match_pack_captured_forwarder,
+    CaptureField, ClassfileError, HiddenForwarder, PlainTextInstantiateMatch,
+    match_hidden_forwarder, match_pack_captured_forwarder, match_plain_text_instantiate,
 };
 use crate::definitions::{
     AttemptId, DefinitionKind, ExecutableSnapshot, HiddenRecipe, MAX_CLASS_BYTES, MAX_METHODS,
@@ -2263,6 +2264,110 @@ fn pack_operation_on_current_thread(id: u64) -> bool {
         };
         operations.ids[..operations.count].contains(&id)
     })
+}
+
+/// Descriptive partial observation, never a code/command permission token.
+/// A pure body failure remains primary if a real native post-check also fails.
+pub(crate) enum PlainTextBodyObservation {
+    Unavailable,
+    Matched(PlainTextInstantiateMatch),
+    Unproven {
+        error: ClassfileError,
+        post: Option<ProducerError>,
+    },
+}
+
+/// Describe only the selected ordinary PlainTextFunction.instantiate body.
+/// The caller first joins its actual plain object's Class to `class`; no named
+/// lookup or caller-supplied receipt can select the source. Even a match does
+/// not prove FunctionCommand's callsite, the other PACK bodies or Apply rights.
+pub(crate) unsafe fn plain_text_instantiate_body(
+    env: *mut JNIEnv,
+    frame: &SourceCaptureToken,
+    class: &ObservedClassStamp,
+) -> Result<PlainTextBodyObservation> {
+    const SIGNATURE: &[u8] = b"Lnet/minecraft/commands/functions/PlainTextFunction;";
+    if env.is_null()
+        || !pack_frame_current(frame)
+        || !class.is_current()
+        || class.signature != SIGNATURE
+        || class.loader == 0
+    {
+        return Ok(PlainTextBodyObservation::Unavailable);
+    }
+    if unsafe { ffi::exception(env)? } {
+        return Err(FfiError::PendingException.into());
+    }
+    let ti = owned_files_vm();
+    let Some(actual) = class.actual_class(frame).filter(|_| !ti.is_null()) else {
+        return Ok(PlainTextBodyObservation::Unavailable);
+    };
+    let status_before = unsafe { ffi::class_status(ti, actual)? };
+    if unsafe { ffi::class_signature(ti, actual)? } != SIGNATURE
+        || !unsafe { ffi::class_prepared(ti, actual)? }
+        || unsafe { existing_source_loader(env, ti, actual)? } != Some(class.loader)
+        || !pack_frame_current(frame)
+        || !class.is_current()
+    {
+        return Ok(PlainTextBodyObservation::Unavailable);
+    }
+    let _matching =
+        Operation::acquire(SNAPSHOT_RESERVATION).ok_or(ProducerError::StateUnavailable)?;
+    let expected_identity = (
+        frame.generation(),
+        class.class_id,
+        class.definition_generation,
+        class.loader,
+    );
+    // STATE -> CORE is held only for this pure borrowed-source inspection.
+    // In particular no token/current query or VM call occurs in the closure.
+    let matched = core(|core| {
+        Ok(core.with_ordinary_source(
+            expected_identity.0,
+            expected_identity.1,
+            expected_identity.2,
+            expected_identity.3,
+            |source| {
+                if source.identity() != expected_identity
+                    || source.name_utf8() != b"net.minecraft.commands.functions.PlainTextFunction"
+                {
+                    return None;
+                }
+                Some(match_plain_text_instantiate(
+                    source.terminal_bytes(),
+                    source.snapshot(),
+                ))
+            },
+        ))
+    })?
+    .flatten();
+    let Some(matched) = matched else {
+        return Ok(PlainTextBodyObservation::Unavailable);
+    };
+    let post = (|| -> Result<()> {
+        if unsafe { ffi::class_status(ti, actual)? } != status_before
+            || !unsafe { ffi::class_prepared(ti, actual)? }
+            || unsafe { existing_source_loader(env, ti, actual)? } != Some(class.loader)
+            || !pack_frame_current(frame)
+            || !class.is_current()
+        {
+            return Err(ProducerError::StateUnavailable);
+        }
+        Ok(())
+    })();
+    match matched {
+        Err(error) => Ok(PlainTextBodyObservation::Unproven {
+            error,
+            post: post.err(),
+        }),
+        Ok(matched) => {
+            post?;
+            if class_internal(SIGNATURE) != Some(matched.method().owner().as_bytes()) {
+                return Ok(PlainTextBodyObservation::Unavailable);
+            }
+            Ok(PlainTextBodyObservation::Matched(matched))
+        }
+    }
 }
 
 impl PackCapturedMethodToken<'_> {
