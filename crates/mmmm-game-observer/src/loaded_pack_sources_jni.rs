@@ -3422,19 +3422,19 @@ mod tests {
                 assert!(!selected_function(kind, unrelated).unwrap_or(true));
             }
         }
-        assert!(
-            !selected_function(
+        assert!(matches!(
+            selected_function(
                 CalibrationSourceKind::Numeric47,
                 "mmmm_calibration:pack/entry"
-            )
-            .unwrap()
-        );
-        let numeric = normative_resources(CalibrationSourceKind::Numeric47).unwrap();
-        assert!(
-            numeric
-                .keys()
-                .all(|name| !selected_function(CalibrationSourceKind::PackCase, name).unwrap())
-        );
+            ),
+            Ok(false)
+        ));
+        let numeric = normative_resources(CalibrationSourceKind::Numeric47)
+            .unwrap_or_else(|_| panic!("closed numeric source contract"));
+        assert!(numeric.keys().all(|name| matches!(
+            selected_function(CalibrationSourceKind::PackCase, name),
+            Ok(false)
+        )));
     }
 
     #[test]

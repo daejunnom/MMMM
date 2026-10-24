@@ -3160,6 +3160,40 @@ source capture·게임 인수 증거가 아니다. 다음 고정 candidate의 �
 5,506,824,705 bytes·catalog는8,825,014,953 bytes가 됐다. command0·drain/output/export·
 scratch 정리·lease 해제와 감독/정리 오류0이며 제품 DB/CAS·복구·원 증거는 보존한다.
 
+고정 `3dc6cd2abf211a03ee9fac1da9830f29995245e3`의 Windows637은 Git blob
+snapshot 547개·12,791,644 bytes·overlay0으로 PACK 관련 세 package의 lib 검사를
+시도했지만 `num-traits` build script가 SAC/WDAC4551로 never executed가 되어 Cargo101로
+실패했다. 실제 검사 함수는 실행되지 않았다. 전후 source manifest SHA는
+`6c23a6548fa9bf569047e2badaecba51da401c467848ce70e196fdc67109ff51`로 같았다.
+가능한 현재 Windows checkout 경로의 638도 같은 프로그램의 같은 정책 차단으로 실패했다.
+선택 source closure321개·8,204,102 bytes·manifest SHA
+`d41abb146ca26eca483c890fbca0b1422d56ff237f3c62259faa1647e456a12a`는 전후 같았으며,
+이는 원자적인 snapshot·dependency/toolchain image 증명이 아니다. 두 시도의 실제
+command1·18,298/7,772 ms·Job peak174,661,632/129,163,264 bytes·5/4 processes·
+gap139/101 ms·자연 종료, drain·output/export·scratch 정리·lease 해제와 감독/정리 오류0을
+확인했다. 원 실패와 증거를 보존하고 Windows 보안 정책이나 자원 상한은 바꾸지 않았다.
+
+같은 SHA의 [JVM101](https://github.com/daejunnom/MMMM/actions/runs/40053930996)은
+세 OS의 JVM tests/Fabric compile·native observer/header/startup·집계 최종 성공 metadata다.
+[Rust110](https://github.com/daejunnom/MMMM/actions/runs/40053930940)은 세 OS 모두
+observer libtest 컴파일의 E0277 세 개로 실패했다. 새 선택 검사의 `unwrap()`이 private
+`Error: Debug`를 요구한 오류이며 stdout0으로 실제 test 실행 근거는 없다. 세 원 ZIP은
+API bytes·SHA와 대조했고 원 ci-context의 actual/expected/PR head가 위 SHA와 일치한다.
+Windows/Linux/macOS 순으로 ZIP SHA는
+`f21b615fea96709fa01e9381498dc676921a93b322c5cbb8f697d70a248ede3d`,
+`5ff2bb38027942abbbf32c969925946bbf06eb555f30d5d8ade1c1b9e5c161a0`,
+`81bb569ae1fa151747c0eeb17bd15efa93aa9aa49e5fce6a88eb6d39bf362516`다.
+세 명령은 Cargo101·262,665/76,496/108,330 ms, drain·완전한 출력·export·scratch 정리·
+lease 해제와 감독/정리 오류0이다. Windows만 소유 tail 정리 뒤 종료했다. lint는 skipped이며
+JVM 성공을 Rust test 성공으로 대체하지 않는다. 직전 `1e6b53d`의 Rust109/JVM100 최종
+success도 새 PACK 23개 소스의 검증으로 재사용하지 않는다.
+
+후속 수정은 해당 inline test의 세 `unwrap()`만 치환한다. 음성 선택은 정확히
+`Ok(false)`에서만 통과하고 `Err`는 실패하며, 정본 resource 획득 오류도 panic으로 실패한다.
+production 오류형·JNI 경로와 선택 알고리즘은 바꾸지 않았다. 독립 정적 리뷰 뒤
+Windows639에서 정확한 소스 하나를 포맷했으며 실제 수정본 compile/test 결과는 다음 고정
+candidate에서 별도로 확인한다. 포맷 성공과 게임·source admission·배포 인수를 구분한다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.
