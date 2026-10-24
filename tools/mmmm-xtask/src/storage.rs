@@ -28,6 +28,13 @@ struct WalkLimits {
     max_entries: usize,
 }
 
+#[derive(Clone, Copy)]
+enum WalkLimitReason {
+    Depth,
+    VisitedEntries,
+    QueuedEntries,
+}
+
 const MANAGED_WALK_LIMITS: WalkLimits = WalkLimits {
     max_depth: MAX_DEPTH,
     max_entries: MAX_ENTRIES,
@@ -2488,9 +2495,18 @@ fn tree_bytes_observed_with_retry_and_limits(
         observation_checkpoint(progress)?;
         entries += 1;
         if depth > limits.max_depth || entries > limits.max_entries {
-            return Err(StorageError::new(
-                "walk_limit",
-                "managed tree depth or entry limit exceeded",
+            return Err(walk_limit_error(
+                if depth > limits.max_depth {
+                    WalkLimitReason::Depth
+                } else {
+                    WalkLimitReason::VisitedEntries
+                },
+                &path,
+                &boundary,
+                depth,
+                entries,
+                pending.len(),
+                limits,
             ));
         }
         reject_secret_path(&path)?;
@@ -2556,9 +2572,14 @@ fn tree_bytes_observed_with_retry_and_limits(
                 observation_checkpoint(progress)?;
                 let Some(entry) = entry else { break };
                 if pending.len() + entries >= limits.max_entries {
-                    return Err(StorageError::new(
-                        "walk_limit",
-                        "managed tree entry limit exceeded",
+                    return Err(walk_limit_error(
+                        WalkLimitReason::QueuedEntries,
+                        &path,
+                        &boundary,
+                        depth,
+                        entries,
+                        pending.len(),
+                        limits,
                     ));
                 }
                 let entry = match entry {
@@ -2607,6 +2628,40 @@ fn tree_bytes_observed_with_retry_and_limits(
     }
     observation_checkpoint(progress)?;
     Ok(bytes)
+}
+
+fn walk_limit_error(
+    reason: WalkLimitReason,
+    path: &Path,
+    boundary: &Path,
+    depth: usize,
+    walk_pops: usize,
+    pending_count: usize,
+    limits: WalkLimits,
+) -> StorageError {
+    let (reason, summary) = match reason {
+        WalkLimitReason::Depth => ("depth", "managed tree depth or entry limit exceeded"),
+        WalkLimitReason::VisitedEntries => (
+            "visited_entries",
+            "managed tree depth or entry limit exceeded",
+        ),
+        WalkLimitReason::QueuedEntries => ("queued_entries", "managed tree entry limit exceeded"),
+    };
+    // Only counters already consumed by this walk are reported. For a queue
+    // limit, path is the enumerated directory, not the unvalidated next entry.
+    // The formatter applies both lexical secret-path and reserved-leaf policy
+    // before formatting a bounded relative label; it performs no native I/O.
+    StorageError::new(
+        "walk_limit",
+        generated_entry_context(
+            format!(
+                "{summary}; reason={reason}; depth={depth}; walk_pops={walk_pops}; pending_count={pending_count}; max_depth={}; max_entries={}; generated_relative=",
+                limits.max_depth, limits.max_entries,
+            ),
+            path,
+            boundary,
+        ),
+    )
 }
 
 fn measurement_io_error(

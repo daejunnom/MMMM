@@ -1452,26 +1452,67 @@ fn bounded_walk_rejects_overdeep_tree_without_removing_it() {
         max_depth: 4,
         ..MANAGED_WALK_LIMITS
     };
+    assert_eq!(MANAGED_WALK_LIMITS.max_depth, 64);
+    assert_eq!(MANAGED_WALK_LIMITS.max_entries, 100_000);
     let mut deepest = paths.scratch.clone();
     for _ in 0..limits.max_depth {
         deepest.push("d");
         fs::create_dir(&deepest).unwrap();
     }
-    let measure_with_limits = || {
+    let metadata_calls = std::cell::Cell::new(0usize);
+    let measure_with_limits = |walk_limits| {
+        metadata_calls.set(0);
         tree_bytes_observed_with_retry_and_limits(
             &paths.scratch,
             &paths.scratch,
             &[],
-            |_| {},
+            |_| metadata_calls.set(metadata_calls.get() + 1),
             &mut || Ok(()),
             None,
-            limits,
+            walk_limits,
         )
     };
-    assert_eq!(measure_with_limits().unwrap(), sentinel_bytes.len() as u64);
+    assert_eq!(
+        measure_with_limits(limits).unwrap(),
+        sentinel_bytes.len() as u64
+    );
     deepest.push("d");
     fs::create_dir(&deepest).unwrap();
-    assert_eq!(error_kind(measure_with_limits()), "walk_limit");
+    let depth_error = measure_with_limits(limits).unwrap_err();
+    let walk_pops = metadata_calls.get() + 1;
+    let total_authored_entries = limits.max_depth + 3; // root, sentinel and five directories
+    assert!((total_authored_entries - 1..=total_authored_entries).contains(&walk_pops));
+    assert!(depth_error.message.contains(&format!(
+        "reason=depth; depth=5; walk_pops={walk_pops}; pending_count={}; max_depth=4; max_entries=100000; generated_relative=d",
+        total_authored_entries - walk_pops,
+    )));
+    let visited_error = measure_with_limits(WalkLimits {
+        max_entries: 0,
+        ..limits
+    })
+    .unwrap_err();
+    assert_eq!(metadata_calls.get(), 0);
+    assert!(visited_error.message.contains(
+        "reason=visited_entries; depth=0; walk_pops=1; pending_count=0; max_depth=4; max_entries=0; generated_relative=."
+    ));
+    let queued_error = measure_with_limits(WalkLimits {
+        max_entries: 2,
+        ..limits
+    })
+    .unwrap_err();
+    assert_eq!(metadata_calls.get(), 1);
+    assert!(queued_error.message.contains(
+        "reason=queued_entries; depth=0; walk_pops=1; pending_count=1; max_depth=4; max_entries=2; generated_relative=."
+    ));
+    for error in [&depth_error, &visited_error, &queued_error] {
+        assert_eq!(error.kind, "walk_limit");
+        assert!(error.message.len() <= 512);
+        assert!(
+            !error
+                .message
+                .contains(fixture.root.to_string_lossy().as_ref())
+        );
+    }
     assert!(deepest.is_dir());
     assert_eq!(fs::read(&sentinel).unwrap(), sentinel_bytes);
     assert!(build.measure().unwrap().within_budget);
@@ -1763,21 +1804,45 @@ fn generated_entry_diagnostic_keeps_relative_labels_bounded_and_private() {
     let fixture = Fixture::new("entry-diagnostic");
     let build = fixture.acquire();
     let prefix = "special filesystem entry is preserved; stage=measurement; native_kind=other_special; generated_relative=";
-    let long = generated_entry_context(
-        prefix.into(),
-        &build
-            .paths()
-            .scratch
-            .join(format!("runtime\n{}", "한".repeat(1024))),
-        &build.paths().slot,
-    );
+    let long_path = build
+        .paths()
+        .scratch
+        .join(format!("runtime\n{}", "한".repeat(1024)));
+    let long = generated_entry_context(prefix.into(), &long_path, &build.paths().slot);
     assert!(long.len() <= 512 && long.ends_with("..."));
     assert!(long.contains("generated_relative=scratch"));
     assert!(long.contains("runtime\\n") && !long.contains('\n'));
     assert!(!long.contains(fixture.root.to_string_lossy().as_ref()));
+    let walk_limits = WalkLimits {
+        max_depth: 4,
+        ..MANAGED_WALK_LIMITS
+    };
+    let walk_message = |path: &Path| {
+        walk_limit_error(
+            WalkLimitReason::Depth,
+            path,
+            &build.paths().slot,
+            5,
+            7,
+            0,
+            walk_limits,
+        )
+        .message
+    };
+    let long_walk = walk_message(&long_path);
+    assert!(long_walk.len() <= 512 && long_walk.ends_with("..."));
+    assert!(long_walk.contains("reason=depth; depth=5; walk_pops=7; pending_count=0;"));
+    assert!(long_walk.contains("runtime\\n") && !long_walk.contains('\n'));
+    assert!(!long_walk.contains(fixture.root.to_string_lossy().as_ref()));
 
     // These are labels only: no protected path is created, inspected or read.
-    for leaf in [".env", "credential", "service-account.json", "private-key"] {
+    for leaf in [
+        ".env",
+        "credential",
+        "service-account.json",
+        "private-key",
+        ".env.private/nested-placeholder",
+    ] {
         let withheld = generated_entry_context(
             prefix.into(),
             &build.paths().scratch.join(leaf),
@@ -1785,6 +1850,11 @@ fn generated_entry_diagnostic_keeps_relative_labels_bounded_and_private() {
         );
         assert!(withheld.ends_with("<withheld by path policy>"));
         assert!(!withheld.contains(leaf));
+        let withheld_walk = walk_message(&build.paths().scratch.join(leaf));
+        assert!(withheld_walk.ends_with("<withheld by path policy>"));
+        assert!(!withheld_walk.contains(leaf));
+        assert!(!withheld_walk.contains("nested-placeholder"));
+        assert!(withheld_walk.len() <= 512);
     }
     let outside = generated_entry_context(
         prefix.into(),
@@ -1794,6 +1864,10 @@ fn generated_entry_diagnostic_keeps_relative_labels_bounded_and_private() {
     assert!(outside.ends_with("<outside generated boundary>"));
     assert!(!outside.contains("private-original"));
     assert!(!outside.contains(fixture.root.to_string_lossy().as_ref()));
+    let outside_walk = walk_message(&fixture.checkout.join("private-original"));
+    assert!(outside_walk.ends_with("<outside generated boundary>"));
+    assert!(!outside_walk.contains("private-original"));
+    assert!(!outside_walk.contains(fixture.root.to_string_lossy().as_ref()));
     assert!(
         generated_entry_context(prefix.into(), &build.paths().slot, &build.paths().slot)
             .ends_with("generated_relative=.")

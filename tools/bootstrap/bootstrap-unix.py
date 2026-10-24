@@ -600,6 +600,36 @@ class NativeSnapshot:
                 self.verify_memory_identity(before, after, pid)
                 observation["memory_identity_match"] = True
                 if after.status != 5:
+                    if (not reserved_leader and before.pid != before.pgid
+                            and error.observation["stage"] == "task_info"
+                            and error.observation["native_result"] == 0
+                            and error.observation["native_errno"] == errno.ESRCH
+                            and 1 <= before.status <= 4 and 1 <= after.status <= 4
+                            and not before.flags & PROC_FLAG_INEXIT
+                            and after.flags & PROC_FLAG_INEXIT):
+                        # One actual BSD query can confirm the transition to
+                        # SZOMB. Keep the original first-after facts intact;
+                        # INEXIT or a missing process alone proves no exit.
+                        confirmation = {
+                            "kind": "query_started", "status": None, "inexit": None,
+                            "memory_identity_check_performed": False, "memory_identity_match": None,
+                        }
+                        observation["memory_exit_confirmation"] = confirmation
+                        try:
+                            confirmed = self.bsd_info(pid, True)
+                        except Exception:
+                            confirmation["kind"] = "query_error"
+                            raise
+                        confirmation.update(
+                            kind="observed" if confirmed is not None else "missing_esrch",
+                            status=confirmed.status if confirmed is not None else None,
+                            inexit=bool(confirmed.flags & PROC_FLAG_INEXIT) if confirmed is not None else None,
+                            memory_identity_check_performed=True, memory_identity_match=False,
+                        )
+                        self.verify_memory_identity(before, confirmed, pid)
+                        confirmation["memory_identity_match"] = True
+                        if confirmed.status == 5:
+                            return None
                     raise RuntimeError("Darwin resource process exit not confirmed by native zombie identity")
                 # The reserved group ID plus unchanged start/PGID identifies a
                 # departed member. This omits an ended process, never a zero sample.

@@ -84,6 +84,14 @@ struct RusageTimestamps {
     start_observed: bool,
     exit_observed: bool,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+struct MemoryExitConfirmation {
+    kind: &'static str,
+    status: Option<u32>,
+    inexit: Option<bool>,
+    identity_match: Option<bool>,
+    current_uid_match: Option<bool>,
+}
 /// Kept only for bounded scan deduplication; identity never enters a report.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PendingWorkerIdentity(LeaderIdentity);
@@ -161,6 +169,8 @@ pub(super) struct LeaderDiagnostic {
     memory_task_lower_bound: Option<TaskMemoryLowerBound>,
     memory_rusage_timestamps: Option<RusageTimestamps>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    memory_exit_confirmation: Option<MemoryExitConfirmation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     after_bsd_kind: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     after_bsd_native_result: Option<i32>,
@@ -201,6 +211,7 @@ impl LeaderDiagnostic {
             memory_role: None,
             memory_task_lower_bound: None,
             memory_rusage_timestamps: None,
+            memory_exit_confirmation: None,
             after_bsd_kind: None,
             after_bsd_native_result: None,
             after_bsd_native_errno: None,
@@ -272,6 +283,17 @@ impl fmt::Display for LeaderDiagnostic {
                 f,
                 ",memory_rusage_start_observed={},memory_rusage_exit_observed={}",
                 timestamps.start_observed, timestamps.exit_observed
+            )?;
+        }
+        if let Some(confirmation) = self.memory_exit_confirmation {
+            write!(
+                f,
+                ",memory_confirmation_kind={},memory_confirmation_status={:?},memory_confirmation_inexit={:?},memory_confirmation_identity_match={:?},memory_confirmation_current_uid_match={:?}",
+                confirmation.kind,
+                confirmation.status,
+                confirmation.inexit,
+                confirmation.identity_match,
+                confirmation.current_uid_match
             )?;
         }
         if let Some(kind) = self.after_bsd_kind {
@@ -652,6 +674,83 @@ pub(super) fn classify_memory_exit(
                 diagnostic.with_pending_worker(anchor),
             ));
         }
+    }
+    Err(diagnostic.attach(ProcessError::new(
+        "resource_observation",
+        "Darwin resource process exit not confirmed by native zombie identity",
+    )))
+}
+
+pub(super) fn member_exit_confirmation_candidate(
+    before: LeaderBsd,
+    first_after: LeaderBsd,
+    native: MemoryFailure,
+) -> bool {
+    // Apple XNU proc.h defines the supported non-zombie states as 1..=4.
+    native.failure == NativeResourceFailure::Exited
+        && native.stage == NativeResourceStage::TaskInfo
+        && native.native_result == 0
+        && native.native_errno == DARWIN_ESRCH
+        && before.identity.pid != before.identity.pgid
+        && before.identity == first_after.identity
+        && matches!(before.status, 1..=4)
+        && matches!(first_after.status, 1..=4)
+        && before.flags & PROC_FLAG_INEXIT == 0
+        && first_after.flags & PROC_FLAG_INEXIT != 0
+}
+
+/// An observed member can cross into exit() during the memory query. This
+/// permits one more actual BSD observation, never a deferred or zero sample.
+/// The caller still checks the original current-UID/PID sandwich and the
+/// whole scan's reserved leader before consuming a confirmed zombie.
+pub(super) fn confirm_member_memory_exit(
+    before: LeaderBsd,
+    first_after: LeaderBsd,
+    native: MemoryFailure,
+    confirm: impl FnOnce() -> Result<(Option<LeaderBsd>, u32), ProcessError>,
+) -> Result<Option<MemoryObservation>, ProcessError> {
+    if !member_exit_confirmation_candidate(before, first_after, native) {
+        return Ok(None);
+    }
+    let mut diagnostic = LeaderDiagnostic::observe(
+        before.identity,
+        Some(before),
+        Some(first_after),
+        LeaderPhase::MemoryResult,
+        LeaderSession::NotObserved,
+    )
+    .with_memory_error(native, false);
+    let (confirmed, current_uid) = match confirm() {
+        Ok(observation) => observation,
+        Err(error) => {
+            diagnostic.memory_exit_confirmation = Some(MemoryExitConfirmation {
+                kind: "query_error",
+                status: None,
+                inexit: None,
+                identity_match: None,
+                current_uid_match: None,
+            });
+            return Err(diagnostic.attach(error));
+        }
+    };
+    diagnostic.memory_exit_confirmation = Some(MemoryExitConfirmation {
+        kind: if confirmed.is_some() {
+            "observed"
+        } else {
+            "missing_esrch"
+        },
+        status: confirmed.map(|info| info.status),
+        inexit: confirmed.map(|info| info.flags & PROC_FLAG_INEXIT != 0),
+        identity_match: confirmed.map(|info| info.identity == before.identity),
+        current_uid_match: Some(current_uid == before.identity.uid),
+    });
+    if current_uid == before.identity.uid
+        && matches!(
+            classify_memory_exit(None, before, confirmed, native),
+            Ok(MemoryObservation::Zombie(_))
+        )
+    {
+        return Ok(Some(MemoryObservation::Zombie(diagnostic)));
     }
     Err(diagnostic.attach(ProcessError::new(
         "resource_observation",
@@ -2521,6 +2620,237 @@ mod tests {
                 .message
                 .contains("memory_native_result=0,memory_native_errno=0")
         );
+    }
+    #[test]
+    fn member_exit_transition_needs_one_actual_same_identity_zombie_confirmation() {
+        let before = LeaderBsd {
+            identity: LeaderIdentity {
+                pid: 18,
+                ..reserved_leader().identity
+            },
+            ..reserved_leader()
+        };
+        let first_after = LeaderBsd {
+            flags: PROC_FLAG_INEXIT,
+            ..before
+        };
+        let zombie = LeaderBsd {
+            status: SZOMB,
+            ..first_after
+        };
+        let native = native_exit_results()[0].into();
+        let mut queries = 0;
+        let Some(MemoryObservation::Zombie(diagnostic)) =
+            confirm_member_memory_exit(before, first_after, native, || {
+                queries += 1;
+                Ok((Some(zombie), before.identity.uid))
+            })
+            .unwrap()
+        else {
+            panic!("actual same-identity zombie was not confirmed")
+        };
+        assert_eq!(queries, 1);
+        assert_eq!(diagnostic.before_status, Some(2));
+        assert_eq!(diagnostic.after_status, Some(2));
+        assert!(!diagnostic.before_inexit && diagnostic.after_inexit);
+        assert_eq!(diagnostic.memory_error, Some(native.native.into()));
+        let confirmation = diagnostic.memory_exit_confirmation.unwrap();
+        assert_eq!(confirmation.kind, "observed");
+        assert_eq!(confirmation.status, Some(SZOMB));
+        assert_eq!(confirmation.identity_match, Some(true));
+        assert_eq!(confirmation.current_uid_match, Some(true));
+
+        let mut confirmations = vec![None, Some(first_after)];
+        confirmations.extend([0, 1, 2, 3, 4, 6, u32::MAX].map(|status| {
+            Some(LeaderBsd {
+                status,
+                ..first_after
+            })
+        }));
+        for identity in [
+            LeaderIdentity {
+                pid: 19,
+                ..before.identity
+            },
+            LeaderIdentity {
+                uid: 502,
+                ..before.identity
+            },
+            LeaderIdentity {
+                pgid: 19,
+                ..before.identity
+            },
+            LeaderIdentity {
+                start_sec: 123456790,
+                ..before.identity
+            },
+            LeaderIdentity {
+                start_usec: 322,
+                ..before.identity
+            },
+        ] {
+            confirmations.push(Some(LeaderBsd { identity, ..zombie }));
+        }
+        for confirmed in confirmations {
+            let mut queries = 0;
+            let error = confirm_member_memory_exit(before, first_after, native, || {
+                queries += 1;
+                Ok((confirmed, before.identity.uid))
+            })
+            .unwrap_err();
+            assert_eq!(queries, 1);
+            assert!(
+                error
+                    .message
+                    .contains("before_status=Some(2),after_status=Some(2)")
+            );
+            assert!(error.message.contains("memory_stage=task_info"));
+            assert!(error.message.contains("memory_confirmation_kind="));
+        }
+        let original = ProcessError::new("io", "actual confirmation query unavailable");
+        let error =
+            confirm_member_memory_exit(before, first_after, native, || Err(original)).unwrap_err();
+        assert_eq!(error.kind, "io");
+        assert!(
+            error
+                .message
+                .starts_with("actual confirmation query unavailable;")
+        );
+        assert!(
+            error
+                .message
+                .contains("memory_confirmation_kind=query_error")
+        );
+        let error = confirm_member_memory_exit(before, first_after, native, || {
+            Ok((Some(zombie), before.identity.uid + 1))
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("memory_confirmation_current_uid_match=Some(false)")
+        );
+    }
+    #[test]
+    fn ineligible_member_exit_facts_never_authorize_the_confirmation_query() {
+        let before = LeaderBsd {
+            identity: LeaderIdentity {
+                pid: 18,
+                ..reserved_leader().identity
+            },
+            ..reserved_leader()
+        };
+        let first_after = LeaderBsd {
+            flags: PROC_FLAG_INEXIT,
+            ..before
+        };
+        let task_exit = native_exit_results()[0];
+        let mut invalid = vec![
+            (
+                reserved_leader(),
+                LeaderBsd {
+                    flags: PROC_FLAG_INEXIT,
+                    ..reserved_leader()
+                },
+                task_exit,
+            ),
+            (first_after, first_after, task_exit),
+            (before, before, task_exit),
+            (
+                before,
+                LeaderBsd {
+                    status: SZOMB,
+                    ..first_after
+                },
+                task_exit,
+            ),
+            (before, first_after, native_exit_results()[1]),
+            (before, first_after, native_exit_results()[2]),
+            (
+                before,
+                first_after,
+                NativeResourceError {
+                    native_result: -1,
+                    ..task_exit
+                },
+            ),
+            (
+                before,
+                first_after,
+                NativeResourceError {
+                    native_errno: 1,
+                    ..task_exit
+                },
+            ),
+            (
+                before,
+                first_after,
+                NativeResourceError {
+                    stage: NativeResourceStage::ProcessIdentifier,
+                    ..task_exit
+                },
+            ),
+        ];
+        for status in [0, SZOMB, 6, u32::MAX] {
+            invalid.push((LeaderBsd { status, ..before }, first_after, task_exit));
+            invalid.push((
+                before,
+                LeaderBsd {
+                    status,
+                    ..first_after
+                },
+                task_exit,
+            ));
+        }
+        for identity in [
+            LeaderIdentity {
+                pid: 19,
+                ..before.identity
+            },
+            LeaderIdentity {
+                uid: 502,
+                ..before.identity
+            },
+            LeaderIdentity {
+                pgid: 19,
+                ..before.identity
+            },
+            LeaderIdentity {
+                start_sec: 123456790,
+                ..before.identity
+            },
+            LeaderIdentity {
+                start_usec: 322,
+                ..before.identity
+            },
+        ] {
+            invalid.push((
+                before,
+                LeaderBsd {
+                    identity,
+                    ..first_after
+                },
+                task_exit,
+            ));
+        }
+        for (before, after, native) in invalid {
+            let mut queries = 0;
+            assert!(
+                confirm_member_memory_exit(before, after, native.into(), || {
+                    queries += 1;
+                    Ok((
+                        Some(LeaderBsd {
+                            status: SZOMB,
+                            ..after
+                        }),
+                        before.identity.uid,
+                    ))
+                })
+                .unwrap()
+                .is_none()
+            );
+            assert_eq!(queries, 0);
+        }
     }
     #[test]
     fn malformed_and_permission_memory_errors_never_become_pending_or_confirmed_zombies() {

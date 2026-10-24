@@ -3575,6 +3575,109 @@ false이며 raw logs·finish·최종 cleanup/lease 결과는 미확정이다. OO
 새 source의 실제 Windows 공유 guard·junction 부정 검사·JAR 제작은 아직 미검증이며,
 후속 고정 CI의 성공을 확인하기 전에 전체 검증 완료로 표시하지 않는다.
 
+### Windows 제작의 실제 결과와 후속 관측
+
+고정 `70b8f205606e3c2acca7827493c63f03de204a8d`의
+[Rust116](https://github.com/daejunnom/MMMM/actions/runs/40066333070)은 실제 3OS의 test·strict와
+집계 최종 success를 확인했다. 이는 아래 후속 planning/tooling source 변경 전의 검사다.
+[JVM109](https://github.com/daejunnom/MMMM/actions/runs/40066333069)는 3OS와 집계가
+성공했다. 별도 opt-in [JVM110](https://github.com/daejunnom/MMMM/actions/runs/40066342293)의
+Windows·macOS job도 성공했다. Windows는 실제 archive channel의 두 share guard와
+두 identity mode를 사용했고 source/toolchain postcheck, 개발 결과 passed를 확인했다.
+이것은 해당 정상 입력의 실행 증거이며 junction 변경·공유 충돌 부정 검사를 대신하지 않는다.
+
+두 성공 job의 ZIP을 API 크기/digest와 대조한 뒤, 추출·실행 없이 제한된 member stream의
+실제 길이·SHA·EOF를 확인했다. 세 JAR의 bytes/digest는 앞선108과 각각 동일하다.
+Windows ZIP5,282,049 bytes·SHA
+`2d77b72d82689e22c43894c9f86f056ba55233ca076a62fe5971113474a90733`,
+macOS ZIP5,710,398 bytes·SHA
+`0c96857cef5a8ff3784ebae5179a50e044d1eb75efd620653e8864d7f82f8f7b`다.
+actual/expected source·target·dispatch, 7-module434 tests의 failure/error/skip0,
+development scope와 제품 proof/source admission false를 확인했다. 실제 native payload도
+observer input pin과 일치했다. Windows DLL3,290,112 bytes·SHA
+`939f61219ae0ce7ba8dc8e8a8cc92940a5836614b3034e95044fe11c53d93c9a`,
+macOS dylib5,306,216 bytes·SHA
+`c37c58f4a9f915e789d78835f4533474dbec0fab45e4eb0e611407c1c3d4cc0c`다.
+이는 Debug development fixture이며 release profile·실제 게임 인수는 아니다.
+
+JVM110 Linux는 원11-task 검증434 tests와 두 번째 Gradle의 성공 출력·archive facts가
+있지만, 종료 도중 RSS 관측 실패로 managed process가 observation_failure/signal9,
+command_exit null이 됐다. 같은 native identity의 zombie multi-thread/pidfd not_ready
+pending3회를 기록한 뒤 후행 running-member RSS ESRCH를 거절했다. peak RSS는
+1,714,954,240 bytes로 2GiB 관측 상한 아래이며 실제 timeout/OOM으로 분류하지 않는다.
+raw logs와 원 오류는 export됐고 finish는 scratch 제거·lease 해제를 기록한다.
+development result와 payload copy는 없으며 observer 단계도 skipped다. Gradle 성공
+출력이나 facts만으로 개발 산출물 발급·전체 job 성공으로 바꾸지 않는다. Linux 원 ZIP은
+71,251 bytes·SHA `20184a8a8a840ebd186d59ea856c352ae551caa1ceec7b8fd9e456f6711283dd`다.
+
+### 완료된 PACK의 계획 소비와 실패 로그 보존
+
+후속 소스는 완료된 PACK을 소비하는 Observe method를 `plan.create`, `action.plan`,
+`pack.build`로 명시한다. 세 method 모두 현재 operation Succeeded·reconcile false·cancel
+false를 요구한다. source origin에는 실제 method에 대응하는 별도 role을 사용하며
+plan.create로 치환하지 않는다. 현재 Store/root·원본 Invocation/CAS·owner·현재 ACL·
+approved route와 completed chain·readback 검사는 유지한다. plan.create 전용 생산자와
+Apply purpose, 기존 prewrite capability 거절은 그대로다. 새 inline 검사는 method/상태/
+flag와 origin-role 경계를 검사하며 실제 완료 run이나 권한을 발급하는 fixture가 아니다.
+
+일반 managed run의 후속 보존 경로는 phased supervisor가 원래 두 capture File을 유지하고,
+actual drain 뒤 현재 owner/lease·evidence ancestry를 확인해 stdout/stderr만 먼저 보존한다.
+전체 트리 측정은 이 진단 보존의 전제에서 분리하되 required export·finish의 기존 측정
+gate는 유지한다. 동일 held File의 기록된 길이·EOF·64MiB/stream·64KiB chunk·5초 읽기
+경계를 사용하고 read/write/hash 전체는 함수 진입부터 30초의 협조적 기한을 갖는다.
+동기 I/O를 선점하는 hard timeout으로 보고하지 않는다. capture handle은 보존 뒤, 기존
+finish/삭제 전에 닫는다. retained-game 전용 보존 규칙은 바꾸지 않는다.
+
+로그 보존 결과는 기존 process/finalization의 `diagnostic_log_preservation`으로 구분한다.
+로그 둘을 보존했어도 전체 측정이 실패하면 storage unknown·원 오류·required export 실패를
+남기며 scratch 삭제·complete·eviction·lease 해제를 허용하지 않는다. actual private capture의
+미시작·drained·output_complete·두 byte count0이 확인된 경우에만 현재 소유 검사를 거쳐
+로그 보존을 not_applicable로 둔다. capture 자체가 없는 Err는 미시작으로 추정하지 않고
+required export 실패·lease 보존으로 남긴다. path를 다시 열어 대신 읽지 않는다.
+
+`walk_limit` 진단에는 depth/visited_entries/queued_entries 구분, 현재 depth·walk pop·pending
+수와 적용 상한, secret 정책을 적용한 512-byte 이하 상대 stop 위치를 추가한다. production
+깊이64/walk100000·비교식·추가 I/O/retry 여부는 바꾸지 않는다. catalog의 여러 slot 중
+어느 tree가 실패했는지까지는 현재 진단으로 구분하지 못하는 한계가 남아 있다.
+
+Darwin은 observed member의 실제 TaskInfo0/ESRCH와 같은 전체 native identity에서 지원되는
+live state의 INEXIT false→true 전환이 일어난 경우에만 BSD를 한 번 더 실제 관측한다.
+그 결과도 같은 PID/UID/PGID/birth·현재 UID·실제 SZOMB여야 기존 zombie 분류를 사용한다.
+원 before/first-after와 confirmation은 따로 남긴다. missing·오류·non-Z·identity 변경은
+여전히 실패하며 Pending·메모리0·성공을 합성하지 않는다. reserved leader·rusage와 기존
+whole-scan anchor는 유지한다. 원115 실패와 보존 lease는 복구하거나 재분류하지 않는다.
+
+Windows665는 Python3.10.11의 isolated/no-bytecode AST 구문 검사와 source81,220 bytes의
+전후 SHA 일치, command0·정상 drain/export/scratch 제거/lease 해제를 확인했다.
+이는 bootstrap 스크립트 실행·실제 macOS 종료 관측·새 Rust 코드 테스트 성공은 아니다.
+Windows666은 고정 물리 rustfmt와 빈 owned cwd의 stdin 방식으로 Rust7개를 포맷하고
+Python witness를 포함한 전8개 source의 사후 hash를 확인했다. command0·정상 drain/export·
+scratch 제거·lease 해제이며 after manifest SHA는
+`e7bf019f5e3f699d18327d851c60f8c0723b34ffb6427d2b0c67ef176ee641a7`이다. source/helper/manifest
+원본과 결과를 외부 보존했다. 새 Rust 실행·3OS CI 성공·실제 게임 검증으로 확대하지 않는다.
+Windows667은 의도한9개 파일만 stage한 index에서554 files·정책 blob1·violations0과
+command0·정상 drain/export/scratch 제거/lease 해제를 확인했다. 관련 없는 dirty source,
+보호된 미추적 초안과 다른 worktree는 포함하거나 정리하지 않았다.
+
+### PACK 본문 증명의 다음 연결
+
+실제 instantiation Mixin은 Sponge `@Redirect`이며 원 instantiate 호출을 감싸는 handler와
+javac 람다3개를 통해 stage hook을 호출한다. 과거 vanilla javap나 hidden SAM의 target
+symbol 일치는 현재 transformed callsite·ordinary body의 의미 증명이 아니다.
+다음 구현은 현재 RecordingCore의 actual Class/loader/generation·terminal input·executable
+snapshot을 빌리는 ordinary source view, 선택 method의 제한 parser와 semantic matcher,
+native private proof와 별도 readonly code-readiness phase, 실제 approved host exchange를
+통한 request-scoped Rust 취득, Java의 init/seed/entry effect 직전 재확인 순서로 연결한다.
+현재 parser가 버리는 bootstrap index와 관련 BootstrapMethods·exception-handler 범위도
+정적으로 확인해야 한다. unknown bootstrap을 resolve하거나 target 초기화를 실행하지 않는다.
+
+별도 code-readiness는 load-only47이나 actual-run48, operation 원장을 대체하지 않는다.
+공개 boolean·CAS 저장 bytes·호출자가 선택한 digest로 private capability를 복원하지 않는다.
+현재 VM의 startup roster·own hook 순서·agent 동작과 실제 시작 파일의 불변 수명을 같은
+issuer에 연결한 후에만 proof를 발급한다. 현재 developer definition-startup은 실제 Fabric
+closed launcher가 아니다. 위 연결과 실제 transformed body의 적합성을 아직 구현·실행
+확인하지 않았으므로 기존 prewrite Apply 거절과 native48 원 gap을 유지한다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

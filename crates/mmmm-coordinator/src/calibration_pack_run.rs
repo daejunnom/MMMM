@@ -23,7 +23,8 @@ use mmmm_exchange::archive::{
     ArchiveLimits, read_zip_with_required_root, write_zip_with_required_root_and_cancel,
 };
 use mmmm_runtime::storage::{
-    BlobRef, DispatchEvidence, DurableStore, OperationRecord, StepRecord, StorageError, WriteScope,
+    BlobRef, DispatchEvidence, DurableStore, OperationRecord, OperationState, StepRecord,
+    StorageError, WriteScope,
     artifact::{ResourceOwner, register_resource_with_diagnostics},
 };
 use serde_json::{Value, json};
@@ -1074,6 +1075,26 @@ pub(crate) enum PackRunAccess {
     Observe,
     Cancel,
 }
+
+fn observation_method_allowed(
+    method: &str,
+    state: &OperationState,
+    reconciliation_required: bool,
+    cancellation_requested: bool,
+) -> bool {
+    match method {
+        // Planning consumes a completed run; it cannot poll, finish or continue
+        // an interrupted operation through this readonly source relationship.
+        "plan.create" | "action.plan" | "pack.build" => {
+            matches!(state, OperationState::Succeeded)
+                && !reconciliation_required
+                && !cancellation_requested
+        }
+        "plan.apply" | "operation.reconcile" | "operation.get" | "operation.cancel" => true,
+        _ => false,
+    }
+}
+
 type FreshPackRunPrepare<'a> = dyn FnMut(&PackRunHostRoute, &RequestContextWitness, &Value, &mut DurableStore) -> AppResult<()>
     + 'a;
 
@@ -1226,23 +1247,12 @@ impl EnteredPackRun<'_> {
                 })?;
             }
             PackRunAccess::Observe => {
-                if !matches!(
+                if !observation_method_allowed(
                     self.request.method(),
-                    "plan.apply"
-                        | "operation.reconcile"
-                        | "operation.get"
-                        | "operation.cancel"
-                        | "plan.create"
+                    &current.state,
+                    current.reconciliation_required,
+                    current.cancellation_requested,
                 ) {
-                    return Err(unavailable());
-                }
-                // Planning may consume only a completed run; it never gains a
-                // right to poll, finish or continue an interrupted operation.
-                if self.request.method() == "plan.create"
-                    && (current.state != mmmm_runtime::storage::OperationState::Succeeded
-                        || current.reconciliation_required
-                        || current.cancellation_requested)
-                {
                     return Err(unavailable());
                 }
                 self.authority.clone().authorize_operation(
@@ -1701,6 +1711,74 @@ fn read_pack_source_zip(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planning_observation_requires_success_without_reconciliation_or_cancellation() {
+        // Access policy only: these values issue no request, Store, origin,
+        // approval, route or private completed-run source capability.
+        for method in ["plan.create", "action.plan", "pack.build"] {
+            assert!(observation_method_allowed(
+                method,
+                &OperationState::Succeeded,
+                false,
+                false,
+            ));
+            for state in [OperationState::Queued, OperationState::Running] {
+                for reconciliation in [false, true] {
+                    for cancellation in [false, true] {
+                        assert!(!observation_method_allowed(
+                            method,
+                            &state,
+                            reconciliation,
+                            cancellation,
+                        ));
+                    }
+                }
+            }
+            for (reconciliation, cancellation) in [(true, false), (false, true), (true, true)] {
+                assert!(!observation_method_allowed(
+                    method,
+                    &OperationState::Succeeded,
+                    reconciliation,
+                    cancellation,
+                ));
+            }
+        }
+        for method in [
+            "plan.apply",
+            "operation.reconcile",
+            "operation.get",
+            "operation.cancel",
+        ] {
+            for state in [OperationState::Queued, OperationState::Succeeded] {
+                for reconciliation in [false, true] {
+                    for cancellation in [false, true] {
+                        assert!(observation_method_allowed(
+                            method,
+                            &state,
+                            reconciliation,
+                            cancellation,
+                        ));
+                    }
+                }
+            }
+        }
+        for method in [
+            "",
+            "Plan.create",
+            "plan.create ",
+            "action.plan.apply",
+            "pack.build/1",
+            "project.get",
+        ] {
+            assert!(!observation_method_allowed(
+                method,
+                &OperationState::Succeeded,
+                false,
+                false,
+            ));
+        }
+    }
 
     #[test]
     fn closed_pack_zip_read_retains_original_checkpoint_and_archive_cancellation() {

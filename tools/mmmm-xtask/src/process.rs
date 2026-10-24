@@ -338,8 +338,10 @@ impl CapturedProcessOutcome {
     /// Nonzero exit, cancellation or incomplete output remain unchanged in `outcome`.
     /// These bytes are evidence only; this method does not satisfy the strict stdout
     /// consumer gate or certify command success, complete output or product acceptance.
-    /// The 64 MiB cap, 64 KiB chunks, five-second local bound and original caller
-    /// ownership/deadline/cancellation checkpoints are shared with `read_stdout`.
+    /// The 64 MiB cap, 64 KiB chunks and five-second local bound are shared with
+    /// `read_stdout`. An explicitly admitted evidence-only post-drain caller may
+    /// use its own finite preservation deadline and current ownership checks;
+    /// that exception cannot resume the command or extend its execution budget.
     pub fn read_drained_log(
         &mut self,
         stream: CaptureStream,
@@ -568,7 +570,10 @@ pub fn supervise_with_progress_phased(
         .map(CapturedProcessOutcome::into_outcome)
 }
 
-fn supervise_with_progress_captured_phased(
+/// Retain the original two capture handles while preserving distinct pre-spawn
+/// and running observation policies. Post-drain diagnostic reads never grant
+/// successful output, managed completion, cleanup or lease release.
+pub fn supervise_with_progress_captured_phased(
     spec: &ProcessSpec,
     cancellation: &AtomicBool,
     observe: impl FnMut(ObservationPhase, &mut dyn FnMut() -> Result<(), String>) -> Result<(), String>,
@@ -3366,6 +3371,31 @@ mod native {
             // a deferred resource candidate, never a same-identity sandwich.
             return darwin_resources::missing_after_task_exit(before.observation(), native);
         }
+        if reserved.is_none()
+            && let Some(first_after) = after.as_ref()
+            && darwin_resources::member_exit_confirmation_candidate(
+                before.observation(),
+                first_after.observation(),
+                native,
+            )
+        {
+            // Reject an invalid first sandwich before the single additional
+            // BSD query. The original first-after record remains diagnostic.
+            verify_memory_identity(Some(before), Some(first_after), pid)
+                .map_err(|error| diagnostic(Some(first_after)).attach(error))?;
+            if let Some(confirmed) = darwin_resources::confirm_member_memory_exit(
+                before.observation(),
+                first_after.observation(),
+                native,
+                || {
+                    let confirmed = mac_bsd_info(pid, true)?;
+                    let uid = unsafe { libc::geteuid() };
+                    Ok((confirmed.map(|info| info.observation()), uid))
+                },
+            )? {
+                return Ok(confirmed);
+            }
+        }
         // The typed native result and actual same-birth BSD facts are both
         // retained. Classification can close a definitively lost reservation
         // before the original current-UID sandwich returns its primary error.
@@ -4334,14 +4364,28 @@ mod tests {
                 assert_eq!(raw_error.kind, "capture_incomplete");
                 assert!(!raw_error.drained);
                 assert_eq!(checks, 0);
-            } else if case == 1 {
+            } else {
+                let original_outcome = serde_json::to_value(captured.outcome()).unwrap();
                 assert_eq!(
                     captured
                         .read_drained_log(CaptureStream::Stdout, 1024, || Ok(()))
                         .unwrap(),
                     b"retained evidence"
                 );
-                assert!(!captured.outcome.output_complete);
+                assert_eq!(
+                    captured
+                        .read_drained_log(CaptureStream::Stderr, 1024, || Ok(()))
+                        .unwrap(),
+                    b""
+                );
+                assert_eq!(
+                    serde_json::to_value(captured.outcome()).unwrap(),
+                    original_outcome
+                );
+                assert_eq!(
+                    captured.read_stdout(1024, || Ok(())).unwrap_err().kind,
+                    "capture_incomplete"
+                );
             }
             drop(captured);
             run.cleanup(true);

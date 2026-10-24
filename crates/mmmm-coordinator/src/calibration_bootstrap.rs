@@ -159,6 +159,8 @@ pub(crate) struct PackBootstrapOrigin {
 enum PackOriginRole {
     PlanCreate,
     RunObservePlanCreate,
+    RunObserveActionPlan,
+    RunObservePackBuild,
     RunApply,
     RunReconcile,
     RunCancel,
@@ -168,6 +170,8 @@ impl PackOriginRole {
     fn for_run(method: &str) -> AppResult<Self> {
         match method {
             "plan.create" => Ok(Self::RunObservePlanCreate),
+            "action.plan" => Ok(Self::RunObserveActionPlan),
+            "pack.build" => Ok(Self::RunObservePackBuild),
             "plan.apply" => Ok(Self::RunApply),
             "operation.reconcile" => Ok(Self::RunReconcile),
             "operation.cancel" => Ok(Self::RunCancel),
@@ -179,6 +183,8 @@ impl PackOriginRole {
         match self {
             Self::PlanCreate => "plan.create",
             Self::RunObservePlanCreate => "plan.create",
+            Self::RunObserveActionPlan => "action.plan",
+            Self::RunObservePackBuild => "pack.build",
             Self::RunApply => "plan.apply",
             Self::RunReconcile => "operation.reconcile",
             Self::RunCancel => "operation.cancel",
@@ -230,7 +236,8 @@ impl PackBootstrapOrigin {
     }
     /// Source provenance remains readonly during a separately entered run.
     /// Its caller must also validate that new operation and typed approval;
-    /// plan.create is only the typed completed-run Observe consumer's role.
+    /// Planning methods are only typed completed-run Observe consumers here;
+    /// the separate plan producer remains restricted to plan.create.
     pub(crate) fn check_for_run(
         &self,
         store: &DurableStore,
@@ -1833,6 +1840,45 @@ impl std::error::Error for RetainedFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_run_origin_roles_preserve_the_actual_planning_method() {
+        // Role projection alone creates no origin or authority. The retained
+        // relationship must still verify its current Store, owner and request.
+        assert!(matches!(
+            PackOriginRole::for_run("plan.create").unwrap(),
+            PackOriginRole::RunObservePlanCreate
+        ));
+        assert!(matches!(
+            PackOriginRole::for_run("action.plan").unwrap(),
+            PackOriginRole::RunObserveActionPlan
+        ));
+        assert!(matches!(
+            PackOriginRole::for_run("pack.build").unwrap(),
+            PackOriginRole::RunObservePackBuild
+        ));
+        for method in [
+            "plan.create",
+            "action.plan",
+            "pack.build",
+            "plan.apply",
+            "operation.reconcile",
+            "operation.get",
+            "operation.cancel",
+        ] {
+            assert_eq!(PackOriginRole::for_run(method).unwrap().method(), method);
+        }
+        assert_eq!(PackOriginRole::PlanCreate.method(), "plan.create");
+        for method in [
+            "",
+            "Plan.create",
+            "plan.create ",
+            "pack.build/1",
+            "project.get",
+        ] {
+            assert!(PackOriginRole::for_run(method).is_err());
+        }
+    }
 
     #[test]
     fn pack_source_recipe_and_empty_registry_do_not_issue_a_private_route() {

@@ -172,6 +172,173 @@ fn write_new_json_with_checkpoint(
     Ok(())
 }
 
+fn write_captured_diagnostic_log(
+    destination: &Path,
+    bytes: &[u8],
+    checkpoint: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    checkpoint()?;
+    let parent = destination.parent().ok_or("diagnostic log parent absent")?;
+    validate_local_ancestry(parent, true, true)?;
+    checkpoint()?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
+    }
+    let mut output = options.open(destination)?;
+    checkpoint()?;
+    for chunk in bytes.chunks(64 * 1024) {
+        checkpoint()?;
+        output.write_all(chunk)?;
+        checkpoint()?;
+    }
+    output.sync_all()?;
+    checkpoint()?;
+    let metadata = output.metadata()?;
+    checkpoint()?;
+    if !metadata.is_file() || metadata.len() != u64::try_from(bytes.len())? {
+        return Err("diagnostic log destination size or type changed".into());
+    }
+    Ok(())
+}
+
+/// Only original held captures are admitted here. This bounded post-drain
+/// evidence path never measures a generated tree or grants managed completion.
+fn preserve_captured_diagnostic_logs(
+    build: &storage::ManagedBuild,
+    capture: Option<&mut process::CapturedProcessOutcome>,
+) -> (serde_json::Value, Result<(), Box<dyn std::error::Error>>) {
+    let started = Instant::now();
+    let mut report = serde_json::json!({
+        "schema": "mmmm-managed-diagnostic-logs/1",
+        "status": "not_preserved",
+        "source": "original_supervisor_capture_handles",
+        "storage_measurement": "not_certified_by_log_preservation",
+        "grants_required_evidence_complete": false,
+        "grants_command_success": false,
+        "cleanup_permitted": false,
+        "lease_release_permitted": false,
+        "budget_ms": 30_000,
+        "clock_origin": "diagnostic_log_preservation_entered",
+        "budget_scope": "two_original_stream_reads_writes_and_hashes_only",
+        "os_io_preemptible": false,
+        "original_cancel_ignored_for_diagnostic_preservation_only": true,
+        "stream_cap_bytes": 64 * 1024 * 1024,
+        "streams": [],
+    });
+    let Some(capture) = capture else {
+        report["status"] = "unavailable_original_capture".into();
+        return (
+            report,
+            Err("original native capture handles are unavailable".into()),
+        );
+    };
+    if !capture.outcome().drained {
+        report["status"] = "not_admitted_without_native_drain".into();
+        return (
+            report,
+            Err("diagnostic logs require a drained native outcome".into()),
+        );
+    }
+    let mut current = || {
+        if started.elapsed() >= Duration::from_secs(30) {
+            return Err("diagnostic post-drain preservation deadline exceeded".to_owned());
+        }
+        build
+            .check_current_ownership()
+            .map_err(|error| storage_error_report(&error).to_string())?;
+        validate_local_ancestry(&build.paths().evidence, true, true)
+            .map_err(|error| error.to_string())?;
+        if started.elapsed() >= Duration::from_secs(30) {
+            return Err("diagnostic post-drain preservation deadline exceeded".to_owned());
+        }
+        Ok(())
+    };
+    if !capture.process_started() {
+        // This is the private producer's explicit pre-spawn cancellation or
+        // expired-deadline result, not an inference from an Err or pathname.
+        let outcome = capture.outcome();
+        if !outcome.output_complete || outcome.stdout_bytes != 0 || outcome.stderr_bytes != 0 {
+            report["status"] = "inconsistent_process_not_started".into();
+            return (
+                report,
+                Err("unstarted capture has incomplete or nonempty output".into()),
+            );
+        }
+        return match current() {
+            Ok(()) => {
+                report["status"] = "not_applicable_process_not_started".into();
+                (report, Ok(()))
+            }
+            Err(error) => {
+                report["status"] = "ownership_or_preservation_unconfirmed".into();
+                (report, Err(error.into()))
+            }
+        };
+    }
+    let mut streams = Vec::with_capacity(2);
+    let mut errors = Vec::new();
+    let mut preserved = 0;
+    for (stream, name) in [
+        (process::CaptureStream::Stdout, "command.stdout.log"),
+        (process::CaptureStream::Stderr, "command.stderr.log"),
+    ] {
+        let result = (|| -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+            let bytes = capture.read_drained_log(stream, 64 * 1024 * 1024, &mut current)?;
+            write_captured_diagnostic_log(
+                &build.paths().evidence.join(name),
+                &bytes,
+                &mut current,
+            )?;
+            current()?;
+            let digest = format!("{:x}", Sha256::digest(&bytes));
+            current()?;
+            Ok(serde_json::json!({
+                "name": name,
+                "write_confirmed": true,
+                "byte_length": bytes.len(),
+                "sha256": digest,
+            }))
+        })();
+        match result {
+            Ok(stream) => {
+                preserved += 1;
+                streams.push(stream);
+            }
+            Err(error) => {
+                let error = error.to_string();
+                streams.push(
+                    serde_json::json!({"name": name, "write_confirmed": false, "error": error}),
+                );
+                errors.push(error);
+            }
+        }
+    }
+    report["status"] = if preserved == 2 {
+        "preserved"
+    } else if preserved == 0 {
+        "not_preserved"
+    } else {
+        "partial"
+    }
+    .into();
+    report["streams"] = serde_json::json!(streams);
+    report["elapsed_ms"] = u64::try_from(started.elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+        .into();
+    report["errors"] = serde_json::json!(&errors);
+    let result = match errors.first() {
+        Some(error) => {
+            Err(format!("original capture diagnostic preservation failed: {error}").into())
+        }
+        None => Ok(()),
+    };
+    (report, result)
+}
+
 struct RetainedPreservation {
     started: Instant,
 }
@@ -493,8 +660,10 @@ fn run_managed(
         .map(|schedule| schedule.handle.clone());
     let mut observation_retries = storage::ObservationRetryLog::default();
     let mut retained_measurement = None;
-    let result =
-        process::supervise_with_progress_phased(&spec, &cancellation, |phase, checkpoint| {
+    let mut result = process::supervise_with_progress_captured_phased(
+        &spec,
+        &cancellation,
+        |phase, checkpoint| {
             if let Some(retained) = &retained {
                 let mut current = || {
                     checkpoint()?;
@@ -526,10 +695,11 @@ fn run_managed(
                 return Err("managed disk budget exceeded".into());
             }
             Ok(())
-        });
+        },
+    );
     // 원 실행 결과는 그대로 두고, 확인된 drain 뒤의 보존에만 별도 유한 기한을 사용한다.
     let native_drained = match &result {
-        Ok(outcome) => outcome.drained,
+        Ok(captured) => captured.outcome().drained,
         Err(error) => error.drained,
     };
     let preservation = if retained.is_some() && native_drained {
@@ -539,8 +709,10 @@ fn run_managed(
     } else {
         None
     };
-    let (command_exit, drained, mut supervisor_errors, command_success, mut report) = match result {
-        Ok(outcome) => {
+    let (command_exit, drained, mut supervisor_errors, command_success, mut report) = match &result
+    {
+        Ok(captured) => {
+            let outcome = captured.outcome();
             let success = outcome.command_exit == Some(0)
                 && outcome.drained
                 && outcome.output_complete
@@ -559,7 +731,7 @@ fn run_managed(
             error.drained,
             vec![error.to_string()],
             false,
-            process_error_report(&error),
+            process_error_report(error),
         ),
     };
     let mut preservation_checkpoint = || {
@@ -589,7 +761,22 @@ fn run_managed(
         // Preserve this independent failure even if process.json also fails.
         supervisor_errors.push(format!("retry companion export: {error}"));
     }
+    let diagnostic_export = if retained.is_none() {
+        let (diagnostic, exported) =
+            preserve_captured_diagnostic_logs(&build, result.as_mut().ok());
+        report["diagnostic_log_preservation"] = diagnostic;
+        if let Err(error) = &exported {
+            supervisor_errors.push(format!("diagnostic log preservation: {error}"));
+        }
+        exported
+    } else {
+        Ok(())
+    };
+    // The held originals protect the read. Close them before any existing
+    // finish/scratch removal; Windows capture sharing deliberately denies delete.
+    drop(result);
     let mut exported = false;
+    let mut diagnostic_storage_measurement_observed = false;
     let export = (|| -> Result<(), Box<dyn std::error::Error>> {
         if let (Some(retained), Some(_)) = (&retained, &preservation) {
             let mut current = || {
@@ -612,6 +799,7 @@ fn run_managed(
         if !drained {
             return Err("unconfirmed drain prevents command log export and cleanup".into());
         }
+        diagnostic_export?;
         if let Some(retained) = &retained {
             let measurement = retained.measure_with_progress(&mut preservation_checkpoint)?;
             if !measurement.within_budget {
@@ -619,6 +807,7 @@ fn run_managed(
             }
         } else {
             build.measure()?;
+            diagnostic_storage_measurement_observed = true;
         }
         for (source, name) in [
             (&stdout, "command.stdout.log"),
@@ -638,8 +827,6 @@ fn run_managed(
                 if exists {
                     export_retained_log(source, &build.paths().evidence.join(name), &mut current)?;
                 }
-            } else if source.try_exists()? {
-                export_log(source, &build.paths().evidence.join(name))?;
             }
         }
         Ok(())
@@ -743,6 +930,15 @@ fn run_managed(
         "evidence_exported": finish_outcome.evidence_exported,
         "supervisor_errors": finish_outcome.supervisor_errors,
     });
+    if let Some(diagnostic) = report.get("diagnostic_log_preservation") {
+        finalization["diagnostic_log_preservation"] = diagnostic.clone();
+        finalization["storage_measurement"] = if diagnostic_storage_measurement_observed {
+            "observed"
+        } else {
+            "unknown"
+        }
+        .into();
+    }
     if let Some(completion) = game_completion {
         finalization["retained_game"] = completion;
     }
@@ -1131,6 +1327,65 @@ mod observation_evidence_tests {
             fs::read(paths.evidence.join("observation-retries.json")).unwrap(),
             bytes
         );
+        // Reuse this owned fixture for the narrow writer boundary. Synthetic
+        // bytes test no native completion grant and create no process fixture.
+        let no_start_spec = process::ProcessSpec::new(
+            std::env::current_exe().unwrap(),
+            checkout.clone(),
+            paths.scratch.join("unstarted.stdout.log"),
+            paths.scratch.join("unstarted.stderr.log"),
+        );
+        // This real producer result creates no native child: cancellation is
+        // already set after its one pre-spawn observation and before spawn.
+        let mut no_start = process::supervise_with_progress_captured_phased(
+            &no_start_spec,
+            &AtomicBool::new(true),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert!(!no_start.process_started() && no_start.outcome().drained);
+        let (not_applicable, preservation) =
+            preserve_captured_diagnostic_logs(&build, Some(&mut no_start));
+        preservation.unwrap();
+        assert_eq!(
+            not_applicable["status"],
+            "not_applicable_process_not_started"
+        );
+        assert_eq!(not_applicable["grants_required_evidence_complete"], false);
+        assert!(!paths.evidence.join("command.stdout.log").exists());
+        assert!(!paths.evidence.join("command.stderr.log").exists());
+        drop(no_start);
+        for name in ["command.stdout.log", "command.stderr.log"] {
+            fs::write(
+                paths.scratch.join(name),
+                b"path-only bytes must not be reopened",
+            )
+            .unwrap();
+        }
+        let (unavailable, preserved) = preserve_captured_diagnostic_logs(&build, None);
+        assert!(preserved.is_err());
+        assert_eq!(unavailable["status"], "unavailable_original_capture");
+        assert_eq!(unavailable["grants_required_evidence_complete"], false);
+        assert_eq!(unavailable["lease_release_permitted"], false);
+        assert!(!paths.evidence.join("command.stdout.log").exists());
+        assert!(!paths.evidence.join("command.stderr.log").exists());
+        let diagnostic = paths.evidence.join("command.stdout.log");
+        let mut current = || {
+            build
+                .check_current_ownership()
+                .map_err(|error| error.to_string())
+        };
+        write_captured_diagnostic_log(&diagnostic, b"bounded failure evidence", &mut current)
+            .unwrap();
+        assert_eq!(fs::read(&diagnostic).unwrap(), b"bounded failure evidence");
+        assert!(write_captured_diagnostic_log(&diagnostic, b"replacement", &mut current).is_err());
+        assert_eq!(fs::read(&diagnostic).unwrap(), b"bounded failure evidence");
+        let original_lease = fs::read(paths.catalog.join("lease.json")).unwrap();
+        fs::write(paths.catalog.join("lease.json"), b"unknown lease owner").unwrap();
+        let denied = paths.evidence.join("command.stderr.log");
+        assert!(write_captured_diagnostic_log(&denied, b"must not write", &mut current).is_err());
+        assert!(!denied.exists());
+        fs::write(paths.catalog.join("lease.json"), original_lease).unwrap();
         let finish = build
             .finish(storage::FinishOutcome {
                 command_exit: Some(0),
