@@ -3397,10 +3397,10 @@ fn pack_entries(
     if supplied.is_some_and(|value| value.is_null()) {
         return Err(Failure::Identity.into());
     }
-    if let Some(supplied) = supplied {
-        if !locals.same(entries, supplied)? {
-            return Err(Failure::Identity.into());
-        }
+    if let Some(supplied) = supplied
+        && !locals.same(entries, supplied)?
+    {
+        return Err(Failure::Identity.into());
     }
     let expected = match role {
         core::PackRunRole::Entry => 3,
@@ -3977,10 +3977,8 @@ fn pack_run_event(
             let mut matched = None;
             for role in [Role::Entry, Role::Dependency] {
                 let binding = state()?.core.pack_schedule_binding(id, actual_run, role)?;
-                if binding.child_frame == parent {
-                    if matched.replace(role).is_some() {
-                        return Err(Failure::Identity.into());
-                    }
+                if binding.child_frame == parent && matched.replace(role).is_some() {
+                    return Err(Failure::Identity.into());
                 }
             }
             let bytes = locals.bytes(frame.payload_array, 8)?;

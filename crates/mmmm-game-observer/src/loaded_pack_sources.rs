@@ -304,9 +304,30 @@ pub(super) struct PackRunFacts {
 /// provider traversal and each event must still pass a fresh native frame.
 pub(super) struct PackScheduleBinding {
     pub plain: ObjectId,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retained actual instantiate result for pending PACK body proof; native phase 48 remains unavailable."
+        )
+    )]
     pub instantiated: ObjectId,
     pub source: ObjectId,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retained actual execution context for pending PACK body proof; native phase 48 remains unavailable."
+        )
+    )]
     pub context: ObjectId,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retained actual caller frame for pending PACK callsite proof; native phase 48 remains unavailable."
+        )
+    )]
     pub parent_frame: ObjectId,
     pub child_frame: ObjectId,
     pub provider: ObjectId,
@@ -1722,10 +1743,10 @@ impl RecordingCore {
         if !capture.complete() {
             capture.fail(Failure::Retired, None);
         }
-        if let Some(run) = &mut capture.pack_run {
-            if !run.completed {
-                run.fail(Failure::Retired, None);
-            }
+        if let Some(run) = &mut capture.pack_run
+            && !run.completed
+        {
+            run.fail(Failure::Retired, None);
         }
         capture.retired = true;
         Ok(())
@@ -1735,10 +1756,10 @@ impl RecordingCore {
         self.first_admission_failure
             .get_or_insert((reason, generation));
         for capture in self.captures.values_mut() {
-            if let Some(run) = &mut capture.pack_run {
-                if !run.completed {
-                    run.fail(reason, None);
-                }
+            if let Some(run) = &mut capture.pack_run
+                && !run.completed
+            {
+                run.fail(reason, None);
             }
         }
     }

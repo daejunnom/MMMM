@@ -1346,12 +1346,11 @@ fn captured_sam_semantics(
     }
     expect_load(&mut reader, &reference, 1)?;
     expect_load(&mut reader, &reference, 2)?;
-    if kind == PackCapturedRecipeKind::TaskProvider {
-        if reader.u1()? != 0xc0
-            || pool.class(reader.u2()?)? != "net/minecraft/commands/execution/UnboundEntryAction"
-        {
-            return Err(ClassfileError::Unsupported("PACK task argument cast"));
-        }
+    if kind == PackCapturedRecipeKind::TaskProvider
+        && (reader.u1()? != 0xc0
+            || pool.class(reader.u2()?)? != "net/minecraft/commands/execution/UnboundEntryAction")
+    {
+        return Err(ClassfileError::Unsupported("PACK task argument cast"));
     }
     let expected_opcode = match kind {
         PackCapturedRecipeKind::TaskProvider => 0xb8,

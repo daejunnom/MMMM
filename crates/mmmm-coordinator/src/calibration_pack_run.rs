@@ -408,7 +408,7 @@ pub(crate) fn retain_plan(
     source: Rc<PreparedPackRunSource>,
     plan: &Value,
 ) -> AppResult<()> {
-    if source.store != store as *const DurableStore
+    if !std::ptr::eq(source.store, store)
         || source.store_root != store.data_root()
         || plan["projectId"] != source.selection.project_id.as_str()
         || plan["projectBaseRevision"] != source.selection.expected_revision.as_str()
@@ -467,7 +467,7 @@ impl PackRunRegistry {
             .get(text(plan, "planHash")?)
             .cloned()
             .ok_or_else(unavailable)?;
-        if entry.source.store != store as *const DurableStore
+        if !std::ptr::eq(entry.source.store, store)
             || entry.source.store_root != store.data_root()
             || entry.plan != *plan
             || store
@@ -732,21 +732,20 @@ impl PackRunRegistry {
                 .try_borrow()
                 .map_err(|_| unavailable())?
                 .as_ref()
+                && let Err(cause) = confirmed.route.retire()
             {
-                if let Err(cause) = confirmed.route.retire() {
-                    let cause = Arc::new(cause);
-                    let mut retained = confirmed
-                        .cleanup_failure
-                        .try_borrow_mut()
-                        .map_err(|_| unavailable())?;
-                    if retained.is_none() {
-                        *retained = Some(cause.clone());
-                    }
-                    if failure.is_none() {
-                        failure = Some(cause);
-                    }
-                    continue;
+                let cause = Arc::new(cause);
+                let mut retained = confirmed
+                    .cleanup_failure
+                    .try_borrow_mut()
+                    .map_err(|_| unavailable())?;
+                if retained.is_none() {
+                    *retained = Some(cause.clone());
                 }
+                if failure.is_none() {
+                    failure = Some(cause);
+                }
+                continue;
             }
             self.entries
                 .try_borrow_mut()
@@ -1585,7 +1584,7 @@ fn fields(value: &Value, keys: &[&str]) -> AppResult<()> {
 fn hex_bytes(value: &str) -> AppResult<Vec<u8>> {
     if value.is_empty()
         || value.len() > 128 * 1024
-        || value.len() % 2 != 0
+        || !value.len().is_multiple_of(2)
         || !value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))

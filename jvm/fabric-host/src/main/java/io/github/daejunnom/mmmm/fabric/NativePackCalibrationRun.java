@@ -302,6 +302,8 @@ final class NativePackCalibrationRun implements HostDispatcher.PurposeRoute, Aut
         return result.minimalCompletionStage();
     }
 
+    // The scope owns stage-listener cleanup; its resource value is intentionally unused.
+    @SuppressWarnings("try")
     private ProviderResult execute(Invocation original, int index, IndependentObjectiveImage preparedBefore, ServerLevel actualLevel,
                                    NativeCalibrationBootstrap.PackRunReadiness readiness, Runnable control) throws CommandSyntaxException {
         Trace trace = new Trace(original, index, actualLevel, readiness, control);

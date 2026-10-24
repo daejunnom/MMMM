@@ -61,13 +61,12 @@ impl Drop for CalibrationCapacityLease {
     fn drop(&mut self) {
         // A conflicting borrow must retain the reservation rather than make a
         // possibly live allocation disappear from the shared capacity bound.
-        if let Ok(mut pending) = self.pending.try_borrow_mut() {
-            if pending
+        if let Ok(mut pending) = self.pending.try_borrow_mut()
+            && pending
                 .get(&self.id)
                 .is_some_and(|actual| Rc::ptr_eq(actual, &self.identity))
-            {
-                pending.remove(&self.id);
-            }
+        {
+            pending.remove(&self.id);
         }
     }
 }

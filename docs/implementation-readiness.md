@@ -3466,6 +3466,52 @@ game/release not_run이다. SDK 최종 공개 형식·rights/license와 전체 �
 SHA `19675d6c95637da452f87a69d8c69feac79f203edce00a9696b6cf7cf7ce454d`가 복원됨을 독립
 리뷰했다. 새 task와 opt-in branch의 실제 실행 성공을 이 정적 동일성으로 표시하지 않는다.
 
+### PACK 후보의 실제 CI 실패와 한정 수정
+
+고정 `52f33e1796ac833463ec7485a1101dbaeca623a1`의
+[Rust114](https://github.com/daejunnom/MMMM/actions/runs/40063099490)는 세 OS의 실제 test
+step이 성공했으나 lint와 집계가 실패했다. Windows 원 ZIP85,999 bytes·SHA
+`aaccdf5686388762c21fdcd18437819cdb17a1a6eac72d6706f9bf3558268588`, Linux 원 ZIP87,292
+bytes·SHA `b7f773fe2b85c14245c5ef3f67b5dfb747d65e076beb4c73370df786a22946ee`를 API digest와
+대조하고 actual/expected/PR head 일치를 확인했다. Windows compiler90·observer107·
+Coordinator419 PASS와 기존 ignored1, Linux Coordinator418 PASS 및 새 PACK 경계 검사의
+실제 ok를 확인했다. 전체 workspace의 기존 ignored를 전부 실행했다고 표시하지 않는다.
+Windows test command0·598,274 ms·Job peak1,789,730,816 bytes·9 processes·gap150 ms이며,
+소유 tail 정리 뒤 drain/output/export·scratch 정리·lease 해제·감독/정리 오류0이다.
+이는 해당 고정 소스의 검사이고 후속 lint 수정이나 실제 게임 인수가 아니다.
+
+Windows lint는 Coordinator의 unused getter·조건식·포인터 비교 등6개 진단으로
+Cargo101을 반환했다. Linux lint는 이에 더해 native 세 필드의 미소비와 조건식 등6개
+진단을 기록했다. unused `absence_images` getter만 제거하고 실제 absence 자료와 검사는
+유지했다. 조건식 순서와 borrow 실패 시 보존, retire 원 오류·cleanup 원인과 continue,
+동일 Store 주소 비교·길이 검사를 유지해 정리했다. native의 actual instantiate/context/
+caller-frame 투영 세 필드는 원 관측을 보존하며, 각 필드의 비-test 빌드에만 pending body
+proof라는 이유를 가진 `expect(dead_code)`를 명시했다. 이미 core가 검사한 관계를 새 JNI
+관측이나 authority로 바꾸지 않으며 native48의 known-gap 거절은 유지한다.
+
+같은 고정 소스의 [JVM105](https://github.com/daejunnom/MMMM/actions/runs/40063099489)와
+`development_jars=true`를 한 번 요청한
+[JVM106](https://github.com/daejunnom/MMMM/actions/runs/40063132127)은 세 OS와 집계가
+실패했다. Windows 두 원 ZIP58,362/58,328 bytes의 API digest·actual/expected head를
+대조했다. 원 compiler 진단은 `NativePackCalibrationRun.execute`의 의도적인 자원 scope가
+미사용이라는 `[try]` 경고와 기존 `-Werror`다. 원 11-task 검증이 실패했으므로 optional
+JAR packaging은 `not_run`이며 생성·복사 성공을 주장하지 않는다. 해당 메서드에 cleanup
+수명이라는 이유와 한정 `SuppressWarnings("try")`만 추가했다. 원 try body·close·primary/
+suppressed throwable은 그대로이며 독립 byte 역변환 리뷰로 다른 변경이 없음을 확인했다.
+
+한정 source7개는 독립 리뷰 후 전후 pin을 대조했다. 659의 직접 포맷 사전 검사는 외부
+module 선언을 발견해 formatter 실행·source write 전에 거절했다. 660은 설치 경로를
+추정한 Root 오류로 child 시작 전에 path 오류를 반환했고, command exit는 null이며 원
+supervisor 오류·export·scratch 정리·lease 해제를 보존했다. 같은 실패를 SAC로 분류하지
+않는다. 실제 제공된 PowerShell 경로를 확인한661은 검토한 helper로 빈 소유 scratch의
+stdin/stdout을 사용해 Rust6개를 staging하고 전7개를 재검사한 뒤 적용·사후 대조했다.
+command0·1,344 ms·Job peak51,732,480 bytes·3 processes·gap101 ms·자연 종료와
+drain/output/export·scratch 정리·lease 해제·감독/정리 오류0이다. 전7개 manifest1,233
+bytes·SHA `7324137b4ee624767eb88f8c5be1c94c2107d33d780f401853a7bc32acb287b3`를 외부
+보존하며 Java 한 파일은 포맷하지 않았다. 출력1 MiB는 완료 후 검사이고 원120초 Job과
+시간/자원/저장 상한은 유지했다. 이 포맷 성공과 source review는 수정본의 compile·strict·
+JVM·JAR 제작 성공이 아니며, 수정본의 실제 검증은 후속 고정 CI에서 확인한다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

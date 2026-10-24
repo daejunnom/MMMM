@@ -211,9 +211,6 @@ impl PackBootstrapOrigin {
     pub(crate) fn recipe_blob(&self) -> &BlobRef {
         &self.entry.source.recipe
     }
-    pub(crate) fn absence_images(&self) -> &[(String, BlobRef)] {
-        &self.absence
-    }
     pub(crate) fn check(
         &self,
         store: &DurableStore,
