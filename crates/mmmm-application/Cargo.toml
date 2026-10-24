@@ -1,0 +1,18 @@
+[package]
+name = "mmmm-application"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MMMM shared planning and execution use cases"
+
+[dependencies]
+mmmm-contracts = { path = "../mmmm-contracts" }
+mmmm-runtime = { path = "../mmmm-runtime" }
+serde.workspace = true
+serde_json.workspace = true
+time = { version = "=0.3.44", features = ["parsing", "formatting"] }
+
+[lints]
+workspace = true

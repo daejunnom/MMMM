@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "mmmm_fixture_provider",
+  "version": "0.1.0",
+  "name": "MMMM Provider Acceptance Fixture",
+  "description": "Authored bounded SDK facade for the shared legacy counter acceptance fixture",
+  "license": "MIT",
+  "environment": "server",
+  "entrypoints": { "mmmm:provider": ["io.github.daejunnom.mmmm.fixture.provider.FixtureProvider"] },
+  "depends": { "mmmm_host": "=0.1.0", "mmmm_fixture_legacy": "=0.1.0", "fabricloader": "=0.19.5", "minecraft": "=26.3", "java": ">=25" }
+}

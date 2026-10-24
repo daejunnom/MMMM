@@ -1,0 +1,23 @@
+[package]
+name = "mmmm-planner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MMMM immutable native intent preparation for the shared application planner"
+
+[dependencies]
+mmmm-contracts = { path = "../mmmm-contracts" }
+mmmm-domain = { path = "../mmmm-domain" }
+mmmm-runtime = { path = "../mmmm-runtime" }
+mmmm-application = { path = "../mmmm-application" }
+mmmm-adapters = { path = "../mmmm-adapters" }
+mmmm-compiler = { path = "../mmmm-compiler" }
+mmmm-exchange = { path = "../mmmm-exchange" }
+serde.workspace = true
+serde_json.workspace = true
+time = { version = "=0.3.44", features = ["parsing", "formatting"] }
+
+[lints]
+workspace = true

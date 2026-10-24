@@ -1,0 +1,219 @@
+name: Rust foundation
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Keep one active run for a ref. A new source SHA does not cancel an active run.
+concurrency:
+  group: rust-foundation-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '2'
+  CARGO_INCREMENTAL: '0'
+  PYTHONDONTWRITEBYTECODE: '1'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  foundation:
+    name: foundation (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - runner: windows-2025
+            target: windows-x64
+            rust_target: x86_64-pc-windows-msvc
+            os: Windows
+            arch: X64
+          - runner: ubuntu-24.04
+            target: linux-x64
+            rust_target: x86_64-unknown-linux-gnu
+            os: Linux
+            arch: X64
+          - runner: macos-15
+            target: macos-arm64
+            rust_target: aarch64-apple-darwin
+            os: Darwin
+            arch: Arm64
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      MMMM_RUST_TARGET: ${{ matrix.rust_target }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+
+      - name: Register actual source and runner
+        env:
+          EXPECTED_OS: ${{ matrix.os }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          MATRIX_TARGET: ${{ matrix.target }}
+          EXPECTED_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          SOURCE_EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || '' }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actualOS = if ($IsWindows) { 'Windows' } elseif ($IsMacOS) { 'Darwin' } elseif ($IsLinux) { 'Linux' } else { 'unsupported' }
+          $actualArch = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
+          if ($actualOS -cne $env:EXPECTED_OS -or $actualArch -cne $env:EXPECTED_ARCH) { throw 'Runner OS or architecture differs from the matrix target.' }
+          $expectedRustTarget = switch ($actualOS) {
+            'Windows' { 'x86_64-pc-windows-msvc' }
+            'Linux' { 'x86_64-unknown-linux-gnu' }
+            'Darwin' { 'aarch64-apple-darwin' }
+            default { throw 'Unsupported native Rust target.' }
+          }
+          if ($env:MMMM_RUST_TARGET -cne $expectedRustTarget) { throw 'Rust target differs from the actual runner profile.' }
+          $outputRoot = Join-Path $env:RUNNER_TEMP 'MMMM'
+          $evidenceRoot = Join-Path $outputRoot 'evidence/foundation'
+          [System.IO.Directory]::CreateDirectory($evidenceRoot) | Out-Null
+          $sourceSha = (& git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $sourceSha -cnotmatch '^[0-9a-f]{40}$') { throw 'Cannot establish the checked-out source SHA.' }
+          if ($env:EXPECTED_SOURCE_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:EVENT_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'Event source SHA metadata is invalid.' }
+          $pullRequest = $null
+          if ($env:SOURCE_EVENT_NAME -ceq 'pull_request') {
+            $prNumber = 0
+            if ($env:PR_NUMBER -cnotmatch '^[1-9][0-9]*$' -or -not [int]::TryParse($env:PR_NUMBER, [ref]$prNumber)) { throw 'Pull request number metadata is invalid.' }
+            if ($env:PR_HEAD_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:PR_BASE_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:PR_HEAD_SHA -cne $env:EXPECTED_SOURCE_SHA) { throw 'Pull request source SHA metadata is invalid.' }
+            $pullRequest = [ordered]@{ number = $prNumber; head_sha = $env:PR_HEAD_SHA; base_sha = $env:PR_BASE_SHA }
+          } elseif ($env:SOURCE_EVENT_NAME -cin @('push', 'workflow_dispatch')) {
+            if ($env:PR_NUMBER -or $env:PR_HEAD_SHA -or $env:PR_BASE_SHA -or $env:EVENT_SHA -cne $env:EXPECTED_SOURCE_SHA) { throw 'Non-PR source metadata is inconsistent.' }
+          } else { throw 'Unsupported CI source event.' }
+          $record = [ordered]@{
+            schema = 'mmmm-ci-context/1'; source_sha = $sourceSha;
+            expected_source_sha = $env:EXPECTED_SOURCE_SHA; source_matches_expected = ($sourceSha -ceq $env:EXPECTED_SOURCE_SHA);
+            event_name = $env:SOURCE_EVENT_NAME; event_sha = $env:EVENT_SHA; pull_request = $pullRequest;
+            repository = $env:GITHUB_REPOSITORY; workflow = $env:GITHUB_WORKFLOW;
+            run_id = $env:GITHUB_RUN_ID; run_attempt = $env:GITHUB_RUN_ATTEMPT;
+            target = $env:MATRIX_TARGET; os = $actualOS; arch = $actualArch;
+            runner_image = $env:ImageOS; runner_image_version = $env:ImageVersion;
+            rust_toolchain = '1.96.0'; rust_target = $env:MMMM_RUST_TARGET;
+            build_jobs = $(if ($IsWindows) { 1 } else { 2 }); bootstrap_build_jobs = 2; test_threads = 2;
+            command_timeout_seconds = 1200; artifact_retention_days = 14
+          }
+          $record | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $evidenceRoot 'ci-context.json') -Encoding utf8NoBOM
+          if ($sourceSha -cne $env:EXPECTED_SOURCE_SHA) { throw 'Checked-out source SHA differs from the expected candidate SHA.' }
+          if (-not (Test-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'Cargo.lock') -PathType Leaf)) { throw 'CI requires the checked-in Cargo lock.' }
+          "MMMM_OUTPUT_ROOT=$outputRoot" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "MMMM_EVIDENCE_ROOT=$evidenceRoot" | Add-Content -LiteralPath $env:GITHUB_ENV
+
+      - name: Install pinned Rust into temporary toolchain root
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rustup = (Get-Command rustup -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+          if ($rustup -isnot [string] -or -not [System.IO.Path]::IsPathFullyQualified($rustup) -or -not (Test-Path -LiteralPath $rustup -PathType Leaf)) { throw 'A single absolute Rustup application path is required.' }
+          $toolchainRoot = Join-Path $env:MMMM_OUTPUT_ROOT 'toolchain'
+          $env:RUSTUP_HOME = Join-Path $toolchainRoot 'rustup'
+          $env:CARGO_HOME = Join-Path $toolchainRoot 'cargo'
+          & $rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Rust installation failed.' }
+          $cargoOutput = @(& $rustup which --toolchain 1.96.0 cargo)
+          if ($LASTEXITCODE -ne 0 -or $cargoOutput.Count -ne 1 -or $cargoOutput[0] -isnot [string]) { throw 'Pinned Cargo path probe must return one line.' }
+          $cargo = $cargoOutput[0].Trim()
+          if (-not [System.IO.Path]::IsPathFullyQualified($cargo) -or -not (Test-Path -LiteralPath $cargo -PathType Leaf)) { throw 'Pinned Cargo executable is unavailable.' }
+          $bin = Split-Path -Parent $cargo
+          "RUSTUP_HOME=$env:RUSTUP_HOME" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "MMMM_CARGO=$cargo" | Add-Content -LiteralPath $env:GITHUB_ENV
+          $bin | Add-Content -LiteralPath $env:GITHUB_PATH
+          & $cargo --version
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Cargo version probe failed.' }
+
+      - name: Bootstrap supervised Rust runner
+        timeout-minutes: 22
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:MMMM_EVIDENCE_ROOT 'bootstrap'
+          if ($IsWindows) {
+            & ./tools/bootstrap/bootstrap.ps1 -Checkout $env:GITHUB_WORKSPACE -OutputRoot $env:MMMM_OUTPUT_ROOT -EvidenceRoot $evidence -TimeoutSeconds 1200 -Jobs 2
+          } else {
+            $python = (Get-Command python3 -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+            if ($python -isnot [string] -or -not [System.IO.Path]::IsPathFullyQualified($python) -or -not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'A single absolute Python application path is required.' }
+            & $python -B ./tools/bootstrap/bootstrap-unix.py --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root $evidence --timeout-seconds 1200 --jobs 2
+            if ($LASTEXITCODE -ne 0) { throw 'Supervised Unix bootstrap did not complete.' }
+          }
+          # Windows bootstrap is a PowerShell script that throws on failure and
+          # validates its native receipts. LASTEXITCODE belongs to the most
+          # recent native command and can be unset or stale after this script.
+          $receipt = Get-Content -LiteralPath (Join-Path $evidence 'bootstrap-complete.json') -Raw | ConvertFrom-Json
+          if ($receipt.schema -cne 'mmmm-bootstrap-complete/1' -or $receipt.lease_released -ne $true -or $receipt.slot_id -cnotmatch '^(windows|linux|macos)-(x86_64|aarch64)-[0-9a-f]{24}-bootstrap$') { throw 'Bootstrap completion receipt is invalid.' }
+          $exe = if ($IsWindows) { 'mmmm-xtask.exe' } else { 'mmmm-xtask' }
+          $tool = Join-Path $env:MMMM_OUTPUT_ROOT "build/managed-v1/slots/$($receipt.slot_id)/cache/cargo-target/debug/$exe"
+          if (-not (Test-Path -LiteralPath $tool -PathType Leaf)) { throw 'Completed bootstrap tool is missing.' }
+          "MMMM_XTASK=$tool" | Add-Content -LiteralPath $env:GITHUB_ENV
+
+      - name: Check repository index policy
+        timeout-minutes: 3
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:MMMM_XTASK run --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root (Join-Path $env:MMMM_EVIDENCE_ROOT 'repository') --purpose ci-checks --timeout-seconds 120 -- $env:MMMM_XTASK check-repository --checkout $env:GITHUB_WORKSPACE
+          if ($LASTEXITCODE -ne 0) { throw 'Repository index policy check failed.' }
+
+      - name: Check Rust formatting
+        timeout-minutes: 3
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:MMMM_XTASK run --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root (Join-Path $env:MMMM_EVIDENCE_ROOT 'format') --purpose ci-checks --timeout-seconds 120 -- $env:MMMM_CARGO fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'Rust formatting check failed.' }
+
+      - name: Run actual Rust tests
+        timeout-minutes: 22
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Keep the existing Job budget: concurrent Windows rustc instances exceeded it locally.
+          $cargoJobs = if ($IsWindows) { 1 } else { 2 }
+          & $env:MMMM_XTASK run --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root (Join-Path $env:MMMM_EVIDENCE_ROOT 'test') --purpose ci-checks --timeout-seconds 1200 --owned-tail-policy terminate-build -- $env:MMMM_CARGO test --verbose --jobs $cargoJobs --workspace --target $env:MMMM_RUST_TARGET --locked -- --test-threads=2
+          if ($LASTEXITCODE -ne 0) { throw 'Rust workspace tests failed.' }
+
+      - name: Check Rust lints
+        timeout-minutes: 22
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cargoJobs = if ($IsWindows) { 1 } else { 2 }
+          & $env:MMMM_XTASK run --checkout $env:GITHUB_WORKSPACE --output-root $env:MMMM_OUTPUT_ROOT --evidence-root (Join-Path $env:MMMM_EVIDENCE_ROOT 'clippy') --purpose ci-checks --timeout-seconds 1200 --owned-tail-policy terminate-build -- $env:MMMM_CARGO clippy --jobs $cargoJobs --workspace --all-targets --target $env:MMMM_RUST_TARGET --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'Rust workspace lint check failed.' }
+
+      - name: Export foundation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: foundation-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/MMMM/evidence/foundation/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
+
+  foundation-result:
+    name: foundation-result
+    if: always()
+    needs: [foundation]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require all three actual foundation jobs
+        env:
+          MATRIX_RESULT: ${{ needs.foundation.result }}
+        shell: bash
+        run: |
+          printf 'Rust foundation matrix: %s\n' "$MATRIX_RESULT"
+          test "$MATRIX_RESULT" = success

@@ -1,0 +1,1351 @@
+//! 원본 examples를 재사용하는 실제 외부 SQLite/CAS 원자성 검사다.
+//! 기존 pure candidate parser 검사와 별개이며 게임/NativeProof 인수를 뜻하지 않는다.
+//! 아래 trusted test permit은 실제 Store root, SQL owner/head/history와 유한한
+//! deadline을 검사한다. NativeOwnerWitness, NativeProof나 실행 grant를 위조하지 않는다.
+//! 실패 후 미참조 CAS 파일과 rollback된 metadata의 수명은 별도로 검사한다.
+
+use super::*;
+use crate::storage::{
+    StoreConfig,
+    artifact::{ResourceOwner, register_resource},
+    bootstrap::{
+        NativeOwnerCreatePermit, ProjectBootstrapReceipt, ProjectBootstrapRequest, create_project,
+        registered_native_project_owner,
+    },
+    owned_documents::{
+        OwnedDocumentAuthority, OwnedDocumentKind, OwnedDocumentPin, OwnedDocumentReader,
+    },
+    project_resources::{
+        ProjectResourceAuthority, ProjectResourceProvenance, ProjectResourceQuery,
+        ProjectResourceReader, ProjectResourceRequest, ProjectSourceRpcContext,
+        RegisteredProjectResource,
+    },
+};
+use mmmm_contracts::{
+    ContextId, ObjectId, OperationId, PlanId, PrincipalId, ProjectId, ResourceId, Sha256Digest,
+    StepId, canonical_bytes, canonical_digest, parse_json, projected_digest, raw_digest,
+    verify_projected_digest,
+};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use serde_json::{Value, json};
+use std::{
+    cell::Cell,
+    fs,
+    path::PathBuf,
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
+};
+
+static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+const ROOT_MARKER: &[u8] = b"mmmm-native-owned-source-tests\n";
+
+struct TestRoot(PathBuf);
+impl TestRoot {
+    fn new() -> Self {
+        let parent = std::env::var_os("MMMM_TEST_DATA_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        assert!(parent.is_absolute());
+        let root = parent.join(format!(
+            "mmmm-native-owned-sources-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed),
+        ));
+        assert!(!root.exists());
+        fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let root = fs::canonicalize(root).unwrap();
+        let checkout =
+            fs::canonicalize(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        assert!(!root.starts_with(checkout));
+        fs::write(root.join("test-owner.txt"), ROOT_MARKER).unwrap();
+        Self(root)
+    }
+    fn store(&self) -> DurableStore {
+        DurableStore::open(StoreConfig::new(self.0.clone())).unwrap()
+    }
+}
+impl Drop for TestRoot {
+    fn drop(&mut self) {
+        // 테스트가 만든 정확한 절대 경로/marker/link 경계를 확인한 뒤만 정리한다.
+        if fs::canonicalize(&self.0).ok().as_ref() == Some(&self.0)
+            && crate::storage::cas::verify_plain_path(&self.0).is_ok()
+            && fs::read(self.0.join("test-owner.txt")).ok().as_deref() == Some(ROOT_MARKER)
+        {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+fn example(name: &str) -> Value {
+    parse_json(
+        &fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../examples")
+                .join(name),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+fn revision(value: &Value) -> Sha256Digest {
+    serde_json::from_value(value["revision"].clone()).unwrap()
+}
+fn revise(definition: &str, value: &mut Value) {
+    value["revision"] = json!(projected_digest(definition, value).unwrap());
+}
+fn raw_json(value: &Value) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec_pretty(value).unwrap();
+    bytes.extend_from_slice(b"\n \n");
+    bytes
+}
+
+struct BootstrapPermit {
+    root: PathBuf,
+    owner: PrincipalId,
+    deadline: Instant,
+}
+impl NativeOwnerCreatePermit for BootstrapPermit {
+    fn check(&self, store: &DurableStore) -> StorageResult<()> {
+        if store.data_root() != self.root || Instant::now() >= self.deadline {
+            return Err(StorageError::Conflict("Authored bootstrap root/deadline"));
+        }
+        Ok(())
+    }
+    fn authorize_create(
+        &mut self,
+        store: &DurableStore,
+        request: &ProjectBootstrapRequest<'_>,
+    ) -> StorageResult<PrincipalId> {
+        self.check(store)?;
+        assert_eq!(*request.policy, example("policy.json"));
+        assert_eq!(request.project["ownedResources"], json!([]));
+        Ok(self.owner.clone())
+    }
+}
+fn bootstrap(
+    store: &mut DurableStore,
+    root: &TestRoot,
+    project_id: &str,
+    policy_id: &str,
+) -> (Value, ProjectBootstrapReceipt) {
+    let mut project = example("project.json");
+    project["projectId"] = json!(project_id);
+    project["policyResourceId"] = json!(policy_id);
+    project["resourceIds"] = json!([policy_id]);
+    project["prefabIds"] = json!([]);
+    project["instanceIds"] = json!([]);
+    project["ownedResources"] = json!([]);
+    revise("Project", &mut project);
+    let policy = example("policy.json");
+    let mut permit = BootstrapPermit {
+        root: root.0.clone(),
+        owner: PrincipalId::new("native-source-test-owner").unwrap(),
+        deadline: Instant::now() + Duration::from_secs(30),
+    };
+    let receipt = create_project(
+        store,
+        &mut permit,
+        &ProjectBootstrapRequest {
+            project: &project,
+            policy: &policy,
+        },
+    )
+    .unwrap();
+    (project, receipt)
+}
+
+#[derive(Clone, Copy)]
+enum FinalFailure {
+    None,
+    Cancel,
+    RevokeOwner,
+    Deadline,
+}
+struct ScopeState {
+    root: PathBuf,
+    project: ProjectId,
+    owner: PrincipalId,
+    deadline: Cell<Instant>,
+    cancelled: Cell<bool>,
+    authorizations: Cell<usize>,
+    final_rows_observed: Cell<bool>,
+    failure: FinalFailure,
+}
+impl ScopeState {
+    fn check(&self) -> StorageResult<()> {
+        if self.cancelled.get() {
+            return Err(StorageError::InvalidTransition(
+                "Authored native request cancelled".into(),
+            ));
+        }
+        if Instant::now() >= self.deadline.get() {
+            return Err(StorageError::InvalidTransition(
+                "Authored native request deadline elapsed".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn authorize_sql(
+        &self,
+        connection: &Connection,
+        principal: &PrincipalId,
+        context: Option<&ContextId>,
+        project: &ProjectId,
+        current_revision: Option<&Sha256Digest>,
+    ) -> StorageResult<()> {
+        self.check()?;
+        if principal != &self.owner || context.is_some() || project != &self.project {
+            return Err(StorageError::Conflict("Authored current Project scope"));
+        }
+        let actual: Option<(String, String)> = connection
+            .query_row(
+                "SELECT n.owner_principal,h.revision FROM native_project_owners n JOIN project_heads h USING(project_id) WHERE n.project_id=?1",
+                [project.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (owner, head) = actual.ok_or(StorageError::NotFound("Authored native owner"))?;
+        if owner != self.owner.as_str()
+            || current_revision.is_some_and(|revision| head != revision.as_str())
+        {
+            return Err(StorageError::Conflict("Authored actual SQL owner/head"));
+        }
+        Ok(())
+    }
+}
+
+struct SqlReadAuthority(Rc<ScopeState>);
+impl ProjectResourceAuthority for SqlReadAuthority {
+    fn authorize_project_read(
+        &mut self,
+        store: &DurableStore,
+        principal: &PrincipalId,
+        context: Option<&ContextId>,
+        project: &ProjectId,
+        revision: &Sha256Digest,
+    ) -> StorageResult<()> {
+        if store.data_root() != self.0.root {
+            return Err(StorageError::Conflict("Authored reader root"));
+        }
+        self.0.authorize_sql(
+            &store.connection,
+            principal,
+            context,
+            project,
+            Some(revision),
+        )
+    }
+    fn authorize_resource_read(
+        &mut self,
+        store: &DurableStore,
+        principal: &PrincipalId,
+        context: Option<&ContextId>,
+        project: &ProjectId,
+        resource: &RegisteredProjectResource,
+    ) -> StorageResult<()> {
+        if store.data_root() != self.0.root {
+            return Err(StorageError::Conflict("Authored resource reader root"));
+        }
+        self.0
+            .authorize_sql(&store.connection, principal, context, project, None)?;
+        if resource.owner != ResourceOwner::Project(project.clone()) {
+            return Err(StorageError::Conflict("Authored resource actual owner"));
+        }
+        let actual: String = store.connection.query_row(
+            "SELECT resource_json FROM artifact_resources WHERE resource_id=?1 AND blob_digest=?2 AND byte_length=?3",
+            params![resource.resource["resourceId"].as_str().unwrap(), resource.blob.digest.as_str(), resource.blob.byte_length as i64],
+            |row| row.get(0),
+        )?;
+        if parse_json(actual.as_bytes())
+            .map_err(|cause| StorageError::Contract(cause.to_string()))?
+            != resource.resource
+        {
+            return Err(StorageError::Conflict(
+                "Authored immutable resource metadata",
+            ));
+        }
+        Ok(())
+    }
+}
+impl OwnedDocumentAuthority for SqlReadAuthority {
+    fn authorize_read(
+        &mut self,
+        principal: &PrincipalId,
+        context: &ContextId,
+        project: &ProjectId,
+        revision: &Sha256Digest,
+        pin: &OwnedDocumentPin,
+    ) -> StorageResult<()> {
+        OwnedDocumentAuthority::authorize_project_read(
+            self,
+            principal,
+            Some(context),
+            project,
+            revision,
+            pin,
+        )
+    }
+    fn authorize_project_read(
+        &mut self,
+        principal: &PrincipalId,
+        context: Option<&ContextId>,
+        project: &ProjectId,
+        revision: &Sha256Digest,
+        pin: &OwnedDocumentPin,
+    ) -> StorageResult<()> {
+        // 이 reader port에는 Store 인수가 없다. 같은 외부 root의 실제 committed
+        // owner/head/history를 별도 read-only WAL connection으로 확인한다.
+        crate::storage::cas::verify_plain_path(&self.0.root)?;
+        let connection = Connection::open_with_flags(
+            self.0.root.join("journal.sqlite3"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        self.0
+            .authorize_sql(&connection, principal, context, project, Some(revision))?;
+        let exists: i64 = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM owned_document_provenance p JOIN owned_documents d USING(project_id,kind,object_id,revision) WHERE p.project_id=?1 AND p.project_revision=?2 AND p.kind=?3 AND p.object_id=?4 AND p.revision=?5)",
+            params![project.as_str(),revision.as_str(),pin.kind.as_str(),pin.object_id.as_str(),pin.revision.as_str()],
+            |row| row.get(0),
+        )?;
+        if exists != 1 {
+            return Err(StorageError::Conflict("Authored actual owned provenance"));
+        }
+        self.0.check()
+    }
+}
+
+struct TestPermit(Rc<ScopeState>);
+impl TestPermit {
+    fn new(root: &TestRoot, receipt: &ProjectBootstrapReceipt) -> Self {
+        Self::with_failure(root, receipt, FinalFailure::None)
+    }
+    fn with_failure(
+        root: &TestRoot,
+        receipt: &ProjectBootstrapReceipt,
+        failure: FinalFailure,
+    ) -> Self {
+        Self(Rc::new(ScopeState {
+            root: root.0.clone(),
+            project: receipt.project_id.clone(),
+            owner: receipt.owner_principal.clone(),
+            deadline: Cell::new(Instant::now() + Duration::from_secs(30)),
+            cancelled: Cell::new(false),
+            authorizations: Cell::new(0),
+            final_rows_observed: Cell::new(false),
+            failure,
+        }))
+    }
+}
+impl ProjectSourceRpcContext for TestPermit {
+    fn check(&self) -> StorageResult<()> {
+        self.0.check()
+    }
+    fn authenticated_principal(&self) -> StorageResult<PrincipalId> {
+        self.check()?;
+        Ok(self.0.owner.clone())
+    }
+    fn context_id(&self) -> Option<&ContextId> {
+        None
+    }
+}
+impl NativeOwnedSourceCommitPermit for TestPermit {
+    fn check_store(&self, store: &DurableStore) -> StorageResult<()> {
+        if store.data_root() != self.0.root {
+            return Err(StorageError::Conflict("Authored native Store root"));
+        }
+        self.0.authorize_sql(
+            &store.connection,
+            &self.0.owner,
+            None,
+            &self.0.project,
+            None,
+        )
+    }
+    fn authorize_commit(
+        &self,
+        store: &DurableStore,
+        view: &NativeOwnedSourceCommitView<'_>,
+    ) -> StorageResult<PrincipalId> {
+        self.check_store(store)?;
+        self.0.authorize_sql(
+            &store.connection,
+            &self.0.owner,
+            None,
+            view.request.project,
+            Some(view.request.expected_revision),
+        )?;
+        if store.project(view.request.project)? != *view.base_project
+            || view.next_project["policyResourceId"] != view.base_project["policyResourceId"]
+        {
+            return Err(StorageError::Conflict("Authored exact base/policy"));
+        }
+        let calls = self.0.authorizations.get() + 1;
+        self.0.authorizations.set(calls);
+        // callback 횟수에 의존하지 않고 실제 provisional 새 revision의 SQL
+        // 존재로 최종 publication 지점을 확인한다. 초기 admission에는 없다.
+        let provisional_project: i64 = store.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM documents WHERE definition='Project' AND document_id=?1 AND content_hash=?2)",
+            params![view.request.project.as_str(), view.next_project["revision"].as_str().unwrap()],
+            |row| row.get(0),
+        )?;
+        if provisional_project == 1 {
+            // resource-only 최초 batch에는 owned registry가 아직 없을 수 있다.
+            // 실제 테이블 부재는 0개이며, 다음의 기대 문서 개수 비교는 그대로 유지한다.
+            let owned_registry: bool = store.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='owned_document_provenance')",
+                [], |row| row.get(0),
+            )?;
+            let owned: i64 = if owned_registry {
+                store.connection.query_row(
+                    "SELECT count(*) FROM owned_document_provenance WHERE project_id=?1 AND project_revision=?2",
+                    params![view.request.project.as_str(), view.next_project["revision"].as_str().unwrap()],
+                    |row| row.get(0),
+                )?
+            } else {
+                0
+            };
+            let resources: i64 = store.connection.query_row(
+                "SELECT count(*) FROM project_resource_provenance WHERE project_id=?1 AND project_revision=?2",
+                params![view.request.project.as_str(), view.next_project["revision"].as_str().unwrap()],
+                |row| row.get(0),
+            )?;
+            self.0.final_rows_observed.set(
+                provisional_project == 1
+                    && owned
+                        == view.next_project["ownedResources"]
+                            .as_array()
+                            .unwrap()
+                            .len() as i64
+                    && resources
+                        == view.next_project["resourceIds"].as_array().unwrap().len() as i64,
+            );
+            match self.0.failure {
+                FinalFailure::None => (),
+                FinalFailure::Cancel => self.0.cancelled.set(true),
+                FinalFailure::Deadline => self.0.deadline.set(Instant::now()),
+                FinalFailure::RevokeOwner => {
+                    // 실제 소유 SQL 행을 같은 transaction에서 변경한다.
+                    // 최종 owner 재검사와 rollback을 시험하며 native 증명은 만들지 않는다.
+                    store.connection.execute(
+                        "UPDATE native_project_owners SET owner_principal='revoked-source-test-owner' WHERE project_id=?1",
+                        [view.request.project.as_str()],
+                    )?;
+                }
+            }
+            self.check_store(store)?;
+        }
+        Ok(self.0.owner.clone())
+    }
+    fn resource_reader(&self, ceiling: u64) -> StorageResult<ProjectResourceReader> {
+        ProjectResourceReader::new(Box::new(SqlReadAuthority(self.0.clone())), ceiling)
+    }
+    fn owned_document_reader(&self, ceiling: u64) -> StorageResult<OwnedDocumentReader> {
+        OwnedDocumentReader::new(Box::new(SqlReadAuthority(self.0.clone())), ceiling)
+    }
+}
+
+#[derive(Clone)]
+struct Batch {
+    next: Value,
+    pins: Vec<OwnedDocumentPin>,
+    documents: Vec<Vec<u8>>,
+    resources: Vec<(Value, Vec<u8>)>,
+}
+impl Batch {
+    fn initial(base: &Value) -> Self {
+        let bytes = b"authored raw block resource\0\n".to_vec();
+        let resource = json!({
+            "resourceId":"resource-wall-blocks",
+            "sha256":raw_digest(&bytes),
+            "mediaType":"application/vnd.mmmm.blockset+json",
+            "sizeBytes":bytes.len(),
+        });
+        let mut prefab = example("prefab.json");
+        // CommandModule은 이 bounded writer의 소유 범위가 아니므로 원본의
+        // 미제공 command 참조를 제거한다. door/Clip과 실제 resource는 유지한다.
+        prefab["commandModuleIds"] = json!([]);
+        prefab["references"] = json!([]);
+        prefab["resources"] = json!([resource]);
+        revise("Prefab", &mut prefab);
+        let mut instance = example("instance.json");
+        instance["prefabRevision"] = prefab["revision"].clone();
+        revise("Instance", &mut instance);
+        let clip = example("animation-clip.json");
+        Self::from_sources(
+            base,
+            vec![
+                (OwnedDocumentKind::Prefab, prefab),
+                (OwnedDocumentKind::Instance, instance),
+                (OwnedDocumentKind::AnimationClip, clip),
+            ],
+            vec![(resource, bytes)],
+        )
+    }
+    fn from_sources(
+        base: &Value,
+        sources: Vec<(OwnedDocumentKind, Value)>,
+        resources: Vec<(Value, Vec<u8>)>,
+    ) -> Self {
+        let pins: Vec<_> = sources
+            .iter()
+            .map(|(kind, value)| OwnedDocumentPin {
+                kind: *kind,
+                object_id: ObjectId::new(value[kind.identity_field()].as_str().unwrap()).unwrap(),
+                revision: revision(value),
+            })
+            .collect();
+        let mut next = base.clone();
+        for pin in &pins {
+            next["ownedResources"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(pin));
+            if let Some(field) = match pin.kind {
+                OwnedDocumentKind::Prefab => Some("prefabIds"),
+                OwnedDocumentKind::Instance => Some("instanceIds"),
+                _ => None,
+            } {
+                next[field]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!(pin.object_id));
+            }
+        }
+        for (resource, _) in &resources {
+            next["resourceIds"]
+                .as_array_mut()
+                .unwrap()
+                .push(resource["resourceId"].clone());
+        }
+        revise("Project", &mut next);
+        Self {
+            next,
+            pins,
+            documents: sources.iter().map(|(_, value)| raw_json(value)).collect(),
+            resources,
+        }
+    }
+    fn commit(
+        &self,
+        store: &mut DurableStore,
+        permit: &TestPermit,
+        base: &Value,
+    ) -> StorageResult<NativeOwnedSourceCommitReceipt> {
+        let project: ProjectId = serde_json::from_value(base["projectId"].clone()).unwrap();
+        let expected_revision = revision(base);
+        let project_bytes = raw_json(&self.next);
+        let documents: Vec<_> = self
+            .pins
+            .iter()
+            .zip(&self.documents)
+            .map(|(pin, bytes)| NativeOwnedDocumentSource { pin, bytes })
+            .collect();
+        let metadata: Vec<_> = self
+            .resources
+            .iter()
+            .map(|(value, _)| raw_json(value))
+            .collect();
+        let resources: Vec<_> = self
+            .resources
+            .iter()
+            .zip(&metadata)
+            .map(|((_, bytes), metadata)| NativeOwnedResourceSource::Raw { metadata, bytes })
+            .collect();
+        commit_native_owned_sources(
+            store,
+            permit,
+            &NativeOwnedSourceCommitRequest {
+                project: &project,
+                expected_revision: &expected_revision,
+                project_bytes: &project_bytes,
+                documents: &documents,
+                resources: &resources,
+            },
+        )
+    }
+    fn replace_document(&mut self, index: usize, value: &Value) {
+        self.documents[index] = raw_json(value);
+        self.pins[index].revision = revision(value);
+        self.next["ownedResources"][index] = json!(self.pins[index]);
+        revise("Project", &mut self.next);
+    }
+}
+
+// 고정된 test table의 전체 SQL 내용을 비교한다. count만으로 head/body
+// 덮어쓰기를 감지할 수 없어 schema 존재와 각 행도 rollback 판정에 포함한다.
+type MetadataRows = Vec<Vec<String>>;
+type TableSnapshot = (String, Option<(String, MetadataRows)>);
+
+fn metadata_snapshot(store: &DurableStore) -> Vec<TableSnapshot> {
+    [
+        "blobs",
+        "blob_refs",
+        "documents",
+        "project_heads",
+        "artifact_resources",
+        "project_resource_versions",
+        "project_resource_heads",
+        "project_resource_provenance",
+        "native_project_owners",
+        "owned_documents",
+        "owned_document_provenance",
+        "operations",
+        "invocations",
+        "events",
+        "write_fences",
+    ]
+    .into_iter()
+    .map(|table| {
+        let schema: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        let content = schema.map(|schema| {
+            let mut statement = store
+                .connection
+                .prepare(&format!("SELECT * FROM {table}"))
+                .unwrap();
+            let columns = statement.column_count();
+            let mut rows: Vec<Vec<String>> = statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|column| row.get_ref(column).map(|value| format!("{value:?}")))
+                        .collect()
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            rows.sort();
+            (schema, rows)
+        });
+        (table.to_owned(), content)
+    })
+    .collect()
+}
+fn assert_unchanged(store: &DurableStore, baseline: &[TableSnapshot], base: &Value) {
+    assert_eq!(metadata_snapshot(store).as_slice(), baseline);
+    let project = ProjectId::new(base["projectId"].as_str().unwrap()).unwrap();
+    assert_eq!(store.project(&project).unwrap(), *base);
+    assert!(
+        store
+            .connection
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query([])
+            .unwrap()
+            .next()
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn raw_sources_project_and_initial_policy_survive_gc_and_reopen() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let batch = Batch::initial(&base);
+    let permit = TestPermit::new(&root, &initial);
+    let receipt = batch.commit(&mut store, &permit, &base).unwrap();
+    assert_eq!(receipt.base_revision, revision(&base));
+    assert_eq!(
+        receipt.project_revision,
+        verify_projected_digest("Project", &batch.next).unwrap()
+    );
+    assert_eq!(
+        receipt.project_blob.digest,
+        raw_digest(&raw_json(&batch.next))
+    );
+    assert_ne!(receipt.project_blob.digest, receipt.project_revision);
+    assert_eq!(
+        store.read_blob(&receipt.project_blob).unwrap(),
+        raw_json(&batch.next)
+    );
+    assert!(permit.0.final_rows_observed.get());
+    for ((pin, bytes), (actual_pin, blob)) in batch
+        .pins
+        .iter()
+        .zip(&batch.documents)
+        .zip(&receipt.documents)
+    {
+        assert_eq!(pin, actual_pin);
+        assert_eq!(blob.digest, raw_digest(bytes));
+        assert_ne!(blob.digest, pin.revision);
+        assert_eq!(store.read_blob(blob).unwrap(), *bytes);
+        let parsed = parse_json(bytes).unwrap();
+        assert_eq!(
+            verify_projected_digest(pin.kind.definition(), &parsed).unwrap(),
+            pin.revision
+        );
+    }
+    let owner_record: (String, String, String, String) = store.connection.query_row(
+        "SELECT owner_principal,initial_revision,policy_resource_id,policy_digest FROM native_project_owners WHERE project_id=?1",
+        [initial.project_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+    ).unwrap();
+    assert_eq!(owner_record.0, initial.owner_principal.as_str());
+    assert_eq!(owner_record.1, initial.project_revision.as_str());
+    assert_eq!(owner_record.2, "policy-local");
+    let policy_bytes = canonical_bytes(&example("policy.json")).unwrap();
+    assert_eq!(owner_record.3, raw_digest(&policy_bytes).as_str());
+    let policy_digest: Sha256Digest =
+        serde_json::from_value(initial.policy_resource["sha256"].clone()).unwrap();
+    assert_eq!(policy_digest, raw_digest(&policy_bytes));
+    assert_eq!(
+        canonical_digest(&example("policy.json")).unwrap(),
+        policy_digest
+    );
+    store
+        .put_blob(b"native source test unreferenced orphan")
+        .unwrap();
+    assert_eq!(store.collect_orphan_blobs(100).unwrap().removed_blobs, 1);
+    drop(store);
+    let store = root.store();
+    assert_eq!(store.project(&initial.project_id).unwrap(), batch.next);
+    assert_eq!(
+        registered_native_project_owner(&store, &initial.project_id).unwrap(),
+        initial.owner_principal
+    );
+    let permit = TestPermit::new(&root, &initial);
+    let mut owned = permit
+        .owned_document_reader(MAX_OWNED_DOCUMENT_BYTES)
+        .unwrap();
+    for (pin, bytes) in batch.pins.iter().zip(&batch.documents) {
+        let loaded = owned
+            .read_known_history_bytes(
+                &store,
+                &permit,
+                &initial.project_id,
+                &receipt.project_revision,
+                pin,
+            )
+            .unwrap();
+        assert_eq!(loaded.bytes, *bytes);
+        assert_eq!(loaded.blob.digest, raw_digest(bytes));
+    }
+    let mut resources = permit.resource_reader(MAX_SOURCE_TOTAL).unwrap();
+    for id in ["policy-local", "resource-wall-blocks"] {
+        let query = ProjectResourceQuery::Current {
+            resource_id: ResourceId::new(id).unwrap(),
+        };
+        let loaded = resources
+            .read(
+                &store,
+                &permit,
+                &ProjectResourceRequest {
+                    project: &initial.project_id,
+                    current_project_revision: &receipt.project_revision,
+                    query: &query,
+                    expected: Some(if id == "policy-local" {
+                        &initial.policy_resource
+                    } else {
+                        &batch.resources[0].0
+                    }),
+                },
+                MAX_SOURCE_TOTAL,
+            )
+            .unwrap();
+        assert_eq!(
+            loaded.registered.provenance,
+            ProjectResourceProvenance::CurrentProject {
+                project_revision: receipt.project_revision.clone()
+            }
+        );
+        let expected = if id == "policy-local" {
+            &policy_bytes
+        } else {
+            &batch.resources[0].1
+        };
+        assert_eq!(loaded.bytes, *expected);
+        assert_eq!(loaded.registered.blob.digest, raw_digest(expected));
+    }
+}
+
+#[test]
+fn later_revision_carries_exact_document_and_resource_provenance() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let first = Batch::initial(&base);
+    let first_receipt = first
+        .commit(&mut store, &TestPermit::new(&root, &initial), &base)
+        .unwrap();
+    let mut clip = example("animation-clip.json");
+    clip["clipId"] = json!("clip-door-second");
+    revise("AnimationClip", &mut clip);
+    let second = Batch::from_sources(
+        &first.next,
+        vec![(OwnedDocumentKind::AnimationClip, clip)],
+        vec![],
+    );
+    let second_receipt = second
+        .commit(&mut store, &TestPermit::new(&root, &initial), &first.next)
+        .unwrap();
+    assert_eq!(second_receipt.base_revision, first_receipt.project_revision);
+    assert_eq!(second_receipt.documents.len(), 1);
+    for pin in &first.pins {
+        for revision in [
+            &first_receipt.project_revision,
+            &second_receipt.project_revision,
+        ] {
+            let actual: String = store.connection.query_row(
+                "SELECT revision FROM owned_document_provenance WHERE project_id=?1 AND project_revision=?2 AND kind=?3 AND object_id=?4",
+                params![initial.project_id.as_str(), revision.as_str(), pin.kind.as_str(), pin.object_id.as_str()], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(actual, pin.revision.as_str());
+        }
+    }
+    for id in ["policy-local", "resource-wall-blocks"] {
+        let first_digest: String = store.connection.query_row(
+            "SELECT digest FROM project_resource_provenance WHERE project_id=?1 AND project_revision=?2 AND resource_id=?3",
+            params![initial.project_id.as_str(),first_receipt.project_revision.as_str(),id], |row| row.get(0),
+        ).unwrap();
+        let second_digest: String = store.connection.query_row(
+            "SELECT digest FROM project_resource_provenance WHERE project_id=?1 AND project_revision=?2 AND resource_id=?3",
+            params![initial.project_id.as_str(),second_receipt.project_revision.as_str(),id], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(first_digest, second_digest);
+    }
+    let permit = TestPermit::new(&root, &initial);
+    let mut reader = permit
+        .owned_document_reader(MAX_OWNED_DOCUMENT_BYTES)
+        .unwrap();
+    for (pin, bytes) in first.pins.iter().zip(&first.documents) {
+        assert_eq!(
+            reader
+                .read_known_history_bytes(
+                    &store,
+                    &permit,
+                    &initial.project_id,
+                    &second_receipt.project_revision,
+                    pin
+                )
+                .unwrap()
+                .bytes,
+            *bytes
+        );
+    }
+}
+
+#[test]
+fn stale_head_and_repeated_owned_identity_do_not_publish_metadata() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let first = Batch::initial(&base);
+    first
+        .commit(&mut store, &TestPermit::new(&root, &initial), &base)
+        .unwrap();
+    let baseline = metadata_snapshot(&store);
+    assert!(matches!(
+        first.commit(&mut store, &TestPermit::new(&root, &initial), &base),
+        Err(StorageError::Conflict(_))
+    ));
+    assert_unchanged(&store, &baseline, &first.next);
+    let duplicate = Batch::initial(&first.next);
+    assert!(
+        duplicate
+            .commit(&mut store, &TestPermit::new(&root, &initial), &first.next)
+            .is_err()
+    );
+    assert_unchanged(&store, &baseline, &first.next);
+}
+
+#[test]
+fn duplicate_pin_identity_body_revision_and_schema_fail_closed() {
+    for case in 0..4 {
+        let root = TestRoot::new();
+        let mut store = root.store();
+        let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+        let mut batch = Batch::initial(&base);
+        match case {
+            0 => {
+                batch.pins.push(batch.pins[0].clone());
+                batch.documents.push(batch.documents[0].clone());
+            }
+            1 => {
+                batch.pins[0].object_id = ObjectId::new("prefab-wrong-pin").unwrap();
+            }
+            2 => {
+                let mut document = parse_json(&batch.documents[0]).unwrap();
+                document["name"] = json!("changed body with old revision");
+                batch.documents[0] = raw_json(&document);
+            }
+            _ => {
+                let mut document = parse_json(&batch.documents[0]).unwrap();
+                document["contractVersion"] = json!("0.1.0");
+                revise("Prefab", &mut document);
+                batch.replace_document(0, &document);
+            }
+        }
+        let baseline = metadata_snapshot(&store);
+        assert!(
+            batch
+                .commit(&mut store, &TestPermit::new(&root, &initial), &base)
+                .is_err(),
+            "case {case}"
+        );
+        assert_unchanged(&store, &baseline, &base);
+    }
+}
+
+#[test]
+fn raw_resource_digest_length_and_exact_owned_reference_mismatch_are_rejected() {
+    for case in 0..4 {
+        let root = TestRoot::new();
+        let mut store = root.store();
+        let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+        let mut batch = Batch::initial(&base);
+        match case {
+            0 => batch.resources[0].0["sha256"] = json!(raw_digest(b"other raw bytes")),
+            1 => batch.resources[0].0["sizeBytes"] = json!(batch.resources[0].1.len() + 1),
+            2 => {
+                let mut prefab = parse_json(&batch.documents[0]).unwrap();
+                prefab["resources"][0]["mediaType"] = json!("application/octet-stream");
+                revise("Prefab", &mut prefab);
+                batch.replace_document(0, &prefab);
+            }
+            _ => {
+                let mut instance = parse_json(&batch.documents[1]).unwrap();
+                instance["prefabRevision"] = json!(raw_digest(b"unowned prefab revision"));
+                revise("Instance", &mut instance);
+                batch.replace_document(1, &instance);
+            }
+        }
+        let baseline = metadata_snapshot(&store);
+        assert!(
+            batch
+                .commit(&mut store, &TestPermit::new(&root, &initial), &base)
+                .is_err(),
+            "case {case}"
+        );
+        assert_unchanged(&store, &baseline, &base);
+    }
+}
+
+#[test]
+fn project_nonmembership_change_and_missing_membership_are_rejected() {
+    for case in 0..2 {
+        let root = TestRoot::new();
+        let mut store = root.store();
+        let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+        let mut batch = Batch::initial(&base);
+        if case == 0 {
+            batch.next["name"] = json!("unauthorized simultaneous project edit");
+        } else {
+            batch.next["ownedResources"].as_array_mut().unwrap().pop();
+        }
+        revise("Project", &mut batch.next);
+        let baseline = metadata_snapshot(&store);
+        assert!(
+            batch
+                .commit(&mut store, &TestPermit::new(&root, &initial), &base)
+                .is_err()
+        );
+        assert_unchanged(&store, &baseline, &base);
+    }
+}
+
+#[test]
+fn cross_project_authority_and_globally_owned_resource_id_conflict_rollback() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let (other_base, other) = bootstrap(&mut store, &root, "project-other", "policy-other");
+    let other_batch = Batch::initial(&other_base);
+    let baseline = metadata_snapshot(&store);
+    assert!(
+        other_batch
+            .commit(&mut store, &TestPermit::new(&root, &initial), &other_base)
+            .is_err()
+    );
+    assert_unchanged(&store, &baseline, &base);
+    let batch = Batch::initial(&base);
+    store.put_blob(&batch.resources[0].1).unwrap();
+    register_resource(
+        &mut store,
+        &batch.resources[0].0,
+        ResourceOwner::Project(other.project_id),
+    )
+    .unwrap();
+    let baseline = metadata_snapshot(&store);
+    assert!(
+        batch
+            .commit(&mut store, &TestPermit::new(&root, &initial), &base)
+            .is_err()
+    );
+    assert_unchanged(&store, &baseline, &base);
+    assert!(store.connection.is_autocommit());
+}
+
+#[test]
+fn existing_same_project_artifact_outside_base_requires_checked_retained_input() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let batch = Batch::initial(&base);
+    let resource = &batch.resources[0].0;
+    let bytes = &batch.resources[0].1;
+    assert!(
+        !base["resourceIds"]
+            .as_array()
+            .unwrap()
+            .contains(&resource["resourceId"])
+    );
+    let actual_blob = store.put_blob(bytes).unwrap();
+    register_resource(
+        &mut store,
+        resource,
+        ResourceOwner::Project(initial.project_id.clone()),
+    )
+    .unwrap();
+    let baseline = metadata_snapshot(&store);
+    let permit = TestPermit::new(&root, &initial);
+    assert!(matches!(
+        batch.commit(&mut store, &permit, &base),
+        Err(StorageError::Conflict(
+            "Raw native resource input requires a new resource ID"
+        )),
+    ));
+    assert_unchanged(&store, &baseline, &base);
+    assert!(store.connection.is_autocommit());
+    assert_eq!(store.read_blob(&actual_blob).unwrap(), *bytes);
+
+    // 같은 실제 registration은 current ACL과 immutable artifact provenance를
+    // 확인하는 checked reader 경로로 읽고 Retained 입력으로 연결할 수 있다.
+    let mut reader = permit.resource_reader(MAX_SOURCE_TOTAL).unwrap();
+    let query = ProjectResourceQuery::RegisteredImmutable {
+        resource_id: ResourceId::new(resource["resourceId"].as_str().unwrap()).unwrap(),
+    };
+    let registered = reader
+        .metadata(
+            &store,
+            &permit,
+            &ProjectResourceRequest {
+                project: &initial.project_id,
+                current_project_revision: &initial.project_revision,
+                query: &query,
+                expected: Some(resource),
+            },
+        )
+        .unwrap();
+    assert_eq!(registered.resource, *resource);
+    assert_eq!(registered.blob, actual_blob);
+    assert_eq!(
+        registered.provenance,
+        ProjectResourceProvenance::ImmutableProjectArtifact,
+    );
+    assert_unchanged(&store, &baseline, &base);
+    let documents: Vec<_> = batch
+        .pins
+        .iter()
+        .zip(&batch.documents)
+        .map(|(pin, bytes)| NativeOwnedDocumentSource { pin, bytes })
+        .collect();
+    let resources = [NativeOwnedResourceSource::Retained { resource }];
+    let project_bytes = raw_json(&batch.next);
+    let receipt = commit_native_owned_sources(
+        &mut store,
+        &permit,
+        &NativeOwnedSourceCommitRequest {
+            project: &initial.project_id,
+            expected_revision: &initial.project_revision,
+            project_bytes: &project_bytes,
+            documents: &documents,
+            resources: &resources,
+        },
+    )
+    .unwrap();
+    assert_eq!(store.project(&initial.project_id).unwrap(), batch.next);
+    let query = ProjectResourceQuery::Current {
+        resource_id: ResourceId::new(resource["resourceId"].as_str().unwrap()).unwrap(),
+    };
+    let loaded = reader
+        .read(
+            &store,
+            &permit,
+            &ProjectResourceRequest {
+                project: &initial.project_id,
+                current_project_revision: &receipt.project_revision,
+                query: &query,
+                expected: Some(resource),
+            },
+            MAX_SOURCE_TOTAL,
+        )
+        .unwrap();
+    assert_eq!(loaded.bytes, *bytes);
+    assert_eq!(loaded.registered.blob, actual_blob);
+    assert_eq!(
+        loaded.registered.provenance,
+        ProjectResourceProvenance::CurrentProject {
+            project_revision: receipt.project_revision,
+        },
+    );
+}
+
+#[test]
+fn final_project_head_sql_abort_rolls_back_all_provisional_associations() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let batch = Batch::initial(&base);
+    store.connection.execute_batch(
+        "CREATE TRIGGER native_source_test_abort BEFORE UPDATE ON project_heads BEGIN SELECT RAISE(ABORT,'authored final head failure'); END;",
+    ).unwrap();
+    let baseline = metadata_snapshot(&store);
+    let permit = TestPermit::new(&root, &initial);
+    assert!(matches!(
+        batch.commit(&mut store, &permit, &base),
+        Err(StorageError::Sqlite(_))
+    ));
+    assert!(permit.0.final_rows_observed.get());
+    assert_unchanged(&store, &baseline, &base);
+    assert!(store.connection.is_autocommit());
+    // 실패 시 먼저 staged된 CAS와 rollback된 SQL 참조를 구분한다.
+    assert!(store.collect_orphan_blobs(100).unwrap().removed_blobs >= 5);
+    store
+        .connection
+        .execute_batch("DROP TRIGGER native_source_test_abort;")
+        .unwrap();
+    drop(store);
+    let store = root.store();
+    assert_unchanged(&store, &baseline, &base);
+}
+
+#[test]
+fn final_cancellation_rolls_back_after_every_source_was_provisionally_registered() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let batch = Batch::initial(&base);
+    let baseline = metadata_snapshot(&store);
+    let permit = TestPermit::with_failure(&root, &initial, FinalFailure::Cancel);
+    let error = batch.commit(&mut store, &permit, &base).unwrap_err();
+    assert!(
+        matches!(&error, StorageError::InvalidTransition(message) if message.contains("cancelled"))
+    );
+    assert!(permit.0.final_rows_observed.get());
+    assert_unchanged(&store, &baseline, &base);
+    assert!(store.connection.is_autocommit());
+}
+
+#[test]
+fn final_actual_owner_revocation_rolls_back_metadata_and_owner_change() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let batch = Batch::initial(&base);
+    let baseline = metadata_snapshot(&store);
+    let permit = TestPermit::with_failure(&root, &initial, FinalFailure::RevokeOwner);
+    assert!(matches!(
+        batch.commit(&mut store, &permit, &base),
+        Err(StorageError::Conflict(_))
+    ));
+    assert!(permit.0.final_rows_observed.get());
+    assert_unchanged(&store, &baseline, &base);
+    assert_eq!(
+        registered_native_project_owner(&store, &initial.project_id).unwrap(),
+        initial.owner_principal
+    );
+    assert!(store.connection.is_autocommit());
+}
+
+#[test]
+fn final_original_deadline_expiry_preserves_no_success_receipt_or_metadata() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let batch = Batch::initial(&base);
+    let baseline = metadata_snapshot(&store);
+    let permit = TestPermit::with_failure(&root, &initial, FinalFailure::Deadline);
+    assert!(
+        matches!(batch.commit(&mut store, &permit, &base), Err(StorageError::InvalidTransition(message)) if message.contains("deadline"))
+    );
+    assert!(permit.0.final_rows_observed.get());
+    assert_unchanged(&store, &baseline, &base);
+}
+
+#[test]
+fn canonical_public_writer_cannot_overwrite_same_pin_original_raw_source() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let batch = Batch::initial(&base);
+    let receipt = batch
+        .commit(&mut store, &TestPermit::new(&root, &initial), &base)
+        .unwrap();
+    let pin = &batch.pins[0];
+    let original = &batch.documents[0];
+    let parsed = parse_json(original).unwrap();
+    let canonical = canonical_bytes(&parsed).unwrap();
+    assert_eq!(
+        verify_projected_digest("Prefab", &parsed).unwrap(),
+        pin.revision
+    );
+    assert_ne!(canonical, *original);
+    assert_ne!(raw_digest(&canonical), receipt.documents[0].1.digest);
+    let baseline = metadata_snapshot(&store);
+    assert!(matches!(
+        crate::storage::owned_documents::register_owned_document(
+            &mut store,
+            &initial.project_id,
+            &receipt.project_revision,
+            pin,
+            &parsed,
+        ),
+        Err(StorageError::Conflict("Immutable owned-document pin")),
+    ));
+    assert_unchanged(&store, &baseline, &batch.next);
+    assert!(store.connection.is_autocommit());
+    let permit = TestPermit::new(&root, &initial);
+    let mut reader = permit
+        .owned_document_reader(MAX_OWNED_DOCUMENT_BYTES)
+        .unwrap();
+    let loaded = reader
+        .read_known_history_bytes(
+            &store,
+            &permit,
+            &initial.project_id,
+            &receipt.project_revision,
+            pin,
+        )
+        .unwrap();
+    assert_eq!(loaded.document, parsed);
+    assert_eq!(loaded.bytes, *original);
+    assert_eq!(loaded.blob, receipt.documents[0].1);
+    assert_eq!(loaded.blob.digest, raw_digest(original));
+}
+
+#[test]
+fn missing_initial_policy_base_provenance_cannot_be_repaired_from_raw_declaration() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let removed = store
+        .connection
+        .execute(
+            "DELETE FROM project_resource_provenance WHERE project_id=?1 AND project_revision=?2 AND resource_id=?3 AND digest=?4",
+            params![
+                initial.project_id.as_str(),
+                initial.project_revision.as_str(),
+                initial.policy_resource["resourceId"].as_str().unwrap(),
+                initial.policy_resource["sha256"].as_str().unwrap(),
+            ],
+        )
+        .unwrap();
+    assert_eq!(removed, 1);
+    // 초기 owner/Policy 원문/immutable artifact/head는 그대로 존재한다.
+    // 사라진 실제 base provenance만 선언으로 보완할 수 없어야 한다.
+    assert_eq!(
+        registered_native_project_owner(&store, &initial.project_id).unwrap(),
+        initial.owner_principal,
+    );
+    let baseline = metadata_snapshot(&store);
+    let permit = TestPermit::new(&root, &initial);
+    let query = ProjectResourceQuery::Current {
+        resource_id: ResourceId::new("policy-local").unwrap(),
+    };
+    let mut reader = permit.resource_reader(MAX_SOURCE_TOTAL).unwrap();
+    assert!(matches!(
+        reader.metadata(
+            &store,
+            &permit,
+            &ProjectResourceRequest {
+                project: &initial.project_id,
+                current_project_revision: &initial.project_revision,
+                query: &query,
+                expected: Some(&initial.policy_resource),
+            },
+        ),
+        Err(StorageError::NotFound("Project resource provenance")),
+    ));
+    let mut batch = Batch::initial(&base);
+    // 정확한 Policy 원문과 정본 ResourceRef까지 입력에 추가한다. 이것도
+    // 기존 head의 실제 history/association을 복구하거나 발급하는 권한은 아니다.
+    batch.resources.push((
+        initial.policy_resource.clone(),
+        canonical_bytes(&example("policy.json")).unwrap(),
+    ));
+    assert!(matches!(
+        batch.commit(&mut store, &TestPermit::new(&root, &initial), &base),
+        Err(StorageError::NotFound("Project resource provenance")),
+    ));
+    assert_unchanged(&store, &baseline, &base);
+    assert!(store.connection.is_autocommit());
+    let associations: i64 = store
+        .connection
+        .query_row(
+            "SELECT count(*) FROM project_resource_provenance WHERE project_id=?1 AND resource_id='policy-local'",
+            [initial.project_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(associations, 0);
+}
+
+#[test]
+fn unresolved_durable_dispatch_fences_membership_even_with_disjoint_scope() {
+    use crate::storage::{OperationState, ReserveOperation};
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let mut plan = example("execution-plan.json");
+    plan["scope"]["resourceIds"] = json!(["unrelated-fenced-resource"]);
+    plan["steps"][0]["effect"] = json!("write");
+    plan["steps"][0]["resourcesWritten"] = json!(["unrelated-fenced-resource"]);
+    plan["steps"][0]["verificationRequirement"] = json!("independent_readback");
+    plan["projectBaseRevision"] = json!(revision(&base));
+    plan["planHash"] = json!(projected_digest("ExecutionPlan", &plan).unwrap());
+    store.save_plan(&plan).unwrap();
+    let operation = OperationId::new("native-source-fenced-operation").unwrap();
+    store
+        .reserve_operation(ReserveOperation {
+            operation_id: operation.clone(),
+            principal: PrincipalId::new("principal-fixture").unwrap(),
+            project_id: initial.project_id.clone(),
+            idempotency_key: "native-source-fence-key".into(),
+            plan_id: PlanId::new(plan["planId"].as_str().unwrap()).unwrap(),
+            plan_hash: serde_json::from_value(plan["planHash"].clone()).unwrap(),
+            context_id: ContextId::new("context-fixture-01").unwrap(),
+        })
+        .unwrap();
+    let mut invocation = example("invocation.json");
+    invocation["operationId"] = json!(operation);
+    store
+        .dispatch_intent(&operation, &StepId::new("echo-step").unwrap(), &invocation)
+        .unwrap();
+    // 실제 durable intent를 재개방하여 unknown/fence가 유지되는지 확인한다.
+    drop(store);
+    let mut store = root.store();
+    assert_eq!(
+        store.operation(&operation).unwrap().state,
+        OperationState::OutcomeUnknown
+    );
+    let baseline = metadata_snapshot(&store);
+    let batch = Batch::initial(&base);
+    assert!(
+        matches!(batch.commit(&mut store, &TestPermit::new(&root, &initial), &base), Err(StorageError::Fenced(operations)) if operations == vec![operation.clone()])
+    );
+    assert_unchanged(&store, &baseline, &base);
+    assert_eq!(store.unresolved_dispatches().unwrap().len(), 1);
+}
+
+// 같은 보호 Store/bootstrap/Batch fixture로 source 사용 결정의 별도 수명을 검사한다.
+#[path = "catalog_source_use_tests.rs"]
+mod catalog_source_use_tests;
+
+#[path = "compatibility_approval_tests.rs"]
+mod compatibility_approval_tests;
+
+#[path = "calibration_approval_tests.rs"]
+mod calibration_approval_tests;

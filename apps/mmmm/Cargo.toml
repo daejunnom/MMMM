@@ -1,0 +1,18 @@
+[package]
+name = "mmmm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MMMM CLI connecting to the shared local Coordinator"
+
+[dependencies]
+mmmm-coordinator = { path = "../../crates/mmmm-coordinator" }
+mmmm-contracts = { path = "../../crates/mmmm-contracts" }
+serde_json.workspace = true
+rmcp = { version = "=3.5.1", default-features = false, features = ["server"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+[lints]
+workspace = true

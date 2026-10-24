@@ -3,7 +3,7 @@
 MMMM은 Minecraft 맵 제작 자료와 변경 작업을 관리하는 로컬 중심 시스템이다.
 CLI, MCP와 제작 도구는 같은 제작 서비스와 Coordinator를 사용한다.
 
-현재 단계는 원본 계약을 도입한 G0 기반 구현이다. 이번 제품 범위는 MVP 구현과
+현재는 원본 계약을 도입하고 공통 제작 서비스와 호스트 연결을 구현 중이다. 이번 제품 범위는 MVP 구현과
 공개 GitHub `v0.1.0` 배포까지이며, 이후 기능 확장과 v1 전환은 후속 범위다.
 
 ## 제품 기준
@@ -41,9 +41,23 @@ SHA-256 목록과 대조한 뒤 계약, 예제, 정책 및 인수 자료를 도�
 상세 구현 요구는 [핸드오프](docs/HANDOFF.ko.md),
 [함수 계약](docs/FUNCTION_CONTRACTS.ko.md)과 [인수 기준](tests/ACCEPTANCE.ko.md)을 따른다.
 
-빌드 관리 도구와 구조 검사기 소스는 구현 중이며 제품 인수와 CI는 아직 완료되지 않았다.
-현재 정책 파일은 자동 검사 통과를 의미하지 않는다. 실제 명령과 toolchain은
-첫 구현과 검증 후 이 문서 및 기준 문서에 등록한다.
+빌드 관리 도구와 구조 검사기는 실제 로컬 및 세 OS CI에서 검증 중이다. 고정 source의
+검사 성공, 현재 source의 검증과 실제 게임 인수는 구분하며 상세 결과와 실행 한도는
+[구현 착수 조건](docs/implementation-readiness.md)과 [빌드 수명주기](docs/build-system.md)에 기록한다.
+
+`calibration-plan --data-root <absolute root> --project <projectId> --expected-revision <sha256>
+--context <contextId>`는 기존 Coordinator와 인증된 Plan 요청을 통해 sealed normative47
+계획을 공통 서비스로 저장하는 개발 경로다. 실제 host descriptor·dependency pin·현재
+Project가 필요하며 계획 생성 자체가 게임 설치·ADMIN 승인·실행·target profile 인수를
+뜻하지 않는다. 최초 runner와 독립 readback의 실제 게임 연결은 아직 구현 중이다.
+
+`manual-import`는 기존 Coordinator에서 원 `exchange.prepare` selection과 명시적으로
+선택한 SourceMap·ScenePatch 파일을 같은 CAS의 공통 `scene.diff`/`scene.plan` 경로에
+연결한다. `--help`의 Project/head/context, 세 resource ID, 두 절대 파일 경로와
+`--allow-delta <kind,instanceId,nodeId>`를 선택한다. SourceMap은 편집 payload의 resource
+ID를 참조하고 편집 patch는 SourceMap의 정확한 Ref를 참조한다. 원 파일과 Project head,
+Unknown 권리는 유지한다. 실제 sealed bake 없이 clip 부착을 허용하지 않으며 정적 patch
+저장 성공을 게임 적용이나 EX14 전체 인수 완료로 표시하지 않는다.
 
 ## 출시 조건
 

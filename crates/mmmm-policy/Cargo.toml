@@ -1,0 +1,17 @@
+[package]
+name = "mmmm-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MMMM pure dependency admission and authenticated release evidence evaluation"
+
+[dependencies]
+mmmm-contracts = { path = "../mmmm-contracts" }
+serde.workspace = true
+serde_json.workspace = true
+unicode-normalization.workspace = true
+
+[lints]
+workspace = true

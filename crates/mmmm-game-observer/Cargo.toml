@@ -1,0 +1,24 @@
+[package]
+name = "mmmm-game-observer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "MMMM bounded JDK 25 definition observer and narrow owned-file game boundary"
+
+[dependencies]
+mmmm-owned-files = { path = "../mmmm-owned-files" }
+mmmm-compiler = { path = "../mmmm-compiler" }
+mmmm-contracts = { path = "../mmmm-contracts" }
+serde_json.workspace = true
+sha2.workspace = true
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+test = true
+
+[lints]
+workspace = true
