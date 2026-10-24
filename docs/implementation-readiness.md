@@ -3716,6 +3716,49 @@ Windows669는 의도한5개 staged 파일의 index554 files·정책 blob1·viola
 정상 drain/export/scratch 제거/lease 해제를 확인했다. 사후 source4개 hash와 index/worktree
 blob5개 일치·추가 줄의 공개 경로 정책·diff check도 확인했으며 다른 변경은 포함하지 않았다.
 
+### Rust118 결과와 Linux JVM112의 Z3 종료 전이
+
+고정 `73a88812a894e676e86d881318e15638c14c21b1`의
+[Rust118](https://github.com/daejunnom/MMMM/actions/runs/40069276678)은 Windows x64·Linux x64·
+macOS ARM64의 실제 test·strict·export와 집계가 모두 성공했다. 새 compact layout의 기존
+8/200-byte 경계 검사도 이 입력에 포함된다. 실제 크기를 별도 출력한 결과나 제품 인수로
+확대하지 않는다. 같은 입력의 [JVM112](https://github.com/daejunnom/MMMM/actions/runs/40069276693)은
+Windows·macOS가 성공했으나 Linux·집계가 실패했다.
+
+Linux 원 ZIP27,896 bytes·SHA
+`d73d1df759e08f0d8d23f2f315ec997fff50a5cf1cc8bca09a1ce17188d6111a`를 API 및 실제 source와
+대조했다. 원 JVM managed run은44,877 ms에 command_exit null·signal9·observation_failure를
+기록했다. 실제 OwnedMember의 양쪽 stat은 같은 전체 native identity의 ZOMBIE·threads3·
+exiting true였고 bound whole-group pidfd는 정확한 TerminalPoll NotReady·errno 없음이었다.
+RSS rollup Open ESRCH를 거절한 결과이며 R1 분기에 진입한 실패로 바꾸지 않는다. peak RSS
+1,549,754,368 bytes와 관측 최대 gap181 ms는 기록한 값이며 OOM·timeout으로 분류하지 않는다.
+실제 JVM 결과는 없고 verification not_run·observer skipped다. 부분 Gradle 출력은 완료가 아니다.
+
+실제 drain·output_complete와 원 stdout1,281 bytes·stderr0의 preserved·write_confirmed를
+확인했다. 이후 독립 storage observed·required export·scratch 제거·lease 해제와 cleanup0도
+확인했지만 원 command·JVM 검증 실패를 성공으로 바꾸지 않는다. 이 원 실패 자료는 보존한다.
+
+후속 소스는 OwnedMember의 기존 양쪽 Z2/Z4 허용 집합에 실제 관측한 Z3 한 형태를 추가한다.
+허용 thread 수는 정확히2·3·4이고 양쪽 수가 같아야 한다. ReservedLeader의2·3과 새 candidate
+거절, 원 전체 identity·현재 leader reservation/anchor·실제 bound pidfd NotReady·typed Open
+ESRCH 조건은 유지한다. R1/PF_EXITING·native UID 분기도 바꾸지 않는다. 기존 Pending의
+live=true·rss=None·VM 최댓값, 마지막 complete부터1,000 ms·prior complete 요구·원 deadline/
+cancel과 normal completion 차단을 그대로 사용한다. RSS0·exit·완료나 drain을 합성하지 않는다.
+기존 fixture로 실제 Z3 조건과 state·thread 불일치·Z1/Z5·identity·reservation·pidfd·RSS 오류의
+거절을 보강했다. 앞 절의 Z 정책 유지 설명은 `73a8881`까지의 변경을 뜻하며 이 후속 확장과
+구분한다. 새 분기의 실제 Linux JVM 실행 결과는 후속 CI에서 확인한다.
+
+Windows670은 외부 고정 source 한 개를 빈 owned cwd의 stdin으로 포맷하고 사후184,339 bytes·
+SHA `c1e4311c8f380e3c7ef9dff815595121c5c2d8207887578aa55a049482033339`를 확인했다.
+이번 count1 after manifest는 단일 object이며 SHA
+`60137ef5867a1f320b03be8057fb532ffd798e9cd63ebd0f1bbe48a90d272882`다. command0·정상
+drain/export/scratch 제거·lease 해제이며 source/helper/manifest와 원 실패는 외부 보존한다.
+이 로컬 포맷 검사는 새 Rust 실행·게임 검증을 대신하지 않는다.
+Windows672는 의도한2개 staged 파일의 index554 files·정책 blob1·violations0과 command0·
+정상 drain/export/scratch 제거·lease 해제를 확인했다. source 사후 pin·index/worktree blob·
+추가 줄의 공개 경로 정책·diff check도 확인했다. 앞선671은 stage 전 index 검사이므로 이번
+2파일의 staged 검증 근거로 사용하지 않는다. 다른 dirty source·초안·worktree는 제외했다.
+
 ### PACK 본문 증명의 다음 연결
 
 실제 instantiation Mixin은 Sponge `@Redirect`이며 원 instantiate 호출을 감싸는 handler와

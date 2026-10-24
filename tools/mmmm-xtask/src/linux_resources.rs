@@ -785,11 +785,11 @@ fn pending_exit_transition(
         }
         ProcessRole::EnumeratedCandidate => false,
     };
-    // The reserved leader has also been observed in stable Z3, and an owned
-    // member in stable Z4. These exact counts admit incompleteness, not exit.
+    // The reserved leader has also been observed in stable Z3, and owned
+    // members in stable Z3/Z4. These exact counts admit incompleteness, not exit.
     let threads_match_role = match conditions.role {
         ProcessRole::ReservedLeader => matches!(before.threads, 2 | 3),
-        ProcessRole::OwnedMember => matches!(before.threads, 2 | 4),
+        ProcessRole::OwnedMember => matches!(before.threads, 2..=4),
         ProcessRole::EnumeratedCandidate => false,
     };
     conditions.owner.reservation_valid
@@ -3339,7 +3339,7 @@ pub(super) mod tests {
 
         // A member has no Child reservation of its own. Only the already
         // checked original leader anchor and its held Child may admit this
-        // incomplete sample; neither Z2/Z4 nor NotReady is an exit witness.
+        // incomplete sample; neither Z2/Z3/Z4 nor NotReady is an exit witness.
         let member = parse_stat(&render_stat("124", &stat_fields('Z', 2)), 124).unwrap();
         let member_conditions = PendingConditions {
             role: ProcessRole::OwnedMember,
@@ -3352,6 +3352,21 @@ pub(super) mod tests {
             &failure,
             member_conditions
         ));
+        // The actual owned-member Z3 shape retains the same unknown RSS and
+        // requires the existing full identity / anchor / NotReady conditions.
+        let member_three_threads = Stat {
+            threads: 3,
+            exiting: true,
+            ..member
+        };
+        assert!(pending_exit_transition(
+            member_three_threads.identity,
+            member_three_threads,
+            Some(member_three_threads),
+            &failure,
+            member_conditions
+        ));
+        assert!(!member_three_threads.definitely_exited());
         let four_threads = Stat {
             threads: 4,
             ..member
@@ -3364,20 +3379,33 @@ pub(super) mod tests {
             member_conditions
         ));
         assert!(!four_threads.definitely_exited());
-        // Z4 plus an actual NotReady check stays unknown RSS: the ordinary
+        // Z3/Z4 plus an actual NotReady check stay unknown RSS: the ordinary
         // settlement must still fail, never omit the process or emit RSS 0.
-        assert!(
-            settle_member(
-                four_threads,
-                Some(four_threads),
-                Some(Err(
-                    pending_observation_for_role(PendingRole::OwnedMember).original_error()
-                )),
-                false
-            )
-            .is_err()
-        );
-        for (before_threads, after_threads) in [(2, 4), (4, 2), (3, 4), (4, 3), (4, 5), (5, 4)] {
+        for candidate in [member_three_threads, four_threads] {
+            assert!(
+                settle_member(
+                    candidate,
+                    Some(candidate),
+                    Some(Err(
+                        pending_observation_for_role(PendingRole::OwnedMember).original_error()
+                    )),
+                    false
+                )
+                .is_err()
+            );
+        }
+        for (before_threads, after_threads) in [
+            (2, 3),
+            (3, 2),
+            (2, 4),
+            (4, 2),
+            (3, 4),
+            (4, 3),
+            (3, 5),
+            (5, 3),
+            (4, 5),
+            (5, 4),
+        ] {
             assert!(!pending_exit_transition(
                 member.identity,
                 Stat {
@@ -3469,7 +3497,9 @@ pub(super) mod tests {
             (b'X', 2),
             (b'x', 2),
             (b'Z', 1),
-            (b'Z', 3),
+            (b'S', 3),
+            (b'X', 3),
+            (b'x', 3),
             (b'S', 4),
             (b'X', 4),
             (b'x', 4),
@@ -3526,7 +3556,7 @@ pub(super) mod tests {
                 ..conditions.owner
             },
         ] {
-            for candidate in [member, four_threads] {
+            for candidate in [member, member_three_threads, four_threads] {
                 assert!(!pending_exit_transition(
                     candidate.identity,
                     candidate,
@@ -3601,7 +3631,7 @@ pub(super) mod tests {
                 ..member_conditions
             },
         ] {
-            for candidate in [member, four_threads] {
+            for candidate in [member, member_three_threads, four_threads] {
                 assert!(!pending_exit_transition(
                     candidate.identity,
                     candidate,
@@ -3611,7 +3641,7 @@ pub(super) mod tests {
                 ));
             }
         }
-        for candidate in [member, four_threads] {
+        for candidate in [member, member_three_threads, four_threads] {
             assert!(!pending_exit_transition(
                 candidate.identity,
                 candidate,
@@ -3627,7 +3657,7 @@ pub(super) mod tests {
                 pending_observation_for_role(PendingRole::OwnedMember).original_error(),
             ),
         ] {
-            for candidate in [member, four_threads] {
+            for candidate in [member, member_three_threads, four_threads] {
                 assert!(!pending_exit_transition(
                     candidate.identity,
                     candidate,
