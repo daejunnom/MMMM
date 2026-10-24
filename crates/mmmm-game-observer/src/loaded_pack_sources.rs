@@ -2730,7 +2730,7 @@ mod tests {
             context,
             frame,
         });
-        let custom = !(index == 0);
+        let custom = index != 0;
         if custom {
             events.push(PackRunEvent::CustomEnter {
                 position,

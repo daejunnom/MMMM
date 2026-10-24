@@ -418,7 +418,8 @@ function Invoke-DevelopmentJars {
         target=$Target; status='not_run'; phase='preflight'; gradle_exit=$null; source_post_checked=$false;
         selected_files_post_checked=$false; product_proof_issued=$false; source_admission_granted=$false;
         sdk_public_format_verified=$false; game_verification='not_run'; release_verification='not_run';
-        artifacts=@(); failure_details=@(); whole_toolchain_image_verified=$false }
+        artifacts=@(); failure_details=@(); whole_toolchain_image_verified=$false;
+        physical_identity_mode=$null; directory_identity_mode=$null }
     $packageRoot = $null; $success = $false
     try {
         $phase = 'development_jars'; $operation = 'development_preflight'
@@ -526,6 +527,15 @@ gradle.taskGraph.afterTask { task, state ->
         if ($facts -isnot [System.Management.Automation.PSCustomObject] -or $facts.schema -isnot [string] -or $facts.schema -cne 'mmmm-development-jar-artifacts/1' -or
             $facts.source_sha -isnot [string] -or $facts.source_sha -cne $ExpectedSourceSha -or $facts.target -isnot [string] -or $facts.target -cne $Target -or
             $facts.development_only -isnot [bool] -or $facts.development_only -ne $true -or $facts.artifacts -isnot [array] -or @($facts.artifacts).Count -ne 3) { throw 'DEVELOPMENT_ARCHIVE_FACT_INVALID' }
+        if ($IsWindows -ne ($Target -ceq 'windows-x64')) { throw 'DEVELOPMENT_ARCHIVE_IDENTITY_TARGET_MISMATCH' }
+        $expectedPhysicalMode = if ($IsWindows) { 'windows-owned-slot-share-guarded' } else { 'basic-file-key' }
+        $expectedDirectoryMode = if ($IsWindows) { 'owned-slot-physical-metadata-recheck' } else { 'basic-file-key' }
+        if ($facts.physical_identity_mode -isnot [string] -or $facts.physical_identity_mode.Length -gt 64 -or
+            $facts.physical_identity_mode -cnotmatch '^[a-z][a-z0-9-]{0,63}$' -or $facts.physical_identity_mode -cne $expectedPhysicalMode -or
+            $facts.directory_identity_mode -isnot [string] -or $facts.directory_identity_mode.Length -gt 64 -or
+            $facts.directory_identity_mode -cnotmatch '^[a-z][a-z0-9-]{0,63}$' -or $facts.directory_identity_mode -cne $expectedDirectoryMode) { throw 'DEVELOPMENT_ARCHIVE_IDENTITY_MODE_INVALID' }
+        $package.physical_identity_mode = $facts.physical_identity_mode
+        $package.directory_identity_mode = $facts.directory_identity_mode
         $roles = @{fabric_host=':fabric-host';definition_observer=':definition-observer';provider_sdk=':provider-sdk'}
         $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
         $pathComparer = if ($IsWindows) { [System.StringComparer]::OrdinalIgnoreCase } else { [System.StringComparer]::Ordinal }

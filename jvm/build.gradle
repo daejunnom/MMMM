@@ -31,40 +31,78 @@ tasks.register('mmmmDevelopmentJars') {
             reject('invalid evidence directory')
         }
         def noFollow = [java.nio.file.LinkOption.NOFOLLOW_LINKS] as java.nio.file.LinkOption[]
+        def defaultFs = java.nio.file.FileSystems.getDefault()
+        def provider = defaultFs.provider()
+        def providerClass = provider.getClass()
+        boolean windowsOwnedMode = (providerClass.getName() == 'sun.nio.fs.WindowsFileSystemProvider'
+            && providerClass.getModule().getName() == 'java.base'
+            && providerClass.getClassLoader() == null && provider.getScheme() == 'file')
+        if ((target == 'windows-x64') != windowsOwnedMode) {
+            reject('Windows target and actual default file provider do not match')
+        }
+        def readOptions = [java.nio.file.StandardOpenOption.READ,
+            java.nio.file.LinkOption.NOFOLLOW_LINKS]
+        def outputOptions = [java.nio.file.StandardOpenOption.CREATE_NEW,
+            java.nio.file.StandardOpenOption.READ, java.nio.file.StandardOpenOption.WRITE,
+            java.nio.file.LinkOption.NOFOLLOW_LINKS]
+        if (windowsOwnedMode) {
+            // Public Windows share guards are mandatory; there is no guardless retry.
+            readOptions.add(com.sun.nio.file.ExtendedOpenOption.NOSHARE_WRITE)
+            readOptions.add(com.sun.nio.file.ExtendedOpenOption.NOSHARE_DELETE)
+            outputOptions.add(com.sun.nio.file.ExtendedOpenOption.NOSHARE_WRITE)
+            outputOptions.add(com.sun.nio.file.ExtendedOpenOption.NOSHARE_DELETE)
+        }
         def physical = { java.nio.file.Path input, boolean directory ->
-            if (!input.isAbsolute() || input.toString().length() > 4096 || input.nameCount > 128) {
+            if (input.fileSystem != defaultFs || !input.isAbsolute()
+                || input.toString().length() > 4096 || input.nameCount > 128) {
                 reject('invalid physical path')
             }
             def path = input.normalize()
             def cursor = path.root
+            def directoryMetadata = []
             def leaf = java.nio.file.Files.readAttributes(cursor,
                 java.nio.file.attribute.BasicFileAttributes, noFollow)
-            if (!leaf.isDirectory() || leaf.isSymbolicLink() || leaf.isOther()) {
+            if (!leaf.isDirectory() || leaf.isSymbolicLink() || leaf.isOther()
+                || cursor.toRealPath() != cursor.toRealPath(noFollow)) {
                 reject('unsafe filesystem root')
             }
+            directoryMetadata.add([path: cursor, created: leaf.creationTime()])
             for (def segment : path) {
                 cursor = cursor.resolve(segment)
                 leaf = java.nio.file.Files.readAttributes(cursor,
                     java.nio.file.attribute.BasicFileAttributes, noFollow)
                 if (leaf.isSymbolicLink() || leaf.isOther()
-                    || (cursor != path && !leaf.isDirectory())) {
+                    || (cursor != path && !leaf.isDirectory())
+                    || cursor.toRealPath() != cursor.toRealPath(noFollow)) {
                     reject('link or non-directory ancestor')
+                }
+                if (leaf.isDirectory()) {
+                    directoryMetadata.add([path: cursor, created: leaf.creationTime()])
                 }
             }
             if ((directory && !leaf.isDirectory()) || (!directory && !leaf.isRegularFile())) {
                 reject('unexpected physical file kind')
             }
             def real = path.toRealPath()
-            if (real != path.toRealPath(noFollow) || leaf.fileKey() == null) {
+            if (real != path.toRealPath(noFollow) || (!windowsOwnedMode && leaf.fileKey() == null)) {
                 reject('unproven physical identity')
             }
-            [path: path, real: real, attributes: leaf]
+            [path: path, real: real, attributes: leaf, directoryMetadata: directoryMetadata]
         }
-        def sameDirectory = { before, after ->
-            before.real == after.real && before.attributes.fileKey() == after.attributes.fileKey()
+        def sameBoundary = { before, after ->
+            if (before.path != after.path || before.real != after.real) {
+                return false
+            }
+            if (windowsOwnedMode) {
+                // Owned-slot observations, not stable file IDs or locked directory handles.
+                return (before.directoryMetadata == after.directoryMetadata
+                    && before.attributes.creationTime() == after.attributes.creationTime())
+            }
+            (before.attributes.fileKey() != null
+                && before.attributes.fileKey() == after.attributes.fileKey())
         }
         def sameFile = { before, after ->
-            (sameDirectory(before, after)
+            (sameBoundary(before, after)
                 && before.attributes.size() == after.attributes.size()
                 && before.attributes.lastModifiedTime() == after.attributes.lastModifiedTime()
                 && before.attributes.creationTime() == after.attributes.creationTime())
@@ -143,59 +181,73 @@ tasks.register('mmmmDevelopmentJars') {
         }
         def fabric = terminals.first()
         executedArchive(fabric)
-        def fabricFile = physical(fabric.archiveFile.get().asFile.toPath(), false)
-        def runtime = fabricProject.configurations.getByName('runtimeElements')
-        def runtimeJars = runtime.outgoing.artifacts.findAll { artifact ->
-            artifact.extension == 'jar' && (artifact.classifier ?: '') == ''
-        }
-        if (runtimeJars.size() != 1) {
-            reject('Fabric runtimeElements does not expose one unclassified JAR')
-        }
-        def runtimeArtifact = runtimeJars.first()
-        def runtimeFile = physical(runtimeArtifact.file.toPath(), false)
-        if (!sameFile(fabricFile, runtimeFile)) {
-            reject('Fabric outgoing artifact does not match the selected archive')
-        }
-        def runtimeSeeds = runtimeArtifact.buildDependencies.getDependencies(fabric)
-        if (runtimeSeeds.size() > 512) {
-            reject('outgoing build dependency set exceeds its bound')
-        }
-        def runtimeClosure = dependencyClosure(runtimeSeeds)
-        def sameOutputOwners = graph.findAll { producer ->
-            (producer instanceof AbstractArchiveTask
-                && producer.archiveFile.get().asFile.toPath().toAbsolutePath().normalize() == fabricFile.path)
-        }
-        if (!runtimeClosure.contains(fabric) || sameOutputOwners.size() != 1
-            || sameOutputOwners.first() != fabric) {
-            reject('Fabric outgoing archive producer ownership is ambiguous')
-        }
-
         def selections = [
             [role: 'fabric_host', producer: fabric],
             [role: 'definition_observer', producer: project(':definition-observer').tasks.named('jar').get()],
             [role: 'provider_sdk', producer: project(':provider-sdk').tasks.named('jar').get()]
         ]
-        def artifacts = []
-        def selectedPaths = new LinkedHashSet()
-        long totalBytes = 0
+        def heldArchives = []
+        Throwable primaryFailure = null
         long fileLimit = 64L * 1024 * 1024
-        for (def selection : selections) {
-            def producer = selection.producer
-            executedArchive(producer)
-            def before = physical(producer.archiveFile.get().asFile.toPath(), false)
-            if (!before.path.startsWith(buildRoot.path) || !before.real.startsWith(buildRoot.real)
-                || !selectedPaths.add(before.real) || before.attributes.size() <= 0
-                || before.attributes.size() > fileLimit) {
-                reject('archive path, uniqueness, or byte bound failed')
-            }
-            def digest = java.security.MessageDigest.getInstance('SHA-256')
-            long observed = 0
-            def options = [java.nio.file.StandardOpenOption.READ,
-                java.nio.file.LinkOption.NOFOLLOW_LINKS] as java.nio.file.OpenOption[]
-            java.nio.channels.FileChannel.open(before.path, options).withCloseable { channel ->
+        try {
+            def selectedPaths = new LinkedHashSet()
+            for (def selection : selections) {
+                def producer = selection.producer
+                executedArchive(producer)
+                def before = physical(producer.archiveFile.get().asFile.toPath(), false)
+                if (!before.path.startsWith(buildRoot.path) || !before.real.startsWith(buildRoot.real)
+                    || !selectedPaths.add(before.real) || before.attributes.size() <= 0
+                    || before.attributes.size() > fileLimit) {
+                    reject('archive path, uniqueness, or byte bound failed')
+                }
+                def channel = java.nio.channels.FileChannel.open(before.path,
+                    readOptions as java.nio.file.OpenOption[])
+                heldArchives.add([selection: selection, before: before, channel: channel])
                 if (channel.size() != before.attributes.size()
                     || !sameFile(before, physical(before.path, false))) {
-                    reject('archive identity changed before reading')
+                    reject('archive boundary changed while opening its guarded channel')
+                }
+            }
+
+            def fabricFile = heldArchives.first().before
+            def runtime = fabricProject.configurations.getByName('runtimeElements')
+            def runtimeJars = runtime.outgoing.artifacts.findAll { artifact ->
+                artifact.extension == 'jar' && (artifact.classifier ?: '') == ''
+            }
+            if (runtimeJars.size() != 1) {
+                reject('Fabric runtimeElements does not expose one unclassified JAR')
+            }
+            def runtimeArtifact = runtimeJars.first()
+            def runtimeFile = physical(runtimeArtifact.file.toPath(), false)
+            if (!sameFile(fabricFile, runtimeFile)) {
+                reject('Fabric outgoing artifact does not match the selected archive')
+            }
+            def runtimeSeeds = runtimeArtifact.buildDependencies.getDependencies(fabric)
+            if (runtimeSeeds.size() > 512) {
+                reject('outgoing build dependency set exceeds its bound')
+            }
+            def runtimeClosure = dependencyClosure(runtimeSeeds)
+            def sameOutputOwners = graph.findAll { producer ->
+                (producer instanceof AbstractArchiveTask
+                    && producer.archiveFile.get().asFile.toPath().toAbsolutePath().normalize() == fabricFile.path)
+            }
+            if (!runtimeClosure.contains(fabric) || sameOutputOwners.size() != 1
+                || sameOutputOwners.first() != fabric) {
+                reject('Fabric outgoing archive producer ownership is ambiguous')
+            }
+
+            def artifacts = []
+            long totalBytes = 0
+            for (def held : heldArchives) {
+                def selection = held.selection
+                def producer = selection.producer
+                def before = held.before
+                def channel = held.channel
+                def digest = java.security.MessageDigest.getInstance('SHA-256')
+                long observed = 0
+                if (channel.size() != before.attributes.size()
+                    || !sameFile(before, physical(before.path, false))) {
+                    reject('archive boundary changed before reading')
                 }
                 def buffer = java.nio.ByteBuffer.allocate(65536)
                 while (true) {
@@ -216,51 +268,91 @@ tasks.register('mmmmDevelopmentJars') {
                 }
                 if (observed != before.attributes.size() || channel.size() != observed
                     || !sameFile(before, physical(before.path, false))) {
-                    reject('archive identity or size changed while reading')
+                    reject('archive boundary or size changed while reading')
+                }
+                totalBytes += observed
+                if (totalBytes > 192L * 1024 * 1024) {
+                    reject('combined archives exceed their byte bound')
+                }
+                def relative = buildRoot.path.relativize(before.path).toString().replace('\\', '/')
+                artifacts.add([
+                    role: selection.role, project_path: producer.project.path, task_path: producer.path,
+                    archive_extension: 'jar', classifier: '', relative_path: relative,
+                    bytes: observed, sha256: java.util.HexFormat.of().formatHex(digest.digest()),
+                    producer_status: 'executed'
+                ])
+            }
+            if (!sameBoundary(buildRoot, physical(buildRoot.path, true))
+                || !sameBoundary(evidenceRoot, physical(evidenceRoot.path, true))) {
+                reject('managed directory boundary changed')
+            }
+            def metadata = [schema: 'mmmm-development-jar-artifacts/1', development_only: true,
+                source_sha: sourceSha, target: target,
+                physical_identity_mode: windowsOwnedMode ? 'windows-owned-slot-share-guarded' : 'basic-file-key',
+                directory_identity_mode: windowsOwnedMode ? 'owned-slot-physical-metadata-recheck' : 'basic-file-key',
+                artifacts: artifacts]
+            byte[] encoded = groovy.json.JsonOutput.toJson(metadata)
+                .getBytes(java.nio.charset.StandardCharsets.UTF_8)
+            if (encoded.length == 0 || encoded.length > 65536) {
+                reject('artifact metadata exceeds its byte bound')
+            }
+            def destination = evidenceRoot.path.resolve('development-jars-artifacts.json')
+            java.nio.channels.FileChannel.open(destination,
+                outputOptions as java.nio.file.OpenOption[]).withCloseable { channel ->
+                def buffer = java.nio.ByteBuffer.wrap(encoded)
+                while (buffer.hasRemaining()) {
+                    if (channel.write(buffer) <= 0) {
+                        reject('metadata write made no progress')
+                    }
+                }
+                channel.force(true)
+                def written = physical(destination, false)
+                if (channel.size() != encoded.length || written.attributes.size() != encoded.length) {
+                    reject('metadata write length mismatch')
+                }
+                channel.position(0)
+                def readBack = java.nio.ByteBuffer.allocate(encoded.length)
+                while (readBack.hasRemaining()) {
+                    if (channel.read(readBack) <= 0) {
+                        reject('metadata read-back made no progress')
+                    }
+                }
+                if (channel.read(java.nio.ByteBuffer.allocate(1)) != -1
+                    || !java.util.Arrays.equals(encoded, readBack.array())
+                    || !sameFile(written, physical(destination, false))
+                    || !sameBoundary(evidenceRoot, physical(evidenceRoot.path, true))) {
+                    reject('metadata bytes or boundary changed while guarded')
                 }
             }
-            totalBytes += observed
-            if (totalBytes > 192L * 1024 * 1024) {
-                reject('combined archives exceed their byte bound')
-            }
-            def relative = buildRoot.path.relativize(before.path).toString().replace('\\', '/')
-            artifacts.add([
-                role: selection.role, project_path: producer.project.path, task_path: producer.path,
-                archive_extension: 'jar', classifier: '', relative_path: relative,
-                bytes: observed, sha256: java.util.HexFormat.of().formatHex(digest.digest()),
-                producer_status: 'executed'
-            ])
-        }
-        if (!sameDirectory(buildRoot, physical(buildRoot.path, true))
-            || !sameDirectory(evidenceRoot, physical(evidenceRoot.path, true))) {
-            reject('managed directory identity changed')
-        }
-        def metadata = [schema: 'mmmm-development-jar-artifacts/1', development_only: true,
-            source_sha: sourceSha, target: target, artifacts: artifacts]
-        byte[] encoded = groovy.json.JsonOutput.toJson(metadata)
-            .getBytes(java.nio.charset.StandardCharsets.UTF_8)
-        if (encoded.length == 0 || encoded.length > 65536) {
-            reject('artifact metadata exceeds its byte bound')
-        }
-        def destination = evidenceRoot.path.resolve('development-jars-artifacts.json')
-        def outputOptions = [java.nio.file.StandardOpenOption.CREATE_NEW,
-            java.nio.file.StandardOpenOption.WRITE,
-            java.nio.file.LinkOption.NOFOLLOW_LINKS] as java.nio.file.OpenOption[]
-        java.nio.channels.FileChannel.open(destination, outputOptions).withCloseable { channel ->
-            def buffer = java.nio.ByteBuffer.wrap(encoded)
-            while (buffer.hasRemaining()) {
-                if (channel.write(buffer) <= 0) {
-                    reject('metadata write made no progress')
+            for (def held : heldArchives) {
+                if (held.channel.size() != held.before.attributes.size()
+                    || !sameFile(held.before, physical(held.before.path, false))) {
+                    reject('archive boundary changed before observation completed')
                 }
             }
-            channel.force(true)
-            if (channel.size() != encoded.length) {
-                reject('metadata write length mismatch')
+        } catch (Throwable failure) {
+            primaryFailure = failure
+            throw failure
+        } finally {
+            Throwable closeFailure = null
+            for (int index = heldArchives.size() - 1; index >= 0; index--) {
+                try {
+                    heldArchives[index].channel.close()
+                } catch (Throwable failure) {
+                    if (closeFailure == null) {
+                        closeFailure = failure
+                    } else {
+                        closeFailure.addSuppressed(failure)
+                    }
+                }
             }
-        }
-        if (!sameDirectory(evidenceRoot, physical(evidenceRoot.path, true))
-            || physical(destination, false).attributes.size() != encoded.length) {
-            reject('metadata destination identity or size changed')
+            if (closeFailure != null) {
+                if (primaryFailure != null) {
+                    primaryFailure.addSuppressed(closeFailure)
+                } else {
+                    throw closeFailure
+                }
+            }
         }
     }
 }

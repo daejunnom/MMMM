@@ -3512,6 +3512,69 @@ bytes·SHA `7324137b4ee624767eb88f8c5be1c94c2107d33d780f401853a7bc32acb287b3`를
 시간/자원/저장 상한은 유지했다. 이 포맷 성공과 source review는 수정본의 compile·strict·
 JVM·JAR 제작 성공이 아니며, 수정본의 실제 검증은 후속 고정 CI에서 확인한다.
 
+### Development JAR의 실제 제작과 Windows 경로
+
+고정 `00dfb27d32c481dc4d3a4d37815c7fd550819f40`의
+[JVM107](https://github.com/daejunnom/MMMM/actions/runs/40064379664)은 세 OS 필수 단계와
+집계가 최종 성공했다. 별도 opt-in
+[JVM108](https://github.com/daejunnom/MMMM/actions/runs/40064455536)은 Linux·macOS가
+성공하고 Windows와 집계는 실패했다. Linux/Mac 원 ZIP15,678,399/5,710,099 bytes의
+API digest, actual/expected source·target·workflow_dispatch, 실제7개 module434 tests와
+개발 결과·세 JAR bytes/digest·실제 native payload를 대조했다. 세 JAR는 두 OS에서 각각
+동일했다: Fabric host4,023,392 bytes·SHA
+`4200116b36089fe1fc903ea8158b006bf58699d06b557c93f735b7f271efe989`, observer agent51,879
+bytes·SHA `dc83fe841f3d4be13715c87f0e78c0defdd2fcc3025f48c373587896781b86bd`, SDK39,643 bytes·
+SHA `679d4fadb88f5aea481a53b058ba1132f47b0dde60fbe60259ad0b6271683d99`다. 실제 Fabric
+producer는 `:fabric-host:jar`였으며 이름을 예상해 고른 결과가 아니다.
+
+같은 archive의 native library는 실제 input pin과 일치하는 Linux54,949,448 bytes·SHA
+`463dea32be0fad2ac5e0e7495ee9463db1ebaef467fcf656606332ec2bfd3c19`, Mac5,306,216 bytes·SHA
+`c37c58f4a9f915e789d78835f4533474dbec0fab45e4eb0e611407c1c3d4cc0c`다. 실제 header와
+controlled definition startup에 사용한 Debug library이며 `development_fixture`,
+SourceAdmission/target policy false·game/release not_run을 유지한다. 이 제작 성공은
+Release profile·전체 bundle·SDK 공개 형식·rights/SBOM/NOTICE·실제 게임 인수가 아니다.
+
+Windows108 원 ZIP72,056 bytes·SHA
+`b34366fa2b1d9ded2df547d5351271dcf0d32febf8e04a97d532fd3ebfb6d14d`와 source를 대조했다.
+원11-task/7-module434 tests는 통과했고 원 `jvm-result.json`은 passed다. 두 번째 Gradle은
+세 archive를 제작한 뒤 `unproven physical identity`로 실패하여 artifacts를 발급하지
+않았다. Windows JDK의 `fileKey()`가 null을 반환하는데 모든 플랫폼에 nonnull key를
+요구한 구현이 원인이다. 원 전체 managed 실패와 packaging 실패를 보존하며 원 JVM
+검증을 실패로 다시 쓰지 않는다. [고정 JDK 구현](https://github.com/openjdk/jdk/blob/jdk-25%2B36/src/java.base/windows/classes/sun/nio/fs/WindowsFileAttributes.java#L378)
+
+보완한 개발 producer는 실제 bootstrap-loaded Windows 기본 file provider와 target
+일치를 확인한 경우에만 Windows 경로를 사용한다. archive 세 개의 READ channel에
+`NOSHARE_WRITE`와 `NOSHARE_DELETE`를 필수로 적용하고, 원 producer·outgoing 연결,
+유한 bytes·EOF·digest와 사후 경계 대조가 끝날 때까지 보유한다. 미지원 option이나
+공유 거절 뒤 더 약한 방식으로 재시도하지 않는다. 각 ancestor와 leaf의 type·link/other·
+follow/nofollow real path, creation 및 file size/mtime를 재검사하며 metadata도 CreateNew
+guarded channel에서 write/flush·실제 readback·EOF·사후 경계를 확인한다.
+
+Windows directory 경계는 관리 슬롯의 소유 lease와 반복 physical metadata 관측이다.
+열린 directory handle·native file ID·동시 namespace 고정이나 임의 filesystem 공격자에
+대한 증명이라고 표시하지 않는다. 이 플랫폼 차이는 private facts/result의
+`physical_identity_mode=windows-owned-slot-share-guarded`와
+`directory_identity_mode=owned-slot-physical-metadata-recheck`로 기록한다. 다른 플랫폼은
+nonnull key를 계속 요구한다. 소비자는 실제 OS/target과 두 bounded string을 확인한 뒤
+관측값을 보존하며, 아직 facts를 얻지 못했다면 null이다. 이 구분을 retained game root의
+native volume/file identity 판정이나 제품 admission에 사용할 수 없다. 도구체인/provider가
+바뀌거나 이 결과를 제품 권한·release proof로 사용하려면 그 경계를 다시 검토한다.
+
+실제 [Rust115](https://github.com/daejunnom/MMMM/actions/runs/40064379643)의 원 실패도
+별도로 남긴다. Linux test는 성공했지만 libtest의 단일 `!(index == 0)` lint로 strict가
+실패해 `index != 0`으로만 정리했다. Mac bootstrap은 동일 native identity에서 status2와
+INEXIT false→true만 관측한 뒤 필요한 zombie 증명을 확보하지 못해 command exit null·
+slot/lease 보존으로 실패했다. 현재 계약의 거절이며 종료·메모리0·성공으로 바꾸지 않는다.
+Windows test 감독은564,713 ms에 `walk_limit`으로 중단됐고 원 stdout/stderr export도
+같은 guard에서 실패했다. process의 drain/output_complete와 별개로 evidence_exported는
+false이며 raw logs·finish·최종 cleanup/lease 결과는 미확정이다. OOM이나 설정1200초의
+실제 timeout으로 분류하지 않는다. 원 세 artifact/API digest와 실패를 보존하며 순회
+상한을 올리지 않고 별도 진단한다.
+
+후속 Windows packaging 변경은 독립 source review와 PowerShell parser0을 확인했다.
+새 source의 실제 Windows 공유 guard·junction 부정 검사·JAR 제작은 아직 미검증이며,
+후속 고정 CI의 성공을 확인하기 전에 전체 검증 완료로 표시하지 않는다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.
