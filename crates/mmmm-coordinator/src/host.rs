@@ -11,7 +11,7 @@ use crate::{
     workspace_bootstrap::NativeOwnerWitness,
 };
 use mmmm_application::{Access, AppError, AppResult, AuthorityPort, ProviderPort};
-use mmmm_compiler::calibration::CalibrationSourceKind;
+use mmmm_compiler::calibration::{CalibrationPackProgram, CalibrationSourceKind};
 use mmmm_contracts::{
     ActionId, BindingId, ContextId, ContractValidator, InvocationId, OperationId, PrincipalId,
     ProjectId, Sha256Digest, StepId, canonical_digest, encode_json, raw_digest,
@@ -241,6 +241,233 @@ pub(crate) struct CalibrationHostRoute {
     read_owner: HostContextWitness,
     generation: [u8; 16],
     expires: Instant,
+}
+
+/// A separately approved PACK run transport. Sharing private transport
+/// mechanics does not share a numeric approval, program, claim or ordinary route.
+#[derive(Clone)]
+pub(crate) struct PackRunHostRoute {
+    transport: CalibrationHostRoute,
+}
+
+/// Borrowed pre-plan selection only. It carries neither a future Invocation
+/// nor a capability to dispatch through the newly completed read pairing.
+pub(crate) struct PackRunReadiness<'a> {
+    pub(crate) request: &'a RequestContextWitness,
+    pub(crate) authority: &'a LocalAuthority,
+    pub(crate) source_original: &'a Value,
+    pub(crate) current_context: &'a Value,
+}
+
+impl PackRunHostRoute {
+    pub(crate) fn context(&self) -> &Value {
+        self.transport.context()
+    }
+    pub(crate) fn lease_expires(&self) -> Instant {
+        self.transport.lease_expires()
+    }
+    pub(crate) fn retire(&self) -> AppResult<()> {
+        self.transport.retire()
+    }
+    pub(crate) fn check_current(&self, request: &RequestContextWitness) -> AppResult<()> {
+        self.transport.check_current(request)
+    }
+    pub(crate) fn check_bootstrap_local(&self, budget: &BootstrapBudget) -> AppResult<()> {
+        self.transport.check_bootstrap_local(budget)
+    }
+    pub(crate) fn check_bootstrap_current(&self, budget: &BootstrapBudget) -> AppResult<()> {
+        self.transport.check_bootstrap_current(budget)
+    }
+    fn validate_original(&self, original: &Value) -> AppResult<()> {
+        self.transport.validate_original(original)?;
+        let recipe = CalibrationPackProgram::java_26_3().map_err(|cause| {
+            AppError::caused_by(
+                cause.code,
+                "The sealed PACK command recipe is unavailable",
+                cause,
+            )
+        })?;
+        let command = original["arguments"]["command"].as_str();
+        if original["actionId"] != "mmmm:command_execute"
+            || original["arguments"]
+                .as_object()
+                .is_none_or(|arguments| arguments.len() != 1 || !arguments.contains_key("command"))
+            || command.is_none_or(|command| {
+                command != recipe.invocation_command()
+                    && !recipe
+                        .initialization_commands()
+                        .iter()
+                        .any(|expected| expected == command)
+            })
+        {
+            return Err(error(
+                "STALE_CONTEXT",
+                "Original PACK command differs from its closed recipe",
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn prepare_observed(
+        &self,
+        store: &mut DurableStore,
+        request: &RequestContextWitness,
+        original: &Value,
+        current: &dyn Fn(&DurableStore) -> AppResult<()>,
+    ) -> AppResult<Value> {
+        self.validate_original(original)?;
+        self.transport
+            .prepare_observed(store, request, original, current)
+    }
+    pub(crate) fn dispatch_with_store(
+        &self,
+        store: &mut DurableStore,
+        request: &RequestContextWitness,
+        original: &Value,
+        current: &dyn Fn(&DurableStore) -> AppResult<()>,
+    ) -> AppResult<Value> {
+        self.validate_original(original)?;
+        let result = self
+            .transport
+            .dispatch_with_store(store, request, original, current)?;
+        validate_pack_run_result(&result)?;
+        Ok(result)
+    }
+    pub(crate) fn poll_with_store(
+        &self,
+        store: &mut DurableStore,
+        request: &RequestContextWitness,
+        original: &Value,
+        receipt: Option<&str>,
+        current: &dyn Fn(&DurableStore) -> AppResult<()>,
+    ) -> AppResult<Option<Value>> {
+        self.validate_original(original)?;
+        let result = self
+            .transport
+            .poll_with_store(store, request, original, receipt, current)?;
+        if let Some(result) = &result {
+            validate_pack_run_result(result)?;
+        }
+        Ok(result)
+    }
+    pub(crate) fn cancel_with_store(
+        &self,
+        store: &mut DurableStore,
+        request: &RequestContextWitness,
+        original: &Value,
+        current: &dyn Fn(&DurableStore) -> AppResult<()>,
+    ) -> AppResult<()> {
+        self.validate_original(original)?;
+        self.transport
+            .cancel_with_store(store, request, original, current)
+    }
+    pub(crate) fn inspect_original_with_store(
+        &self,
+        store: &mut DurableStore,
+        request: &RequestContextWitness,
+        original: &Value,
+        selector: Value,
+        current: &dyn Fn(&DurableStore) -> AppResult<()>,
+    ) -> AppResult<Value> {
+        self.validate_original(original)?;
+        let fields: &[&str] = match selector["kind"].as_str() {
+            Some("pack_calibration_run_target_state") => {
+                &["kind", "invocationId", "invocationDigest"]
+            }
+            Some("pack_calibration_run_source") => {
+                if original["arguments"]["command"] != "function mmmm_calibration:pack/entry" {
+                    return Err(error(
+                        "INVALID_INPUT",
+                        "PACK run source requires the original entry command",
+                    ));
+                }
+                &[
+                    "kind",
+                    "invocationId",
+                    "invocationDigest",
+                    "expectedRuntimeSourceFactsDigest",
+                    "expectedRegistryGeneration",
+                ]
+            }
+            _ => {
+                return Err(error(
+                    "INVALID_INPUT",
+                    "Private PACK run query is unsupported",
+                ));
+            }
+        };
+        self.transport
+            .inspect_original_request(store, request, original, selector, fields, current)
+    }
+    /// Plan preflight reads the actual whole objective before an Invocation
+    /// exists. Only the retained PACK registry supplies the mandatory source,
+    /// current ADMIN and exact plan guard; this issues no run or dispatch claim.
+    pub(crate) fn inspect_plan_targets_with_store(
+        &self,
+        store: &mut DurableStore,
+        request: &RequestContextWitness,
+        plan: &Value,
+        current: &dyn Fn(&DurableStore) -> AppResult<()>,
+    ) -> AppResult<Value> {
+        validate("ExecutionPlan", plan)?;
+        current(store)?;
+        let result = (|| {
+            let id = serde_json::from_value(plan["planId"].clone())
+                .map_err(|_| error("STALE_PLAN", "Private PACK plan identity is invalid"))?;
+            let hash = serde_json::from_value(plan["planHash"].clone())
+                .map_err(|_| error("STALE_PLAN", "Private PACK plan hash is invalid"))?;
+            let project: ProjectId = serde_json::from_value(plan["projectId"].clone())
+                .map_err(|_| error("STALE_PLAN", "Private PACK Project is invalid"))?;
+            if request.method() != "plan.apply"
+                || store
+                    .plan(&id, &hash)
+                    .map_err(|cause| AppError::storage("STALE_PLAN", cause))?
+                    != *plan
+                || plan["contextPins"]
+                    .as_array()
+                    .is_none_or(|pins| pins.len() != 1)
+                || plan["contextPins"][0]["contextId"] != self.context()["contextId"]
+                || plan["contextPins"][0]["contextDigest"] != self.context()["contextDigest"]
+                || plan["contextPins"][0]["environment"] != self.context()["environment"]
+                || plan["projectId"] != self.context()["projectId"]
+                || self.context()["principalRef"] != request.authenticated().principal().as_str()
+            {
+                return Err(error(
+                    "STALE_PLAN",
+                    "Private PACK preflight does not identify the current frozen plan",
+                ));
+            }
+            self.transport
+                .request_identity(request, &|| current(store))?;
+            let host = self.transport.current_request_host(request)?;
+            let expires =
+                bounded_host_deadline(request.budget().deadline().min(self.lease_expires()))?;
+            current(store)?;
+            let acquired = exchange_acquired(
+                &host,
+                "inspect",
+                Some(&self.transport.read_owner.context_id),
+                json!({"kind":"pack_calibration_run_target_state","planId":id,"planHash":hash}),
+                &expires,
+                request.budget().deadline(),
+            )?;
+            let acquired = retain_pack_plan_truth(store, project, acquired)?;
+            response_payload(acquired.into_response()?)
+        })();
+        calibration_route_finish(
+            result,
+            self.transport.request_identity(request, &|| current(store)),
+        )
+    }
+}
+
+fn validate_pack_run_result(result: &Value) -> AppResult<()> {
+    if result["status"] == "job_accepted" || result.get("jobHandle").is_some() {
+        return Err(error(
+            "OBSERVATION_INVALID",
+            "The synchronous PACK command has no issued job",
+        ));
+    }
+    Ok(())
 }
 
 /// One borrowed original control and its already-started reply deadline.
@@ -773,6 +1000,18 @@ impl CalibrationHostRoute {
                 ));
             }
         };
+        self.inspect_original_request(store, request, original, selector, fields, current)
+    }
+    fn inspect_original_request(
+        &self,
+        store: &mut DurableStore,
+        request: &RequestContextWitness,
+        original: &Value,
+        selector: Value,
+        fields: &[&str],
+        current: &dyn Fn(&DurableStore) -> AppResult<()>,
+    ) -> AppResult<Value> {
+        self.validate_original(original)?;
         if selector.as_object().is_none_or(|value| {
             value.len() != fields.len() || fields.iter().any(|key| !value.contains_key(*key))
         }) || selector["invocationId"] != original["invocationId"]
@@ -1711,6 +1950,115 @@ impl HostBridge {
         witness.check_current(authority)?;
         Ok(witness)
     }
+    /// Read original PACK preparation facts through the actual current read
+    /// pairing before creating a new plan. No future Invocation is accepted.
+    pub(crate) fn inspect_pack_run_readiness_with_store(
+        &self,
+        store: &mut DurableStore,
+        selection: PackRunReadiness<'_>,
+        selector: Value,
+        current: &dyn Fn(&DurableStore) -> AppResult<()>,
+    ) -> AppResult<Value> {
+        let PackRunReadiness {
+            request,
+            authority,
+            source_original,
+            current_context,
+        } = selection;
+        validate_bootstrap_observation_selector(
+            &selector,
+            source_original,
+            "pack_calibration_run_readiness",
+        )?;
+        let (key, record) = bootstrap_observation_original(
+            store,
+            request,
+            authority,
+            source_original,
+            BootstrapObservationRole::PackRunReadiness,
+        )?;
+        validate("ExecutionContext", current_context)?;
+        verify_projected_digest("ExecutionContext", current_context)
+            .map_err(|_| error("STALE_CONTEXT", "PACK readiness context digest is invalid"))?;
+        let id = context_id(current_context)?;
+        let pairing = self.completed_pairing_witness(request, authority, &id)?;
+        pairing.with_current_native_owner_mut(store, authority, |store, owner_current| {
+            let check = |store: &DurableStore| {
+                owner_current(store)?;
+                current(store)?;
+                let actual = store
+                    .operation(&key.operation)
+                    .map_err(|cause| AppError::storage("STALE_CONTEXT", cause))?;
+                if request.method() != "plan.create"
+                    || pairing.context() != current_context
+                    || pairing.principal() != &record.principal
+                    || pairing.project() != &record.project_id
+                    || actual.principal != record.principal
+                    || actual.project_id != record.project_id
+                    || actual.plan_id != record.plan_id
+                    || actual.plan_hash != record.plan_hash
+                    || actual.context_id != record.context_id
+                    || actual.scope != record.scope
+                    || !bootstrap_successor_environment(
+                        &source_original["context"]["environment"],
+                        &current_context["environment"],
+                    )
+                    || !crate::authority::scope_contains(
+                        &current_context["scope"],
+                        &serde_json::to_value(&record.scope).map_err(|_| {
+                            error("INVALID_INPUT", "Original PACK scope is invalid")
+                        })?,
+                    )
+                {
+                    return Err(error(
+                        "PERMISSION_REQUIRED",
+                        "PACK readiness differs from its actual original or current pairing",
+                    ));
+                }
+                authority.clone().authorize_operation(
+                    pairing.principal(),
+                    &actual,
+                    Access::ObserveOperation,
+                )?;
+                authority.clone().authorize(
+                    pairing.principal(),
+                    pairing.project(),
+                    Access::Plan,
+                    Some(current_context),
+                    None,
+                )?;
+                pairing.check_current(authority)?;
+                owner_current(store)
+            };
+            check(store)?;
+            let observed = (|| {
+                self.bootstrap_successor_identity(&pairing, authority, &|| check(store))?;
+                let host = self.bootstrap_successor_host(&pairing, authority)?;
+                let expires = bounded_host_deadline(
+                    request
+                        .budget()
+                        .deadline()
+                        .min(host.expires)
+                        .min(pairing.lease_expires()),
+                )?;
+                check(store)?;
+                let acquired = exchange_acquired(
+                    &host,
+                    "inspect",
+                    Some(&pairing.context_id),
+                    selector,
+                    &expires,
+                    request.budget().deadline(),
+                )?;
+                let acquired = retain_acquired_operation_truth(store, &key, acquired)?;
+                response_payload(acquired.into_response()?)
+            })();
+            calibration_route_finish(
+                observed,
+                self.bootstrap_successor_identity(&pairing, authority, &|| check(store)),
+            )
+        })
+    }
     /// Find one actual newly completed native pairing for the same running
     /// server/world. A public context locator cannot choose among routes, and
     /// the original bootstrap approval never becomes a successor capability.
@@ -2026,6 +2374,27 @@ impl HostBridge {
         };
         route.check_bootstrap_current(budget)?;
         Ok(route)
+    }
+    /// The caller has already checked the separate PACK run purpose and exact
+    /// manifest. This creates only a fresh private transport and sticky set.
+    pub(crate) fn prepare_pack_run_route(
+        &self,
+        client: HostRpcClient,
+        principal: PrincipalId,
+        contexts: Vec<Value>,
+        expected_hello: Value,
+        lease_expires: Instant,
+        budget: &BootstrapBudget,
+    ) -> AppResult<PackRunHostRoute> {
+        self.prepare_calibration_route(
+            client,
+            principal,
+            contexts,
+            expected_hello,
+            lease_expires,
+            budget,
+        )
+        .map(|transport| PackRunHostRoute { transport })
     }
     pub fn attach(
         &self,
@@ -3064,17 +3433,43 @@ fn bootstrap_successor_original(
     authority: &LocalAuthority,
     original: &Value,
 ) -> AppResult<(OriginalInvocationKey, OperationRecord)> {
+    bootstrap_observation_original(
+        store,
+        request,
+        authority,
+        original,
+        BootstrapObservationRole::Successor,
+    )
+}
+#[derive(Clone, Copy)]
+enum BootstrapObservationRole {
+    Successor,
+    PackRunReadiness,
+}
+fn bootstrap_observation_original(
+    store: &DurableStore,
+    request: &RequestContextWitness,
+    authority: &LocalAuthority,
+    original: &Value,
+    role: BootstrapObservationRole,
+) -> AppResult<(OriginalInvocationKey, OperationRecord)> {
     request
         .check_local()
         .map_err(|cause| AppError::caused_by(cause.code, cause.message, cause))?;
-    if request.method() != "operation.reconcile"
+    let method = match role {
+        BootstrapObservationRole::Successor => "operation.reconcile",
+        BootstrapObservationRole::PackRunReadiness => "plan.create",
+    };
+    if request.method() != method
         || bootstrap_original_kind(original).is_none()
+        || (matches!(role, BootstrapObservationRole::PackRunReadiness)
+            && bootstrap_original_kind(original) != Some(CalibrationSourceKind::PackCase))
         || original["context"]["principalRef"] != request.authenticated().principal().as_str()
         || original["contextDigest"] != original["context"]["contextDigest"]
     {
         return Err(error(
             "PERMISSION_REQUIRED",
-            "Successor observation requires the exact original bootstrap reconcile request",
+            "Bootstrap observation requires its exact original and current request role",
         ));
     }
     verify_projected_digest("ExecutionContext", &original["context"]).map_err(|_| {
@@ -3148,6 +3543,13 @@ fn bootstrap_successor_environment(original: &Value, successor: &Value) -> bool 
     original == successor
 }
 fn validate_bootstrap_successor_selector(selector: &Value, original: &Value) -> AppResult<()> {
+    validate_bootstrap_observation_selector(selector, original, "calibration_bootstrap_successor")
+}
+fn validate_bootstrap_observation_selector(
+    selector: &Value,
+    original: &Value,
+    expected_kind: &str,
+) -> AppResult<()> {
     let kind = bootstrap_original_kind(original).ok_or_else(|| {
         error(
             "INVALID_INPUT",
@@ -3163,7 +3565,7 @@ fn validate_bootstrap_successor_selector(selector: &Value, original: &Value) -> 
     ];
     if selector.as_object().is_none_or(|object| {
         object.len() != fields.len() || fields.iter().any(|key| !object.contains_key(*key))
-    }) || selector["kind"] != "calibration_bootstrap_successor"
+    }) || selector["kind"] != expected_kind
         || selector["invocationId"] != original["invocationId"]
         || selector["invocationDigest"]
             != canonical_digest(original)
@@ -3286,6 +3688,43 @@ fn retain_acquired_operation_truth(
         Err(cause) => Err(AppError::caused_by(
             "EVIDENCE_RETENTION_FAILED",
             "Actual host reply could not be durably retained",
+            HostTruthRetentionFailure { acquired, cause },
+        )),
+    }
+}
+/// A preflight has no new Invocation yet. Retaining actual validated bytes as
+/// a Project resource grants no execution, source admission or settled effect.
+fn retain_pack_plan_truth(
+    store: &mut DurableStore,
+    project: ProjectId,
+    acquired: HostReplyAcquisition,
+) -> AppResult<HostReplyAcquisition> {
+    let Some(response) = acquired.validated_response() else {
+        return Ok(acquired);
+    };
+    let retained = (|| -> mmmm_runtime::storage::StorageResult<()> {
+        let bytes = encode_json(response)
+            .map_err(|cause| mmmm_runtime::storage::StorageError::Contract(cause.to_string()))?;
+        if bytes.len() > crate::rpc::MAX_CONTROL_BYTES {
+            return Err(mmmm_runtime::storage::StorageError::InvalidInput(
+                "PACK plan observation exceeds the finite byte limit".into(),
+            ));
+        }
+        let blob = store.put_blob(&bytes)?;
+        let resource = json!({"resourceId":format!("pack-plan-target-observation-{}",blob.digest),
+            "sha256":blob.digest,"sizeBytes":blob.byte_length,"mediaType":"application/vnd.mmmm.host-inspection-evidence+json"});
+        mmmm_runtime::storage::artifact::register_resource_with_diagnostics(
+            store,
+            &resource,
+            mmmm_runtime::storage::artifact::ResourceOwner::Project(project),
+        )
+        .map_err(|cause| mmmm_runtime::storage::StorageError::Io(std::io::Error::other(cause)))
+    })();
+    match retained {
+        Ok(()) => Ok(acquired),
+        Err(cause) => Err(AppError::caused_by(
+            "EVIDENCE_RETENTION_FAILED",
+            "Actual PACK plan observation could not be retained",
             HostTruthRetentionFailure { acquired, cause },
         )),
     }
@@ -3652,6 +4091,24 @@ mod tests {
         validate_bootstrap_successor_selector(&pack_selector, &pack).unwrap();
         pack_selector["sourceBundleDigest"] = json!("invalid-digest");
         assert!(validate_bootstrap_successor_selector(&pack_selector, &pack).is_err());
+        pack_selector["sourceBundleDigest"] = json!(raw_digest(b"pack-source-bundle"));
+        pack_selector["kind"] = json!("pack_calibration_run_readiness");
+        validate_bootstrap_observation_selector(
+            &pack_selector,
+            &pack,
+            "pack_calibration_run_readiness",
+        )
+        .unwrap();
+        assert!(validate_bootstrap_successor_selector(&pack_selector, &pack).is_err());
+        pack_selector["futureInvocation"] = pack.clone();
+        assert!(
+            validate_bootstrap_observation_selector(
+                &pack_selector,
+                &pack,
+                "pack_calibration_run_readiness",
+            )
+            .is_err()
+        );
     }
     #[test]
     fn bootstrap_route_kind_rejects_changed_action_or_argument_shape_before_io() {
@@ -3693,6 +4150,54 @@ mod tests {
         }
         numeric["arguments"]["sourceBundleDigest"] = json!("invalid-digest");
         assert!(numeric_route.validate_original(&numeric).is_err());
+    }
+    #[test]
+    fn pack_run_private_route_accepts_only_the_three_sealed_command_shapes() {
+        // This local comparison issues no approval, native source witness,
+        // stored Invocation, dispatch or read capability.
+        let (bridge, witness) = local_route_witness();
+        let route = PackRunHostRoute {
+            transport: local_calibration_route(&bridge, &witness),
+        };
+        let recipe = CalibrationPackProgram::java_26_3().unwrap();
+        let mut original = route_fixture_invocation();
+        original["context"] = route.context().clone();
+        original["contextDigest"] = original["context"]["contextDigest"].clone();
+        original["actionId"] = json!("mmmm:command_execute");
+        for command in recipe
+            .initialization_commands()
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(recipe.invocation_command()))
+        {
+            original["arguments"] = json!({"command":command});
+            route.validate_original(&original).unwrap();
+        }
+        for arguments in [
+            json!({"command":"function mmmm_calibration:pack/dependency"}),
+            json!({"command":"scoreboard objectives remove mcalpack"}),
+            json!({"command":"function mmmm_calibration:pack/entry "}),
+            json!({"command":recipe.invocation_command(),"sourceKind":"pack_case"}),
+            json!({"sourceBundleDigest":raw_digest(b"PACK source")}),
+        ] {
+            original["arguments"] = arguments;
+            assert!(route.validate_original(&original).is_err());
+        }
+        original["arguments"] = json!({"command":recipe.invocation_command()});
+        original["actionId"] = json!(crate::calibration_bootstrap::ACTION);
+        assert!(route.validate_original(&original).is_err());
+
+        let mut result = json!({"contractVersion":"0.2.0","status":"complete",
+            "data":{"commandReturnInt32":1,"completionClaim":"native_command_return_only"},
+            "effects":"unknown","diagnostics":[],"artifacts":[]});
+        validate("ProviderResult", &result).unwrap();
+        validate_pack_run_result(&result).unwrap();
+        result["status"] = json!("job_accepted");
+        result["jobHandle"] = json!("unissued-job");
+        validate("ProviderResult", &result).unwrap();
+        assert!(validate_pack_run_result(&result).is_err());
+        result["status"] = json!("failed");
+        assert!(validate_pack_run_result(&result).is_err());
     }
     #[test]
     fn completed_pairing_provenance_keeps_host_bridge_send_and_sync() {

@@ -7,6 +7,8 @@ pub mod bootstrap;
 pub mod calibration_bootstrap;
 pub mod calibration_execution;
 mod calibration_observer;
+mod calibration_pack_observer;
+pub(crate) mod calibration_pack_run;
 mod calibration_planning;
 pub mod catalog_source;
 pub mod catalog_source_use;

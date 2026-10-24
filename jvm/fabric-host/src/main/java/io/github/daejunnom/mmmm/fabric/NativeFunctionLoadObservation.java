@@ -2,6 +2,9 @@ package io.github.daejunnom.mmmm.fabric;
 
 import io.github.daejunnom.mmmm.observer.DefinitionPackLoadBridge;
 import io.github.daejunnom.mmmm.fabric.mixin.FixedPathPackReadAccess;
+import io.github.daejunnom.mmmm.sdk.ContractException;
+import io.github.daejunnom.mmmm.sdk.ContractJson;
+import io.github.daejunnom.mmmm.sdk.Invocation;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -45,7 +48,8 @@ public final class NativeFunctionLoadObservation {
         COMPILED_FUNCTION_FAILED(32), ENTRY_COMPLETED(33), FUNCTIONS_PUBLISHED(34),
         LIBRARY_REPLACED(35), RELOAD_COMPLETED(36), RELOAD_FAILED(37), RETIRED(38),
         STREAM_OPAQUE_READ(39), OBSERVATION_INVALID(40), READ_LINES_RETURNED(41), READ_LINES_FAILED(42),
-        OBSERVE_CURRENT(43), READER_BOUND(44), RELOAD_FUTURE_BOUND(45), ENTRY_SELECTION(46);
+        OBSERVE_CURRENT(43), READER_BOUND(44), RELOAD_FUTURE_BOUND(45), ENTRY_SELECTION(46),
+        PACK_RUN_READINESS(47), PACK_RUN_OBSERVATION(48);
         private final int code;
         Phase(int code) { this.code = code; }
         public int code() { return code; }
@@ -59,6 +63,7 @@ public final class NativeFunctionLoadObservation {
     @FunctionalInterface public interface Operation<T, E extends Throwable> { T call() throws E; }
 
     private final Object server, attempt, invocation, sealedFiles, heldRootAnchor;
+    private final String loadInvocationDigest;
     private final Collection<String> selection;
     private final Object failureLock = new Object();
     private final Object receiptLock = new Object();
@@ -75,6 +80,8 @@ public final class NativeFunctionLoadObservation {
         this.server = Objects.requireNonNull(server); this.attempt = Objects.requireNonNull(attempt);
         this.invocation = Objects.requireNonNull(invocation); this.sealedFiles = Objects.requireNonNull(sealedFiles);
         this.heldRootAnchor = Objects.requireNonNull(heldRootAnchor); this.selection = Objects.requireNonNull(selection);
+        // Cached from the actual immutable SDK object. A caller's digest pin is never an issuer.
+        loadInvocationDigest = invocation instanceof Invocation actual ? ContractJson.digest(actual.wire()) : null;
     }
 
     public static NativeFunctionLoadObservation begin(Object server, Object attempt, Object invocation,
@@ -113,6 +120,74 @@ public final class NativeFunctionLoadObservation {
         // Keep current-call failure separate from the original source observation.
         // Never return a prior receipt after an unavailable current observation.
         return DefinitionPackLoadBridge.observe(call, EMPTY, 0, 0, Phase.OBSERVE_CURRENT.code());
+    }
+
+    /** Load-only observation: no future run Invocation exists at this boundary. */
+    byte[] packRunReadiness(Object actualFreshCurrentPort, Object actualEntryPlain, Object actualDependencyPlain) {
+        var call = new NativeCall(this, Phase.PACK_RUN_READINESS, this);
+        call.freshCurrentPort = Objects.requireNonNull(actualFreshCurrentPort);
+        call.input = Objects.requireNonNull(actualEntryPlain); call.result = Objects.requireNonNull(actualDependencyPlain);
+        call.prepareScalars();
+        return observePack(call, EMPTY);
+    }
+
+    /** Actual objects only. Intermediate verified events do not mean a completed run. */
+    byte[] packRunObservation(Object actualFreshCurrentPort, Object actualEntryPlain, Object actualDependencyPlain,
+            Invocation actualRun, int eventKind, Object owner, Object callee, Object source, Object context,
+            Object parentFrame, Object childFrame, List<?> entries, Object provider, Object entry,
+            Object queueEntry, Object action, Throwable failure, byte[] rawFacts) {
+        if (eventKind < 0 || eventKind > 14) throw packUnavailable(null, null);
+        var call = new NativeCall(this, Phase.PACK_RUN_OBSERVATION, Objects.requireNonNull(owner));
+        call.freshCurrentPort = Objects.requireNonNull(actualFreshCurrentPort);
+        call.input = Objects.requireNonNull(actualEntryPlain); call.result = Objects.requireNonNull(actualDependencyPlain);
+        call.operation = Objects.requireNonNull(actualRun);
+        call.runInvocationDigest = ContractJson.digest(actualRun.wire());
+        call.offset = eventKind; call.callee = callee; call.source = source; call.context = context;
+        call.parentFrame = parentFrame; call.childFrame = childFrame; call.entries = entries;
+        call.provider = provider; call.entry = entry; call.queueEntry = queueEntry; call.action = action;
+        call.throwable = failure; call.prepareScalars();
+        byte[] actualFacts = Objects.requireNonNull(rawFacts);
+        return observePack(call, actualFacts);
+    }
+
+    private static byte[] observePack(NativeCall call, byte[] rawFacts) {
+        try {
+            return requirePackReceipt(DefinitionPackLoadBridge.observe(call, rawFacts, 0, rawFacts.length,
+                    call.phase.code()), call.phase.code());
+        } catch (DefinitionPackLoadBridge.PackObservationFailure actual) {
+            throw packUnavailable(actual.actualReceipt(), actual);
+        } catch (RuntimeException | Error actual) {
+            if (actual instanceof ContractException expected && "CAPABILITY_UNAVAILABLE".equals(expected.code())) throw expected;
+            throw packUnavailable(null, actual);
+        }
+    }
+
+    /** Closed native status framing only. Rust alone interprets the opaque payload. */
+    static byte[] requirePackReceipt(byte[] raw, int expectedPhase) {
+        if ((expectedPhase != 47 && expectedPhase != 48) || raw == null || raw.length < 12 || raw.length > 65536)
+            throw packUnavailable(raw, null);
+        byte[] value = raw.clone();
+        byte[] magic = { 'M', 'M', 'M', 'M', 'P', 'R', '0', '1' };
+        for (int index = 0; index < magic.length; index++) if (value[index] != magic[index]) throw packUnavailable(value, null);
+        int length = (Byte.toUnsignedInt(value[10]) << 8) | Byte.toUnsignedInt(value[11]);
+        if (Byte.toUnsignedInt(value[8]) != expectedPhase || value[9] != 1 || length == 0 || length != value.length - 12)
+            throw packUnavailable(value, null);
+        return value;
+    }
+
+    /** Preserves original bytes even when the native domain result is unavailable. */
+    static final class PackObservationFailure extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+        private final transient byte[] originalReceipt;
+        private PackObservationFailure(byte[] original, Throwable actual) {
+            super("The native PACK event did not verify", actual);
+            originalReceipt = original == null || original.length > 65536 ? null : original.clone();
+        }
+        byte[] originalReceipt() { return originalReceipt == null ? null : originalReceipt.clone(); }
+    }
+    private static ContractException packUnavailable(byte[] raw, Throwable actual) {
+        var failure = new ContractException("CAPABILITY_UNAVAILABLE", "The actual PACK source or execution observation is unavailable");
+        failure.initCause(new PackObservationFailure(raw, actual)); return failure;
     }
 
     private void retain(Phase phase, Reason reason, Throwable failure) {
@@ -584,6 +659,8 @@ public final class NativeFunctionLoadObservation {
         private Object supplier, executor, future, function, consumer, operation, input, result;
         private Object manager, library, functionId, resourceId, resource, stream, reader, entry;
         private Object freshCurrentPort;
+        private Object callee, source, context, parentFrame, childFrame, entries, provider, queueEntry, action;
+        private String runInvocationDigest;
         private Object sourcePack;
         private String selectedRoot;
         private byte[] scalars;
@@ -628,6 +705,8 @@ public final class NativeFunctionLoadObservation {
         private Object nativeServer() { return observation.server; }
         private Object nativeAttempt() { return observation.attempt; }
         private Object nativeInvocation() { return observation.invocation; }
+        private String nativeLoadInvocationDigest() { return observation.loadInvocationDigest; }
+        private String nativeRunInvocationDigest() { return runInvocationDigest; }
         private Object nativeSealedFiles() { return observation.sealedFiles; }
         private Object nativeHeldRootAnchor() { return observation.heldRootAnchor; }
         private Object nativeSelection() { return observation.selection; }
@@ -653,6 +732,15 @@ public final class NativeFunctionLoadObservation {
         /** Fixed factual scalar layout; domain parsing and receipt ownership remain native. */
         private byte[] nativeScalars() { return scalars; }
         private Object nativeFreshCurrentPort() { return freshCurrentPort; }
+        private Object nativeCallee() { return callee; }
+        private Object nativeSource() { return source; }
+        private Object nativeContext() { return context; }
+        private Object nativeParentFrame() { return parentFrame; }
+        private Object nativeChildFrame() { return childFrame; }
+        private Object nativeEntries() { return entries; }
+        private Object nativeProvider() { return provider; }
+        private Object nativeQueueEntry() { return queueEntry; }
+        private Object nativeAction() { return action; }
         private Throwable nativeObservationFailure() {
             synchronized (observation.failureLock) { return observation.firstThrowable; }
         }

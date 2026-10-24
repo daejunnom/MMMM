@@ -10,7 +10,7 @@ use crate::{
     },
     service::{ApplicationService, RequestBudget, ServiceError},
 };
-use mmmm_contracts::{PlanId, ProjectId, RequestId, SessionEpoch, Sha256Digest};
+use mmmm_contracts::{OperationId, PlanId, ProjectId, RequestId, SessionEpoch, Sha256Digest};
 use std::{
     collections::BTreeMap,
     io,
@@ -271,6 +271,18 @@ impl HostManagement {
         let purpose = frame["purpose"]
             .as_str()
             .ok_or(ManagementError::InvalidFrame)?;
+        let origin_bootstrap_operation = if purpose == crate::calibration_pack_run::PURPOSE {
+            Some(
+                OperationId::new(
+                    frame["originBootstrapOperation"]
+                        .as_str()
+                        .ok_or(ManagementError::InvalidFrame)?,
+                )
+                .map_err(|_| ManagementError::InvalidFrame)?,
+            )
+        } else {
+            None
+        };
         let selection = mmmm_application::SetupSelection {
             project_id: ProjectId::new(
                 frame["projectId"]
@@ -378,6 +390,26 @@ impl HostManagement {
                     let registry = self.processor.bootstrap_planning_registry();
                     service.prepare_pack_bootstrap_plan(
                         &principal, &selection, &request, &hosts, &registry,
+                    )
+                }
+                crate::calibration_pack_run::PURPOSE => {
+                    let calibration = self.processor.calibration_planning_registry();
+                    let bootstrap = self.processor.bootstrap_planning_registry();
+                    let local_authority = self.processor.calibration_planning_authority();
+                    service.prepare_pack_run_plan(
+                        &principal,
+                        &selection,
+                        &request,
+                        &hosts,
+                        &calibration,
+                        &bootstrap,
+                        origin_bootstrap_operation.as_ref().ok_or_else(|| {
+                            ServiceError::new(
+                                "INVALID_INPUT",
+                                "Original bootstrap operation locator is required",
+                            )
+                        })?,
+                        &local_authority,
                     )
                 }
                 _ => Err(ServiceError::new(

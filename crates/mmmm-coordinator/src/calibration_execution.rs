@@ -10,12 +10,12 @@ use crate::{
         calibration_approval::{policy_digest_for_rpc, verify_normative_plan},
     },
     host::CalibrationHostRoute,
-    peer_management::{CompletedBootstrap, ManagementError},
+    peer_management::{BootstrapBudget, BootstrapWitness, CompletedBootstrap, ManagementError},
     service::RequestContextWitness,
     workspace_bootstrap::NativeOwnerWitness,
 };
 use mmmm_application::{Access, AppError, AppResult, AuthorityPort};
-use mmmm_contracts::{OperationId, PrincipalId, StepId, canonical_digest};
+use mmmm_contracts::{OperationId, PrincipalId, RequestId, StepId, canonical_digest};
 use mmmm_runtime::storage::{
     BlobRef, DurableStore, OperationRecord, StepRecord, StorageError, StorageResult,
     calibration_approval::{
@@ -33,6 +33,149 @@ use std::{cell::RefCell, collections::BTreeMap, path::PathBuf, rc::Rc, sync::Arc
 #[derive(Clone, Default)]
 pub struct CalibrationRegistry {
     entries: Rc<RefCell<BTreeMap<String, Rc<ConfirmedCalibration>>>>,
+    // Numeric approval records retain their exact storage contract. PACK is a
+    // closed sibling record in the same process index, using the same journal.
+    pack_runs: crate::calibration_pack_run::PackRunRegistry,
+    pending: Rc<RefCell<BTreeMap<RequestId, Rc<()>>>>,
+}
+
+/// A private reservation follows the actual pending witness even while its
+/// owner temporarily removes the pending record to perform a completion check.
+/// It cannot be cloned or constructed from a public approval frame.
+pub(crate) struct CalibrationPendingSlot {
+    lease: CalibrationCapacityLease,
+    witness: BootstrapWitness,
+    budget: BootstrapBudget,
+    owner: NativeOwnerWitness,
+    store: *const DurableStore,
+    store_root: PathBuf,
+}
+
+struct CalibrationCapacityLease {
+    pending: Rc<RefCell<BTreeMap<RequestId, Rc<()>>>>,
+    id: RequestId,
+    identity: Rc<()>,
+}
+
+impl Drop for CalibrationCapacityLease {
+    fn drop(&mut self) {
+        // A conflicting borrow must retain the reservation rather than make a
+        // possibly live allocation disappear from the shared capacity bound.
+        if let Ok(mut pending) = self.pending.try_borrow_mut() {
+            if pending
+                .get(&self.id)
+                .is_some_and(|actual| Rc::ptr_eq(actual, &self.identity))
+            {
+                pending.remove(&self.id);
+            }
+        }
+    }
+}
+
+/// Sealed identity of a real pending reservation promoted by its own private
+/// completion. A public RequestId is never sufficient to obtain this value.
+pub(crate) struct CalibrationConfirmedSlot {
+    identity: Rc<()>,
+    witness: BootstrapWitness,
+    budget: BootstrapBudget,
+    owner: NativeOwnerWitness,
+    store: *const DurableStore,
+    store_root: PathBuf,
+    completion: Arc<CompletedBootstrap>,
+}
+
+impl CalibrationPendingSlot {
+    pub(crate) fn confirmed(
+        &self,
+        completion: &Arc<CompletedBootstrap>,
+    ) -> CalibrationConfirmedSlot {
+        // This is an identity transfer after the protected receipt committed,
+        // not another mutable budget/owner admission that could hide its truth.
+        CalibrationConfirmedSlot {
+            identity: self.lease.identity.clone(),
+            witness: self.witness.clone(),
+            budget: self.budget.clone(),
+            owner: self.owner.clone(),
+            store: self.store,
+            store_root: self.store_root.clone(),
+            completion: completion.clone(),
+        }
+    }
+}
+
+impl CalibrationConfirmedSlot {
+    fn matches(&self, value: &ConfirmedCalibration) -> bool {
+        Arc::ptr_eq(&self.completion, &value.completion)
+            && same_private_witness(&self.witness, value.completion.witness())
+            && self.owner.principal() == &value.record.confirmation().principal_id
+            && self.store_root == value.store_root
+            && value.completion.delivered()
+            && value.completion.completed_at() < self.budget.deadline()
+    }
+}
+
+fn same_private_witness(actual: &BootstrapWitness, expected: &BootstrapWitness) -> bool {
+    actual.id() == expected.id()
+        && actual.nonce() == expected.nonce()
+        && actual.offer_digest() == expected.offer_digest()
+        && actual.is_calibration_plan() == expected.is_calibration_plan()
+        && actual.is_manual_scene() == expected.is_manual_scene()
+}
+
+#[cfg(test)]
+mod pending_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn pending_witness_reservations_share_the_existing_eight_slot_bound() {
+        let registry = CalibrationRegistry::default();
+        let mut slots = Vec::new();
+        for index in 0..8 {
+            let id = RequestId::new(format!("pending-{index}"))
+                .unwrap_or_else(|_| panic!("valid request id"));
+            slots.push(
+                registry
+                    .reserve_capacity(&id)
+                    .unwrap_or_else(|_| panic!("available shared capacity")),
+            );
+        }
+        let ninth = RequestId::new("pending-8").unwrap_or_else(|_| panic!("valid request id"));
+        assert!(matches!(registry.len(), Ok(8)));
+        assert!(matches!(
+            registry.reserve_capacity(&ninth),
+            Err(ManagementError::Busy)
+        ));
+        slots.pop();
+        assert!(matches!(registry.len(), Ok(7)));
+        let replacement = registry
+            .reserve_capacity(&ninth)
+            .unwrap_or_else(|_| panic!("retired pending slot is available"));
+        assert!(matches!(registry.len(), Ok(8)));
+        drop(replacement);
+        drop(slots);
+        assert!(matches!(registry.len(), Ok(0)));
+    }
+
+    #[test]
+    fn duplicate_witness_and_conflicting_retirement_never_free_a_live_slot() {
+        let registry = CalibrationRegistry::default();
+        let id = RequestId::new("pending-same").unwrap_or_else(|_| panic!("valid request id"));
+        let slot = registry
+            .reserve_capacity(&id)
+            .unwrap_or_else(|_| panic!("available shared capacity"));
+        assert!(matches!(
+            registry.reserve_capacity(&id),
+            Err(ManagementError::WrongReply)
+        ));
+        let held = registry.pending.borrow();
+        drop(slot);
+        drop(held);
+        assert!(matches!(registry.len(), Ok(1)));
+        assert!(matches!(
+            registry.reserve_capacity(&id),
+            Err(ManagementError::WrongReply)
+        ));
+    }
 }
 
 pub(crate) struct ConfirmedCalibration {
@@ -41,15 +184,87 @@ pub(crate) struct ConfirmedCalibration {
     pub(crate) completion: Arc<CompletedBootstrap>,
     pub(crate) publication_failure: Option<Arc<AppError>>,
     pub(crate) store_root: PathBuf,
+    pub(crate) capacity: CalibrationConfirmedSlot,
 }
 
 impl CalibrationRegistry {
+    pub(crate) fn pack_runs(&self) -> &crate::calibration_pack_run::PackRunRegistry {
+        &self.pack_runs
+    }
     pub(crate) fn len(&self) -> Result<usize, ManagementError> {
-        Ok(self
+        let entries = self
+            .entries
+            .try_borrow()
+            .map_err(|_| ManagementError::TransportUncertain)?;
+        let pending = self
+            .pending
+            .try_borrow()
+            .map_err(|_| ManagementError::TransportUncertain)?;
+        let pending = pending
+            .values()
+            .filter(|identity| {
+                !entries.values().any(|entry| {
+                    entry.capacity.matches(entry) && Rc::ptr_eq(&entry.capacity.identity, identity)
+                })
+            })
+            .count();
+        entries
+            .len()
+            .checked_add(self.pack_runs.len()?)
+            .and_then(|count| count.checked_add(pending))
+            .ok_or(ManagementError::TransportUncertain)
+    }
+    pub(crate) fn reserve_pending(
+        &self,
+        store: &DurableStore,
+        witness: &BootstrapWitness,
+        budget: &BootstrapBudget,
+        owner: &NativeOwnerWitness,
+    ) -> Result<CalibrationPendingSlot, ManagementError> {
+        budget.check()?;
+        owner
+            .check_store(store)
+            .map_err(|_| ManagementError::WrongReply)?;
+        let lease = self.reserve_capacity(witness.id())?;
+        Ok(CalibrationPendingSlot {
+            lease,
+            witness: witness.clone(),
+            budget: budget.clone(),
+            owner: owner.clone(),
+            store: store as *const DurableStore,
+            store_root: store.data_root().to_path_buf(),
+        })
+    }
+    fn reserve_capacity(
+        &self,
+        id: &RequestId,
+    ) -> Result<CalibrationCapacityLease, ManagementError> {
+        if self.len()? >= 8 {
+            return Err(ManagementError::Busy);
+        }
+        if self
             .entries
             .try_borrow()
             .map_err(|_| ManagementError::TransportUncertain)?
-            .len())
+            .values()
+            .any(|entry| entry.completion.witness().id() == id)
+        {
+            return Err(ManagementError::WrongReply);
+        }
+        let mut pending = self
+            .pending
+            .try_borrow_mut()
+            .map_err(|_| ManagementError::TransportUncertain)?;
+        if pending.contains_key(id) {
+            return Err(ManagementError::WrongReply);
+        }
+        let identity = Rc::new(());
+        pending.insert(id.clone(), identity.clone());
+        Ok(CalibrationCapacityLease {
+            pending: self.pending.clone(),
+            id: id.clone(),
+            identity,
+        })
     }
     pub(crate) fn contains(&self, id: &str) -> Result<bool, ManagementError> {
         Ok(self
@@ -66,13 +281,30 @@ impl CalibrationRegistry {
         id: String,
         value: Rc<ConfirmedCalibration>,
     ) -> Result<(), ManagementError> {
+        let total = self.len()?;
+        let owns_pending = value.capacity.matches(&value)
+            && self
+                .pending
+                .try_borrow()
+                .map_err(|_| ManagementError::TransportUncertain)?
+                .values()
+                .any(|actual| Rc::ptr_eq(actual, &value.capacity.identity));
+        // Promotion consumes the same actual witness's reservation; it is not
+        // a ninth allocation. After insertion len() deduplicates that witness.
+        let retained = total
+            .checked_sub(usize::from(owns_pending))
+            .ok_or(ManagementError::TransportUncertain)?;
         let mut entries = self
             .entries
             .try_borrow_mut()
             .map_err(|_| ManagementError::TransportUncertain)?;
         if entries.contains_key(&id)
-            || entries.len() >= 8
+            || entries
+                .values()
+                .any(|entry| entry.completion.witness().id() == value.completion.witness().id())
+            || retained >= 8
             || id != value.record.selection().approval_ref()
+            || !value.capacity.matches(&value)
         {
             return Err(ManagementError::WrongReply);
         }
@@ -154,7 +386,9 @@ impl CalibrationRegistry {
                 RetainedPublicationFailure(cause.clone()),
             ));
         }
-        if store.data_root() != entry.store_root.as_path() {
+        if !std::ptr::eq(store, entry.capacity.store)
+            || store.data_root() != entry.store_root.as_path()
+        {
             return Err(unavailable());
         }
         let owner = NativeOwnerWitness::capture(store, request.budget().deadline())
@@ -282,7 +516,8 @@ impl EnteredCalibration<'_> {
             .map_err(storage_error)?;
         let context = self.route().context();
         let principal = self.request.authenticated().principal();
-        if store.data_root() != self.entry.store_root.as_path()
+        if !std::ptr::eq(store, self.entry.capacity.store)
+            || store.data_root() != self.entry.store_root.as_path()
             || self.owner.principal() != self.approval().selection().native_owner()
             || current.project_id != pins.project_id
             || current.plan_id != pins.plan_id

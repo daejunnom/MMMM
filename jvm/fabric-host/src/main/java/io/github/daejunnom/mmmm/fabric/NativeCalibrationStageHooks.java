@@ -5,13 +5,22 @@ import com.mojang.brigadier.ResultConsumer;
 import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import io.github.daejunnom.mmmm.sdk.ContractException;
+import java.util.List;
 import java.util.Objects;
+import java.util.function.Function;
+import java.util.function.Supplier;
+import net.minecraft.commands.FunctionInstantiationException;
 
 /** Internal exact native callsite hooks. No public installer, proof or grant.
  * Outside the private synchronous runner scope the native invocation is unchanged. */
 public final class NativeCalibrationStageHooks {
     private static final ThreadLocal<Listener> ACTIVE = new ThreadLocal<>();
     private NativeCalibrationStageHooks() { }
+
+    @FunctionalInterface
+    public interface FunctionInstantiation<T> {
+        T instantiate() throws FunctionInstantiationException;
+    }
 
     interface Listener {
         void beforeEntry(Object entry, Object source, Object executionContext, Object frame);
@@ -24,6 +33,15 @@ public final class NativeCalibrationStageHooks {
         default void beforeFrameReturn(Object frame, Integer returned) { }
         default void beforeResultCallback(CommandContext<?> context) { }
         default void afterResultCallback(CommandContext<?> context, Throwable failure) { }
+        default void functionInstantiated(Object actualPlain, Object actualInstantiated, Object actualSource,
+                Object actualExecutionControl, Object actualParentFrame, List<?> actualEntries, Throwable actualFailure) { }
+        default void functionCall(Object call, Object function, Object source, Object context, Object parentFrame) { }
+        default void functionSchedule(Object call, Object function, Object source, Object context, Object parentFrame,
+                Object childFrame, List<?> actualEntries, Object provider) { }
+        default void beforeTaskCreate(Object provider, Object frame, Object argument) { }
+        default void taskCreated(Object provider, Object frame, Object argument, Object actualQueueEntry, Throwable failure) { }
+        default void beforeQueueEntry(Object context, Object actualQueueEntry, Object frame, Object action) { }
+        default void afterQueueEntry(Object context, Object actualQueueEntry, Object frame, Object action, Throwable failure) { }
     }
     static final class Scope implements AutoCloseable {
         private final Listener owner;
@@ -49,6 +67,85 @@ public final class NativeCalibrationStageHooks {
     public static void nativeQueueReturned(Object context, int quota, boolean overflow, int queued, int newTopCommands) {
         Listener current = ACTIVE.get();
         if (current != null) current.queueReturned(context, quota, overflow, queued, newTopCommands);
+    }
+    public static void nativeFunctionCall(Object call, Object function, Object source, Object context, Object parentFrame) {
+        Listener current = ACTIVE.get();
+        if (current != null) current.functionCall(call, function, source, context, parentFrame);
+    }
+    public static <T> T nativeFunctionInstantiation(Object actualPlain, Object actualSource, Object actualExecutionControl,
+            Supplier<?> actualParentFrame, Function<T, ? extends List<?>> actualEntries, FunctionInstantiation<T> actualCall)
+            throws FunctionInstantiationException {
+        Listener current = ACTIVE.get();
+        if (current == null) return actualCall.instantiate();
+        T returned = null;
+        Throwable primary = null;
+        try {
+            returned = actualCall.instantiate();
+            return returned;
+        } catch (FunctionInstantiationException | RuntimeException | Error failure) {
+            primary = failure;
+            throw failure;
+        } finally {
+            try {
+                Object frame = primary == null ? actualParentFrame.get() : null;
+                List<?> entries = primary == null && returned != null ? actualEntries.apply(returned) : null;
+                current.functionInstantiated(actualPlain, returned, actualSource, actualExecutionControl, frame, entries, primary);
+            } catch (RuntimeException | Error post) {
+                if (primary == null) throw post;
+                preservePrimaryFailure(primary, post);
+            }
+        }
+    }
+    public static void nativeFunctionSchedule(Object call, Object function, Object source, Object context, Object parentFrame,
+            Object childFrame, List<?> actualEntries, Object provider, Runnable actualCall) {
+        Listener current = ACTIVE.get();
+        if (current != null) current.functionSchedule(call, function, source, context, parentFrame, childFrame, actualEntries, provider);
+        actualCall.run();
+    }
+    public static <T> T nativeTaskCreate(Object provider, Object frame, Object argument, Supplier<T> actualCall) {
+        Listener current = ACTIVE.get();
+        if (current == null) return actualCall.get();
+        current.beforeTaskCreate(provider, frame, argument);
+        T returned = null;
+        Throwable primary = null;
+        try {
+            returned = actualCall.get();
+            return returned;
+        } catch (RuntimeException | Error failure) {
+            primary = failure;
+            throw failure;
+        } finally {
+            try { current.taskCreated(provider, frame, argument, returned, primary); }
+            catch (RuntimeException | Error post) {
+                if (primary == null) throw post;
+                preservePrimaryFailure(primary, post);
+            }
+        }
+    }
+    public static void nativeQueueEntry(Object context, Object actualQueueEntry, Supplier<?> actualFrame,
+            Supplier<?> actualAction, Runnable actualCall) {
+        Listener current = ACTIVE.get();
+        if (current == null) { actualCall.run(); return; }
+        Object frame = actualFrame.get();
+        Object action = actualAction.get();
+        current.beforeQueueEntry(context, actualQueueEntry, frame, action);
+        Throwable primary = null;
+        try { actualCall.run(); }
+        catch (RuntimeException | Error failure) { primary = failure; throw failure; }
+        finally {
+            try { current.afterQueueEntry(context, actualQueueEntry, frame, action, primary); }
+            catch (RuntimeException | Error post) {
+                if (primary == null) throw post;
+                preservePrimaryFailure(primary, post);
+            }
+        }
+    }
+    private static void preservePrimaryFailure(Throwable primary, Throwable post) {
+        if (primary == post) return;
+        try { primary.addSuppressed(post); }
+        catch (RuntimeException | Error suppressionFailure) {
+            // Even unavailable suppression storage cannot replace the actual engine failure.
+        }
     }
     public static void nativeCustom(Object receiver, Object chain, Object frame, boolean modifier, Runnable actualCall) {
         Listener current = ACTIVE.get();

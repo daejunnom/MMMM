@@ -42,6 +42,7 @@ import java.util.function.Supplier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.commands.functions.PlainTextFunction;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.FileToIdConverter;
 import net.minecraft.resources.Identifier;
@@ -300,6 +301,60 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
         void requireActualOwner(MinecraftServer actual, String actualGame, String actualWorld) {
             if (actual != owner || !gameInstanceId.equals(actualGame) || !worldId.equals(actualWorld)) throw invalid();
         }
+
+        /** A fresh load-only native witness. The historical bootstrap grants no new execution authority. */
+        PackRunReadiness packRunReadiness(MinecraftServer actual, ServerLevel actualLevel, HostSession freshOwner,
+                                         ObjectNode freshContext, Runnable freshCurrent) {
+            requireActualServer(actual);
+            return NativeCalibrationStateReader.currentContext(actual, actualLevel, freshOwner, freshContext,
+                    freshCurrent::run, (ignored, checkpoint) -> {
+                checkpoint.check();
+                requireActualOwner(actual, freshContext.path("environment").path("gameInstanceId").asText(),
+                        freshContext.path("environment").path("worldId").asText());
+                for (String field : Set.of("principalRef", "projectId", "dimension"))
+                    if (!original.context().path(field).equals(freshContext.path(field))) throw packRunUnavailable();
+                if (purpose != Purpose.PACK_CASE || !"completed".equals(reload.outcome()) || heldRootAnchor == null
+                        || sourceObservation == null || sourceObservationFailure != null) throw packRunUnavailable();
+                var entry = actual.getFunctions().get(Identifier.parse("mmmm_calibration:pack/entry"))
+                        .orElseThrow(NativeCalibrationBootstrap::packRunUnavailable);
+                var dependency = actual.getFunctions().get(Identifier.parse("mmmm_calibration:pack/dependency"))
+                        .orElseThrow(NativeCalibrationBootstrap::packRunUnavailable);
+                if (entry.getClass() != PlainTextFunction.class || dependency.getClass() != PlainTextFunction.class
+                        || entry == dependency) throw packRunUnavailable();
+                var readiness = new PackRunReadiness(this, actualLevel, (PlainTextFunction<?>) entry,
+                        (PlainTextFunction<?>) dependency);
+                readiness.checkCurrent(checkpoint::check);
+                byte[] originalReceipt = withRetainedPackRoot(actual, sourceFiles.repositoryId(), checkpoint::check,
+                        root -> sourceObservation.packRunReadiness(
+                                NativeCalibrationPackFiles.freshCurrentRootPort(actual, this, root, checkpoint::check),
+                                entry, dependency));
+                readiness.retainLoadReceipt(originalReceipt);
+                readiness.checkCurrent(checkpoint::check); return readiness;
+            });
+        }
+
+        /** Plan-create baseline only. No future run Invocation or command result is manufactured. */
+        PackRunReadiness packRunInitialReadiness(MinecraftServer actual, ServerLevel actualLevel, HostSession freshOwner,
+                ObjectNode freshContext, Runnable freshCurrent, Clock observationClock) {
+            Objects.requireNonNull(observationClock);
+            return NativeCalibrationStateReader.currentContext(actual, actualLevel, freshOwner, freshContext,
+                    freshCurrent::run, (installed, checkpoint) -> {
+                if (!stringSet(installed.path("scope").path("externalTargetIds")).contains("calibration-objective-mcalpack"))
+                    throw packRunUnavailable();
+                PackRunReadiness readiness = packRunReadiness(actual, actualLevel, freshOwner, installed, checkpoint::check);
+                readiness.checkCurrent(checkpoint::check);
+                long from = Integer.toUnsignedLong(actual.getTickCount());
+                ObjectNode raw = NativeTargets.readObjectiveImage(actualLevel, "mcalpack", checkpoint::check);
+                if (!"known".equals(raw.path("status").asText()) || !"full_target".equals(raw.path("coverage").asText())
+                        || !"absent".equals(raw.path("presence").asText())) throw packRunUnavailable();
+                byte[] bytes = ContractJson.canonical(raw);
+                if (bytes.length == 0 || bytes.length > NativeCalibrationTargetImages.MAX_TARGET_BYTES) throw limit();
+                checkpoint.check(); readiness.checkCurrent(checkpoint::check);
+                readiness.retainInitialTarget(installed, bytes, from, Integer.toUnsignedLong(actual.getTickCount()),
+                        observationClock.instant().toString());
+                readiness.checkCurrent(checkpoint::check); return readiness;
+            });
+        }
         private void startReload() { effectPhase = "reload_call_attempted"; reload = new ReloadState("call_attempted_without_future", null); }
         private void retainReload(CompletionStage<Void> actual) {
             Objects.requireNonNull(actual); effectPhase = "reload_future_returned";
@@ -421,6 +476,101 @@ final class NativeCalibrationBootstrap implements HostDispatcher.PurposeRoute, A
         private static void addTarget(ArrayNode rows, String id, byte[] raw, String sha) {
             rows.addObject().put("targetId", id).put("rawBytesHex", java.util.HexFormat.of().formatHex(raw)).put("rawSha256", sha);
         }
+    }
+
+    /** Actual object capability issued only by the retained native load observation above. */
+    static final class PackRunReadiness {
+        private final Attempt attempt;
+        private final ServerLevel level;
+        private final Object resources, functions, repository;
+        private final PlainTextFunction<?> entry, dependency;
+        private final List<?> entryEntries, dependencyEntries;
+        private byte[] loadReceipt;
+        private InitialTarget initialTarget;
+        private record InitialTarget(ObjectNode context, byte[] bytes, long from, long to, String observedAt) { }
+        private PackRunReadiness(Attempt actual, ServerLevel actualLevel, PlainTextFunction<?> actualEntry,
+                                 PlainTextFunction<?> actualDependency) {
+            attempt = actual; level = actualLevel;
+            resources = actual.owner.getResourceManager(); functions = actual.owner.getFunctions();
+            repository = actual.owner.getPackRepository(); entry = actualEntry; dependency = actualDependency;
+            entryEntries = actualEntry.entries(); dependencyEntries = actualDependency.entries();
+            if (entryEntries == null || dependencyEntries == null) throw packRunUnavailable();
+        }
+        private void retainLoadReceipt(byte[] raw) {
+            if (loadReceipt != null) throw packRunUnavailable();
+            loadReceipt = NativeFunctionLoadObservation.requirePackReceipt(raw, 47);
+        }
+        byte[] receipt() {
+            if (loadReceipt == null) throw packRunUnavailable(); return loadReceipt.clone();
+        }
+        private void retainInitialTarget(ObjectNode actualContext, byte[] actualBytes, long from, long to, String observedAt) {
+            if (initialTarget != null || from < 0 || to < from) throw packRunUnavailable();
+            initialTarget = new InitialTarget(actualContext.deepCopy(), actualBytes.clone(), from, to, observedAt);
+        }
+        /** Transports one actual absent-objective baseline. It is never a command-settlement observation. */
+        ObjectNode targetImages(ObjectNode actualSourceFacts, String actualHostArtifactDigest,
+                                String actualRegistryGeneration, Clock observationClock) {
+            Objects.requireNonNull(observationClock);
+            ObjectNode sourceFacts = Objects.requireNonNull(actualSourceFacts).deepCopy();
+            InitialTarget actual = initialTarget;
+            if (actual == null || actualHostArtifactDigest == null || !actualHostArtifactDigest.matches("[a-f0-9]{64}")
+                    || actualRegistryGeneration == null || !actualRegistryGeneration.matches("(0|[1-9][0-9]{0,19})")
+                    || !actual.context().path("environment").equals(sourceFacts.path("environment"))
+                    || !actualRegistryGeneration.equals(sourceFacts.path("registryGeneration").asText())) throw packRunUnavailable();
+            String sourceFactsDigest = NativeProfileAdmission.sourceDigest(sourceFacts);
+            ObjectNode value = ContractJson.newObject().put("format", NativePackCalibrationSource.TARGET_IMAGES_FORMAT)
+                    .put("protocolVersion", ContractJson.VERSION).put("contextId", actual.context().path("contextId").asText())
+                    .put("contextDigest", actual.context().path("contextDigest").asText())
+                    .put("runtimeSourceFactsDigest", sourceFactsDigest).put("hostArtifactDigest", actualHostArtifactDigest)
+                    .put("registryGeneration", actualRegistryGeneration)
+                    .put("observedFromTick", Long.toString(actual.from())).put("observedToTick", Long.toString(actual.to()))
+                    .put("observedAt", actual.observedAt());
+            value.set("environment", actual.context().path("environment").deepCopy());
+            value.putArray("targets").addObject().put("targetId", "calibration-objective-mcalpack")
+                    .put("rawBytesHex", java.util.HexFormat.of().formatHex(actual.bytes()))
+                    .put("rawSha256", ContractJson.sha256(actual.bytes()));
+            ObjectNode observation = value.putObject("commandObservation").put("commandReturnObserved", false)
+                    .put("singleCallbackObserved", false).put("queueTerminalObserved", false)
+                    .put("actualTaskTerminalObserved", false).put("terminationConfirmed", false).put("furtherEffectsPossible", true);
+            observation.putNull("continuationPending");
+            NativePackCalibrationSource.bounded(value); return value;
+        }
+        PlainTextFunction<?> entryFunction() { return entry; }
+        PlainTextFunction<?> dependencyFunction() { return dependency; }
+        List<?> entryEntries() { return entryEntries; }
+        List<?> dependencyEntries() { return dependencyEntries; }
+        void checkCurrent(Runnable freshCurrent) {
+            Objects.requireNonNull(freshCurrent).run(); MinecraftServer actual = attempt.owner;
+            if (!actual.isSameThread() || level.getServer() != actual || actual.getLevel(level.dimension()) != level
+                    || actual.getResourceManager() != resources || actual.getFunctions() != functions
+                    || actual.getPackRepository() != repository || attempt.purpose != Purpose.PACK_CASE
+                    || attempt.heldRootAnchor == null || attempt.sourceObservation == null
+                    || actual.getFunctions().get(Identifier.parse("mmmm_calibration:pack/entry")).orElse(null) != entry
+                    || actual.getFunctions().get(Identifier.parse("mmmm_calibration:pack/dependency")).orElse(null) != dependency
+                    || entry.entries() != entryEntries || dependency.entries() != dependencyEntries) throw packRunUnavailable();
+            freshCurrent.run();
+        }
+        /** Fresh current checks bracket each original native event; no original bootstrap callback is retained. */
+        byte[] requireRun(Invocation actualRun, int eventKind, Object owner, Object callee, Object source, Object context,
+                          Object parent, Object child, List<?> entries, Object provider, Object actualEntry,
+                          Object queueEntry, Object action, Throwable failure, byte[] rawFacts, Runnable freshCurrent) {
+            Objects.requireNonNull(actualRun); checkCurrent(freshCurrent);
+            if (loadReceipt == null || !"pack-entry".equals(actualRun.stepId())
+                    || !PACK_ACTION_ID.equals(actualRun.actionId())
+                    || !arguments(Purpose.PACK_CASE, attempt.bundleDigest).equals(actualRun.arguments())
+                    || actualRun == attempt.original || actualRun.invocationId().equals(attempt.original.invocationId())
+                    || actualRun.operationId().equals(attempt.original.operationId())) throw packRunUnavailable();
+            return checked(() -> withRetainedPackRoot(attempt.owner, attempt.sourceFiles.repositoryId(), freshCurrent,
+                    root -> attempt.sourceObservation.packRunObservation(
+                            NativeCalibrationPackFiles.freshCurrentRootPort(attempt.owner, attempt, root, freshCurrent),
+                            entry, dependency, actualRun, eventKind, owner, callee, source, context, parent, child,
+                            entries, provider, actualEntry, queueEntry, action, failure, rawFacts)),
+                    () -> checkCurrent(freshCurrent));
+        }
+    }
+
+    private static ContractException packRunUnavailable() {
+        return new ContractException("CAPABILITY_UNAVAILABLE", "The actual current PACK load or run boundary is unavailable");
     }
 
     private static ObjectNode heldRootFacts(DefinitionOwnedPackFilesBridge.HeldRootReceipt actual) {

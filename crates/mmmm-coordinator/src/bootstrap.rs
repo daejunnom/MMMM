@@ -470,6 +470,14 @@ impl HostBootstrapProcessor {
     pub(crate) fn calibration_planning_hosts(&self) -> HostBridge {
         self.hosts.clone()
     }
+    pub(crate) fn calibration_planning_authority(&self) -> LocalAuthority {
+        self.authority.clone()
+    }
+    pub(crate) fn calibration_planning_registry(
+        &self,
+    ) -> crate::calibration_execution::CalibrationRegistry {
+        self.calibration.registry()
+    }
     pub(crate) fn bootstrap_planning_registry(
         &self,
     ) -> crate::calibration_bootstrap::BootstrapRegistry {

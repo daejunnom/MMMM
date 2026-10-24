@@ -512,6 +512,12 @@ enum CalibrationPlanningMode<'a> {
     NumericRun,
     NumericBootstrap(&'a crate::calibration_bootstrap::BootstrapRegistry),
     PackBootstrap(&'a crate::calibration_bootstrap::BootstrapRegistry),
+    PackRun {
+        calibration: &'a crate::calibration_execution::CalibrationRegistry,
+        bootstrap: &'a crate::calibration_bootstrap::BootstrapRegistry,
+        origin_operation: &'a mmmm_contracts::OperationId,
+        authority: &'a crate::authority::LocalAuthority,
+    },
 }
 
 /// Exactly one store opens and holds the native data-root lock for this service's
@@ -676,6 +682,34 @@ impl ApplicationService {
             CalibrationPlanningMode::PackBootstrap(registry),
         )
     }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Current request, source, registries, bootstrap operation and actual local authority are independent planning inputs"
+    )]
+    pub(crate) fn prepare_pack_run_plan(
+        &mut self,
+        principal: &AuthenticatedPrincipal,
+        selection: &mmmm_application::SetupSelection,
+        budget: &RequestBudget,
+        hosts: &crate::host::HostBridge,
+        calibration: &crate::calibration_execution::CalibrationRegistry,
+        bootstrap: &crate::calibration_bootstrap::BootstrapRegistry,
+        origin_operation: &mmmm_contracts::OperationId,
+        authority: &crate::authority::LocalAuthority,
+    ) -> Result<crate::calibration_planning::CalibrationPlanReceipt, ServiceError> {
+        self.prepare_selected_calibration_plan(
+            principal,
+            selection,
+            budget,
+            hosts,
+            CalibrationPlanningMode::PackRun {
+                calibration,
+                bootstrap,
+                origin_operation,
+                authority,
+            },
+        )
+    }
     fn prepare_selected_calibration_plan(
         &mut self,
         principal: &AuthenticatedPrincipal,
@@ -756,6 +790,22 @@ impl ApplicationService {
                     registry,
                 )
             }
+            CalibrationPlanningMode::PackRun {
+                calibration,
+                bootstrap,
+                origin_operation,
+                authority,
+            } => crate::calibration_pack_run::prepare_plan(
+                &mut application,
+                &request,
+                &owner,
+                hosts,
+                selection,
+                calibration,
+                bootstrap,
+                origin_operation,
+                authority,
+            ),
             CalibrationPlanningMode::NumericRun => {
                 crate::calibration_planning::prepare_normative47_plan(
                     &mut application,

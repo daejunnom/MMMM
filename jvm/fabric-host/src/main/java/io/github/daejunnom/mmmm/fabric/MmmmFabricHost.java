@@ -61,8 +61,14 @@ public final class MmmmFabricHost implements ModInitializer {
     private final Map<HostSession, Map<String, Invocation>> nativeHistory = new IdentityHashMap<>();
     private final Map<String, PendingCalibrationOffer> calibrationOffers = new HashMap<>();
     private final Map<String, PendingBootstrapOffer> bootstrapOffers = new HashMap<>();
+    private final Map<String, PendingPackRunOffer> packRunOffers = new HashMap<>();
     // These eight actual attempts survive route retirement, but never a server instance.
     private final Map<String, NativeCalibrationBootstrap.Attempt> bootstrapAttempts = new HashMap<>();
+    // Actual original records survive route retirement. Neither map restores authority.
+    private final Map<String, NativePackCalibrationRun> packRunOperations = new HashMap<>();
+    private final Map<String, RetainedPackRun> packRunInvocations = new HashMap<>();
+    private int persistentHistoryCount;
+    private long persistentHistoryBytes;
     private final Map<HostSession, String> completedReadonlyPairings = new IdentityHashMap<>();
     private NativeCalibrationApproval.Runner calibrationRunner;
     private int nativeHistoryCount;
@@ -100,7 +106,8 @@ public final class MmmmFabricHost implements ModInitializer {
         ServerEntityEvents.ENTITY_LOAD.register(tombstones::loaded);
         ServerEntityEvents.ENTITY_UNLOAD.register(entities::unloaded);
         ServerLifecycleEvents.SERVER_STARTED.register(current -> {
-            bootstrapAttempts.clear(); completedReadonlyPairings.clear();
+            bootstrapAttempts.clear(); packRunOperations.clear(); packRunInvocations.clear();
+            persistentHistoryCount = 0; persistentHistoryBytes = 0; completedReadonlyPairings.clear();
             server = current;
             reloading = false; stopping = false;
             gameInstanceId = "game-" + UUID.randomUUID();
@@ -142,7 +149,9 @@ public final class MmmmFabricHost implements ModInitializer {
                 // Native close uncertainty or an unretired root is not deletion
                 // or successful close. Its bounded native owner remains until
                 // VM retirement, and may keep later root admission unavailable.
-                bootstrapAttempts.clear(); tombstones.clear(); loaded.clear(); entities.clear(); reloading = false; server = null;
+                bootstrapAttempts.clear(); packRunOperations.clear(); packRunInvocations.clear();
+                persistentHistoryCount = 0; persistentHistoryBytes = 0; nativeHistoryCount = 0; nativeHistoryBytes = 0;
+                tombstones.clear(); loaded.clear(); entities.clear(); reloading = false; server = null;
             }
         }
         if (primary instanceof RuntimeException failure) throw failure;
@@ -235,12 +244,17 @@ public final class MmmmFabricHost implements ModInitializer {
 
     private record SessionRoute(PairedLoopbackServer endpoint, NativePlanApproval approval,
                                 ObjectNode sourceFacts, ObjectNode profileEvidence, NativeCalibrationApproval calibration,
-                                NativeCalibrationBootstrap bootstrap, HostRuntime bootstrapRuntime) { }
+                                NativeCalibrationBootstrap bootstrap, HostRuntime bootstrapRuntime,
+                                NativePackCalibrationRun packRun, HostRuntime packRunRuntime) { }
     private record PendingCalibrationOffer(HostSession paired, HostRuntime runtime, String offerDigest,
                                            String factsDigest, String hostArtifactDigest, long generation, long until) { }
     private record PendingBootstrapOffer(HostSession paired, HostRuntime runtime, String offerDigest,
                                          String factsDigest, String hostArtifactDigest, long generation, long until,
                                          NativeCalibrationBootstrap.Purpose purpose) { }
+    private record PendingPackRunOffer(HostSession paired, HostRuntime runtime, MinecraftServer server,
+                                       String offerDigest, String factsDigest, String hostArtifactDigest,
+                                       long generation, long until) { }
+    private record RetainedPackRun(NativePackCalibrationRun owner, Invocation original) { }
 
     /**
      * Trusted out-of-band composition only. The Rust authority supplies approved artifact/action digests,
@@ -408,7 +422,7 @@ public final class MmmmFabricHost implements ModInitializer {
             List<ObjectNode> admittedContexts = contexts.stream().map(ObjectNode::deepCopy).toList();
             synchronized (routes) {
                 candidateSession.checkOpen();
-                routes.put(candidateSession, new SessionRoute(listener, null, null, null, null, null, null)); routeOrder.add(candidateSession);
+                routes.put(candidateSession, new SessionRoute(listener, null, null, null, null, null, null, null, null)); routeOrder.add(candidateSession);
                 installedSources = acceptedSources; installedActions = acceptedActions; installedContexts = admittedContexts;
                 compatibilityApprovals = pendingCompatibility;
                 compatibilityMetadataResolver = resolver;
@@ -512,7 +526,7 @@ public final class MmmmFabricHost implements ModInitializer {
             synchronized (routes) {
                 previous.checkOpen(); approved.checkOpen();
                 if (session != previous || runtime != currentRuntime || !routes.containsKey(previous)) throw new ContractException("SESSION_EXPIRED", "Original approval runtime is no longer installed");
-                routes.put(approved, new SessionRoute(listener, grant, facts.deepCopy(), profileEvidence, null, null, null)); routeOrder.add(approved);
+                routes.put(approved, new SessionRoute(listener, grant, facts.deepCopy(), profileEvidence, null, null, null, null, null)); routeOrder.add(approved);
                 session = approved; endpoint = listener;
             }
             return listener.endpoint();
@@ -524,7 +538,7 @@ public final class MmmmFabricHost implements ModInitializer {
         synchronized (routes) {
             for (HostSession paired : List.copyOf(routeOrder)) {
                 SessionRoute route = routes.get(paired);
-                if (route != null && (route.approval() != null || route.calibration() != null || route.bootstrap() != null) && installedEndpoint.equals(route.endpoint().endpoint())) {
+                if (route != null && (route.approval() != null || route.calibration() != null || route.bootstrap() != null || route.packRun() != null) && installedEndpoint.equals(route.endpoint().endpoint())) {
                     route.endpoint().close(); paired.close(); routes.remove(paired); routeOrder.remove(paired);
                 }
             }
@@ -532,6 +546,26 @@ public final class MmmmFabricHost implements ModInitializer {
                 session = routeOrder.isEmpty() ? null : routeOrder.getLast(); endpoint = session == null ? null : routes.get(session).endpoint();
             }
         }
+    }
+    void revokePackRunApproval(String installedEndpoint) {
+        if (installedEndpoint == null) return;
+        Throwable primary = null;
+        synchronized (routes) {
+            for (HostSession paired : List.copyOf(routeOrder)) {
+                SessionRoute route = routes.get(paired);
+                if (route == null || route.packRun() == null || !installedEndpoint.equals(route.endpoint().endpoint())) continue;
+                try { route.endpoint().close(); }
+                catch (RuntimeException | Error failure) { primary = failure; }
+                try { paired.close(); }
+                catch (RuntimeException | Error failure) { if (primary == null) primary = failure; else if (primary != failure) primary.addSuppressed(failure); }
+                routes.remove(paired); routeOrder.remove(paired);
+            }
+            if (session != null && session.closed()) {
+                session = routeOrder.isEmpty() ? null : routeOrder.getLast(); endpoint = session == null ? null : routes.get(session).endpoint();
+            }
+        }
+        if (primary instanceof RuntimeException failure) throw failure;
+        if (primary instanceof Error failure) throw failure;
     }
     /** 실제 runner를 만드는 trusted platform composition만 호출한다. RPC/설정/inspect 설치 경로는 없다. */
     void installCalibrationRunner(NativeCalibrationApproval.Runner runner) {
@@ -569,7 +603,7 @@ public final class MmmmFabricHost implements ModInitializer {
             current.run();
             synchronized (routes) {
                 calibrationOffers.entrySet().removeIf(entry -> entry.getValue().until() - System.nanoTime() <= 0);
-                if (routes.size() >= 8 || calibrationOffers.size() >= 8) throw new ContractException("SESSION_LIMIT", "현재 immutable route 또는 승인 준비 한도가 찼습니다");
+                if (routes.size() >= 8 || calibrationOffers.size() + bootstrapOffers.size() + packRunOffers.size() >= 8) throw new ContractException("SESSION_LIMIT", "현재 immutable route 또는 승인 준비 한도가 찼습니다");
                 calibrationOffers.put(nonce, new PendingCalibrationOffer(paired, actualRuntime, ContractJson.digest(offer),
                         NativeProfileAdmission.sourceDigest(facts), setup.hostArtifactDigest(), generation, until));
             }
@@ -668,7 +702,7 @@ public final class MmmmFabricHost implements ModInitializer {
             current.run();
             synchronized (routes) {
                 if (routes.size() >= 8) throw new ContractException("SESSION_LIMIT", "현재 immutable route 한도가 찼습니다");
-                routes.put(approved, new SessionRoute(listener, null, facts.deepCopy(), null, grant, null, null)); routeOrder.add(approved);
+                routes.put(approved, new SessionRoute(listener, null, facts.deepCopy(), null, grant, null, null, null, null)); routeOrder.add(approved);
                 session = approved; endpoint = listener;
             }
             original.run(); checkCalibrationCurrent(approved, contexts.getFirst(), original, false); return listener.endpoint();
@@ -745,7 +779,7 @@ public final class MmmmFabricHost implements ModInitializer {
             current.run();
             synchronized (routes) {
                 bootstrapOffers.entrySet().removeIf(entry -> entry.getValue().until() - System.nanoTime() <= 0);
-                if (routes.size() >= 8 || bootstrapOffers.size() + calibrationOffers.size() >= 8) throw new ContractException("SESSION_LIMIT", "현재 immutable route 또는 승인 준비 한도가 찼습니다");
+                if (routes.size() >= 8 || bootstrapOffers.size() + calibrationOffers.size() + packRunOffers.size() >= 8) throw new ContractException("SESSION_LIMIT", "현재 immutable route 또는 승인 준비 한도가 찼습니다");
                 bootstrapOffers.put(nonce, new PendingBootstrapOffer(paired, actualRuntime, ContractJson.digest(offer),
                         NativeProfileAdmission.sourceDigest(facts), setup.hostArtifactDigest(), generation, until, purpose));
             }
@@ -837,7 +871,7 @@ public final class MmmmFabricHost implements ModInitializer {
             current.run();
             synchronized (routes) {
                 if (routes.size() >= 8) throw new ContractException("SESSION_LIMIT", "현재 immutable route 한도가 찼습니다");
-                routes.put(approved, new SessionRoute(listener, null, facts.deepCopy(), null, null, grant, pending.runtime())); routeOrder.add(approved);
+                routes.put(approved, new SessionRoute(listener, null, facts.deepCopy(), null, null, grant, pending.runtime(), null, null)); routeOrder.add(approved);
                 session = approved; endpoint = listener;
             }
             original.run(); checkBootstrapCurrent(approved, contexts.getFirst(), original, true); return listener.endpoint();
@@ -880,8 +914,9 @@ public final class MmmmFabricHost implements ModInitializer {
             if (previousAttempt != null) {
                 if (previousAttempt != attempt) throw authorityInvalid(); return;
             }
+            if (packRunInvocations.containsKey(invocation.invocationId())) throw authorityInvalid();
             // Reject before the first effect. Unresolved history is never evicted to make room.
-            if (bootstrapAttempts.size() >= 8) throw new ContractException("CALIBRATION_BOOTSTRAP_HISTORY_FULL", "The bounded actual bootstrap history is full");
+            if (bootstrapAttempts.size() + packRunOperations.size() >= 8) throw new ContractException("CALIBRATION_BOOTSTRAP_HISTORY_FULL", "The bounded actual bootstrap/run history is full");
             Map<String, Invocation> retained = nativeHistory.computeIfAbsent(paired, ignored -> new HashMap<>());
             Invocation previous = retained.get(invocation.invocationId());
             if (previous != null) { if (!previous.wire().equals(invocation.wire())) throw authorityInvalid(); return; }
@@ -890,8 +925,249 @@ public final class MmmmFabricHost implements ModInitializer {
             String key = invocationRouteKey(invocation); HostSession owner = invocationRoutes.putIfAbsent(key, paired);
             if (owner != null && owner != paired) throw new ContractException("SESSION_ROUTE_CHANGED", "원 Invocation의 route를 바꿀 수 없습니다");
             retained.put(invocation.invocationId(), invocation); nativeHistoryCount++; nativeHistoryBytes += bytes;
+            persistentHistoryCount++; persistentHistoryBytes += bytes;
             bootstrapAttempts.put(invocation.invocationId(), attempt);
         }
+    }
+
+    ObjectNode packRunApprovalOffer(UUID playerId, HostSetup setup, String planId, String planHash, Runnable original, long until) {
+        original.run(); requireServerThread(); HostSession paired = requireSession();
+        HostRuntime actualRuntime = runtime; MinecraftServer actualServer = server; long generation = registryGeneration;
+        Runnable current = () -> {
+            original.run(); requireServerThread(); paired.checkOpen();
+            if (until - System.nanoTime() <= 0 || session != paired || runtime != actualRuntime || server != actualServer
+                    || generation != registryGeneration || !playerId.equals(paired.playerId())
+                    || player(paired).createCommandSourceStack().getPermissionContext().permissionLevel() != PermissionLevel.ADMINS) throw authorityInvalid();
+        };
+        current.run();
+        if (!planId.matches("[a-z0-9][a-z0-9._:-]{0,127}") || !planHash.matches("[a-f0-9]{64}")
+                || installedContexts.isEmpty() || !setup.projectId().equals(installedContexts.getFirst().path("projectId").asText())
+                || !setup.hostArtifactDigest().equals(artifactDigest(container("mmmm_host")))) throw authorityInvalid();
+        ObjectNode facts = NativeSourceFacts.observe(server, Long.toString(generation), environment(), current::run); current.run();
+        ObjectNode offer = ContractJson.newObject().put("kind", "host_apply_approval_offer").put("protocolVersion", ContractJson.VERSION)
+                .put("nonce", "approve-" + UUID.randomUUID()).put("purpose", NativePackCalibrationRun.PURPOSE)
+                .put("dataRoot", setup.dataRoot().toString()).put("projectId", setup.projectId())
+                .put("principalId", paired.principalRef()).put("playerId", playerId.toString()).put("planId", planId).put("planHash", planHash)
+                .put("hostArtifactDigest", setup.hostArtifactDigest());
+        offer.set("hostHello", actualRuntime.hello()); offer.set("runtimeSourceFacts", facts);
+        var ids = offer.putArray("contextIds"); installedContexts.forEach(value -> ids.add(value.path("contextId").asText()));
+        String nonce = offer.path("nonce").asText();
+        try {
+            current.run();
+            synchronized (routes) {
+                packRunOffers.entrySet().removeIf(entry -> entry.getValue().until() - System.nanoTime() <= 0);
+                if (routes.size() >= 8 || packRunOffers.size() + bootstrapOffers.size() + calibrationOffers.size() >= 8)
+                    throw new ContractException("SESSION_LIMIT", "현재 immutable route 또는 승인 준비 한도가 찼습니다");
+                packRunOffers.put(nonce, new PendingPackRunOffer(paired, actualRuntime, actualServer, ContractJson.digest(offer),
+                        NativeProfileAdmission.sourceDigest(facts), setup.hostArtifactDigest(), generation, until));
+            }
+            current.run(); return offer;
+        } catch (RuntimeException | Error failure) { releasePackRunOffer(nonce); throw failure; }
+    }
+
+    void releasePackRunOffer(String nonce) { if (nonce != null) synchronized (routes) { packRunOffers.remove(nonce); } }
+
+    String installPackRunApproval(UUID playerId, ObjectNode offer, ObjectNode authority, byte[] bearer, Runnable original) throws IOException {
+        original.run(); requireServerThread(); PendingPackRunOffer pending;
+        synchronized (routes) { pending = packRunOffers.remove(offer.path("nonce").asText()); }
+        if (pending == null) throw authorityInvalid(); HostSession previous = pending.paired();
+        Runnable current = () -> {
+            original.run(); requireServerThread(); previous.checkOpen();
+            synchronized (routes) {
+                if (pending.until() - System.nanoTime() <= 0 || session != previous || runtime != pending.runtime()
+                        || server != pending.server() || !routes.containsKey(previous) || registryGeneration != pending.generation()) throw authorityInvalid();
+            }
+            if (!playerId.equals(previous.playerId()) || !pending.offerDigest().equals(ContractJson.digest(offer))
+                    || player(previous).createCommandSourceStack().getPermissionContext().permissionLevel() != PermissionLevel.ADMINS) throw authorityInvalid();
+        };
+        current.run();
+        HostDispatcher.exactFields(authority, Set.of("kind", "protocolVersion", "nonce", "purpose", "contexts", "approvedSources", "approvedActions", "permissions", "manifest"));
+        if (!"host_apply_approval_authority".equals(authority.path("kind").asText()) || !ContractJson.VERSION.equals(authority.path("protocolVersion").asText())
+                || !offer.path("nonce").equals(authority.path("nonce")) || !NativePackCalibrationRun.PURPOSE.equals(authority.path("purpose").asText())
+                || !offer.path("purpose").equals(authority.path("purpose")) || !offer.path("hostHello").equals(pending.runtime().hello())
+                || !authority.path("contexts").isArray() || authority.path("contexts").size() != installedContexts.size()) throw authorityInvalid();
+        List<ObjectNode> contexts = new ArrayList<>(); Set<String> ids = new java.util.HashSet<>();
+        for (JsonNode value : authority.path("contexts")) {
+            current.run(); contracts.validate("ExecutionContext", value); ObjectNode context = ContractJson.object(value);
+            String id = context.path("contextId").asText();
+            if (!ids.add(id) || !sameExecutionIdentity(previous.context(id), context)) throw authorityInvalid();
+            contexts.add(context.deepCopy());
+        }
+        if (!authority.path("approvedSources").isObject() || !authority.path("approvedActions").isArray() || !authority.path("permissions").isArray()) throw authorityInvalid();
+        Map<String, String> sources = new HashMap<>(); authority.path("approvedSources").fields().forEachRemaining(entry -> {
+            if (!entry.getValue().isTextual()) throw authorityInvalid(); sources.put(entry.getKey(), entry.getValue().asText());
+        });
+        Set<String> actions = new java.util.HashSet<>(), permissions = new java.util.HashSet<>();
+        authority.path("approvedActions").forEach(value -> { if (!value.isTextual() || !actions.add(value.asText())) throw authorityInvalid(); });
+        authority.path("permissions").forEach(value -> { if (!value.isTextual() || !permissions.add(value.asText())) throw authorityInvalid(); });
+        if (!sources.equals(installedSources) || !actions.equals(installedActions) || !permissions.equals(NativeCalibrationApproval.READ_PERMISSIONS)) throw authorityInvalid();
+        ObjectNode facts = NativeSourceFacts.observe(server, Long.toString(registryGeneration), environment(), current::run); current.run();
+        if (!pending.factsDigest().equals(NativeProfileAdmission.sourceDigest(facts))
+                || !pending.hostArtifactDigest().equals(artifactDigest(container("mmmm_host")))) throw new ContractException("TARGET_DRIFT", "PACK run 승인 대기 중 실제 runtime source가 바뀌었습니다");
+        ObjectNode manifest = ContractJson.object(authority.path("manifest")), inner = ContractJson.object(manifest.path("plan"));
+        HostDispatcher.exactFields(manifest, Set.of("kind", "purpose", "selectionDigest", "hostEpoch", "registryGeneration", "runtimeSourceFactsDigest",
+                "programDigest", "sourceBundleDigest", "sourceZipResource", "sourceOrigin", "plan", "targetId", "stepGuards"));
+        if (!"native_pack_calibration_run_approval/1".equals(manifest.path("kind").asText())
+                || !NativePackCalibrationRun.PURPOSE.equals(manifest.path("purpose").asText())
+                || !offer.path("planId").equals(inner.path("planId")) || !offer.path("planHash").equals(inner.path("planHash"))
+                || !offer.path("projectId").equals(inner.path("projectId")) || !offer.path("principalId").equals(inner.path("principalId"))
+                || !inner.path("steps").isArray() || inner.path("steps").size() != 3
+                || !inner.path("nativeExecutions").isArray() || !inner.path("nativeExecutions").isEmpty()
+                || !pending.factsDigest().equals(manifest.path("runtimeSourceFactsDigest").asText())
+                || !Long.toString(pending.generation()).equals(manifest.path("registryGeneration").asText())) throw authorityInvalid();
+        for (JsonNode step : inner.path("steps")) {
+            current.run(); ObjectNode descriptor = pending.runtime().describe(step.path("bindingId").asText(), step.path("actionId").asText());
+            if (!"mmmm:command_execute".equals(step.path("actionId").asText())
+                    || !pending.hostArtifactDigest().equals(step.path("implementationDigest").asText())
+                    || !ContractJson.digest(descriptor).equals(step.path("actionDigest").asText())) throw authorityInvalid();
+        }
+        NativeCalibrationBootstrap.Attempt sourceAttempt = retainedPackSource(ContractJson.object(manifest.path("sourceOrigin")));
+        if (!sourceAttempt.sourceBundleDigest().equals(manifest.path("sourceBundleDigest").asText())) throw authorityInvalid();
+        for (ObjectNode context : contexts) checkPackSourceScope(sourceAttempt, previous, context);
+        HostSession approved = new HostSession(previous.principalRef(), previous.epoch(), previous.gameInstanceId(), previous.side(), playerId, permissions, false);
+        NativePackCalibrationRun grant;
+        try {
+            contexts.forEach(context -> approved.installContext(contracts, context));
+            grant = new NativePackCalibrationRun(contracts, manifest, approved, Clock.systemUTC(), this::gameTask,
+                    this::checkPackRunCurrent, invocation -> retainAcceptedPackRun(approved, invocation), server,
+                    () -> player(approved), this::level, sourceAttempt, this::retainPackRunEvidenceBytes);
+            approved.whenClosed(() -> { definitionCollection.retire(approved); grant.close(); });
+        } catch (RuntimeException | Error failure) { approved.close(); throw failure; }
+        PairedLoopbackServer listener = null;
+        try {
+            current.run();
+            listener = new PairedLoopbackServer(approved, new HostDispatcher(contracts, pending.runtime(), this::inspect, Clock.systemUTC(), grant), bearer);
+            current.run();
+            synchronized (routes) {
+                if (routes.size() >= 8) throw new ContractException("SESSION_LIMIT", "현재 immutable route 한도가 찼습니다");
+                routes.put(approved, new SessionRoute(listener, null, facts.deepCopy(), null, null, null, null, grant, pending.runtime()));
+                routeOrder.add(approved); session = approved; endpoint = listener;
+            }
+            original.run(); checkPackRunCurrent(approved, contexts.getFirst(), original, true); return listener.endpoint();
+        } catch (IOException | RuntimeException | Error failure) {
+            try { if (listener != null) listener.close(); } catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+            try { approved.close(); } catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+            synchronized (routes) {
+                routes.remove(approved); routeOrder.remove(approved);
+                if (session == approved) { session = previous; SessionRoute old = routes.get(previous); endpoint = old == null ? null : old.endpoint(); }
+            }
+            throw failure;
+        }
+    }
+
+    void confirmPackRunApproval(String address, ObjectNode offer, String selectionDigest, String manifestDigest, Runnable original) {
+        original.run(); requireServerThread(); HostSession paired = null;
+        synchronized (routes) {
+            for (var entry : routes.entrySet()) if (entry.getValue().packRun() != null && entry.getValue().endpoint().endpoint().equals(address)) {
+                paired = entry.getKey(); break;
+            }
+        }
+        if (paired == null) throw authorityInvalid(); NativePackCalibrationRun grant = sessionRoute(paired).packRun();
+        if (!NativePackCalibrationRun.PURPOSE.equals(offer.path("purpose").asText())
+                || !offer.path("principalId").asText().equals(paired.principalRef())
+                || !offer.path("hostHello").equals(runtime.hello())) throw authorityInvalid();
+        ObjectNode context = paired.context(offer.path("contextIds").get(0).asText());
+        checkPackRunCurrent(paired, context, original, true);
+        grant.activateAfterBridge(paired, selectionDigest, manifestDigest, original);
+        checkPackRunCurrent(paired, context, original, true);
+    }
+
+    private NativeCalibrationBootstrap.Attempt retainedPackSource(ObjectNode origin) {
+        requireServerThread(); HostDispatcher.exactFields(origin, Set.of("operationId", "invocationId", "invocationDigest", "frozenManifestDigest"));
+        NativeCalibrationBootstrap.Attempt actual = bootstrapAttempts.get(HostDispatcher.string(origin, "invocationId"));
+        if (actual == null || actual.purpose() != NativeCalibrationBootstrap.Purpose.PACK_CASE
+                || !actual.original().operationId().equals(HostDispatcher.string(origin, "operationId"))
+                || !actual.invocationDigest().equals(HostDispatcher.string(origin, "invocationDigest"))
+                || !actual.frozenManifestDigest().equals(HostDispatcher.string(origin, "frozenManifestDigest"))) throw authorityInvalid();
+        actual.requireActualOwner(server, gameInstanceId, worldId); return actual;
+    }
+
+    private void checkPackSourceScope(NativeCalibrationBootstrap.Attempt source, HostSession paired, ObjectNode context) {
+        source.requireActualOwner(server, gameInstanceId, worldId); source.requireScope(context);
+        ObjectNode before = source.original().context();
+        if (!paired.principalRef().equals(before.path("principalRef").asText())
+                || !paired.principalRef().equals(context.path("principalRef").asText())
+                || !before.path("projectId").equals(context.path("projectId"))
+                || !before.path("dimension").equals(context.path("dimension"))) throw authorityInvalid();
+    }
+
+    private void checkPackRunCurrent(HostSession paired, ObjectNode context, Runnable original, boolean observeSources) {
+        original.run(); requireServerThread(); paired.checkOpen(); SessionRoute route = sessionRoute(paired);
+        NativePackCalibrationRun grant = route.packRun();
+        if (grant == null || runtime != route.packRunRuntime() || paired.verifiedWriteProfile() || !epoch.equals(paired.epoch())
+                || !Long.toString(registryGeneration).equals(grant.registryGeneration()) || !gameInstanceId.equals(paired.gameInstanceId())
+                || !context.equals(paired.context(context.path("contextId").asText()))
+                || !worldId.equals(context.path("environment").path("worldId").asText()) || !"server".equals(paired.side())) throw authorityInvalid();
+        checkPackSourceScope(grant.sourceAttempt(), paired, context); ServerPlayer player = player(paired);
+        if (!context.path("executorHandle").asText().equals("player-" + paired.playerId())
+                || !player.level().dimension().identifier().toString().equals(context.path("dimension").asText())
+                || player.createCommandSourceStack().getPermissionContext().permissionLevel() != PermissionLevel.ADMINS)
+            throw new ContractException("PERMISSION_DENIED", "현재 실제 PACK run ADMIN 또는 실행 context 권한이 끝났습니다");
+        if (observeSources) {
+            ObjectNode facts = NativeSourceFacts.observe(server, Long.toString(registryGeneration), environment(),
+                    () -> checkPackRunCurrent(paired, context, original, false));
+            if (sessionRoute(paired) != route || runtime != route.packRunRuntime()
+                    || !grant.runtimeSourceFactsDigest().equals(NativeProfileAdmission.sourceDigest(facts))
+                    || !installedSources.getOrDefault("mmmm_host", "").equals(artifactDigest(container("mmmm_host"))))
+                throw new ContractException("TARGET_DRIFT", "원 PACK run source pin이 현재 게임과 다릅니다");
+        }
+        original.run();
+    }
+
+    private void retainAcceptedPackRun(HostSession paired, Invocation invocation) {
+        requireServerThread(); NativePackCalibrationRun grant = sessionRoute(paired).packRun();
+        if (grant == null) throw authorityInvalid(); checkPackSourceScope(grant.sourceAttempt(), paired, invocation.context());
+        synchronized (routes) {
+            RetainedPackRun previous = packRunInvocations.get(invocation.invocationId());
+            if (previous != null) {
+                if (previous.owner() != grant || !previous.original().wire().equals(invocation.wire())) throw authorityInvalid(); return;
+            }
+            if (bootstrapAttempts.containsKey(invocation.invocationId())
+                    || nativeHistory.values().stream().anyMatch(history -> history.containsKey(invocation.invocationId()))) throw authorityInvalid();
+            NativePackCalibrationRun operationOwner = packRunOperations.get(invocation.operationId());
+            if (operationOwner != null && operationOwner != grant) throw authorityInvalid();
+            if (operationOwner == null && bootstrapAttempts.size() + packRunOperations.size() >= 8)
+                throw new ContractException("CALIBRATION_RUN_HISTORY_FULL", "Actual bootstrap/run history is full; retained evidence cannot be evicted");
+            int bytes = ContractJson.bytes(invocation.wire()).length;
+            if (nativeHistoryCount >= 512 || nativeHistoryBytes > 32L * 1024 * 1024 - bytes)
+                throw new ContractException("HOST_HISTORY_FULL", "원 PACK Invocation 자료의 보존 한도가 찼습니다");
+            String key = invocationRouteKey(invocation); HostSession owner = invocationRoutes.putIfAbsent(key, paired);
+            if (owner != null && owner != paired) throw new ContractException("SESSION_ROUTE_CHANGED", "원 PACK Invocation의 route를 바꿀 수 없습니다");
+            nativeHistory.computeIfAbsent(paired, ignored -> new HashMap<>()).put(invocation.invocationId(), invocation);
+            packRunOperations.put(invocation.operationId(), grant); packRunInvocations.put(invocation.invocationId(), new RetainedPackRun(grant, invocation));
+            nativeHistoryCount++; persistentHistoryCount++; nativeHistoryBytes += bytes; persistentHistoryBytes += bytes;
+        }
+    }
+
+    private void retainPackRunEvidenceBytes(long additionalBytes) {
+        requireServerThread();
+        synchronized (routes) {
+            if (additionalBytes < 0 || additionalBytes > 32L * 1024 * 1024 || nativeHistoryBytes > 32L * 1024 * 1024 - additionalBytes)
+                throw new ContractException("HOST_HISTORY_FULL", "원 PACK 관측 자료의 공유 보존 한도가 찼습니다");
+            nativeHistoryBytes += additionalBytes; persistentHistoryBytes += additionalBytes;
+        }
+    }
+
+    private RetainedPackRun retainedPackRun(ObjectNode payload) {
+        requireServerThread(); RetainedPackRun actual = packRunInvocations.get(HostDispatcher.string(payload, "invocationId"));
+        if (actual == null || !ContractJson.digest(actual.original().wire()).equals(HostDispatcher.string(payload, "invocationDigest")))
+            throw new ContractException("CALIBRATION_RUN_ISSUER_UNAVAILABLE", "The actual original PACK Invocation is not retained");
+        return actual;
+    }
+
+    private Runnable packRunReadonlyCurrent(HostSession paired, ObjectNode context, HostDispatcher.InspectionControl control,
+                                            CompletableFuture<ObjectNode> result, NativeCalibrationBootstrap.Attempt source) {
+        requireServerThread(); SessionRoute actualRoute = sessionRoute(paired); MinecraftServer actualServer = server;
+        HostRuntime actualRuntime = runtime; long actualGeneration = registryGeneration;
+        return () -> {
+            control.checkpoint(); requireServerThread(); paired.checkOpen();
+            if (result.isDone() || sessionRoute(paired) != actualRoute || server != actualServer || runtime != actualRuntime
+                    || registryGeneration != actualGeneration || !context.path("contextId").asText().equals(completedReadonlyPairings.get(paired))
+                    || !context.equals(paired.context(context.path("contextId").asText()))) throw authorityInvalid();
+            checkPackSourceScope(source, paired, context);
+            if (player(paired).createCommandSourceStack().getPermissionContext().permissionLevel() != PermissionLevel.ADMINS) throw authorityInvalid();
+            new PlatformAuthority(null).check(paired, context, Set.of("mmmm:world_read"), false); control.checkpoint();
+        };
     }
 
     /** Called only after the ordinary private bridge has consumed and checked its actual completion reply. */
@@ -901,7 +1177,7 @@ public final class MmmmFabricHost implements ModInitializer {
                 || !expectedEpoch.equals(completed.path("hostEpoch").asText()) || !completed.path("ready").isBoolean()
                 || !completed.path("ready").booleanValue() || !ContractJson.VERSION.equals(completed.path("protocolVersion").asText())
                 || !actual.context(completed.path("contextId").asText()).path("contextId").equals(completed.path("contextId"))
-                || route.bootstrap() != null || route.calibration() != null || route.approval() != null
+                || route.bootstrap() != null || route.calibration() != null || route.approval() != null || route.packRun() != null
                 || player(actual).createCommandSourceStack().getPermissionContext().permissionLevel() != PermissionLevel.ADMINS) throw authorityInvalid();
         original.run(); completedReadonlyPairings.put(actual, completed.path("contextId").asText()); original.run();
     }
@@ -1165,6 +1441,89 @@ public final class MmmmFabricHost implements ModInitializer {
                             (installed, step, index, parsed, admitted) -> {
                                 throw new ContractException("NATIVE_READONLY_GUARD_UNAVAILABLE", "No admitted loaded-definition parser closure is installed");
                             }));
+                } else if ("pack_calibration_run_readiness".equals(kind)) {
+                    HostDispatcher.exactFields(payload, Set.of("kind", "invocationId", "invocationDigest", "sourceBundleDigest", "frozenManifestDigest"));
+                    NativeCalibrationBootstrap.Attempt attempt = bootstrapAttempts.get(HostDispatcher.string(payload, "invocationId"));
+                    if (attempt == null || attempt.purpose() != NativeCalibrationBootstrap.Purpose.PACK_CASE
+                            || !attempt.invocationDigest().equals(HostDispatcher.string(payload, "invocationDigest"))
+                            || !attempt.sourceBundleDigest().equals(HostDispatcher.string(payload, "sourceBundleDigest"))
+                            || !attempt.frozenManifestDigest().equals(HostDispatcher.string(payload, "frozenManifestDigest"))) throw authorityInvalid();
+                    Runnable current = packRunReadonlyCurrent(paired, context, control, result, attempt);
+                    result.complete(NativeCalibrationFunctions.checked(() -> {
+                        current.run();
+                        ObjectNode facts = collectSourceFacts(paired, context, control, result, required);
+                        String digest = NativeProfileAdmission.sourceDigest(facts), hostDigest = artifactDigest(container("mmmm_host"));
+                        String generation = Long.toString(registryGeneration);
+                        Clock actualClock = Clock.systemUTC();
+                        NativeCalibrationBootstrap.PackRunReadiness actual = attempt.packRunInitialReadiness(server,
+                                level(context.path("dimension").asText()), paired, context, current, actualClock);
+                        byte[] receipt = actual.receipt();
+                        if (receipt.length == 0 || receipt.length > 64 * 1024) throw new ContractException("INPUT_LIMIT", "PACK readiness receipt exceeds its transport limit");
+                        ObjectNode observation = ContractJson.newObject().put("format", "mmmm.native.pack-run-readiness/1")
+                                .put("receiptBytesHex", HexFormat.of().formatHex(receipt));
+                        observation.set("targetImages", actual.targetImages(facts, hostDigest, generation, actualClock));
+                        ObjectNode after = collectSourceFacts(paired, context, control, result, required);
+                        if (!digest.equals(NativeProfileAdmission.sourceDigest(after)) || !hostDigest.equals(artifactDigest(container("mmmm_host")))
+                                || !generation.equals(Long.toString(registryGeneration))) throw new ContractException("TARGET_DRIFT", "Actual PACK source changed during readiness and initial target capture");
+                        if (ContractJson.bytes(observation).length > 256 * 1024) throw new ContractException("INPUT_LIMIT", "PACK readiness and target images exceed their total transport limit");
+                        return observation;
+                    }, current));
+                } else if ("pack_calibration_run_source".equals(kind)) {
+                    HostDispatcher.exactFields(payload, Set.of("kind", "invocationId", "invocationDigest", "expectedRuntimeSourceFactsDigest", "expectedRegistryGeneration"));
+                    RetainedPackRun retained = retainedPackRun(payload);
+                    Runnable current = packRunReadonlyCurrent(paired, context, control, result, retained.owner().sourceAttempt());
+                    result.complete(NativeCalibrationFunctions.checked(() -> {
+                        ObjectNode facts = collectSourceFacts(paired, context, control, result, required);
+                        String digest = NativeProfileAdmission.sourceDigest(facts), hostDigest = artifactDigest(container("mmmm_host"));
+                        String generation = Long.toString(registryGeneration);
+                        ObjectNode observation = new NativePackCalibrationSource(contracts).inspect(context, facts, hostDigest, generation, payload,
+                                retained.original(), (installed, id) -> {
+                                    if (!context.equals(installed) || !retained.original().invocationId().equals(id)) throw authorityInvalid();
+                                    return retained.owner().lookupRetained(retained.original(), current);
+                                }, current);
+                        ObjectNode after = collectSourceFacts(paired, context, control, result, required);
+                        if (!digest.equals(NativeProfileAdmission.sourceDigest(after)) || !hostDigest.equals(artifactDigest(container("mmmm_host")))
+                                || !generation.equals(Long.toString(registryGeneration))) throw new ContractException("TARGET_DRIFT", "Actual PACK source changed during the fresh source query");
+                        return observation;
+                    }, current));
+                } else if ("pack_calibration_run_target_state".equals(kind)) {
+                    final NativePackCalibrationRun owner;
+                    final Runnable current;
+                    final Supplier<NativePackCalibrationRun.IndependentObjectiveImage> read;
+                    if (payload.has("planId") || payload.has("planHash")) {
+                        HostDispatcher.exactFields(payload, Set.of("kind", "planId", "planHash"));
+                        SessionRoute actualRoute = sessionRoute(paired); owner = actualRoute.packRun();
+                        if (owner == null || !owner.planId().equals(HostDispatcher.string(payload, "planId"))
+                                || !owner.planHash().equals(HostDispatcher.string(payload, "planHash"))) throw authorityInvalid();
+                        MinecraftServer actualServer = server; HostRuntime actualRuntime = runtime; long actualGeneration = registryGeneration;
+                        current = () -> {
+                            control.checkpoint(); requireServerThread(); paired.checkOpen();
+                            if (result.isDone() || sessionRoute(paired) != actualRoute || server != actualServer || runtime != actualRuntime
+                                    || registryGeneration != actualGeneration) throw authorityInvalid();
+                            checkPackRunCurrent(paired, context, control::checkpoint, false); control.checkpoint();
+                        };
+                        read = () -> owner.observePlanState(context, paired, current);
+                    } else {
+                        HostDispatcher.exactFields(payload, Set.of("kind", "invocationId", "invocationDigest"));
+                        RetainedPackRun retained = retainedPackRun(payload); owner = retained.owner();
+                        current = packRunReadonlyCurrent(paired, context, control, result, owner.sourceAttempt());
+                        read = () -> owner.observeState(retained.original(), context, paired, current);
+                    }
+                    result.complete(NativeCalibrationFunctions.checked(() -> {
+                        ObjectNode facts = collectSourceFacts(paired, context, control, result, required);
+                        String digest = NativeProfileAdmission.sourceDigest(facts), hostDigest = artifactDigest(container("mmmm_host"));
+                        String generation = Long.toString(registryGeneration);
+                        if (!digest.equals(owner.runtimeSourceFactsDigest()) || !hostDigest.equals(owner.hostArtifactDigest())
+                                || !generation.equals(owner.registryGeneration())) throw new ContractException("TARGET_DRIFT", "The retained PACK run pins differ from the actual current read source");
+                        var actual = read.get();
+                        ObjectNode observation = NativePackCalibrationSource.targetImages(actual, current);
+                        ObjectNode after = collectSourceFacts(paired, context, control, result, required);
+                        if (!digest.equals(NativeProfileAdmission.sourceDigest(after)) || !hostDigest.equals(artifactDigest(container("mmmm_host")))
+                                || !generation.equals(Long.toString(registryGeneration))
+                                || !digest.equals(owner.runtimeSourceFactsDigest()) || !hostDigest.equals(owner.hostArtifactDigest())
+                                || !generation.equals(owner.registryGeneration())) throw new ContractException("TARGET_DRIFT", "Actual PACK source changed during the independent target read");
+                        return observation;
+                    }, current));
                 } else if ("calibration_bootstrap_successor".equals(kind)) {
                     HostDispatcher.exactFields(payload, Set.of("kind", "invocationId", "invocationDigest", "sourceBundleDigest", "frozenManifestDigest"));
                     NativeCalibrationBootstrap.Attempt attempt = bootstrapAttempts.get(HostDispatcher.string(payload, "invocationId"));
@@ -1851,7 +2210,7 @@ public final class MmmmFabricHost implements ModInitializer {
             oldCompatibility = compatibilityApprovals; compatibilityApprovals = null;
             oldMetadata = compatibilityMetadataResolver; compatibilityMetadataResolver = null;
             owners.forEach(HostSession::close); if (oldSession != null) oldSession.close();
-            routes.clear(); routeOrder.clear(); calibrationOffers.clear(); bootstrapOffers.clear(); nativeHistory.clear(); nativeHistoryCount = 0; nativeHistoryBytes = 0;
+            routes.clear(); routeOrder.clear(); calibrationOffers.clear(); bootstrapOffers.clear(); packRunOffers.clear(); nativeHistory.clear(); nativeHistoryCount = persistentHistoryCount; nativeHistoryBytes = persistentHistoryBytes;
             completedReadonlyPairings.clear();
             invocationRoutes.clear(); installedSources = Map.of(); installedActions = Set.of(); installedContexts = List.of();
             endpoint = null; runtime = null; session = null;

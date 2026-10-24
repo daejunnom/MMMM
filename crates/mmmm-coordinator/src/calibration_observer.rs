@@ -1062,6 +1062,15 @@ fn decode_nbt(value: &Value, check: &dyn Fn() -> AppResult<()>) -> AppResult<Tag
     Ok(tag)
 }
 
+/// Reuse the exact bounded native NBT and floating-bit sidecar decoder. This
+/// pure byte relation issues no acquisition, source or execution authority.
+pub(crate) fn decode_native_nbt(
+    value: &Value,
+    check: &dyn Fn() -> AppResult<()>,
+) -> AppResult<Tag> {
+    decode_nbt(value, check)
+}
+
 /// A pure persisted-byte decoder, shared with the native display reader. It
 /// issues no acquisition, source, completeness or current-authority witness.
 pub(crate) fn decode_persisted_named_nbt(

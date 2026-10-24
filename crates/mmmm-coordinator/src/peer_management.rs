@@ -6,9 +6,9 @@
 
 use crate::credential::SecretToken;
 use mmmm_contracts::{
-    ContextId, ContractValidator, InstanceId, JsonLimits, NodeId, PatchId, PlanId, PrincipalId,
-    ProjectId, RequestId, ResourceId, ResourceLocation, SessionEpoch, Sha256Digest, SourceId,
-    canonical_digest, parse_json_with_limits, verify_projected_digest,
+    ContextId, ContractValidator, InstanceId, JsonLimits, NodeId, OperationId, PatchId, PlanId,
+    PrincipalId, ProjectId, RequestId, ResourceId, ResourceLocation, SessionEpoch, Sha256Digest,
+    SourceId, canonical_digest, parse_json_with_limits, verify_projected_digest,
 };
 use serde_json::{Map, Value};
 use std::{
@@ -329,25 +329,29 @@ fn validate_public(value: &Value) -> Result<ManagementKind, ManagementError> {
             Ok(ManagementKind::Authority)
         }
         "native_calibration_plan_offer" => {
-            exact(
-                object,
-                &[
-                    "kind",
-                    "protocolVersion",
-                    "nonce",
-                    "purpose",
-                    "dataRoot",
-                    "projectId",
-                    "expectedRevision",
-                    "contextId",
-                ],
-            )?;
             let purpose = text(value, "purpose")?;
             if purpose != CALIBRATION_PLAN_PURPOSE
                 && !crate::calibration_bootstrap::is_purpose(purpose)
+                && purpose != crate::calibration_pack_run::PURPOSE
             {
                 return Err(ManagementError::InvalidFrame);
             }
+            let mut fields = vec![
+                "kind",
+                "protocolVersion",
+                "nonce",
+                "purpose",
+                "dataRoot",
+                "projectId",
+                "expectedRevision",
+                "contextId",
+            ];
+            if purpose == crate::calibration_pack_run::PURPOSE {
+                fields.push("originBootstrapOperation");
+                OperationId::new(text(value, "originBootstrapOperation")?)
+                    .map_err(|_| ManagementError::InvalidFrame)?;
+            }
+            exact(object, &fields)?;
             let root = text(value, "dataRoot")?;
             if root.len() > 4096
                 || root.chars().any(char::is_control)
@@ -376,7 +380,8 @@ fn validate_public(value: &Value) -> Result<ManagementKind, ManagementError> {
             )?;
             let purpose = text(value, "purpose")?;
             if (purpose != CALIBRATION_PLAN_PURPOSE
-                && !crate::calibration_bootstrap::is_purpose(purpose))
+                && !crate::calibration_bootstrap::is_purpose(purpose)
+                && purpose != crate::calibration_pack_run::PURPOSE)
                 || !matches!(
                     text(value, "outcome")?,
                     "prepared" | "committed_checkpoint_failed"
@@ -1215,10 +1220,40 @@ mod tests {
             CALIBRATION_PLAN_PURPOSE,
             crate::calibration_bootstrap::PURPOSE,
             crate::calibration_bootstrap::PACK_PURPOSE,
+            crate::calibration_pack_run::PURPOSE,
         ] {
-            let planning = json!({"kind":"native_calibration_plan_offer","protocolVersion":"0.2.0","nonce":"plan-calibration",
+            let mut planning = json!({"kind":"native_calibration_plan_offer","protocolVersion":"0.2.0","nonce":"plan-calibration",
             "purpose":purpose,"dataRoot":std::env::temp_dir(),"projectId":"project-fixture",
             "expectedRevision":"a".repeat(64),"contextId":"context-fixture"});
+            if purpose == crate::calibration_pack_run::PURPOSE {
+                planning["originBootstrapOperation"] = json!("operation-pack-bootstrap");
+                let mut missing = planning.clone();
+                missing
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("originBootstrapOperation");
+                assert!(PublicFrame::from_value(missing).is_err());
+                for origin in [json!(null), json!(true), json!(""), json!("../bootstrap")] {
+                    let mut forged = planning.clone();
+                    forged["originBootstrapOperation"] = origin;
+                    assert!(PublicFrame::from_value(forged).is_err());
+                }
+                let first =
+                    HostOffer::calibration_plan(PublicFrame::from_value(planning.clone()).unwrap())
+                        .unwrap();
+                let mut changed = planning.clone();
+                changed["originBootstrapOperation"] = json!("other-pack-bootstrap");
+                let second =
+                    HostOffer::calibration_plan(PublicFrame::from_value(changed).unwrap()).unwrap();
+                assert_ne!(
+                    first.witness().offer_digest(),
+                    second.witness().offer_digest()
+                );
+            } else {
+                let mut forged = planning.clone();
+                forged["originBootstrapOperation"] = json!("operation-pack-bootstrap");
+                assert!(PublicFrame::from_value(forged).is_err());
+            }
             let plan_offer =
                 HostOffer::calibration_plan(PublicFrame::from_value(planning.clone()).unwrap())
                     .unwrap();
@@ -1250,6 +1285,7 @@ mod tests {
             for (field, replacement) in [
                 ("purpose", json!("world_write")),
                 ("purpose", json!("pack_calibration_bootstrap/2")),
+                ("purpose", json!("pack_calibration_run/2")),
                 ("expectedRevision", json!("A".repeat(64))),
                 ("dataRoot", json!("relative")),
                 ("contextId", json!("")),
@@ -1271,39 +1307,44 @@ mod tests {
             prepared["outcome"] = json!("rollback_complete");
             assert!(PublicFrame::from_value(prepared).is_err());
         }
-        let value = json!({"kind":"native_calibration_owner_offer","protocolVersion":"0.2.0","nonce":"owner-calibration",
-            "purpose":crate::bootstrap::calibration_approval::PURPOSE,"dataRoot":std::env::temp_dir(),
-            "projectId":"project-fixture","planId":"plan-fixture","planHash":"a".repeat(64)});
-        let owner =
-            HostOffer::owner_selection(PublicFrame::from_value(value.clone()).unwrap()).unwrap();
-        assert!(owner.into_parts().1.is_none());
-        assert!(
-            HostOffer::new(
-                PublicFrame::from_value(value.clone()).unwrap(),
-                SecretToken::generate().unwrap()
-            )
-            .is_err()
-        );
-        for field in [
-            "principalId",
-            "admin",
-            "verifiedWriteProfile",
-            "manifest",
-            "capability",
+        for purpose in [
+            crate::bootstrap::calibration_approval::PURPOSE,
+            crate::calibration_pack_run::PURPOSE,
         ] {
-            let mut forged = value.clone();
-            forged[field] = json!(true);
-            assert!(PublicFrame::from_value(forged).is_err());
+            let value = json!({"kind":"native_calibration_owner_offer","protocolVersion":"0.2.0","nonce":"owner-calibration",
+            "purpose":purpose,"dataRoot":std::env::temp_dir(),
+            "projectId":"project-fixture","planId":"plan-fixture","planHash":"a".repeat(64)});
+            let owner = HostOffer::owner_selection(PublicFrame::from_value(value.clone()).unwrap())
+                .unwrap();
+            assert!(owner.into_parts().1.is_none());
+            assert!(
+                HostOffer::new(
+                    PublicFrame::from_value(value.clone()).unwrap(),
+                    SecretToken::generate().unwrap()
+                )
+                .is_err()
+            );
+            for field in [
+                "principalId",
+                "admin",
+                "verifiedWriteProfile",
+                "manifest",
+                "capability",
+            ] {
+                let mut forged = value.clone();
+                forged[field] = json!(true);
+                assert!(PublicFrame::from_value(forged).is_err());
+            }
+            let mut wrong = value.clone();
+            wrong["purpose"] = json!("world_write");
+            assert!(PublicFrame::from_value(wrong).is_err());
+            let mut wrong = value.clone();
+            wrong["planHash"] = json!("A".repeat(64));
+            assert!(PublicFrame::from_value(wrong).is_err());
+            let mut wrong = value;
+            wrong["dataRoot"] = json!("relative");
+            assert!(PublicFrame::from_value(wrong).is_err());
         }
-        let mut wrong = value.clone();
-        wrong["purpose"] = json!("world_write");
-        assert!(PublicFrame::from_value(wrong).is_err());
-        let mut wrong = value.clone();
-        wrong["planHash"] = json!("A".repeat(64));
-        assert!(PublicFrame::from_value(wrong).is_err());
-        let mut wrong = value;
-        wrong["dataRoot"] = json!("relative");
-        assert!(PublicFrame::from_value(wrong).is_err());
         let duplicate=br#"{"kind":"native_calibration_owner_offer","protocolVersion":"0.2.0","nonce":"one","nonce":"two","purpose":"numeric_calibration_normative47/1","dataRoot":"/tmp","projectId":"project-fixture","planId":"plan-fixture","planHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
         assert!(PublicFrame::decode(duplicate).is_err());
     }

@@ -10,6 +10,7 @@ use crate::{
         BootstrapAccess, BootstrapPreflight, BootstrapRegistry, EnteredBootstrap,
     },
     calibration_execution::{CalibrationAccess, CalibrationRegistry, EnteredCalibration},
+    calibration_pack_run::{EnteredPackRun, PackRunAccess, PackRunPreflight},
     host::{
         DependencyProvenance, HostBridge, HostContextWitness, HttpProviderPort, VerifiedDependency,
     },
@@ -339,6 +340,18 @@ impl CompositeProvider {
         }
         if let Some(entered) =
             self.shared
+                .enter_pack_run(store, &request, invocation, PackRunAccess::Cancel)?
+        {
+            entered.verify_claim(store, invocation)?;
+            let result = entered
+                .route()
+                .cancel_with_store(store, &request, invocation, &|store| {
+                    entered.check_local(store)
+                });
+            return finish_native_observation(result, entered.check_local(store));
+        }
+        if let Some(entered) =
+            self.shared
                 .enter_calibration(store, &request, invocation, CalibrationAccess::Cancel)?
         {
             entered.verify_claim(store, invocation)?;
@@ -391,6 +404,23 @@ impl Shared {
     ) -> AppResult<Option<EnteredCalibration<'a>>> {
         let operation: OperationId = decode(&original["operationId"])?;
         self.calibration.enter(
+            store,
+            request,
+            &self.authority,
+            &operation,
+            original,
+            access,
+        )
+    }
+    fn enter_pack_run<'a>(
+        &'a self,
+        store: &DurableStore,
+        request: &'a RequestContextWitness,
+        original: &Value,
+        access: PackRunAccess,
+    ) -> AppResult<Option<EnteredPackRun<'a>>> {
+        let operation: OperationId = decode(&original["operationId"])?;
+        self.calibration.pack_runs().enter(
             store,
             request,
             &self.authority,
@@ -1290,6 +1320,9 @@ impl ProviderPort for CompositeProvider {
                 condition,
             );
         }
+        if self.shared.calibration.pack_runs().matches_plan(plan)? {
+            return Err(store_required());
+        }
         if self.shared.calibration.matches_plan(plan)? {
             return Err(store_required());
         }
@@ -1327,6 +1360,25 @@ impl ProviderPort for CompositeProvider {
         conditions: &[&Value],
         context: &Value,
     ) -> AppResult<Option<Vec<Sha256Digest>>> {
+        if self.shared.calibration.pack_runs().matches_plan(plan)? {
+            let request = self.shared.calibration_request()?;
+            return self
+                .shared
+                .calibration
+                .pack_runs()
+                .preconditions(
+                    store,
+                    &request,
+                    &self.shared.authority,
+                    PackRunPreflight {
+                        plan,
+                        step,
+                        context,
+                    },
+                    conditions,
+                )
+                .map(Some);
+        }
         if !self.shared.bootstrap.matches_plan(plan)? {
             return Ok(None);
         }
@@ -1361,6 +1413,20 @@ impl ProviderPort for CompositeProvider {
                 &request,
                 &self.shared.authority,
                 BootstrapPreflight {
+                    plan,
+                    step,
+                    context,
+                },
+                condition,
+            );
+        }
+        if self.shared.calibration.pack_runs().matches_plan(plan)? {
+            let request = self.shared.calibration_request()?;
+            return self.shared.calibration.pack_runs().precondition(
+                store,
+                &request,
+                &self.shared.authority,
+                PackRunPreflight {
                     plan,
                     step,
                     context,
@@ -1470,6 +1536,24 @@ impl ProviderPort for CompositeProvider {
         }
         if let Some(entered) =
             self.shared
+                .enter_pack_run(store, &request, invocation, PackRunAccess::Apply)?
+        {
+            if &entered.operation().operation_id != operation {
+                return Err(stale());
+            }
+            return entered.persist_intent(
+                store,
+                step,
+                invocation,
+                resolution,
+                &mut |route, request, original, store| {
+                    let _ = (route, request, original);
+                    crate::calibration_pack_observer::check_prepared_capture(&entered, store)
+                },
+            );
+        }
+        if let Some(entered) =
+            self.shared
                 .enter_calibration(store, &request, invocation, CalibrationAccess::Apply)?
         {
             if &entered.operation().operation_id != operation {
@@ -1506,6 +1590,19 @@ impl ProviderPort for CompositeProvider {
                 .enter_bootstrap(store, &request, invocation, BootstrapAccess::Apply)?
         {
             return entered.dispatch(store);
+        }
+        if let Some(entered) =
+            self.shared
+                .enter_pack_run(store, &request, invocation, PackRunAccess::Apply)?
+        {
+            entered.verify_claim(store, invocation)?;
+            let result =
+                entered
+                    .route()
+                    .dispatch_with_store(store, &request, invocation, &|store| {
+                        entered.check_local(store)
+                    });
+            return finish_native_observation(result, entered.check_local(store));
         }
         if let Some(entered) =
             self.shared
@@ -1612,6 +1709,19 @@ impl ProviderPort for CompositeProvider {
                 .enter_bootstrap(store, &request, invocation, BootstrapAccess::Observe)?
         {
             return entered.poll(store, receipt);
+        }
+        if let Some(entered) =
+            self.shared
+                .enter_pack_run(store, &request, invocation, PackRunAccess::Observe)?
+        {
+            entered.verify_claim(store, invocation)?;
+            let result =
+                entered
+                    .route()
+                    .poll_with_store(store, &request, invocation, receipt, &|store| {
+                        entered.check_local(store)
+                    });
+            return finish_native_observation(result, entered.check_local(store));
         }
         if let Some(entered) = self.shared.enter_calibration(
             store,
@@ -2020,6 +2130,21 @@ impl IndependentObserverPort for CompositeObserver {
                 target,
             );
         }
+        if self
+            .shared
+            .calibration
+            .pack_runs()
+            .handles_original(invocation)?
+        {
+            let request = self.shared.calibration_request()?;
+            return self.shared.calibration.pack_runs().validate_capture_target(
+                &request,
+                &self.shared.authority,
+                invocation,
+                scope,
+                target,
+            );
+        }
         self.shared.call(&invocation["context"])?;
         if registered_direct_block(invocation) {
             return self
@@ -2044,6 +2169,13 @@ impl IndependentObserverPort for CompositeObserver {
         if self
             .shared
             .enter_bootstrap(store, &request, invocation, BootstrapAccess::Apply)?
+            .is_some()
+        {
+            return Err(store_required());
+        }
+        if self
+            .shared
+            .enter_pack_run(store, &request, invocation, PackRunAccess::Apply)?
             .is_some()
         {
             return Err(store_required());
@@ -2085,6 +2217,16 @@ impl IndependentObserverPort for CompositeObserver {
                 return Err(forbidden());
             }
             return entered.capture(store).map(Some);
+        }
+        if let Some(entered) =
+            self.shared
+                .enter_pack_run(store, &request, invocation, PackRunAccess::Apply)?
+        {
+            if &entered.operation().scope != scope {
+                return Err(forbidden());
+            }
+            let result = crate::calibration_pack_observer::capture_before(&entered, store);
+            return finish_native_observation(result, entered.check_local(store));
         }
         if let Some(entered) =
             self.shared
@@ -2165,6 +2307,18 @@ impl IndependentObserverPort for CompositeObserver {
                 "CAPABILITY_UNAVAILABLE",
                 "Bootstrap readback requires a newly paired owner and independently observed loaded source",
             ));
+        }
+        if let Some(entered) =
+            self.shared
+                .enter_pack_run(store, &request, invocation, PackRunAccess::Observe)?
+        {
+            entered.verify_claim(store, invocation)?;
+            let result = if &entered.operation().scope != scope {
+                Err(forbidden())
+            } else {
+                crate::calibration_pack_observer::readback(&entered, store)
+            };
+            return finish_native_observation(result, entered.check_local(store));
         }
         if let Some(entered) = self.shared.enter_calibration(
             store,
@@ -2286,6 +2440,19 @@ impl IndependentObserverPort for CompositeObserver {
         target: &str,
     ) -> AppResult<Vec<u8>> {
         let request = self.shared.calibration_request()?;
+        if let Some(entered) =
+            self.shared
+                .enter_pack_run(store, &request, invocation, PackRunAccess::Observe)?
+        {
+            entered.verify_claim(store, invocation)?;
+            return finish_native_observation(
+                Err(error(
+                    "NATIVE_RETENTION_REQUIRED",
+                    "PACK recovery reads require the mutable acquisition boundary",
+                )),
+                entered.check_local(store),
+            );
+        }
         if let Some(entered) = self.shared.enter_calibration(
             store,
             &request,
@@ -2332,6 +2499,14 @@ impl IndependentObserverPort for CompositeObserver {
         target: &str,
     ) -> AppResult<Vec<u8>> {
         let request = self.shared.calibration_request()?;
+        if let Some(entered) =
+            self.shared
+                .enter_pack_run(store, &request, invocation, PackRunAccess::Observe)?
+        {
+            entered.verify_claim(store, invocation)?;
+            let result = crate::calibration_pack_observer::read_target(&entered, store, target);
+            return finish_native_observation(result, entered.check_local(store));
+        }
         if let Some(entered) = self.shared.enter_calibration(
             store,
             &request,

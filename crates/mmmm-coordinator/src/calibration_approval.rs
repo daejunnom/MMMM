@@ -3,8 +3,8 @@
 
 use super::*;
 use crate::{
-    calibration_execution::{CalibrationRegistry, ConfirmedCalibration},
-    host::{CalibrationHostRoute, HostContextWitness},
+    calibration_execution::{CalibrationPendingSlot, CalibrationRegistry, ConfirmedCalibration},
+    host::{CalibrationHostRoute, HostContextWitness, PackRunHostRoute},
     workspace_bootstrap::{NativeOwnerWitness, native_owner_resource_reader},
 };
 use mmmm_compiler::calibration_dispatch::CalibrationDispatchPlan;
@@ -60,7 +60,8 @@ pub(crate) fn validate_frame(
     value: &Value,
     validator: &ContractValidator,
 ) -> Result<ManagementKind, ManagementError> {
-    if value["purpose"] != PURPOSE {
+    let pack_run = value["purpose"] == crate::calibration_pack_run::PURPOSE;
+    if value["purpose"] != PURPOSE && !pack_run {
         return Err(invalid());
     }
     match field(value, "kind")? {
@@ -193,6 +194,9 @@ pub(crate) fn validate_frame(
                 return Err(invalid());
             }
             validate_manifest(&value["manifest"], validator)?;
+            if value["manifest"]["purpose"] != value["purpose"] {
+                return Err(invalid());
+            }
             let context = &contexts[0];
             let manifest = &value["manifest"];
             let plan = &manifest["plan"];
@@ -204,13 +208,30 @@ pub(crate) fn validate_frame(
             {
                 return Err(invalid());
             }
-            for program in array(manifest, "programs")? {
-                for binding in array(program, "targetBindings")? {
-                    if !context["scope"]["externalTargetIds"]
-                        .as_array()
-                        .is_some_and(|targets| targets.contains(&binding["targetId"]))
-                    {
-                        return Err(invalid());
+            if pack_run {
+                if !context["scope"]["externalTargetIds"]
+                    .as_array()
+                    .is_some_and(|targets| targets.contains(&manifest["targetId"]))
+                    || actions
+                        != array(plan, "steps")?
+                            .iter()
+                            .map(|step| {
+                                Sha256Digest::new(field(step, "actionDigest")?)
+                                    .map_err(|_| invalid())
+                            })
+                            .collect::<Result<BTreeSet<_>, _>>()?
+                {
+                    return Err(invalid());
+                }
+            } else {
+                for program in array(manifest, "programs")? {
+                    for binding in array(program, "targetBindings")? {
+                        if !context["scope"]["externalTargetIds"]
+                            .as_array()
+                            .is_some_and(|targets| targets.contains(&binding["targetId"]))
+                        {
+                            return Err(invalid());
+                        }
                     }
                 }
             }
@@ -277,6 +298,9 @@ pub(crate) fn validate_frame(
 }
 
 fn validate_manifest(value: &Value, validator: &ContractValidator) -> Result<(), ManagementError> {
+    if value["purpose"] == crate::calibration_pack_run::PURPOSE {
+        return validate_pack_run_manifest(value, validator);
+    }
     exact(
         value,
         &[
@@ -477,6 +501,173 @@ fn validate_manifest(value: &Value, validator: &ContractValidator) -> Result<(),
     }
     Ok(())
 }
+fn validate_pack_run_manifest(
+    value: &Value,
+    validator: &ContractValidator,
+) -> Result<(), ManagementError> {
+    exact(
+        value,
+        &[
+            "kind",
+            "purpose",
+            "selectionDigest",
+            "hostEpoch",
+            "registryGeneration",
+            "runtimeSourceFactsDigest",
+            "programDigest",
+            "sourceBundleDigest",
+            "sourceZipResource",
+            "sourceOrigin",
+            "plan",
+            "targetId",
+            "stepGuards",
+        ],
+    )?;
+    if value["kind"] != "native_pack_calibration_run_approval/1"
+        || value["purpose"] != crate::calibration_pack_run::PURPOSE
+        || value["targetId"] != "calibration-objective-mcalpack"
+    {
+        return Err(invalid());
+    }
+    for key in [
+        "selectionDigest",
+        "runtimeSourceFactsDigest",
+        "programDigest",
+        "sourceBundleDigest",
+    ] {
+        sha(value, key)?;
+    }
+    let recipe =
+        mmmm_compiler::calibration::CalibrationPackProgram::java_26_3().map_err(|_| invalid())?;
+    if value["programDigest"] != recipe.program_digest().as_str() {
+        return Err(invalid());
+    }
+    SessionEpoch::new(field(value, "hostEpoch")?).map_err(|_| invalid())?;
+    generation(field(value, "registryGeneration")?)?;
+    let zip = &value["sourceZipResource"];
+    exact(zip, &["resourceId", "sha256", "sizeBytes", "mediaType"])?;
+    ResourceId::new(field(zip, "resourceId")?).map_err(|_| invalid())?;
+    sha(zip, "sha256")?;
+    if zip["sizeBytes"].as_u64().is_none_or(|size| size == 0)
+        || zip["mediaType"] != "application/zip"
+    {
+        return Err(invalid());
+    }
+    let origin = &value["sourceOrigin"];
+    exact(
+        origin,
+        &[
+            "operationId",
+            "invocationId",
+            "invocationDigest",
+            "frozenManifestDigest",
+        ],
+    )?;
+    mmmm_contracts::OperationId::new(field(origin, "operationId")?).map_err(|_| invalid())?;
+    mmmm_contracts::InvocationId::new(field(origin, "invocationId")?).map_err(|_| invalid())?;
+    sha(origin, "invocationDigest")?;
+    sha(origin, "frozenManifestDigest")?;
+    let plan = &value["plan"];
+    exact(
+        plan,
+        &[
+            "kind",
+            "protocolVersion",
+            "principalId",
+            "projectId",
+            "planId",
+            "planHash",
+            "policyRevision",
+            "contextPins",
+            "expiresAt",
+            "steps",
+            "nativeExecutions",
+        ],
+    )?;
+    if plan["kind"] != "native_plan_approval"
+        || plan["protocolVersion"] != mmmm_contracts::CONTRACT_VERSION
+        || !array(plan, "nativeExecutions")?.is_empty()
+        || array(plan, "contextPins")?.len() != 1
+        || array(plan, "steps")?.len() != 3
+    {
+        return Err(invalid());
+    }
+    selected_plan(plan)?;
+    PrincipalId::new(field(plan, "principalId")?).map_err(|_| invalid())?;
+    sha(plan, "policyRevision")?;
+    instant(field(plan, "expiresAt")?)?;
+    validator
+        .validate("ContextPin", &plan["contextPins"][0])
+        .map_err(|_| invalid())?;
+    let guards = json!({
+        "pack-init-objective":{"kind":"initial_absence"},
+        "pack-seed-marker":{"kind":"actual_previous_after","previousStepId":"pack-init-objective"},
+        "pack-entry":{"kind":"actual_previous_after","previousStepId":"pack-seed-marker"},
+    });
+    if value["stepGuards"] != guards {
+        return Err(invalid());
+    }
+    let first_conditions = &plan["steps"][0]["preconditions"];
+    for (step, (id, command)) in array(plan, "steps")?.iter().zip([
+        (
+            "pack-init-objective",
+            "scoreboard objectives add mcalpack dummy",
+        ),
+        (
+            "pack-seed-marker",
+            "scoreboard players set #marker mcalpack 7331",
+        ),
+        ("pack-entry", "function mmmm_calibration:pack/entry"),
+    ]) {
+        exact(
+            step,
+            &[
+                "stepId",
+                "bindingId",
+                "actionId",
+                "actionDigest",
+                "implementationDigest",
+                "argumentsDigest",
+                "contextId",
+                "contextDigest",
+                "resourcesRead",
+                "resourcesWritten",
+                "preconditions",
+            ],
+        )?;
+        if step["stepId"] != id
+            || step["actionId"] != "mmmm:command_execute"
+            || step["argumentsDigest"]
+                != canonical_digest(&json!({"command":command}))
+                    .map_err(|_| invalid())?
+                    .as_str()
+            || step["contextId"] != plan["contextPins"][0]["contextId"]
+            || step["contextDigest"] != plan["contextPins"][0]["contextDigest"]
+            || step["resourcesRead"] != json!([value["targetId"]])
+            || step["resourcesWritten"] != json!([value["targetId"]])
+            || &step["preconditions"] != first_conditions
+        {
+            return Err(invalid());
+        }
+        for key in ["stepId", "bindingId", "contextId"] {
+            RequestId::new(field(step, key)?).map_err(|_| invalid())?;
+        }
+        for key in [
+            "actionDigest",
+            "implementationDigest",
+            "argumentsDigest",
+            "contextDigest",
+        ] {
+            sha(step, key)?;
+        }
+        for condition in array(step, "preconditions")? {
+            validator
+                .validate("Precondition", condition)
+                .map_err(|_| invalid())?;
+        }
+    }
+    Ok(())
+}
 fn reference(value: &str) -> Result<(), ManagementError> {
     if value.is_empty()
         || value.len() > 256
@@ -508,6 +699,7 @@ fn generation(value: &str) -> Result<(), ManagementError> {
 #[derive(Default)]
 pub(super) struct CalibrationApprovals {
     pending: BTreeMap<RequestId, PendingCalibration>,
+    pack_pending: BTreeMap<RequestId, PendingPackRun>,
     confirmed: CalibrationRegistry,
     // Retain original typed source/transport failures; public diagnostics never
     // expose untrusted messages, local paths, capabilities or raw offers.
@@ -520,6 +712,7 @@ struct CalibrationFailure {
     _original_offer: Arc<PublicFrame>,
 }
 struct PendingCalibration {
+    _slot: CalibrationPendingSlot,
     public: Arc<PublicFrame>,
     witness: BootstrapWitness,
     budget: BootstrapBudget,
@@ -533,12 +726,83 @@ struct PendingCalibration {
     completion: Option<Arc<CompletedBootstrap>>,
     first_failure: Option<StorageError>,
 }
+struct PendingPackRun {
+    _slot: CalibrationPendingSlot,
+    public: Arc<PublicFrame>,
+    witness: BootstrapWitness,
+    budget: BootstrapBudget,
+    plan: Value,
+    selection: Value,
+    manifest: Value,
+    manifest_digest: Sha256Digest,
+    context: Value,
+    policy_digest: Sha256Digest,
+    token: Option<SecretToken>,
+    route: Option<PackRunHostRoute>,
+    complete_issued: bool,
+    completion: Option<Arc<CompletedBootstrap>>,
+    first_failure: Option<StorageError>,
+    current_failure: Option<StorageError>,
+}
+fn retain_pack_failure(pending: &mut PendingPackRun, cause: StorageError) {
+    if pending.first_failure.is_none() {
+        pending.first_failure = Some(cause);
+    } else {
+        // Keep the original cause and the current checkpoint in bounded slots.
+        // Repeated invalid transport messages cannot grow a recursive history.
+        pending.current_failure = Some(cause);
+    }
+}
+fn take_pack_failure(pending: &mut PendingPackRun) -> Option<StorageError> {
+    match (pending.first_failure.take(), pending.current_failure.take()) {
+        (Some(primary), Some(checkpoint)) => Some(StorageError::CalibrationCheckpointFailure {
+            primary: Box::new(primary),
+            checkpoint: Box::new(checkpoint),
+        }),
+        (primary, checkpoint) => primary.or(checkpoint),
+    }
+}
+#[derive(Debug)]
+struct PackPublicationFailure(Arc<mmmm_application::AppError>);
+impl std::fmt::Display for PackPublicationFailure {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        output.write_str("Original PACK approval publication failure is retained")
+    }
+}
+impl std::error::Error for PackPublicationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+fn pack_confirmation_result(
+    confirmed: mmmm_application::AppResult<()>,
+    publication_failure: Option<Arc<mmmm_application::AppError>>,
+) -> StorageResult<bool> {
+    match confirmed {
+        Ok(()) => Ok(publication_failure.is_some()),
+        Err(cause) => {
+            let checkpoint = app_failure(cause);
+            Err(match publication_failure {
+                Some(primary) => StorageError::CalibrationCheckpointFailure {
+                    primary: Box::new(StorageError::Io(std::io::Error::other(
+                        PackPublicationFailure(primary),
+                    ))),
+                    checkpoint: Box::new(checkpoint),
+                },
+                None => checkpoint,
+            })
+        }
+    }
+}
 impl CalibrationApprovals {
     pub(super) fn with_registry(confirmed: CalibrationRegistry) -> Self {
         Self {
             confirmed,
             ..Self::default()
         }
+    }
+    pub(super) fn registry(&self) -> CalibrationRegistry {
+        self.confirmed.clone()
     }
 }
 
@@ -714,6 +978,19 @@ fn denied() -> StorageError {
 }
 fn app_failure(cause: mmmm_application::AppError) -> StorageError {
     StorageError::Io(std::io::Error::other(cause))
+}
+fn verify_pack_host_artifact(plan: &Value, artifact: &Sha256Digest) -> StorageResult<()> {
+    let steps = plan["steps"]
+        .as_array()
+        .filter(|steps| steps.len() == 3)
+        .ok_or_else(denied)?;
+    if steps
+        .iter()
+        .any(|step| step["implementationDigest"].as_str() != Some(artifact.as_str()))
+    {
+        return Err(denied());
+    }
+    Ok(())
 }
 fn codec_failure(cause: ManagementError) -> StorageError {
     StorageError::Io(std::io::Error::other(cause))
@@ -921,6 +1198,535 @@ pub(crate) fn policy_digest_for_rpc(
 }
 
 impl HostBootstrapProcessor {
+    #[allow(clippy::too_many_arguments)] // Independent retained owner, context and original controls.
+    fn pack_calibration_authority(
+        &self,
+        store: &DurableStore,
+        owner: &NativeOwnerWitness,
+        budget: &BootstrapBudget,
+        plan: &Value,
+        context: &Value,
+        context_witness: &HostContextWitness,
+        expected_policy: Option<&Sha256Digest>,
+    ) -> StorageResult<Sha256Digest> {
+        budget.check().map_err(codec_failure)?;
+        let project = ProjectId::new(field(plan, "projectId").map_err(codec_failure)?)
+            .map_err(|_| denied())?;
+        let revision =
+            Sha256Digest::new(field(plan, "projectBaseRevision").map_err(codec_failure)?)
+                .map_err(|_| denied())?;
+        let policy = Sha256Digest::new(field(plan, "policyRevision").map_err(codec_failure)?)
+            .map_err(|_| denied())?;
+        let context_id = ContextId::new(field(context, "contextId").map_err(codec_failure)?)
+            .map_err(|_| denied())?;
+        owner.check_project(store, &project)?;
+        context_witness.check_local().map_err(app_failure)?;
+        if context["principalRef"] != owner.principal().as_str()
+            || context["contextDigest"] != plan["contextPins"][0]["contextDigest"]
+            || context["environment"] != plan["contextPins"][0]["environment"]
+        {
+            return Err(denied());
+        }
+        self.authority
+            .authorize_retained_scope(
+                owner.principal(),
+                &project,
+                &context_id,
+                &policy,
+                &context["scope"],
+            )
+            .map_err(app_failure)?;
+        self.authority
+            .authorize_retained_scope(
+                owner.principal(),
+                &project,
+                &context_id,
+                &policy,
+                &plan["scope"],
+            )
+            .map_err(app_failure)?;
+        let pin = policy_digest(store, owner, budget, &project, &revision)?;
+        if expected_policy.is_some_and(|expected| expected != &pin) {
+            return Err(denied());
+        }
+        self.calibration
+            .confirmed
+            .pack_runs()
+            .check_prepared(store, plan, &|| {
+                budget.check().map_err(|cause| {
+                    mmmm_application::AppError::caused_by(
+                        "HOST_UNAVAILABLE",
+                        "Original PACK approval control ended",
+                        cause,
+                    )
+                })?;
+                owner.check_project(store, &project).map_err(|cause| {
+                    mmmm_application::AppError::storage("PERMISSION_REQUIRED", cause)
+                })?;
+                context_witness.check_local()
+            })
+            .map_err(app_failure)?;
+        Ok(pin)
+    }
+
+    fn pack_calibration_offer(
+        &mut self,
+        store: &DurableStore,
+        public: Arc<PublicFrame>,
+        token: Option<SecretToken>,
+        witness: BootstrapWitness,
+        budget: &BootstrapBudget,
+        reply_deadline: Instant,
+    ) -> Result<PublicFrame, ManagementError> {
+        let result = (|| -> StorageResult<PublicFrame> {
+            let value = public.value();
+            budget.check().map_err(codec_failure)?;
+            if Instant::now() >= reply_deadline {
+                return Err(codec_failure(ManagementError::Deadline));
+            }
+            let project = ProjectId::new(field(value, "projectId").map_err(codec_failure)?)
+                .map_err(|_| denied())?;
+            let id = PlanId::new(field(value, "planId").map_err(codec_failure)?)
+                .map_err(|_| denied())?;
+            let hash = Sha256Digest::new(field(value, "planHash").map_err(codec_failure)?)
+                .map_err(|_| denied())?;
+            let owner = NativeOwnerWitness::capture(store, budget.deadline().min(reply_deadline))?;
+            owner.check_project(store, &project)?;
+            let plan = store.plan(&id, &hash)?;
+            if plan["projectId"] != project.as_str() {
+                return Err(denied());
+            }
+            let (context, context_witness, artifact) =
+                self.calibration_snapshot(store, &plan, budget)?;
+            verify_pack_host_artifact(&plan, &artifact)?;
+            let policy_digest = self.pack_calibration_authority(
+                store,
+                &owner,
+                budget,
+                &plan,
+                &context,
+                &context_witness,
+                None,
+            )?;
+            let registry = self.calibration.confirmed.pack_runs();
+            if value["kind"] == "native_calibration_owner_offer" {
+                if token.is_some() {
+                    return Err(denied());
+                }
+                let selected = registry.select(store, &plan).map_err(app_failure)?;
+                exact(&selected, &["approvalRef", "selectionDigest", "expiresAt"])
+                    .map_err(codec_failure)?;
+                reference(field(&selected, "approvalRef").map_err(codec_failure)?)
+                    .map_err(codec_failure)?;
+                sha(&selected, "selectionDigest").map_err(codec_failure)?;
+                instant(field(&selected, "expiresAt").map_err(codec_failure)?)
+                    .map_err(codec_failure)?;
+                return PublicFrame::from_value(json!({
+                    "kind":"native_calibration_owner_selected", "protocolVersion":mmmm_contracts::CONTRACT_VERSION,
+                    "nonce":witness.nonce(), "purpose":crate::calibration_pack_run::PURPOSE,
+                    "projectId":project, "planId":id, "planHash":hash,
+                    "approvalRef":selected["approvalRef"], "selectionDigest":selected["selectionDigest"],
+                    "expiresAt":selected["expiresAt"],
+                })).map_err(codec_failure);
+            }
+            if value["kind"] != "host_apply_approval_offer"
+                || token.is_none()
+                || context["principalRef"] != value["principalId"]
+                || context["environment"] != value["hostHello"]["environment"]
+                || value["hostArtifactDigest"] != artifact.as_str()
+                || value["hostHello"]["hostBuild"] != artifact.as_str()
+                || value["contextIds"] != json!([context["contextId"]])
+            {
+                return Err(denied());
+            }
+            crate::catalog_source::validate_source_facts(&value["runtimeSourceFacts"], &context)
+                .map_err(app_failure)?;
+            let selection = registry.selection(store, &plan).map_err(app_failure)?;
+            let manifest = registry
+                .manifest(store, &plan, &context, &value["runtimeSourceFacts"])
+                .map_err(app_failure)?;
+            validate_pack_run_manifest(
+                &manifest,
+                ContractValidator::shared()
+                    .map_err(|cause| StorageError::Contract(cause.to_string()))?,
+            )
+            .map_err(codec_failure)?;
+            if manifest["selectionDigest"] != selection["selectionDigest"]
+                || manifest["plan"]["planId"] != plan["planId"]
+                || manifest["plan"]["planHash"] != plan["planHash"]
+            {
+                return Err(denied());
+            }
+            let manifest_digest = canonical_digest(&manifest)
+                .map_err(|cause| StorageError::Contract(cause.to_string()))?;
+            let actions = plan["steps"]
+                .as_array()
+                .ok_or_else(denied)?
+                .iter()
+                .map(|step| {
+                    field(step, "actionDigest")
+                        .map(str::to_owned)
+                        .map_err(codec_failure)
+                })
+                .collect::<StorageResult<BTreeSet<_>>>()?;
+            let reply = PublicFrame::from_value(json!({
+                "kind":"host_apply_approval_authority", "protocolVersion":mmmm_contracts::CONTRACT_VERSION,
+                "nonce":witness.nonce(), "purpose":crate::calibration_pack_run::PURPOSE,
+                "contexts":[context], "approvedSources":{(NATIVE_SOURCE_ID):artifact},
+                "approvedActions":actions, "permissions":READ_PERMISSIONS, "manifest":manifest,
+            })).map_err(codec_failure)?;
+            budget.check().map_err(codec_failure)?;
+            if Instant::now() >= reply_deadline {
+                return Err(codec_failure(ManagementError::Deadline));
+            }
+            let slot = self
+                .calibration
+                .confirmed
+                .reserve_pending(store, &witness, budget, &owner)
+                .map_err(codec_failure)?;
+            self.calibration.pack_pending.insert(
+                witness.id().clone(),
+                PendingPackRun {
+                    _slot: slot,
+                    public: public.clone(),
+                    witness: witness.clone(),
+                    budget: budget.clone(),
+                    plan,
+                    selection,
+                    manifest,
+                    manifest_digest,
+                    context,
+                    policy_digest,
+                    token,
+                    route: None,
+                    complete_issued: false,
+                    completion: None,
+                    first_failure: None,
+                    current_failure: None,
+                },
+            );
+            Ok(reply)
+        })();
+        match result {
+            Ok(reply) => Ok(reply),
+            Err(cause) => {
+                self.calibration.failures.push(CalibrationFailure {
+                    _witness: witness,
+                    _cause: cause,
+                    _completion: None,
+                    _original_offer: public,
+                });
+                Err(ManagementError::InvalidFrame)
+            }
+        }
+    }
+
+    fn install_pack_calibration(
+        &mut self,
+        store: &DurableStore,
+        public: PublicFrame,
+        witness: BootstrapWitness,
+        coordinator_epoch: &SessionEpoch,
+        budget: &BootstrapBudget,
+        reply_deadline: Instant,
+    ) -> Result<PublicFrame, ManagementError> {
+        let pending = self
+            .calibration
+            .pack_pending
+            .get_mut(witness.id())
+            .ok_or(ManagementError::WrongReply)?;
+        if !same_witness(&pending.witness, &witness)
+            || public.nonce() != pending.witness.nonce()
+            || public.value()["kind"] != "host_apply_approval_installed"
+            || public.value()["purpose"] != crate::calibration_pack_run::PURPOSE
+            || public.value()["selectionDigest"] != pending.selection["selectionDigest"]
+            || public.value()["manifestDigest"] != pending.manifest_digest.as_str()
+            || pending.complete_issued
+        {
+            return Err(ManagementError::WrongReply);
+        }
+        budget.check()?;
+        pending.budget.check()?;
+        if Instant::now() >= reply_deadline {
+            return Err(ManagementError::Deadline);
+        }
+        // This is still the same retained prepared source in this Store, not
+        // an admission derived from the public purpose or manifest JSON.
+        self.calibration
+            .confirmed
+            .pack_runs()
+            .check_prepared(store, &pending.plan, &|| {
+                pending.budget.check().map_err(|cause| {
+                    mmmm_application::AppError::caused_by(
+                        "HOST_UNAVAILABLE",
+                        "Original PACK approval control ended",
+                        cause,
+                    )
+                })
+            })
+            .map_err(|cause| {
+                retain_pack_failure(pending, app_failure(cause));
+                ManagementError::WrongReply
+            })?;
+        let endpoint = &public.value()["hostEndpoint"];
+        if endpoint["hostEpoch"] != pending.context["environment"]["sessionEpoch"] {
+            return Err(ManagementError::WrongReply);
+        }
+        let epoch = field(endpoint, "hostEpoch")?;
+        let record = EndpointRecord {
+            schema_version: 1,
+            contract_version: mmmm_contracts::CONTRACT_VERSION.into(),
+            address: field(endpoint, "address")?.parse().map_err(|_| invalid())?,
+            path: field(endpoint, "path")?.into(),
+            coordinator_epoch: epoch.into(),
+            credential_ref: format!("MMMM.coordinator.calibration-{}", witness.id()),
+        };
+        let token = pending.token.take().ok_or(ManagementError::WrongReply)?;
+        let client = HostRpcClient::paired(record, token).map_err(|cause| {
+            retain_pack_failure(pending, StorageError::Io(std::io::Error::other(cause)));
+            ManagementError::Disconnected
+        })?;
+        let remaining =
+            instant(field(&pending.selection, "expiresAt")?)? - time::OffsetDateTime::now_utc();
+        let expires = Instant::now()
+            .checked_add(Duration::try_from(remaining).map_err(|_| ManagementError::Deadline)?)
+            .ok_or(ManagementError::Deadline)?;
+        let principal =
+            PrincipalId::new(field(&pending.context, "principalRef")?).map_err(|_| invalid())?;
+        match self.hosts.prepare_pack_run_route(
+            client,
+            principal,
+            vec![pending.context.clone()],
+            pending.public.value()["hostHello"].clone(),
+            expires,
+            &pending.budget,
+        ) {
+            Ok(route) => pending.route = Some(route),
+            Err(cause) => {
+                retain_pack_failure(pending, app_failure(cause));
+                return Err(ManagementError::Disconnected);
+            }
+        }
+        budget.check()?;
+        pending.budget.check()?;
+        if Instant::now() >= reply_deadline {
+            return Err(ManagementError::Deadline);
+        }
+        let reply = PublicFrame::from_value(json!({
+            "kind":"host_apply_approval_complete", "protocolVersion":mmmm_contracts::CONTRACT_VERSION,
+            "nonce":witness.nonce(), "purpose":crate::calibration_pack_run::PURPOSE,
+            "selectionDigest":pending.selection["selectionDigest"], "manifestDigest":pending.manifest_digest,
+            "ready":true, "coordinatorEpoch":coordinator_epoch, "hostEpoch":epoch,
+            "contextId":pending.context["contextId"],
+        }))?;
+        pending.complete_issued = true;
+        Ok(reply)
+    }
+
+    fn finish_pack_calibration(
+        &mut self,
+        store: &DurableStore,
+        receipt: CompletedBootstrap,
+    ) -> Result<(), ManagementError> {
+        let mut pending = self
+            .calibration
+            .pack_pending
+            .remove(receipt.witness().id())
+            .ok_or(ManagementError::WrongReply)?;
+        if !same_witness(&pending.witness, receipt.witness()) {
+            self.calibration
+                .pack_pending
+                .insert(pending.witness.id().clone(), pending);
+            return Err(ManagementError::WrongReply);
+        }
+        if let Some(old) = &pending.completion {
+            if old.delivered() != receipt.delivered()
+                || old.completed_at() != receipt.completed_at()
+            {
+                self.calibration
+                    .pack_pending
+                    .insert(pending.witness.id().clone(), pending);
+                return Err(ManagementError::WrongReply);
+            }
+        } else {
+            pending.completion = Some(Arc::new(receipt));
+        }
+        let observed = pending
+            .completion
+            .as_ref()
+            .ok_or(ManagementError::WrongReply)?
+            .clone();
+        let result = (|| -> StorageResult<bool> {
+            if !pending.complete_issued
+                || !observed.delivered()
+                || observed.completed_at() >= pending.budget.deadline()
+            {
+                return Err(denied());
+            }
+            let route = pending.route.as_ref().ok_or_else(denied)?;
+            route
+                .check_bootstrap_current(&pending.budget)
+                .map_err(app_failure)?;
+            let owner = NativeOwnerWitness::capture(store, pending.budget.deadline())?;
+            let (context, context_witness, artifact) =
+                self.calibration_snapshot(store, &pending.plan, &pending.budget)?;
+            verify_pack_host_artifact(&pending.plan, &artifact)?;
+            self.pack_calibration_authority(
+                store,
+                &owner,
+                &pending.budget,
+                &pending.plan,
+                &context,
+                &context_witness,
+                Some(&pending.policy_digest),
+            )?;
+            let registry = self.calibration.confirmed.pack_runs();
+            if registry
+                .selection(store, &pending.plan)
+                .map_err(app_failure)?
+                != pending.selection
+                || registry
+                    .manifest(
+                        store,
+                        &pending.plan,
+                        &context,
+                        &pending.public.value()["runtimeSourceFacts"],
+                    )
+                    .map_err(app_failure)?
+                    != pending.manifest
+            {
+                return Err(denied());
+            }
+            let principal =
+                PrincipalId::new(field(&context, "principalRef").map_err(codec_failure)?)
+                    .map_err(|_| denied())?;
+            let project = ProjectId::new(field(&pending.plan, "projectId").map_err(codec_failure)?)
+                .map_err(|_| denied())?;
+            let lifetime = route
+                .lease_expires()
+                .saturating_duration_since(Instant::now());
+            // Borrow the original control and local witnesses across both the
+            // authority publication and the final retained confirmation.
+            let current = || {
+                pending.budget.check().map_err(|cause| {
+                    mmmm_application::AppError::caused_by(
+                        match cause {
+                            ManagementError::Cancelled => "CANCELLED",
+                            ManagementError::Deadline => "TIME_BUDGET_EXCEEDED",
+                            _ => "HOST_UNAVAILABLE",
+                        },
+                        "Original PACK confirmation control is no longer current",
+                        cause,
+                    )
+                })?;
+                owner.check_project(store, &project).map_err(|cause| {
+                    mmmm_application::AppError::storage("PERMISSION_REQUIRED", cause)
+                })?;
+                context_witness.check_local()?;
+                route.check_bootstrap_local(&pending.budget)
+            };
+            let publication = self.authority.approve_plan_with_control(
+                &principal,
+                &pending.plan,
+                lifetime,
+                pending.budget.deadline(),
+                &current,
+            );
+            let publication_failure = publication.err().map(Arc::new);
+            // A completed real ADMIN exchange is retained even when LocalAuthority
+            // publication fails. Registry presence cannot erase that failure or
+            // admit execution; the consumer must check publication_failure.
+            let confirmed = registry.confirm(
+                store,
+                &pending.plan,
+                &pending.manifest,
+                route.clone(),
+                observed.clone(),
+                publication_failure.clone(),
+                &current,
+            );
+            pack_confirmation_result(confirmed, publication_failure)
+        })();
+        match result {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(ManagementError::WrongReply),
+            Err(cause) => {
+                retain_pack_failure(&mut pending, cause);
+                if self.calibration.failures.len() >= MAX_REJECTED_COMPLETIONS {
+                    self.calibration
+                        .pack_pending
+                        .insert(pending.witness.id().clone(), pending);
+                    return Err(ManagementError::TransportUncertain);
+                }
+                if let Some(route) = &pending.route
+                    && let Err(cause) = route.retire()
+                {
+                    retain_pack_failure(&mut pending, app_failure(cause));
+                    self.calibration
+                        .pack_pending
+                        .insert(pending.witness.id().clone(), pending);
+                    return Err(ManagementError::TransportUncertain);
+                }
+                let delivered = observed.delivered();
+                let cause =
+                    take_pack_failure(&mut pending).ok_or(ManagementError::TransportUncertain)?;
+                self.calibration.failures.push(CalibrationFailure {
+                    _witness: pending.witness,
+                    _cause: cause,
+                    _completion: Some(observed),
+                    _original_offer: pending.public,
+                });
+                if delivered {
+                    Err(ManagementError::WrongReply)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn cleanup_pack_calibration(&mut self, shutdown: bool) -> Result<(), ManagementError> {
+        let expired = self
+            .calibration
+            .pack_pending
+            .iter()
+            .filter_map(|(id, pending)| {
+                calibration_cleanup_stop(&pending.budget, shutdown).map(|stop| (id.clone(), stop))
+            })
+            .collect::<Vec<_>>();
+        for (id, stop) in expired {
+            if self.calibration.failures.len() >= MAX_REJECTED_COMPLETIONS {
+                return Err(ManagementError::TransportUncertain);
+            }
+            let mut pending = self
+                .calibration
+                .pack_pending
+                .remove(&id)
+                .ok_or(ManagementError::WrongReply)?;
+            if let Some(route) = &pending.route
+                && let Err(cause) = route.retire()
+            {
+                let stopped = StorageError::Io(std::io::Error::other(stop));
+                retain_pack_failure(&mut pending, stopped);
+                retain_pack_failure(&mut pending, app_failure(cause));
+                self.calibration.pack_pending.insert(id, pending);
+                return Err(ManagementError::TransportUncertain);
+            }
+            let previous = take_pack_failure(&mut pending);
+            self.calibration.failures.push(CalibrationFailure {
+                _witness: pending.witness,
+                _cause: calibration_cleanup_failure(previous, stop),
+                _completion: pending.completion,
+                _original_offer: pending.public,
+            });
+        }
+        self.calibration
+            .confirmed
+            .pack_runs()
+            .retire_expired(shutdown)
+            .map_err(|_| ManagementError::TransportUncertain)
+    }
+
     fn calibration_snapshot(
         &self,
         store: &DurableStore,
@@ -1010,7 +1816,9 @@ impl HostBootstrapProcessor {
         budget: &BootstrapBudget,
         reply_deadline: Instant,
     ) -> Result<PublicFrame, ManagementError> {
-        if self.calibration.pending.len() + self.calibration.confirmed.len()? >= MAX_PENDING
+        // The shared registry counts prepared, confirmed and RAII-reserved
+        // pending entries. A local remove/reinsert keeps the same reservation.
+        if self.calibration.confirmed.len()? >= MAX_PENDING
             || self.calibration.failures.len() >= MAX_REJECTED_COMPLETIONS
         {
             return Err(ManagementError::Busy);
@@ -1022,6 +1830,16 @@ impl HostBootstrapProcessor {
             return Err(ManagementError::WrongReply);
         }
         let public = Arc::new(public);
+        if public.value()["purpose"] == crate::calibration_pack_run::PURPOSE {
+            return self.pack_calibration_offer(
+                store,
+                public,
+                token,
+                witness,
+                budget,
+                reply_deadline,
+            );
+        }
         let result = (|| -> StorageResult<PublicFrame> {
             let value = public.value();
             budget.check().map_err(codec_failure)?;
@@ -1127,9 +1945,15 @@ impl HostBootstrapProcessor {
                 "nonce":witness.nonce(),"purpose":PURPOSE,"contexts":[context],"approvedSources":{(NATIVE_SOURCE_ID):artifact},
                 "approvedActions":actions,"permissions":READ_PERMISSIONS,"manifest":manifest})).map_err(codec_failure)?;
             rpc.check()?;
+            let slot = self
+                .calibration
+                .confirmed
+                .reserve_pending(store, &witness, budget, &owner)
+                .map_err(codec_failure)?;
             self.calibration.pending.insert(
                 witness.id().clone(),
                 PendingCalibration {
+                    _slot: slot,
                     public: public.clone(),
                     witness: witness.clone(),
                     budget: budget.clone(),
@@ -1161,22 +1985,38 @@ impl HostBootstrapProcessor {
     }
     pub(super) fn has_calibration_witness(&self, witness: &BootstrapWitness) -> bool {
         self.calibration.pending.contains_key(witness.id())
+            || self.calibration.pack_pending.contains_key(witness.id())
     }
     pub(super) fn has_calibration_completion(&self) -> bool {
         self.calibration
             .pending
             .values()
             .any(|pending| pending.complete_issued)
+            || self
+                .calibration
+                .pack_pending
+                .values()
+                .any(|pending| pending.complete_issued)
     }
     pub(super) fn install_calibration(
         &mut self,
-        _store: &DurableStore,
+        store: &DurableStore,
         public: PublicFrame,
         witness: BootstrapWitness,
         coordinator_epoch: &SessionEpoch,
         budget: &BootstrapBudget,
         reply_deadline: Instant,
     ) -> Result<PublicFrame, ManagementError> {
+        if self.calibration.pack_pending.contains_key(witness.id()) {
+            return self.install_pack_calibration(
+                store,
+                public,
+                witness,
+                coordinator_epoch,
+                budget,
+                reply_deadline,
+            );
+        }
         let pending = self
             .calibration
             .pending
@@ -1185,6 +2025,7 @@ impl HostBootstrapProcessor {
         if !same_witness(&pending.witness, &witness)
             || public.nonce() != pending.witness.nonce()
             || public.value()["kind"] != "host_apply_approval_installed"
+            || public.value()["purpose"] != PURPOSE
             || pending.complete_issued
             || public.value()["selectionDigest"] != pending.selection.selection_digest().as_str()
             || public.value()["manifestDigest"] != pending.manifest_digest.as_str()
@@ -1251,6 +2092,13 @@ impl HostBootstrapProcessor {
         store: &mut DurableStore,
         receipt: CompletedBootstrap,
     ) -> Result<(), ManagementError> {
+        if self
+            .calibration
+            .pack_pending
+            .contains_key(receipt.witness().id())
+        {
+            return self.finish_pack_calibration(store, receipt);
+        }
         let mut pending = self
             .calibration
             .pending
@@ -1363,6 +2211,7 @@ impl HostBootstrapProcessor {
                 let retained = self.calibration.confirmed.insert(
                     pending.selection.approval_ref().into(),
                     std::rc::Rc::new(ConfirmedCalibration {
+                        capacity: pending._slot.confirmed(&observed),
                         record,
                         route,
                         completion: observed,
@@ -1422,6 +2271,7 @@ impl HostBootstrapProcessor {
         }
     }
     pub(super) fn cleanup_calibration(&mut self, shutdown: bool) -> Result<(), ManagementError> {
+        self.cleanup_pack_calibration(shutdown)?;
         let expired = self
             .calibration
             .pending
@@ -1467,6 +2317,50 @@ impl HostBootstrapProcessor {
         }
         Ok(())
     }
+}
+
+/// Render only the exact retained plan summary for the private PACK exchange.
+/// This codec issues neither source authority nor a plan execution grant.
+pub(crate) fn pack_run_plan_manifest(
+    plan: &Value,
+    context: &Value,
+) -> mmmm_application::AppResult<Value> {
+    let failure = || {
+        mmmm_application::AppError::new(
+            "PACK_SOURCE_UNAVAILABLE",
+            "The retained PACK plan summary is unavailable",
+        )
+    };
+    if plan["contextPins"]
+        .as_array()
+        .is_none_or(|pins| pins.len() != 1)
+        || context["contextId"] != plan["contextPins"][0]["contextId"]
+        || context["contextDigest"] != plan["contextPins"][0]["contextDigest"]
+        || context["environment"] != plan["contextPins"][0]["environment"]
+    {
+        return Err(failure());
+    }
+    let conditions = plan["preconditions"].as_array().ok_or_else(failure)?;
+    let steps = plan["steps"].as_array().filter(|steps| steps.len() == 3)
+        .ok_or_else(failure)?.iter().map(|step| {
+            let arguments_digest = canonical_digest(&step["arguments"])
+                .map_err(|_| failure())?;
+            Ok(json!({
+                "stepId":step["stepId"], "bindingId":step["bindingId"],
+                "actionId":step["actionId"], "actionDigest":step["actionDigest"],
+                "implementationDigest":step["implementationDigest"], "argumentsDigest":arguments_digest,
+                "contextId":step["contextId"], "contextDigest":plan["contextPins"][0]["contextDigest"],
+                "resourcesRead":step["resourcesRead"], "resourcesWritten":step["resourcesWritten"],
+                "preconditions":conditions,
+            }))
+        }).collect::<mmmm_application::AppResult<Vec<_>>>()?;
+    Ok(json!({
+        "kind":"native_plan_approval", "protocolVersion":mmmm_contracts::CONTRACT_VERSION,
+        "principalId":context["principalRef"], "projectId":plan["projectId"],
+        "planId":plan["planId"], "planHash":plan["planHash"], "policyRevision":plan["policyRevision"],
+        "contextPins":plan["contextPins"], "expiresAt":plan["expiresAt"],
+        "steps":steps, "nativeExecutions":[],
+    }))
 }
 
 fn build_manifest(
@@ -1757,6 +2651,192 @@ mod tests {
             "normative_calibration_authority bytes={bytes} nodes={nodes} limit_bytes={} limit_nodes=4096",
             crate::peer_management::MAX_PUBLIC_BYTES
         );
+    }
+
+    // Reuses the existing plan/context examples and the sealed PACK recipe.
+    // Numeric fixtures cannot exercise the three distinct Invocation summaries,
+    // immutable shared preconditions and private predecessor guards.
+    fn pack_run_manifest_input() -> Value {
+        let mut plan =
+            mmmm_contracts::parse_json(include_bytes!("../../../examples/execution-plan.json"))
+                .unwrap();
+        let context =
+            mmmm_contracts::parse_json(include_bytes!("../../../examples/execution-context.json"))
+                .unwrap();
+        plan["contextPins"][0]["contextId"] = context["contextId"].clone();
+        plan["contextPins"][0]["contextDigest"] = context["contextDigest"].clone();
+        plan["contextPins"][0]["environment"] = context["environment"].clone();
+        plan["contextId"] = context["contextId"].clone();
+        plan["steps"] = json!(
+            [
+                (
+                    "pack-init-objective",
+                    "scoreboard objectives add mcalpack dummy"
+                ),
+                (
+                    "pack-seed-marker",
+                    "scoreboard players set #marker mcalpack 7331"
+                ),
+                ("pack-entry", "function mmmm_calibration:pack/entry"),
+            ]
+            .into_iter()
+            .map(|(id, command)| json!({
+                "stepId":id, "bindingId":"pack-binding", "actionId":"mmmm:command_execute",
+                "actionDigest":"1".repeat(64), "implementationDigest":"2".repeat(64),
+                "arguments":{"command":command}, "contextId":context["contextId"],
+                "resourcesRead":["calibration-objective-mcalpack"],
+                "resourcesWritten":["calibration-objective-mcalpack"],
+            }))
+            .collect::<Vec<_>>()
+        );
+        let recipe = mmmm_compiler::calibration::CalibrationPackProgram::java_26_3().unwrap();
+        json!({
+            "kind":"native_pack_calibration_run_approval/1", "purpose":crate::calibration_pack_run::PURPOSE,
+            "selectionDigest":"3".repeat(64), "hostEpoch":"pack-epoch", "registryGeneration":"1",
+            "runtimeSourceFactsDigest":"4".repeat(64), "programDigest":recipe.program_digest(),
+            "sourceBundleDigest":"5".repeat(64),
+            "sourceZipResource":{"resourceId":"pack-zip-fixture", "sha256":"6".repeat(64), "sizeBytes":32, "mediaType":"application/zip"},
+            "sourceOrigin":{"operationId":"pack-origin-operation", "invocationId":"pack-origin-invocation",
+                "invocationDigest":"7".repeat(64), "frozenManifestDigest":"8".repeat(64)},
+            "plan":pack_run_plan_manifest(&plan, &context).unwrap(), "targetId":"calibration-objective-mcalpack",
+            "stepGuards":{
+                "pack-init-objective":{"kind":"initial_absence"},
+                "pack-seed-marker":{"kind":"actual_previous_after","previousStepId":"pack-init-objective"},
+                "pack-entry":{"kind":"actual_previous_after","previousStepId":"pack-seed-marker"},
+            },
+        })
+    }
+
+    #[test]
+    fn pack_run_manifest_keeps_purpose_commands_whole_target_and_actual_guard_order_closed() {
+        let validator = ContractValidator::shared().unwrap();
+        let original = pack_run_manifest_input();
+        validate_manifest(&original, validator).unwrap();
+        assert_eq!(
+            original["plan"]["steps"][0]["preconditions"],
+            original["plan"]["steps"][2]["preconditions"]
+        );
+        assert!(
+            !original["plan"]["steps"][0]["preconditions"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        for (path, replacement) in [
+            ("/purpose", json!(PURPOSE)),
+            ("/kind", json!("native_calibration_approval/2")),
+            ("/targetId", json!("pack-marker-only")),
+            ("/programDigest", json!("9".repeat(64))),
+            ("/sourceZipResource/mediaType", json!("application/json")),
+            ("/sourceZipResource/sizeBytes", json!(0)),
+            ("/stepGuards", json!([])),
+            (
+                "/stepGuards/pack-entry/previousStepId",
+                json!("pack-init-objective"),
+            ),
+            (
+                "/plan/steps/0/actionId",
+                json!("mmmm:calibration_command_execute"),
+            ),
+            ("/plan/steps/1/stepId", json!("pack-init-objective")),
+            (
+                "/plan/steps/2/argumentsDigest",
+                json!(
+                    canonical_digest(&json!({"command":"function mmmm_calibration:pack/entry "}))
+                        .unwrap()
+                ),
+            ),
+            ("/plan/steps/1/preconditions", json!([])),
+            (
+                "/plan/steps/2/resourcesWritten",
+                json!(["calibration-objective-mcalpack", "another-objective"]),
+            ),
+        ] {
+            let mut changed = original.clone();
+            *changed.pointer_mut(path).unwrap() = replacement;
+            assert!(validate_manifest(&changed, validator).is_err(), "{path}");
+        }
+        let mut changed = original;
+        changed["sourceOrigin"]["ownerClaim"] = json!(true);
+        assert!(validate_manifest(&changed, validator).is_err());
+        let owner = json!({
+            "kind":"native_calibration_owner_offer", "protocolVersion":mmmm_contracts::CONTRACT_VERSION,
+            "nonce":"pack-owner-fixture", "purpose":crate::calibration_pack_run::PURPOSE,
+            "dataRoot":std::env::temp_dir().to_str().unwrap(), "projectId":"project-fixture",
+            "planId":"pack-plan-fixture", "planHash":"1".repeat(64),
+        });
+        assert!(validate_frame(&owner, validator).is_ok());
+        let mut changed = owner;
+        changed["purpose"] = json!("pack_calibration_run/2");
+        assert!(validate_frame(&changed, validator).is_err());
+    }
+
+    #[test]
+    fn pack_confirmation_failure_retains_actual_publication_and_confirmation_causes() {
+        let publication = Arc::new(mmmm_application::AppError::new(
+            "PACK_PUBLICATION_FAILED",
+            "Actual publication failed",
+        ));
+        let failed = pack_confirmation_result(
+            Err(mmmm_application::AppError::new(
+                "PACK_CONFIRMATION_FAILED",
+                "Actual confirmation failed",
+            )),
+            Some(publication.clone()),
+        )
+        .unwrap_err();
+        let StorageError::CalibrationCheckpointFailure {
+            primary,
+            checkpoint,
+        } = failed
+        else {
+            panic!("Both actual failures must remain in the typed failure graph");
+        };
+        let StorageError::Io(primary) = *primary else {
+            panic!("Missing publication failure");
+        };
+        let retained = primary
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<PackPublicationFailure>()
+            .unwrap();
+        assert!(Arc::ptr_eq(&retained.0, &publication));
+        let StorageError::Io(checkpoint) = *checkpoint else {
+            panic!("Missing confirmation failure");
+        };
+        let checkpoint = checkpoint
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<mmmm_application::AppError>()
+            .unwrap();
+        assert_eq!(checkpoint.code, "PACK_CONFIRMATION_FAILED");
+        assert!(pack_confirmation_result(Ok(()), Some(publication)).unwrap());
+        assert!(!pack_confirmation_result(Ok(()), None).unwrap());
+    }
+
+    #[test]
+    fn pack_owner_selection_requires_each_step_to_match_the_observed_host_artifact() {
+        let artifact = Sha256Digest::new("1".repeat(64)).unwrap();
+        let original = json!({"steps":[
+            {"implementationDigest":artifact},
+            {"implementationDigest":artifact},
+            {"implementationDigest":artifact},
+        ]});
+        verify_pack_host_artifact(&original, &artifact).unwrap();
+        for index in 0..3 {
+            let mut changed = original.clone();
+            changed["steps"][index]["implementationDigest"] = json!("2".repeat(64));
+            assert!(verify_pack_host_artifact(&changed, &artifact).is_err());
+        }
+        let mut changed = original.clone();
+        changed["steps"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("implementationDigest");
+        assert!(verify_pack_host_artifact(&changed, &artifact).is_err());
+        let mut changed = original;
+        changed["steps"].as_array_mut().unwrap().pop();
+        assert!(verify_pack_host_artifact(&changed, &artifact).is_err());
     }
 
     fn retained_stop(cause: &StorageError) -> &CalibrationCleanupStop {

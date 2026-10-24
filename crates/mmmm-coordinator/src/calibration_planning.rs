@@ -1,9 +1,12 @@
-//! 실제 owner와 entered Plan 요청 아래 sealed47 원문만 공통 setup/freeze로 전달한다.
-//! 계획 생성은 설치, ADMIN 승인, runner 준비 또는 numeric 인수의 증거가 아니다.
+//! 실제 owner와 entered Plan 요청 아래 봉인된 calibration 원문을 공통 setup/freeze로 전달한다.
+//! 계획 생성은 설치, ADMIN 승인, 실제 run 또는 profile 인수의 증거가 아니다.
 
 use crate::{
+    authority::LocalAuthority,
     bootstrap::NativeWorkspacePermit,
-    calibration_bootstrap::{BootstrapRegistry, BootstrapSource},
+    calibration_bootstrap::{BootstrapRegistry, BootstrapSource, PackBootstrapOrigin},
+    calibration_execution::CalibrationRegistry,
+    calibration_pack_run::PreparedPackRunSource,
     host::{HostBridge, HostContextWitness, HttpProviderPort},
     observer::finish_native_observation,
     service::RequestContextWitness,
@@ -16,7 +19,8 @@ use mmmm_compiler::{
     calibration::CalibrationSourceKind, calibration_dispatch::CalibrationDispatchPlan,
 };
 use mmmm_contracts::{
-    BindingId, PlanId, PrincipalId, Sha256Digest, TargetId, canonical_digest, raw_digest,
+    BindingId, OperationId, PlanId, PrincipalId, Sha256Digest, TargetId, canonical_digest,
+    raw_digest,
 };
 use mmmm_runtime::storage::{
     DurableStore, StorageError, StorageResult, WriteScope,
@@ -35,6 +39,9 @@ pub(crate) struct CalibrationPlanReceipt {
     plan_hash: Sha256Digest,
 }
 impl CalibrationPlanReceipt {
+    pub(crate) fn new(plan_id: PlanId, plan_hash: Sha256Digest) -> Self {
+        Self { plan_id, plan_hash }
+    }
     pub(crate) fn plan_id(&self) -> &PlanId {
         &self.plan_id
     }
@@ -58,6 +65,7 @@ pub(crate) fn prepare_normative47_plan(
         selection,
         None,
         CalibrationSourceKind::Numeric47,
+        None,
     )
 }
 
@@ -77,6 +85,7 @@ pub(crate) fn prepare_bootstrap_plan(
         selection,
         Some(registry),
         CalibrationSourceKind::Numeric47,
+        None,
     )
 }
 
@@ -96,9 +105,56 @@ pub(crate) fn prepare_pack_bootstrap_plan(
         selection,
         Some(registry),
         CalibrationSourceKind::PackCase,
+        None,
     )
 }
 
+/// A new ordinary setup plan references a dispatched PACK preparation as
+/// readonly source provenance. It neither replays nor settles that operation.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The current request, concrete authority, two actual registries and original operation have independent trust roles"
+)]
+pub(crate) fn prepare_pack_run_plan(
+    app: &mut Application<'_>,
+    request: &RequestContextWitness,
+    owner: &NativeOwnerWitness,
+    hosts: &HostBridge,
+    selection: &SetupSelection,
+    registry: &CalibrationRegistry,
+    bootstrap: &BootstrapRegistry,
+    operation: &OperationId,
+    authority: &LocalAuthority,
+) -> AppResult<CalibrationPlanReceipt> {
+    request_check(request, owner)?;
+    let origin =
+        bootstrap.pack_run_origin(app.store, request, owner, authority, selection, operation)?;
+    prepare_selected_plan(
+        app,
+        request,
+        owner,
+        hosts,
+        selection,
+        None,
+        CalibrationSourceKind::PackCase,
+        Some(PackRunSelection {
+            registry,
+            origin,
+            authority,
+        }),
+    )
+}
+
+struct PackRunSelection<'a> {
+    registry: &'a CalibrationRegistry,
+    origin: PackBootstrapOrigin,
+    authority: &'a LocalAuthority,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The shared setup producer keeps explicit bootstrap and PACK run provenance separate"
+)]
 fn prepare_selected_plan(
     app: &mut Application<'_>,
     request: &RequestContextWitness,
@@ -107,6 +163,7 @@ fn prepare_selected_plan(
     selection: &SetupSelection,
     bootstrap: Option<&BootstrapRegistry>,
     source_kind: CalibrationSourceKind,
+    pack_run: Option<PackRunSelection<'_>>,
 ) -> AppResult<CalibrationPlanReceipt> {
     request_check(request, owner)?;
     if !request
@@ -158,6 +215,7 @@ fn prepare_selected_plan(
             cause,
         )
     })?;
+    let pack_registry = pack_run.as_ref().map(|selection| selection.registry);
     let mut creator = Creator {
         store: app.store as *const DurableStore,
         root: app.store.data_root().to_path_buf(),
@@ -174,6 +232,8 @@ fn prepare_selected_plan(
         bootstrap,
         source_kind,
         staged: None,
+        pack_run,
+        staged_pack: None,
     };
     let plan = app.prepare_setup(owner.principal(), selection, &mut creator)?;
     if let Some(registry) = bootstrap {
@@ -191,11 +251,26 @@ fn prepare_selected_plan(
             ));
         }
     }
+    if let Some(registry) = pack_registry {
+        let source = creator.staged_pack.take().ok_or_else(unavailable)?;
+        if let Err(cause) =
+            crate::calibration_pack_run::retain_plan(registry, app.store, source, &plan)
+        {
+            return Err(AppError::caused_by(
+                "SETUP_PLAN_COMMITTED",
+                "PACK run plan was saved before its protected source association failed",
+                BootstrapPlanCommitted {
+                    plan: plan.clone(),
+                    cause,
+                },
+            ));
+        }
+    }
     // No extra fallible checkpoint follows the common committed-plan postcheck.
-    Ok(CalibrationPlanReceipt {
-        plan_id: decode(&plan["planId"])?,
-        plan_hash: decode(&plan["planHash"])?,
-    })
+    Ok(CalibrationPlanReceipt::new(
+        decode(&plan["planId"])?,
+        decode(&plan["planHash"])?,
+    ))
 }
 
 struct Creator<'a> {
@@ -214,6 +289,8 @@ struct Creator<'a> {
     bootstrap: Option<&'a BootstrapRegistry>,
     source_kind: CalibrationSourceKind,
     staged: Option<Rc<BootstrapSource>>,
+    pack_run: Option<PackRunSelection<'a>>,
+    staged_pack: Option<Rc<PreparedPackRunSource>>,
 }
 impl Creator<'_> {
     fn check_local(&self) -> AppResult<()> {
@@ -257,7 +334,9 @@ impl Creator<'_> {
         store: &DurableStore,
         context: &Value,
     ) -> AppResult<(BindingId, Value, Value)> {
-        let action_id = if self.bootstrap.is_some() {
+        let action_id = if self.pack_run.is_some() {
+            "mmmm:command_execute"
+        } else if self.bootstrap.is_some() {
             crate::calibration_bootstrap::action_for_kind(self.source_kind)
         } else {
             "mmmm:calibration_command_execute"
@@ -379,6 +458,37 @@ impl SetupPlanningPort for Creator<'_> {
             return Err(denied());
         }
         let (binding, descriptor, dependency) = self.observed_action(store, context)?;
+        if let Some(run) = self.pack_run.take() {
+            let source = crate::calibration_pack_run::stage_source(
+                store,
+                self.request,
+                self.owner,
+                self.hosts,
+                selection,
+                context,
+                run.origin,
+                run.authority,
+            )?;
+            let (scope, steps) =
+                project_pack_run_steps(selection, context, &binding, &descriptor, source.target())?;
+            let preconditions = source.preconditions();
+            self.check_store(store)?;
+            self.staged_pack = Some(source);
+            self.prepared = true;
+            return Ok(PreparedPlan {
+                contexts: vec![context.clone()],
+                scope,
+                preconditions,
+                steps,
+                atomicity: "none".into(),
+                losses: vec![],
+                diagnostics: vec![],
+                approval_requirement: "explicit_approval".into(),
+                dependency_pins: vec![dependency],
+                expires_at: self.expires_at.clone(),
+                time_budget_ms: self.time_budget_ms,
+            });
+        }
         if self.bootstrap.is_some() {
             let source = match self.source_kind {
                 CalibrationSourceKind::Numeric47 => crate::calibration_bootstrap::stage_source(
@@ -575,6 +685,61 @@ fn project_steps(
     scope.validate().map_err(storage)?;
     Ok((scope, steps))
 }
+
+fn project_pack_run_steps(
+    selection: &SetupSelection,
+    context: &Value,
+    binding: &BindingId,
+    descriptor: &Value,
+    target: &TargetId,
+) -> AppResult<(WriteScope, Vec<Value>)> {
+    validate_descriptor_for(descriptor, "mmmm:command_execute")?;
+    // Objective existence and all of its child scores share one canonical
+    // scope. Renaming the marker write must not bypass an existing fence.
+    if target.as_str() != "calibration-objective-mcalpack" {
+        return Err(invalid());
+    }
+    let action_digest = canonical_digest(descriptor).map_err(|_| invalid())?;
+    let mut steps = Vec::with_capacity(3);
+    let mut previous: Option<&str> = None;
+    for (step_id, command) in [
+        (
+            "pack-init-objective",
+            "scoreboard objectives add mcalpack dummy",
+        ),
+        (
+            "pack-seed-marker",
+            "scoreboard players set #marker mcalpack 7331",
+        ),
+        ("pack-entry", "function mmmm_calibration:pack/entry"),
+    ] {
+        let step = json!({"stepId":step_id,"bindingId":binding,
+            "actionId":"mmmm:command_execute","actionContractVersion":descriptor["contractVersion"],
+            "actionDigest":action_digest,"arguments":{"command":command},
+            "dependsOn":previous.iter().copied().collect::<Vec<_>>(),
+            "effect":descriptor["effect"],"completion":descriptor["completion"],
+            "recovery":descriptor["recovery"],"resourcesRead":[target],"resourcesWritten":[target],
+            "verificationRequirement":descriptor["verificationRequirement"],
+            "contextId":context["contextId"],"implementationDigest":descriptor["implementationDigest"],
+            "resultBindings":[]});
+        mmmm_contracts::ContractValidator::shared()
+            .map_err(|_| invalid())?
+            .validate("PlanStep", &step)
+            .map_err(|_| invalid())?;
+        steps.push(step);
+        previous = Some(step_id);
+    }
+    let scope = WriteScope {
+        project_id: selection.project_id.clone(),
+        resource_ids: vec![],
+        object_ids: vec![],
+        regions: vec![],
+        external_target_ids: vec![target.clone()],
+    };
+    scope.validate().map_err(storage)?;
+    Ok((scope, steps))
+}
+
 fn validate_descriptor(descriptor: &Value) -> AppResult<()> {
     validate_descriptor_for(descriptor, "mmmm:calibration_command_execute")
 }
@@ -604,7 +769,7 @@ impl std::fmt::Display for BootstrapPlanCommitted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Committed bootstrap plan {} / {} could not retain its protected source",
+            "Committed calibration plan {} / {} could not retain its protected source",
             self.plan["planId"], self.plan["planHash"]
         )
     }
@@ -659,6 +824,67 @@ fn revision_changed() -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pack_run_keeps_three_original_commands_in_one_objective_scope() {
+        let provider: Value =
+            serde_json::from_slice(include_bytes!("../../../examples/provider-supported.json"))
+                .unwrap();
+        let mut descriptor = provider["actions"][0].clone();
+        descriptor["actionId"] = json!("mmmm:command_execute");
+        descriptor["semanticKind"] = json!("mmmm:raw_command");
+        descriptor["effect"] = json!("unknown");
+        descriptor["verificationRequirement"] = json!("independent_readback");
+        let context: Value =
+            serde_json::from_slice(include_bytes!("../../../examples/execution-context.json"))
+                .unwrap();
+        let selection = SetupSelection {
+            project_id: decode(&context["projectId"]).unwrap(),
+            expected_revision: raw_digest(b"pack run fixture revision"),
+            context_id: decode(&context["contextId"]).unwrap(),
+        };
+        let binding = BindingId::new("binding-fixture-01").unwrap();
+        let target = TargetId::new("calibration-objective-mcalpack").unwrap();
+        let (scope, steps) =
+            project_pack_run_steps(&selection, &context, &binding, &descriptor, &target).unwrap();
+        assert_eq!(scope.external_target_ids, vec![target.clone()]);
+        assert_eq!(steps.len(), 3);
+        for (index, command) in [
+            "scoreboard objectives add mcalpack dummy",
+            "scoreboard players set #marker mcalpack 7331",
+            "function mmmm_calibration:pack/entry",
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(steps[index]["arguments"], json!({"command":command}));
+            assert_eq!(steps[index]["actionId"], "mmmm:command_execute");
+            assert_eq!(steps[index]["resourcesRead"], json!([target]));
+            assert_eq!(steps[index]["resourcesWritten"], json!([target]));
+            assert_eq!(
+                steps[index]["dependsOn"],
+                if index == 0 {
+                    json!([])
+                } else {
+                    json!([steps[index - 1]["stepId"]])
+                }
+            );
+        }
+        assert!(
+            project_pack_run_steps(
+                &selection,
+                &context,
+                &binding,
+                &descriptor,
+                &TargetId::new("calibration-score-mcalpack-marker").unwrap()
+            )
+            .is_err()
+        );
+        descriptor["completion"] = json!("job");
+        assert!(
+            project_pack_run_steps(&selection, &context, &binding, &descriptor, &target,).is_err()
+        );
+    }
 
     #[test]
     fn sealed47_projection_keeps_original_invocations_exact_chain_and_descriptor_pins() {

@@ -7,7 +7,9 @@ use crate::{
     observer::finish_native_observation, peer_management::CompletedBootstrap,
     service::RequestContextWitness, workspace_bootstrap::NativeOwnerWitness,
 };
-use mmmm_application::{Access, AppError, AppResult, AuthorityPort, BeforeCapture, BeforeImage};
+use mmmm_application::{
+    Access, AppError, AppResult, AuthorityPort, BeforeCapture, BeforeImage, SetupSelection,
+};
 use mmmm_compiler::{
     calibration::{CalibrationPackProgram, CalibrationSourceKind},
     calibration_dispatch::CalibrationDispatchPlan,
@@ -17,7 +19,7 @@ use mmmm_contracts::{
     canonical_digest, raw_digest, verify_projected_digest,
 };
 use mmmm_runtime::storage::{
-    BlobRef, DurableStore, OperationRecord, StorageError, WriteScope,
+    BlobRef, DispatchEvidence, DurableStore, OperationRecord, StorageError, WriteScope,
     artifact::{ResourceOwner, register_resource_with_diagnostics},
 };
 use serde_json::{Value, json};
@@ -80,6 +82,7 @@ pub(crate) fn is_candidate(original: &Value) -> bool {
 const MAX_ENTRIES: usize = 8;
 const MAX_BUNDLE_BYTES: u64 = 3 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 1024 * 1024;
+const MAX_ORIGIN_INVOCATION_BYTES: u64 = 64 * 1024;
 
 #[path = "calibration_bootstrap_successor.rs"]
 mod successor;
@@ -133,6 +136,276 @@ impl BootstrapSource {
             "expected":blob.digest,"coverage":"full_target"})
             })
             .collect()
+    }
+}
+
+/// Readonly provenance of one actual dispatched PACK preparation. Only the
+/// same-Store registry can construct it; bytes and locators cannot recreate it.
+/// The old route may have retired during its reload and grants no new Apply.
+pub(crate) struct PackBootstrapOrigin {
+    registry: BootstrapRegistry,
+    entry: Rc<PreparedBootstrap>,
+    confirmed: Rc<ConfirmedBootstrap>,
+    store: *const DurableStore,
+    store_root: PathBuf,
+    operation: OperationRecord,
+    original: Value,
+    bundle_digest: Sha256Digest,
+    manifest_digest: Sha256Digest,
+    absence: Vec<(String, BlobRef)>,
+}
+
+#[derive(Clone, Copy)]
+enum PackOriginRole {
+    PlanCreate,
+    RunObservePlanCreate,
+    RunApply,
+    RunReconcile,
+    RunCancel,
+    RunGet,
+}
+impl PackOriginRole {
+    fn for_run(method: &str) -> AppResult<Self> {
+        match method {
+            "plan.create" => Ok(Self::RunObservePlanCreate),
+            "plan.apply" => Ok(Self::RunApply),
+            "operation.reconcile" => Ok(Self::RunReconcile),
+            "operation.cancel" => Ok(Self::RunCancel),
+            "operation.get" => Ok(Self::RunGet),
+            _ => Err(denied()),
+        }
+    }
+    fn method(self) -> &'static str {
+        match self {
+            Self::PlanCreate => "plan.create",
+            Self::RunObservePlanCreate => "plan.create",
+            Self::RunApply => "plan.apply",
+            Self::RunReconcile => "operation.reconcile",
+            Self::RunCancel => "operation.cancel",
+            Self::RunGet => "operation.get",
+        }
+    }
+}
+impl PackBootstrapOrigin {
+    pub(crate) fn original(&self) -> &Value {
+        &self.original
+    }
+    pub(crate) fn operation(&self) -> &OperationId {
+        &self.operation.operation_id
+    }
+    pub(crate) fn source_bundle_digest(&self) -> &Sha256Digest {
+        &self.bundle_digest
+    }
+    pub(crate) fn logical_program_digest(&self) -> &Sha256Digest {
+        &self.entry.source.recipe.digest
+    }
+    pub(crate) fn frozen_manifest_digest(&self) -> &Sha256Digest {
+        &self.manifest_digest
+    }
+    pub(crate) fn source_bundle(&self) -> &Value {
+        &self.entry.source.bundle
+    }
+    pub(crate) fn source_blob(&self) -> &BlobRef {
+        &self.entry.source.blob
+    }
+    pub(crate) fn recipe_blob(&self) -> &BlobRef {
+        &self.entry.source.recipe
+    }
+    pub(crate) fn absence_images(&self) -> &[(String, BlobRef)] {
+        &self.absence
+    }
+    pub(crate) fn check(
+        &self,
+        store: &DurableStore,
+        request: &RequestContextWitness,
+        owner: &NativeOwnerWitness,
+        selection: &SetupSelection,
+        authority: &LocalAuthority,
+    ) -> AppResult<()> {
+        self.check_relationship(
+            store,
+            request,
+            owner,
+            selection,
+            authority,
+            PackOriginRole::PlanCreate,
+        )
+    }
+    /// Source provenance remains readonly during a separately entered run.
+    /// Its caller must also validate that new operation and typed approval;
+    /// plan.create is only the typed completed-run Observe consumer's role.
+    pub(crate) fn check_for_run(
+        &self,
+        store: &DurableStore,
+        request: &RequestContextWitness,
+        owner: &NativeOwnerWitness,
+        selection: &SetupSelection,
+        authority: &LocalAuthority,
+    ) -> AppResult<()> {
+        let role = PackOriginRole::for_run(request.method())?;
+        self.check_relationship(store, request, owner, selection, authority, role)
+    }
+    fn check_relationship(
+        &self,
+        store: &DurableStore,
+        request: &RequestContextWitness,
+        owner: &NativeOwnerWitness,
+        selection: &SetupSelection,
+        authority: &LocalAuthority,
+        role: PackOriginRole,
+    ) -> AppResult<()> {
+        request.check_local().map_err(request_error)?;
+        owner
+            .check_project(store, &selection.project_id)
+            .map_err(storage)?;
+        let current = store
+            .operation(&self.operation.operation_id)
+            .map_err(storage)?;
+        let plan = &self.entry.plan;
+        let frozen = &plan["steps"][0];
+        let step_id: StepId = decode(&frozen["stepId"])?;
+        let step = current.steps.first().ok_or_else(denied)?;
+        if !std::ptr::eq(store, self.store)
+            || store.data_root() != self.store_root
+            || request.method() != role.method()
+            || request.authenticated().principal() != owner.principal()
+            || !request
+                .authenticated()
+                .permits_context(selection.context_id.as_str())
+            || current.principal != *owner.principal()
+            || current.principal != self.entry.source.principal
+            || current.project_id != selection.project_id
+            || current.project_id != self.entry.source.project
+            || current.plan_id != self.operation.plan_id
+            || current.plan_hash != self.operation.plan_hash
+            || current.context_id != self.operation.context_id
+            || current.scope != self.operation.scope
+            || plan["projectBaseRevision"] != selection.expected_revision.as_str()
+            || serde_json::to_value(&current.scope).map_err(|_| unavailable())? != plan["scope"]
+            || current.steps.len() != 1
+            || step.step_id != step_id
+            || step.dispatch == DispatchEvidence::NotSent
+            || step.invocation_id.as_ref().map(|id| id.as_str())
+                != self.original["invocationId"].as_str()
+            || self.original["operationId"] != current.operation_id.as_str()
+            || self.original["context"] != *self.confirmed.route.context()
+            || self.original["context"]["contextId"] != current.context_id.as_str()
+            || self.original["context"]["principalRef"] != current.principal.as_str()
+            || self.original["contextDigest"] != self.original["context"]["contextDigest"]
+            || self.original["contextDigest"] != plan["contextPins"][0]["contextDigest"]
+            || self.original["argumentsDigest"]
+                != canonical_digest(&self.original["arguments"])
+                    .map_err(|_| unavailable())?
+                    .as_str()
+            || [
+                "stepId",
+                "bindingId",
+                "actionId",
+                "actionContractVersion",
+                "actionDigest",
+                "implementationDigest",
+                "arguments",
+            ]
+            .iter()
+            .any(|field| self.original[*field] != frozen[*field])
+            || self.entry.source.kind != CalibrationSourceKind::PackCase
+            || self.entry.source.targets.len() != 1
+            || self.entry.source.targets[0].as_str() != PACK_CASE_TARGET
+            || frozen["actionId"] != PACK_ACTION
+            || frozen["arguments"] != json!({"command":PACK_COMMAND})
+            || !self.confirmed.completion.delivered()
+            || self.confirmed.publication_failure.is_some()
+            || self.confirmed.manifest["purpose"] != PACK_PURPOSE
+            || self.confirmed.manifest["kind"] != PACK_MANIFEST_KIND
+            || self.confirmed.manifest["plan"]["planId"] != current.plan_id.as_str()
+            || self.confirmed.manifest["plan"]["planHash"] != current.plan_hash.as_str()
+            || self.confirmed.manifest["sourceBundle"] != self.entry.source.bundle
+            || self.entry.source.digest() != &json!(self.bundle_digest)
+            || canonical_digest(&self.confirmed.manifest).map_err(|_| unavailable())?
+                != self.manifest_digest
+            || !Rc::ptr_eq(&self.registry.prepared(store, plan)?, &self.entry)
+            || self
+                .entry
+                .operation
+                .try_borrow()
+                .map_err(|_| unavailable())?
+                .as_ref()
+                != Some(&current.operation_id)
+            || self
+                .entry
+                .confirmed
+                .try_borrow()
+                .map_err(|_| unavailable())?
+                .as_ref()
+                .is_none_or(|value| !Rc::ptr_eq(value, &self.confirmed))
+        {
+            return Err(denied());
+        }
+        authority.clone().authorize_operation(
+            &current.principal,
+            &current,
+            Access::ObserveOperation,
+        )?;
+        let original = store
+            .stored_invocation_checked(
+                &current.operation_id,
+                &step_id,
+                MAX_ORIGIN_INVOCATION_BYTES,
+                || {
+                    request.check_local().map_err(|cause| {
+                        StorageError::Io(std::io::Error::other(request_error(cause)))
+                    })?;
+                    owner.check()
+                },
+            )
+            .map_err(storage)?;
+        if original != self.original {
+            return Err(denied());
+        }
+        let blob = store
+            .stored_invocation_blob(&current.operation_id, &step_id)
+            .map_err(storage)?;
+        verify_raw_invocation_pin(&self.original, &blob)?;
+        // Journal StepRecord pins encode_json bytes, while wire identity uses
+        // the separate canonical digest (including valid native f64 fields).
+        if step.invocation_digest.as_ref() != Some(&blob.digest) {
+            return Err(denied());
+        }
+        let key = canonical_digest(&self.original).map_err(|_| unavailable())?;
+        if self
+            .entry
+            .captures
+            .try_borrow()
+            .map_err(|_| unavailable())?
+            .get(key.as_str())
+            != Some(&self.absence)
+            || self.absence.len() != 1
+            || self.absence[0].0 != PACK_CASE_TARGET
+            || self.absence != self.entry.source.expected
+        {
+            return Err(unavailable());
+        }
+        for (_, image) in &self.absence {
+            store
+                .read_blob_checked(image, MAX_IMAGE_BYTES as u64, || {
+                    request.check_local().map_err(|cause| {
+                        StorageError::Io(std::io::Error::other(request_error(cause)))
+                    })?;
+                    owner.check()
+                })
+                .map_err(storage)?;
+        }
+        self.registry.check_source(store, plan, &|| {
+            request.check_local().map_err(request_error)?;
+            owner
+                .check_project(store, &selection.project_id)
+                .map_err(storage)?;
+            authority.clone().authorize_operation(
+                &current.principal,
+                &current,
+                Access::ObserveOperation,
+            )
+        })
     }
 }
 
@@ -499,6 +772,90 @@ pub(crate) fn absence_requirements_for_kind(
 }
 
 impl BootstrapRegistry {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Readonly origin binds an actual current request, concrete authority, selected context and original journal operation"
+    )]
+    pub(crate) fn pack_run_origin(
+        &self,
+        store: &DurableStore,
+        request: &RequestContextWitness,
+        owner: &NativeOwnerWitness,
+        authority: &LocalAuthority,
+        selection: &SetupSelection,
+        operation_id: &OperationId,
+    ) -> AppResult<PackBootstrapOrigin> {
+        request.check_local().map_err(request_error)?;
+        owner
+            .check_project(store, &selection.project_id)
+            .map_err(storage)?;
+        if request.method() != "plan.create"
+            || request.authenticated().principal() != owner.principal()
+            || !request
+                .authenticated()
+                .permits_context(selection.context_id.as_str())
+        {
+            return Err(denied());
+        }
+        let operation = store.operation(operation_id).map_err(storage)?;
+        authority.clone().authorize_operation(
+            owner.principal(),
+            &operation,
+            Access::ObserveOperation,
+        )?;
+        let plan = store
+            .plan(&operation.plan_id, &operation.plan_hash)
+            .map_err(storage)?;
+        let entry = self.prepared(store, &plan)?;
+        if entry.source.kind != CalibrationSourceKind::PackCase
+            || plan["steps"]
+                .as_array()
+                .is_none_or(|steps| steps.len() != 1)
+        {
+            return Err(denied());
+        }
+        let confirmed = entry
+            .confirmed
+            .try_borrow()
+            .map_err(|_| unavailable())?
+            .as_ref()
+            .cloned()
+            .ok_or_else(unavailable)?;
+        let step: StepId = decode(&plan["steps"][0]["stepId"])?;
+        let original = store
+            .stored_invocation_checked(operation_id, &step, MAX_ORIGIN_INVOCATION_BYTES, || {
+                request.check_local().map_err(|cause| {
+                    StorageError::Io(std::io::Error::other(request_error(cause)))
+                })?;
+                owner.check()
+            })
+            .map_err(storage)?;
+        let key = canonical_digest(&original).map_err(|_| unavailable())?;
+        let absence = entry
+            .captures
+            .try_borrow()
+            .map_err(|_| unavailable())?
+            .get(key.as_str())
+            .cloned()
+            .ok_or_else(unavailable)?;
+        let bundle_digest = decode(entry.source.digest())?;
+        let manifest_digest = canonical_digest(&confirmed.manifest).map_err(|_| unavailable())?;
+        let origin = PackBootstrapOrigin {
+            registry: self.clone(),
+            entry,
+            confirmed,
+            store,
+            store_root: store.data_root().to_path_buf(),
+            operation,
+            original,
+            bundle_digest,
+            manifest_digest,
+            absence,
+        };
+        origin.check(store, request, owner, selection, authority)?;
+        Ok(origin)
+    }
+
     pub(crate) fn retire_routes(&self, shutdown: bool) -> AppResult<()> {
         let entries = self.entries.try_borrow().map_err(|_| unavailable())?;
         for entry in entries.values() {

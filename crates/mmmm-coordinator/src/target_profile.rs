@@ -755,12 +755,6 @@ impl RegisteredTargetProfiles {
         _cache: &mut BTreeMap<SourceId, RegisteredCatalogSourceIdentity>,
         _bytes_left: &mut u64,
     ) -> AppResult<CalibrationRunSource> {
-        let RuntimeCaseProgram::Numeric(program) = &expected.program else {
-            return Err(error(
-                "CALIBRATION_RUN_ISSUER_UNAVAILABLE",
-                "Actual pack lifecycle issuer is not implemented by numeric Source3",
-            ));
-        };
         let (slot, registry) = self.calibration.as_ref().ok_or_else(unverified)?;
         let request = slot
             .occupied_witness()
@@ -771,6 +765,92 @@ impl RegisteredTargetProfiles {
         {
             return Err(forbidden());
         }
+        if let RuntimeCaseProgram::DataPack(program) = &expected.program {
+            let historical = durable.pack_readback.as_ref().ok_or_else(unverified)?;
+            let payload =
+                store.with_write(|store| {
+                    let entered = registry
+                        .pack_runs()
+                        .enter(
+                            store,
+                            &request,
+                            &self.authority,
+                            &case.operation_id,
+                            &durable.original,
+                            crate::calibration_pack_run::PackRunAccess::Observe,
+                        )?
+                        .ok_or_else(unverified)?;
+                    entered.verify_claim(store, &durable.original)?;
+                    if case.step_id.as_str() != "pack-entry"
+                        || entered.operation().state != OperationState::Succeeded
+                        || entered.operation().reconciliation_required
+                        || entered.operation().cancellation_requested
+                        || entered.program_digest() != program.program_digest()
+                        || entered.source_zip_resource() != &expected.source.resource
+                    {
+                        return Err(unverified());
+                    }
+                    let current = |store: &DurableStore| {
+                        entered.verify_claim(store, &durable.original)?;
+                        let operation = store.operation(&case.operation_id).map_err(storage_app)?;
+                        if operation.state != OperationState::Succeeded
+                            || operation.reconciliation_required
+                            || operation.cancellation_requested
+                        {
+                            return Err(unverified());
+                        }
+                        Ok(())
+                    };
+                    crate::calibration_pack_observer::verify_completed_chain(&entered, store)?;
+                    let pins = crate::calibration_pack_observer::SourcePins {
+                        facts: &suite.runtime_source_facts_digest,
+                        generation: &suite.registry_generation,
+                        artifact: &suite.host_artifact_digest,
+                        bundle_digest: entered.source_bundle_digest(),
+                        zip_resource: entered.source_zip_resource(),
+                        load_invocation_digest: entered.load_invocation_digest(),
+                    };
+                    crate::calibration_pack_observer::verify_readback(
+                        historical,
+                        &durable.original,
+                        program,
+                        &pins,
+                        &|| current(store),
+                    )?;
+                    let payload = entered.route().inspect_original_with_store(
+                    store, &request, &durable.original,
+                    json!({"kind":"pack_calibration_run_source","invocationId":case.invocation_id,
+                        "invocationDigest":durable.invocation_digest,
+                        "expectedRuntimeSourceFactsDigest":suite.runtime_source_facts_digest,
+                        "expectedRegistryGeneration":suite.registry_generation}),
+                    &current,
+                )?;
+                    crate::observer::finish_native_observation(
+                        crate::calibration_pack_observer::verify_run_source(
+                            &payload,
+                            &durable.original,
+                            program,
+                            &pins,
+                            &|| current(store),
+                        ),
+                        current(store),
+                    )?;
+                    if digest(&payload)? != digest(&historical["runSource"])? {
+                        return Err(unverified());
+                    }
+                    Ok(payload)
+                })?;
+            rpc.fresh()?;
+            return Ok(CalibrationRunSource {
+                case_id: case.case_id.clone(),
+                invocation_id: case.invocation_id.clone(),
+                program_digest: program.program_digest().clone(),
+                receipt_digest: digest(&payload)?,
+            });
+        }
+        let RuntimeCaseProgram::Numeric(program) = &expected.program else {
+            return Err(unverified());
+        };
         let payload=store.with_write(|store| {
             let entered=registry.enter(store,&request,&self.authority,&case.operation_id,&durable.original,crate::calibration_execution::CalibrationAccess::Observe)?.ok_or_else(unverified)?;
             entered.verify_claim(store,&durable.original)?;
@@ -1053,6 +1133,7 @@ struct RuntimeCaseRecord {
 struct DurableCaseWitness {
     invocation_digest: Sha256Digest,
     original: Value,
+    pack_readback: Option<Value>,
 }
 
 /// No JSON/public constructor. Only a response from the actual privately
@@ -1399,11 +1480,21 @@ fn verify_durable_case(
             profile,
             source_bytes,
             &rpc.budget,
+            &original,
         )?;
+        store.with_read(|store| {
+            crate::calibration_pack_observer::verify_before_capture_pin(
+                store,
+                &original,
+                &field_digest(&observation, "beforeImageSha256")?,
+                &|| rpc.local_current(),
+            )
+        })?;
         rpc.fresh()?;
         return Ok(DurableCaseWitness {
             invocation_digest,
             original,
+            pack_readback: Some(observation),
         });
     }
     if observation["format"] == "mmmm.target-case-readback/3" {
@@ -1466,6 +1557,7 @@ fn verify_durable_case(
             Ok(DurableCaseWitness {
                 invocation_digest,
                 original,
+                pack_readback: None,
             })
         })();
         return crate::observer::finish_native_observation(verified, rpc.fresh());
@@ -1593,21 +1685,10 @@ fn verified_rules(
     })
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct PackReadback {
-    format: String,
-    case_id: String,
-    source_resource: Value,
-    command_stage_index: u32,
-    invocation_id: InvocationId,
-    runtime_source_facts_digest: Sha256Digest,
-    min_format: Value,
-    max_format: Value,
-    installed_function_ids: BTreeSet<String>,
-    dispatched_function_id: String,
-    marker: Int32,
-}
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Actual durable original, independent native image and normative ZIP/profile pins have separate evidence roots"
+)]
 fn verify_pack_readback(
     value: &Value,
     case: &RuntimeCaseRecord,
@@ -1616,31 +1697,30 @@ fn verify_pack_readback(
     profile: &Value,
     source_bytes: &[u8],
     budget: &RequestBudget,
+    original: &Value,
 ) -> AppResult<()> {
-    let readback: PackReadback = serde_json::from_value(value.clone()).map_err(|_| unverified())?;
-    if readback.format != "mmmm.target-pack-readback/1"
-        || readback.case_id != PACK_CASE
-        || readback.source_resource != expected.source.resource
-        || readback.command_stage_index != expected.program.command_stage_index()
-        || readback.invocation_id != case.invocation_id
-        || readback.runtime_source_facts_digest != suite.runtime_source_facts_digest
-        || format_pair(&readback.min_format)? != profile_format_pair(profile)?
-        || format_pair(&readback.max_format)? != profile_format_pair(profile)?
-        || readback.marker.get() != 1337
-        || expected.program.invocation_command()
-            != format!("function {}", readback.dispatched_function_id)
-        || readback.installed_function_ids.is_empty()
-        || readback.installed_function_ids.len() > 4096
-    {
-        return Err(unverified());
-    }
     let RuntimeCaseProgram::DataPack(program) = &expected.program else {
         return Err(unverified());
     };
-    let entries = read_calibration_pack(source_bytes, budget)?;
-    if entries != *program.source_entries()
-        || readback.installed_function_ids != *program.function_ids()
+    if case.case_id != PACK_CASE
+        || case.step_id.as_str() != "pack-entry"
+        || original["invocationId"] != case.invocation_id.as_str()
     {
+        return Err(unverified());
+    }
+    // The old /1 DTO's marker and installed ID claims cannot replace actual
+    // whole-objective bytes or the separately issued new-run source witness.
+    crate::calibration_pack_observer::verify_readback_images(
+        value,
+        original,
+        program,
+        &suite.runtime_source_facts_digest,
+        &suite.registry_generation,
+        &suite.host_artifact_digest,
+        &|| budget_check(budget),
+    )?;
+    let entries = read_calibration_pack(source_bytes, budget)?;
+    if entries != *program.source_entries() {
         return Err(unverified());
     }
     let metadata = parse(entries.get("pack.mcmeta").ok_or_else(unverified)?, budget)?;
@@ -1649,52 +1729,7 @@ fn verify_pack_readback(
     {
         return Err(unverified());
     }
-    let mut functions = BTreeMap::new();
-    for (path, bytes) in &entries {
-        budget_check(budget)?;
-        let Some(rest) = path.strip_prefix("data/") else {
-            continue;
-        };
-        let Some((namespace, suffix)) = rest.split_once("/function/") else {
-            if rest.contains("/functions/") {
-                return Err(unverified());
-            }
-            continue;
-        };
-        let Some(name) = suffix.strip_suffix(".mcfunction") else {
-            continue;
-        };
-        let id = format!("{namespace}:{name}");
-        mmmm_contracts::ResourceLocation::new(&id).map_err(|_| unverified())?;
-        let source = std::str::from_utf8(bytes).map_err(|_| unverified())?;
-        if source.contains('\0') || source.lines().any(|line| line.starts_with('$')) {
-            return Err(unverified());
-        }
-        functions.insert(id, source);
-    }
-    if functions.keys().cloned().collect::<BTreeSet<_>>() != readback.installed_function_ids
-        || !functions.contains_key(&readback.dispatched_function_id)
-    {
-        return Err(unverified());
-    }
-    for source in functions.values() {
-        for line in source
-            .lines()
-            .filter(|line| !line.trim_start().starts_with('#'))
-        {
-            budget_check(budget)?;
-            let tokens: Vec<_> = line.split_ascii_whitespace().collect();
-            for pair in tokens.windows(2) {
-                // Registered runtime evidence currently admits an entirely
-                // owned, finite function closure. External calls and tag/macros
-                // need their separate exact source authority, not a name match.
-                if pair[0] == "function" && !functions.contains_key(pair[1]) {
-                    return Err(unverified());
-                }
-            }
-        }
-    }
-    Ok(())
+    budget_check(budget)
 }
 
 #[derive(Clone)]

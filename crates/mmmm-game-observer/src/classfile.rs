@@ -114,6 +114,54 @@ impl HiddenForwarder {
     }
 }
 
+/// Only the two PACK queue closures below have a supported captured shape.
+/// This enum selects a parser policy, never an execution or source permission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PackCapturedRecipeKind {
+    TaskProvider,
+    EntryAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CaptureField {
+    name: String,
+    descriptor: String,
+}
+
+impl CaptureField {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn descriptor(&self) -> &str {
+        &self.descriptor
+    }
+}
+
+/// A supported semantic shape from an authenticated recipe and VM snapshot.
+/// Actual receiver, captured objects and declaring method still need native joins.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PackCapturedForwarder {
+    kind: PackCapturedRecipeKind,
+    target: MethodSymbol,
+    captures: Vec<CaptureField>,
+}
+
+impl PackCapturedForwarder {
+    pub(crate) fn kind(&self) -> PackCapturedRecipeKind {
+        self.kind
+    }
+
+    pub(crate) fn target(&self) -> &MethodSymbol {
+        &self.target
+    }
+
+    /// In actual constructor parameter order, independent of field names/order.
+    pub(crate) fn captures(&self) -> &[CaptureField] {
+        &self.captures
+    }
+}
+
 #[derive(Clone, Debug)]
 enum PoolEntry {
     Unusable,
@@ -205,6 +253,24 @@ impl Pool {
             descriptor: self.text(descriptor)?,
             interface,
         })
+    }
+
+    fn field(&self, index: u16) -> Result<(String, CaptureField), ClassfileError> {
+        let (owner, name_type) = match self.entry(index)? {
+            PoolEntry::Field(owner, name_type) => (*owner, *name_type),
+            _ => return Err(ClassfileError::Malformed("field reference is not Fieldref")),
+        };
+        let (name, descriptor) = match self.entry(name_type)? {
+            PoolEntry::NameAndType(name, descriptor) => (*name, *descriptor),
+            _ => return Err(ClassfileError::Malformed("field has no NameAndType")),
+        };
+        Ok((
+            self.class(owner)?,
+            CaptureField {
+                name: self.text(name)?,
+                descriptor: self.text(descriptor)?,
+            },
+        ))
     }
 
     fn validate(&self) -> Result<(), ClassfileError> {
@@ -1153,6 +1219,597 @@ pub(crate) fn match_hidden_forwarder(
     })
 }
 
+struct PackRecipeShape {
+    interface: &'static str,
+    sam_name: &'static str,
+    sam_descriptor: &'static str,
+    capture_descriptors: &'static [&'static str],
+    target_owner: &'static str,
+    target_name: &'static str,
+    target_descriptor: &'static str,
+}
+
+impl PackCapturedRecipeKind {
+    fn shape(self) -> PackRecipeShape {
+        match self {
+            Self::TaskProvider => PackRecipeShape {
+                interface: "net/minecraft/commands/execution/tasks/ContinuationTask$TaskProvider",
+                sam_name: "create",
+                sam_descriptor: "(Lnet/minecraft/commands/execution/Frame;Ljava/lang/Object;)Lnet/minecraft/commands/execution/CommandQueueEntry;",
+                capture_descriptors: &["Lnet/minecraft/commands/ExecutionCommandSource;"],
+                target_owner: "net/minecraft/commands/execution/tasks/CallFunction",
+                target_name: "lambda$execute$0",
+                target_descriptor: "(Lnet/minecraft/commands/ExecutionCommandSource;Lnet/minecraft/commands/execution/Frame;Lnet/minecraft/commands/execution/UnboundEntryAction;)Lnet/minecraft/commands/execution/CommandQueueEntry;",
+            },
+            Self::EntryAction => PackRecipeShape {
+                interface: "net/minecraft/commands/execution/EntryAction",
+                sam_name: "execute",
+                sam_descriptor: "(Lnet/minecraft/commands/execution/ExecutionContext;Lnet/minecraft/commands/execution/Frame;)V",
+                capture_descriptors: &[
+                    "Lnet/minecraft/commands/execution/UnboundEntryAction;",
+                    "Ljava/lang/Object;",
+                ],
+                target_owner: "net/minecraft/commands/execution/UnboundEntryAction",
+                target_name: "lambda$bind$0",
+                target_descriptor: "(Ljava/lang/Object;Lnet/minecraft/commands/execution/ExecutionContext;Lnet/minecraft/commands/execution/Frame;)V",
+            },
+        }
+    }
+}
+
+fn reference_field_type(descriptor: &str) -> Result<ValueType, ClassfileError> {
+    let mut reader = Reader::new(descriptor.as_bytes());
+    let value = field_type(&mut reader, false)?;
+    reader.done()?;
+    if !matches!(value, ValueType::Reference(_)) {
+        return Err(ClassfileError::Unsupported("nonreference capture"));
+    }
+    Ok(value)
+}
+
+fn capture_field(
+    reader: &mut Reader<'_>,
+    pool: &Pool,
+    opcode: u8,
+    self_name: &str,
+) -> Result<CaptureField, ClassfileError> {
+    if reader.u1()? != opcode {
+        return Err(ClassfileError::Unsupported("capture field instruction"));
+    }
+    let (owner, field) = pool.field(reader.u2()?)?;
+    if owner != self_name {
+        return Err(ClassfileError::Unsupported("capture field owner"));
+    }
+    validate_method_name(&field.name)?;
+    reference_field_type(&field.descriptor)?;
+    Ok(field)
+}
+
+fn captured_constructor_semantics(
+    bytes: &[u8],
+    pool: &Pool,
+    self_name: &str,
+    descriptors: &[&str],
+) -> Result<Vec<CaptureField>, ClassfileError> {
+    let mut reader = Reader::new(bytes);
+    let reference = ValueType::Reference("java/lang/Object".to_owned());
+    expect_load(&mut reader, &reference, 0)?;
+    if reader.u1()? != 0xb7 {
+        return Err(ClassfileError::Unsupported(
+            "capture constructor invocation",
+        ));
+    }
+    let object = pool.method(reader.u2()?)?;
+    if object.owner != "java/lang/Object"
+        || object.name != "<init>"
+        || object.descriptor != "()V"
+        || object.interface
+    {
+        return Err(ClassfileError::Unsupported(
+            "capture constructor superclass",
+        ));
+    }
+    let mut fields = Vec::with_capacity(descriptors.len());
+    for (index, descriptor) in descriptors.iter().enumerate() {
+        expect_load(&mut reader, &reference, 0)?;
+        expect_load(&mut reader, &reference_field_type(descriptor)?, index + 1)?;
+        let field = capture_field(&mut reader, pool, 0xb5, self_name)?;
+        if field.descriptor != *descriptor || fields.contains(&field) {
+            return Err(ClassfileError::Unsupported(
+                "capture constructor assignment",
+            ));
+        }
+        fields.push(field);
+    }
+    if reader.u1()? != 0xb1 {
+        return Err(ClassfileError::Unsupported("capture constructor return"));
+    }
+    reader.done()?;
+    Ok(fields)
+}
+
+fn captured_sam_semantics(
+    bytes: &[u8],
+    pool: &Pool,
+    self_name: &str,
+    kind: PackCapturedRecipeKind,
+    captures: &[CaptureField],
+) -> Result<MethodSymbol, ClassfileError> {
+    let shape = kind.shape();
+    let mut reader = Reader::new(bytes);
+    let reference = ValueType::Reference("java/lang/Object".to_owned());
+    for expected in captures {
+        expect_load(&mut reader, &reference, 0)?;
+        if capture_field(&mut reader, pool, 0xb4, self_name)? != *expected {
+            return Err(ClassfileError::Unsupported("capture SAM field order"));
+        }
+    }
+    expect_load(&mut reader, &reference, 1)?;
+    expect_load(&mut reader, &reference, 2)?;
+    if kind == PackCapturedRecipeKind::TaskProvider {
+        if reader.u1()? != 0xc0
+            || pool.class(reader.u2()?)? != "net/minecraft/commands/execution/UnboundEntryAction"
+        {
+            return Err(ClassfileError::Unsupported("PACK task argument cast"));
+        }
+    }
+    let expected_opcode = match kind {
+        PackCapturedRecipeKind::TaskProvider => 0xb8,
+        PackCapturedRecipeKind::EntryAction => 0xb9,
+    };
+    if reader.u1()? != expected_opcode {
+        return Err(ClassfileError::Unsupported("PACK target invocation"));
+    }
+    let target = pool.method(reader.u2()?)?;
+    if target.owner != shape.target_owner
+        || target.name != shape.target_name
+        || target.descriptor != shape.target_descriptor
+        || target.interface != (kind == PackCapturedRecipeKind::EntryAction)
+    {
+        return Err(ClassfileError::Unsupported("PACK target method"));
+    }
+    if kind == PackCapturedRecipeKind::EntryAction && (reader.u1()? != 4 || reader.u1()? != 0) {
+        return Err(ClassfileError::Unsupported("PACK interface argument slots"));
+    }
+    let expected_return = match kind {
+        PackCapturedRecipeKind::TaskProvider => 0xb0,
+        PackCapturedRecipeKind::EntryAction => 0xb1,
+    };
+    if reader.u1()? != expected_return {
+        return Err(ClassfileError::Unsupported("PACK SAM return"));
+    }
+    reader.done()?;
+    Ok(target)
+}
+
+/// Supports two closed captured shapes; these are parser policies, not claims
+/// that a generated hidden layout has already been observed in a live game.
+/// `actual_hidden_name` must come from the exact VM Class's current signature.
+pub(crate) fn match_pack_captured_forwarder(
+    recipe: &HiddenRecipe,
+    snapshot: &ExecutableSnapshot,
+    kind: PackCapturedRecipeKind,
+    actual_hidden_name: &str,
+) -> Result<PackCapturedForwarder, ClassfileError> {
+    if recipe.flags & 0x0003 != 0x0003 || recipe.flags & !0x000f != 0 {
+        return Err(ClassfileError::Unsupported("PACK hidden nestmate flags"));
+    }
+    let parsed = parse_classfile(&recipe.input)?;
+    parsed.pool.reject_dynamic_dispatch()?;
+    let shape = kind.shape();
+    if parsed.flags & !0x1000 != 0x0030
+        || parsed.super_name.as_deref() != Some("java/lang/Object")
+        || parsed.interfaces.len() != 1
+        || parsed.interfaces[0] != shape.interface
+        || parsed.fields.len() != shape.capture_descriptors.len()
+        || parsed.methods.len() != 2
+    {
+        return Err(ClassfileError::Unsupported("PACK captured class shape"));
+    }
+    validate_class_name(&parsed.class_name)?;
+    if actual_hidden_name.len() > MAX_SYMBOLIC_TEXT_BYTES {
+        return Err(ClassfileError::Bounds("actual PACK hidden name length"));
+    }
+    validate_class_name(actual_hidden_name)?;
+    if recipe.requested_name_mutf8.len() > MAX_SYMBOLIC_TEXT_BYTES {
+        return Err(ClassfileError::Bounds("requested PACK hidden name length"));
+    }
+    if !recipe.requested_name_mutf8.is_empty() {
+        let requested = decode_mutf8(&recipe.requested_name_mutf8)?;
+        if requested.iter().any(|unit| *unit == 0 || *unit > 0x7f) {
+            return Err(ClassfileError::Unsupported("non-ASCII PACK hidden name"));
+        }
+        let requested: String = requested
+            .iter()
+            .map(|unit| {
+                if *unit == u16::from(b'.') {
+                    '/'
+                } else {
+                    char::from(*unit as u8)
+                }
+            })
+            .collect();
+        if requested != parsed.class_name {
+            return Err(ClassfileError::Malformed(
+                "PACK requested name and class disagree",
+            ));
+        }
+    }
+    for attribute in &parsed.attributes {
+        if attribute.name != "SourceFile" || attribute.bytes.len() != 2 {
+            return Err(ClassfileError::Unsupported("PACK class attribute"));
+        }
+        parsed
+            .pool
+            .utf8(u16::from_be_bytes([attribute.bytes[0], attribute.bytes[1]]))?;
+    }
+    for field in &parsed.fields {
+        validate_method_name(&field.name)?;
+        reference_field_type(&field.descriptor)?;
+        if field.flags & !0x1000 != 0x0012 || !field.attributes.is_empty() {
+            return Err(ClassfileError::Unsupported(
+                "PACK private final capture field",
+            ));
+        }
+    }
+    let constructor = parsed
+        .methods
+        .iter()
+        .find(|method| method.name == "<init>")
+        .ok_or(ClassfileError::Unsupported("PACK constructor absent"))?;
+    let (parameters, result) = method_descriptor(&constructor.descriptor)?;
+    let expected_parameters = shape
+        .capture_descriptors
+        .iter()
+        .map(|descriptor| reference_field_type(descriptor))
+        .collect::<Result<Vec<_>, _>>()?;
+    if constructor.flags & !0x1000 != 0x0002
+        || parameters != expected_parameters
+        || result != ValueType::Void
+    {
+        return Err(ClassfileError::Unsupported("PACK constructor parameters"));
+    }
+    let sam = parsed
+        .methods
+        .iter()
+        .find(|method| method.name == shape.sam_name)
+        .ok_or(ClassfileError::Unsupported("PACK SAM absent"))?;
+    if sam.descriptor != shape.sam_descriptor || !matches!(sam.flags & !0x1000, 0x0001 | 0x0011) {
+        return Err(ClassfileError::Unsupported("PACK SAM signature"));
+    }
+    let constructor_code = supported_code(constructor)?;
+    let sam_code = supported_code(sam)?;
+    let required_stack = match kind {
+        PackCapturedRecipeKind::TaskProvider => 3,
+        PackCapturedRecipeKind::EntryAction => 4,
+    };
+    if constructor_code.max_stack < 2
+        || usize::from(constructor_code.max_locals) < parameters.len() + 1
+        || sam_code.max_stack < required_stack
+        || sam_code.max_locals < 3
+    {
+        return Err(ClassfileError::Malformed("PACK Code limits"));
+    }
+    let captures = captured_constructor_semantics(
+        &constructor_code.bytes,
+        &parsed.pool,
+        &parsed.class_name,
+        shape.capture_descriptors,
+    )?;
+    if captures.iter().any(|capture| {
+        !parsed
+            .fields
+            .iter()
+            .any(|field| field.name == capture.name && field.descriptor == capture.descriptor)
+    }) {
+        return Err(ClassfileError::Unsupported("PACK undeclared capture field"));
+    }
+    let target = captured_sam_semantics(
+        &sam_code.bytes,
+        &parsed.pool,
+        &parsed.class_name,
+        kind,
+        &captures,
+    )?;
+    if snapshot.methods.len() != parsed.methods.len() {
+        return Err(ClassfileError::SnapshotMismatch(
+            "PACK complete VM method set",
+        ));
+    }
+    let vm_pool = snapshot_pool(snapshot)?;
+    let vm_constructor = snapshot_method(snapshot, constructor)?;
+    let vm_sam = snapshot_method(snapshot, sam)?;
+    let vm_captures = captured_constructor_semantics(
+        bytecodes(vm_constructor)?,
+        &vm_pool,
+        actual_hidden_name,
+        shape.capture_descriptors,
+    )?;
+    if vm_captures != captures
+        || captured_sam_semantics(
+            bytecodes(vm_sam)?,
+            &vm_pool,
+            actual_hidden_name,
+            kind,
+            &vm_captures,
+        )? != target
+    {
+        return Err(ClassfileError::SnapshotMismatch(
+            "PACK executable semantics",
+        ));
+    }
+    Ok(PackCapturedForwarder {
+        kind,
+        target,
+        captures,
+    })
+}
+
 #[cfg(test)]
 #[path = "classfile_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod pack_captured_tests {
+    use super::*;
+
+    struct FixturePool {
+        count: u16,
+        bytes: Vec<u8>,
+    }
+    impl FixturePool {
+        fn entry(&mut self, tag: u8, body: &[u8]) -> u16 {
+            let index = self.count;
+            self.count += 1;
+            self.bytes.push(tag);
+            self.bytes.extend_from_slice(body);
+            index
+        }
+        fn text(&mut self, value: &str) -> u16 {
+            let mut body = (value.len() as u16).to_be_bytes().to_vec();
+            body.extend_from_slice(value.as_bytes());
+            self.entry(1, &body)
+        }
+        fn class(&mut self, name: &str) -> u16 {
+            let name = self.text(name);
+            self.entry(7, &name.to_be_bytes())
+        }
+        fn member(&mut self, tag: u8, owner: u16, name: &str, descriptor: &str) -> u16 {
+            let name = self.text(name);
+            let descriptor = self.text(descriptor);
+            let mut body = name.to_be_bytes().to_vec();
+            body.extend_from_slice(&descriptor.to_be_bytes());
+            let name_type = self.entry(12, &body);
+            let mut body = owner.to_be_bytes().to_vec();
+            body.extend_from_slice(&name_type.to_be_bytes());
+            self.entry(tag, &body)
+        }
+    }
+
+    fn u2(bytes: &mut Vec<u8>, value: u16) {
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+    fn u4(bytes: &mut Vec<u8>, value: usize) {
+        bytes.extend_from_slice(&(value as u32).to_be_bytes());
+    }
+    fn instruction(bytes: &mut Vec<u8>, opcode: u8, reference: u16) {
+        bytes.push(opcode);
+        u2(bytes, reference);
+    }
+    fn method(
+        bytes: &mut Vec<u8>,
+        flags: u16,
+        name: u16,
+        descriptor: u16,
+        code_name: u16,
+        code: &[u8],
+    ) {
+        u2(bytes, flags);
+        u2(bytes, name);
+        u2(bytes, descriptor);
+        u2(bytes, 1);
+        u2(bytes, code_name);
+        u4(bytes, code.len() + 12);
+        u2(bytes, 4);
+        u2(bytes, 3);
+        u4(bytes, code.len());
+        bytes.extend_from_slice(code);
+        u2(bytes, 0);
+        u2(bytes, 0);
+    }
+
+    /// Synthetic test data for a supported policy, never a live VM observation.
+    fn fixture(
+        kind: PackCapturedRecipeKind,
+        self_name: &str,
+        noise: bool,
+    ) -> (HiddenRecipe, ExecutableSnapshot) {
+        let shape = kind.shape();
+        let mut pool = FixturePool {
+            count: 1,
+            bytes: Vec::new(),
+        };
+        if noise {
+            pool.text("unused pool renumbering sentinel");
+        }
+        let this = pool.class(self_name);
+        let object = pool.class("java/lang/Object");
+        let interface = pool.class(shape.interface);
+        let owner = pool.class(shape.target_owner);
+        let object_init = pool.member(10, object, "<init>", "()V");
+        let target = pool.member(
+            if kind == PackCapturedRecipeKind::EntryAction {
+                11
+            } else {
+                10
+            },
+            owner,
+            shape.target_name,
+            shape.target_descriptor,
+        );
+        let cast = pool.class("net/minecraft/commands/execution/UnboundEntryAction");
+        let code_name = pool.text("Code");
+        let ctor_name = pool.text("<init>");
+        let ctor_descriptor = format!("({})V", shape.capture_descriptors.concat());
+        let ctor_desc = pool.text(&ctor_descriptor);
+        let sam_name = pool.text(shape.sam_name);
+        let sam_desc = pool.text(shape.sam_descriptor);
+        let mut declared = Vec::new();
+        let mut references = Vec::new();
+        for (index, descriptor) in shape.capture_descriptors.iter().enumerate() {
+            let name = format!("retainedValue{index}");
+            declared.push((pool.text(&name), pool.text(descriptor)));
+            references.push(pool.member(9, this, &name, descriptor));
+        }
+        let mut constructor = vec![0x2a];
+        instruction(&mut constructor, 0xb7, object_init);
+        for (index, reference) in references.iter().enumerate() {
+            constructor.push(0x2a);
+            constructor.push(0x2b + index as u8);
+            instruction(&mut constructor, 0xb5, *reference);
+        }
+        constructor.push(0xb1);
+        let mut sam = Vec::new();
+        for reference in references {
+            sam.push(0x2a);
+            instruction(&mut sam, 0xb4, reference);
+        }
+        sam.extend_from_slice(&[0x2b, 0x2c]);
+        if kind == PackCapturedRecipeKind::TaskProvider {
+            instruction(&mut sam, 0xc0, cast);
+            instruction(&mut sam, 0xb8, target);
+            sam.push(0xb0);
+        } else {
+            instruction(&mut sam, 0xb9, target);
+            sam.extend_from_slice(&[4, 0, 0xb1]);
+        }
+        let mut bytes = vec![0xca, 0xfe, 0xba, 0xbe];
+        u2(&mut bytes, 0);
+        u2(&mut bytes, 69);
+        u2(&mut bytes, pool.count);
+        bytes.extend_from_slice(&pool.bytes);
+        u2(&mut bytes, 0x1030);
+        u2(&mut bytes, this);
+        u2(&mut bytes, object);
+        u2(&mut bytes, 1);
+        u2(&mut bytes, interface);
+        u2(&mut bytes, declared.len() as u16);
+        for (name, descriptor) in declared {
+            u2(&mut bytes, 0x0012);
+            u2(&mut bytes, name);
+            u2(&mut bytes, descriptor);
+            u2(&mut bytes, 0);
+        }
+        u2(&mut bytes, 2);
+        method(&mut bytes, 2, ctor_name, ctor_desc, code_name, &constructor);
+        method(&mut bytes, 1, sam_name, sam_desc, code_name, &sam);
+        u2(&mut bytes, 0);
+        (
+            HiddenRecipe {
+                input: bytes,
+                flags: 3,
+                initialize: true,
+                lookup_class_id: 1,
+                defining_loader_id: 2,
+                requested_name_mutf8: self_name.as_bytes().to_vec(),
+            },
+            ExecutableSnapshot {
+                constant_pool_count: u32::from(pool.count),
+                constant_pool: pool.bytes,
+                methods: vec![
+                    MethodSnapshot {
+                        name_mutf8: b"<init>".to_vec(),
+                        descriptor_mutf8: ctor_descriptor.into_bytes(),
+                        modifiers: 2,
+                        code: MethodCode::Bytecodes(constructor),
+                    },
+                    MethodSnapshot {
+                        name_mutf8: shape.sam_name.as_bytes().to_vec(),
+                        descriptor_mutf8: shape.sam_descriptor.as_bytes().to_vec(),
+                        modifiers: 1,
+                        code: MethodCode::Bytecodes(sam),
+                    },
+                ],
+            },
+        )
+    }
+
+    #[test]
+    fn two_closed_shapes_preserve_capture_order_and_pool_semantics() {
+        for kind in [
+            PackCapturedRecipeKind::TaskProvider,
+            PackCapturedRecipeKind::EntryAction,
+        ] {
+            let (recipe, _) = fixture(kind, "test/OriginalHidden", false);
+            let (_, vm) = fixture(kind, "test/ActualHidden", true);
+            let matched =
+                match_pack_captured_forwarder(&recipe, &vm, kind, "test/ActualHidden").unwrap();
+            assert_eq!(matched.kind(), kind);
+            assert_eq!(
+                matched.captures().len(),
+                kind.shape().capture_descriptors.len()
+            );
+            for (index, field) in matched.captures().iter().enumerate() {
+                assert_eq!(field.name(), format!("retainedValue{index}"));
+                assert_eq!(field.descriptor(), kind.shape().capture_descriptors[index]);
+            }
+            assert!(match_hidden_forwarder(&recipe, &vm).is_err());
+        }
+    }
+
+    #[test]
+    fn wrong_kind_hidden_owner_and_incomplete_snapshot_are_unavailable() {
+        let (recipe, snapshot) =
+            fixture(PackCapturedRecipeKind::TaskProvider, "test/Hidden", false);
+        assert!(
+            match_pack_captured_forwarder(
+                &recipe,
+                &snapshot,
+                PackCapturedRecipeKind::EntryAction,
+                "test/Hidden"
+            )
+            .is_err()
+        );
+        assert!(
+            match_pack_captured_forwarder(
+                &recipe,
+                &snapshot,
+                PackCapturedRecipeKind::TaskProvider,
+                "test/Other"
+            )
+            .is_err()
+        );
+        let mut missing = snapshot.clone();
+        missing.methods.pop();
+        assert!(
+            match_pack_captured_forwarder(
+                &recipe,
+                &missing,
+                PackCapturedRecipeKind::TaskProvider,
+                "test/Hidden"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn changed_vm_dispatch_or_constructor_effects_are_not_recipe_matches() {
+        let kind = PackCapturedRecipeKind::EntryAction;
+        let (recipe, snapshot) = fixture(kind, "test/Hidden", false);
+        for method_index in [0, 1] {
+            let mut changed = snapshot.clone();
+            let MethodCode::Bytecodes(code) = &mut changed.methods[method_index].code else {
+                unreachable!();
+            };
+            code.insert(code.len() - 1, 0x00);
+            assert!(match_pack_captured_forwarder(&recipe, &changed, kind, "test/Hidden").is_err());
+        }
+        let mut changed = snapshot;
+        let MethodCode::Bytecodes(code) = &mut changed.methods[1].code else {
+            unreachable!();
+        };
+        let count = code.len() - 3;
+        code[count] = 3;
+        assert!(match_pack_captured_forwarder(&recipe, &changed, kind, "test/Hidden").is_err());
+    }
+}

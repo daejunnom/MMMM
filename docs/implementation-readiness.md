@@ -3269,6 +3269,173 @@ command1·19,744/27,145 ms·Job peak297,824,256/312,152,064 bytes·7/10 processe
 새 독립 helper 리뷰는 미수행이다. archive 코드 자체의 독립 리뷰와 구분한다. 수정본의
 실제 검사는 새 고정 CI에서 확인하며5992415의 이전 성공으로 대체하지 않는다.
 
+고정 `d4cd2f79ae73fc9540052824ab7f5c0d9174f485`의
+[Rust113](https://github.com/daejunnom/MMMM/actions/runs/40057634118)와
+[JVM104](https://github.com/daejunnom/MMMM/actions/runs/40057634080)는 세 OS의 필수 단계와
+집계까지 최종 success metadata를 확인했다. Rust는 repository/format/test/strict를,
+JVM은 tests/Fabric/observer/fixture와 native observer의 실제 JDK ABI/controlled startup을
+포함한다. 새 PACK actual-run 연결의 미커밋 소스와 실제 Minecraft 인수를 포함하지 않는다.
+
+Windows Rust113 원 ZIP83,479 bytes·SHA
+`bb6686cf290d62df386fc4e2baf235cfc8caaaafc8f0254a4db68b42485f57cf`를 API bytes/digest와
+대조했다. 33 entries·확장555,534 bytes의 경로·중복·개수·크기 경계를 검사한 뒤 추출 없이
+읽었으며 ci-context actual/expected/PR head는 위 고정 SHA와 같다. 원 test stdout의
+`required_root_writer_preserves_exact_members_and_default_boundary`와
+`required_root_writer_reuses_cancellation_limits_and_exact_root_checks`는 각각 실제 ok이며,
+같은 실행 구간의 exchange63 tests는 passed63/failed0/ignored0/filtered0이다. strict도
+command0이다. Windows646/647의 SAC/WDAC never-executed는 이 별도 CI 성공으로
+재분류하지 않는다.
+
+Windows113 test/Clippy는 command0·437,469/141,655 ms·Job peak
+1,680,191,488/982,265,856 bytes·8/6 processes·gap181/147 ms·자연 종료다. 둘 다
+drain·완전한 출력·evidence export·scratch 정리·lease 해제와 감독/정리 오류0을 확인했다.
+원 test stdout142,269 bytes·SHA
+`1a798e5140f954025e07872f89fdcb7f39315a0e0ebec2c7d6dc9533cc6752ec`,
+test stderr394,200 bytes·SHA
+`55c4b51526fb6393d1ed91f8d4f31d634fa786c856571b2edce1a9a559e47a12`,
+strict stderr5,349 bytes·SHA
+`59a24f4f5beb17234b44eaa4d20aa237e04d9443bdb8f088b4cdde324f97f96c`를 원 ZIP과 함께
+외부 보존한다. 이 감사는 Windows 원 로그를 직접 확인했으며 다른 두 OS는 현재
+필수 단계·집계의 최종 metadata 확인 범위다. Draft PR의 결과도 같은 범위로 갱신했다.
+
+### PACK actual-run 연결의 후속 WIP
+
+독립 소스 검토를 마친 후속 입력은 36 paths·2,336,964 bytes다. ordinal path 순으로
+`path|decimal_bytes|lowercase_sha256`, UTF-8/LF/마지막 LF 없이 직렬화한 manifest는
+4,911 bytes·SHA `e506697fe1c1c6decee2b95129f761341eba8bc965acbff4dceed06e6a2cfa87`다.
+Root가 실제 파일을 다시 읽어 전부 대조하고 포맷 전 backup을 외부 보존했다.
+`definitions.rs`는 검토한 범위이나 미변경이며, `archive.rs`는 이미 d4cd2f7에 포함한다.
+5992415 대비 나머지 35 paths의 실제 변경을 이 선언만으로 compile·실행 성공으로
+취급하지 않는다. 보호 draft와 다른 작업의 policy 변경은 이 입력에 포함하지 않는다.
+
+새 typed `pack_calibration_run/1` 승인은 기존 준비 operation과 별도의 새 operation을
+사용한다. 실제 action은 `mmmm:command_execute`이며 objective 생성, marker7331 seed,
+`function mmmm_calibration:pack/entry`의 세 step 각각을 원 Invocation과 결속한다.
+세 step의 footprint는 같은 whole-objective target이다. 원 준비 작업의 unknown·fence는
+그대로 남으며 새 run 성공으로 원 operation을 자동 완료하거나 재전송하지 않는다.
+
+plan.create에서 load-only native phase47과 실제 초기 whole-objective 부재 이미지를
+읽고 원 bytes를 CAS/Project resource와 다섯 번째 TARGET precondition에 고정한다.
+후속 preflight는 실제 현재 bytes를 반환한다. 기존 Application의
+`phase_expected_digests`가 검증된 recovery snapshot의 before→after chain을 소비하므로,
+초기 absence를 seed/entry 단계에 다시 요구하지 않는다. 미래 after·Invocation·marker
+이미지를 합성하지 않으며 일반 Application/schema를 완화하지 않는다. source/ZIP/
+bundle digest와 실제 초기 target digest는 별도다.
+
+PACK 전용 route·Composite·승인은 같은 Store, retained plan, 원 RequestBudget과 현재
+ADMIN·owner, operation과 원 Invocation을 확인한다. intent/fence는 기존 journal
+transaction이 발급한다. command 반환·단일 callback·queue terminal·실제 원 게임 task의
+정상 종료·quiescence와 실패 부재를 함께 요구하는 settlement 경로를 연결했다.
+timeout future나 단순 request future 완료는 그 근거가 아니다. JNI private phase catalog는
+기존47개에서49개, Java 최대 phase는46에서48로 확장하며64-frame/512-object와 기존
+capture/root/function 상한은 유지한다. 새47/48의 fresh/current·거절·late cleanup 분기를
+함께 다룬다. 이 private host/observer delta의 실제 VM 호출은 아직 미실행이다.
+
+numeric confirmed, retained PACK, numeric/PACK pending은 같은 합계8개 상한을 쓴다.
+staging 전과 retain 시점에 검사하고, sealed permit의 실제 Rc identity와 completion Arc,
+원 private witness·owner·Store·budget 관계가 맞는 promotion만 중복 집계에서 제외한다.
+public RequestId 동등성만으로 count가 줄지 않는다. pending의 일시 remove/재삽입 동안
+non-Clone permit을 유지하고 Drop의 borrow 충돌은 보수적으로 예약을 남긴다. 원 protected
+receipt commit 뒤에는 새 budget/owner I/O로 완료 사실을 가리지 않는다.
+
+현재 WIP의 필수 미완성 경계는 다음과 같다.
+
+- native phase48 BEGIN은 `pack_original_callsite_body_unproven`으로 거부하며 실제 slot과
+  sticky first cause를 보존한다. PACK full run·COMPLETE13·Source3·SourceAdmission 발급
+  성공의 근거가 아니다. 현재 terminal hook record와 prepared VM snapshot은 launcher가
+  닫은 terminal pipeline의 권한을 대신하지 않는다. ordinary target body·captured reference와
+  현재 설치된 method metadata를 충분히 검증하는 producer가 필요하다. launcher의 최종성
+  stamp는 검토 중인 한 대안이며 유일하게 필수인 구현 방식으로 확정하지 않는다. 기존
+  redefinition 무효화와 실제 VM metadata 관측을 결합하는 대안도 읽기 전용 조사 중이다.
+  아직 어느 대안도 구현·실행·인수 완료로 표시하지 않는다.
+- 완료 PACK source의 소비는 현재 plan.create만 허용한다. action.plan·pack.build의
+  exact method gate는 unavailable이며 MVP 필수 후속 경로다.
+- route 만료 뒤 fresh readonly/cancel/reconcile successor의 수명 계약은 미구현이다.
+  durable operation·fence·CAS·복구 자료를 보존한다. 원 prep unknown을 종결할 실제
+  independent reconcile 또는 승인 cleanup producer도 계속 필요하다.
+
+포맷은 Windows652에서 선택 Rust20개에만 적용했다. 실제 formatter는651의
+`rustup which rustfmt`로 찾은1.96.0 binary4,772,864 bytes·SHA
+`5846618be9dafc003c7f9235d10fd7b3d79dd956f3fe07bf853f56cea672778a`에 고정했다.
+원650은 rustup alias의 정상 symlink가 physical guard에 걸려 source write 전 실패했고,
+그 원 실패와 정상 종료·export·scratch 정리·lease 해제를 보존한다. source/evidence/
+scratch의 link 경계를 완화하지 않았다. 별도652 helper는 최소 변경 독립 리뷰 뒤,
+빈 소유 scratch에서 각 source를 stdin으로 전달해 전부 staging하고 전36개를 재검사한
+뒤 선택20개만 썼다. 완료 후 전36개2,392,677 bytes를 다시 검사했으며 JSON manifest
+6,621 bytes·SHA `9965f7e4a0e23b7b885e2b83abcbb04e0acd7a9c15a6d588a44de19b07c6c658`를
+외부 보존했다. 각 formatter output1 MiB는 완료 후 검사이며 실행 중 hard cap 주장이
+아니다. 실행은 원 finite Job/timeout·helper90초 checkpoint를 유지했다. command0·
+3,664 ms·Job peak63,909,888 bytes·3 processes·gap102 ms·자연 종료와 drain/output/export·
+scratch 정리·lease 해제·감독/정리 오류0이다. 포맷은 compile·게임 검증이 아니다.
+
+추가 생산 경로 리뷰에서 phase48의 알려진 거절을 entry 단계에서만 소비하면 앞의
+init/seed 두 쓰기가 먼저 실행될 수 있음을 확인했다. `calibration_pack_run.rs` 한 파일의
+두 Apply 호출 지점에 같은 private typed gate를 추가했다. 현재 request·deadline·owner·
+권한의 원 실패를 먼저 검사한 뒤 `CAPABILITY_UNAVAILABLE`와
+`PackRunDispatchGap::OriginalCallsiteBodyUnproven`으로 거절한다. 첫 preflight와 entered
+Apply 입장에서 PACK 승인 local reservation·before capture·claim·durable dispatch intent·
+게임 쓰기 전에 막으며, readonly 준비와 Observe/Cancel 및 numeric 분기는 바꾸지 않는다.
+공통 Application이 첫 preflight 전에 만드는 Queued operation 기록 자체는 생길 수 있다.
+일반 journal을 수정하거나 그 기록을 자동 삭제한 변경이 아니다.
+
+같은 gate의 후속 작업 중단과 원 cancellation/deadline/권한/current 오류의 code·message·
+typed cause/Arc identity를 검사하는 inline 회귀 소스를 보완했다. 독립 리뷰와 Root의
+정확한 before/after diff 확인 후 Windows653에서 해당 파일만 포맷했다. 포맷 뒤70,076
+bytes·SHA `5dafe9aacf30d1cd3a261f1c66eace43d6f62035f207e6893a9db41898b73afb`다.
+command0·166 ms·Job peak7,729,152 bytes·1 process·gap100 ms·자연 종료와 drain/output/
+export·scratch 정리·lease 해제·감독/정리 오류0이다. 최종36개2,397,484 bytes를 Root가 다시
+대조한 JSON manifest6,621 bytes·SHA
+`e3087004ad6ccf49b1c90d4d52def1337c2238d2ebf13dec8aa6f8275acfd9ef`를 외부 보존한다.
+이 회귀 소스와 정적 배치 확인은 실제 Application/game의 write0 실행 검증과 구분한다.
+실제 finality issuer가 완성되면 이 거절을 실제 capability 소비로 교체해야 하며, 현재는
+실행 가능하다고 표시하지 않는다.
+
+Windows655 저장소 검사는 stage한 index554 files·정책 blob1·violations0이며 command0·
+931 ms·Job peak39,981,056 bytes·4 processes·gap101 ms·자연 종료와 drain/output/export·
+scratch 정리·lease 해제·감독/정리 오류0이다. 새 source34개와 문서1개만 공유 대상으로
+stage했고 unrelated policy와 보호 draft는 제외했다.
+
+Windows654는 위 d4cd2f7의 clean Git blobs에 승인된34 overlays만 적용해 명시적
+Windows target·locked/offline·jobs1·test threads2로 compiler/observer/Coordinator libtest를
+시도했다. source554 files·13,359,447 bytes·manifest SHA
+`a80bd89d8402af7ed15608914de916c3c25cc2f32eb6143475c90e608ae2a9ba`를 전후 대조했다.
+이번에는 실제 Rust 컴파일에 도달했고 Coordinator의 새 Core 한 파일에서 E0061 두 개
+(required-root reader의 cancellation 인자 누락), E0277 한 개(Value/Vec 비교), E0599 두 개
+(NativeWorkspacePermit trait 범위 누락)로 Cargo101·command1을 반환했다. 실제 test 실행
+전 실패이며 SAC/WDAC never-executed로 분류하지 않는다. 원 source·진단·helper를 보존하고
+같은 current cancellation과 오류 보존 기준으로 수정한 뒤 Windows에서 다시 검사한다.
+실행167,949 ms·Job peak1,331,494,912 bytes·8 processes·gap145 ms·소유 tail 정리 뒤
+drain/output/export·scratch 정리·lease 해제·감독/정리 오류0이다. strict는 이 시점 미실행이다.
+
+위5개 오류의 수정 후보는 같은 Core 한 파일에 한정한다. trait import·정확한 Value::Array
+비교와 두 ZIP read의 실제 current cancellation callback을 연결했다. 첫 AppError와 후행
+archive cancellation을 typed cause로 함께 보존하는 closed helper 및 기존 compiler recipe를
+재사용한 roundtrip·중간 취소·원 Arc identity·malformed ZIP 회귀 소스를 보완했다. 독립
+delta 리뷰와 Windows656의 단일 파일 포맷 뒤75,292 bytes·SHA
+`fcd8a441afc06cb87e53c5f4bb6c6a94a114973a17066a0758870c3f22960aeb`다. 포맷 command0·
+165 ms·자연 종료·drain/output/export·scratch 정리·lease 해제·감독/정리 오류0이다.
+전36개2,402,700 bytes를 재검사한 JSON manifest6,621 bytes·SHA
+`248773e470702c8d7c38c17a983d886020563d47570e23d83ee9e11f29dda445`를 외부 보존했다.
+
+Windows657의 libtest 재시도와658의 strict는 각각 game-observer/proc-macro2 build script가
+SAC/WDAC4551로 never executed되어 Cargo101·command1을 반환했다. 수정본의 Coordinator
+compile·test 실행·strict 검증까지 도달하지 못했다. 두 snapshot554 files·13,364,663 bytes·
+manifest SHA `eb3fa1de3d66118967e7d81fa110529889204806a14ee5d08be8349c41cadc33`와34개
+held overlay는 전후 같았다. 각각43,052/16,624 ms·Job peak595,955,712/113,352,704 bytes·
+7/8 processes·gap140/108 ms이며,657은 소유 tail 정리 뒤658은 자연 종료했다. 둘 다
+drain/output/export·scratch 정리·lease 해제·감독/정리 오류0이다. 원 보안 차단과654의
+이전 소스 컴파일 실패를 별도로 보존하며 현재 수정본이 검증됐다고 재분류하지 않는다.
+
+657/658 helper는 독립 delta 리뷰 뒤 같은 고정 managed scratch 안의 source work 이름을
+안정화했다. 매번 fresh scratch와 lease를 요구하고 work가 이미 있으면 삭제 없이 거절한다.
+고정 Git blobs와 정확한34 overlay·물리 경계·금지 metadata·원 시간/자원/사후 hash 검사는
+유지한다. 고정 이름을 이전 실행 성공의 자동 재사용이나 다른 owner 덮어쓰기로 해석하지
+않는다. 현재 변경의 전체 검증은 새 고정 CI에서 확인한다.
+
+위 소스 단위의 WIP 공유를 MVP·82개 인수·배포 완료로 재정의하지 않는다. 사용자 계정
+인증 문제로 클라이언트 로그인·ADMIN pairing·시각 검증은 not_run이다. 해당 경계를
+우회하지 않으며 독립적으로 진행 가능한 구현·검증과 별도로 남긴다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

@@ -10,13 +10,16 @@
 //! https://github.com/openjdk/jdk/blob/jdk-25-ga/src/hotspot/share/prims/jvm.cpp
 
 use std::cell::RefCell;
-use std::ffi::{c_char, c_void};
+use std::ffi::{CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::classfile::{HiddenForwarder, match_hidden_forwarder};
+pub(crate) use crate::classfile::PackCapturedRecipeKind;
+use crate::classfile::{
+    CaptureField, HiddenForwarder, match_hidden_forwarder, match_pack_captured_forwarder,
+};
 use crate::definitions::{
     AttemptId, DefinitionKind, ExecutableSnapshot, HiddenRecipe, MAX_CLASS_BYTES, MAX_METHODS,
     MAX_TOTAL_BYTES, MethodCode, MethodSnapshot, RecordingCore, RecordingError,
@@ -90,6 +93,19 @@ const SOURCE_CLASS_ROSTER: &[&[u8]] = &[
     b"net/minecraft/resources/Identifier",
     b"net/minecraft/server/MinecraftServer",
     b"net/minecraft/server/dedicated/DedicatedServer",
+    b"net/minecraft/commands/functions/PlainTextFunction",
+    b"net/minecraft/commands/functions/InstantiatedFunction",
+    b"net/minecraft/commands/execution/tasks/CallFunction",
+    b"net/minecraft/commands/execution/tasks/ContinuationTask",
+    b"net/minecraft/commands/execution/tasks/ContinuationTask$TaskProvider",
+    b"net/minecraft/commands/execution/UnboundEntryAction",
+    b"net/minecraft/commands/execution/EntryAction",
+    b"net/minecraft/commands/execution/CommandQueueEntry",
+    b"net/minecraft/commands/execution/ExecutionContext",
+    b"net/minecraft/commands/execution/ExecutionControl",
+    b"net/minecraft/commands/execution/ExecutionControl$1",
+    b"net/minecraft/commands/execution/Frame",
+    b"net/minecraft/commands/CommandSourceStack",
     b"io/github/daejunnom/mmmm/fabric/NativeFunctionLoadObservation",
     b"io/github/daejunnom/mmmm/fabric/NativeFunctionLoadObservation$NativeCall",
     b"io/github/daejunnom/mmmm/fabric/NativeFunctionLoadObservation$TrackedSupplier",
@@ -2223,6 +2239,264 @@ pub(crate) unsafe fn resolve_static_target(
     Ok(Some(token))
 }
 
+/// Same-frame description of one exact captured PACK recipe. The borrowed
+/// source lease pins the issuer's Classes; no JNI env, local ref, operation
+/// token, receipt or caller-supplied object ID is retained here.
+pub(crate) struct PackCapturedMethodToken<'frame> {
+    frame: &'frame SourceCaptureToken,
+    same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    context: NativeResolutionContext,
+    target: ResolvedMethodToken,
+    hidden_class_handle: usize,
+    kind: PackCapturedRecipeKind,
+    captures: Vec<CaptureField>,
+}
+
+fn pack_frame_current(frame: &SourceCaptureToken) -> bool {
+    frame.is_current() && pack_operation_on_current_thread(frame._operation.id)
+}
+
+fn pack_operation_on_current_thread(id: u64) -> bool {
+    OPERATIONS.with(|operations| {
+        let Ok(operations) = operations.try_borrow() else {
+            return false;
+        };
+        operations.ids[..operations.count].contains(&id)
+    })
+}
+
+impl PackCapturedMethodToken<'_> {
+    pub(crate) fn kind(&self) -> PackCapturedRecipeKind {
+        self.kind
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        pack_frame_current(self.frame) && self.context.is_current() && self.target.is_current()
+    }
+
+    pub(crate) unsafe fn recheck(
+        &self,
+        env: *mut JNIEnv,
+        frame: &SourceCaptureToken,
+    ) -> Result<bool> {
+        if env.is_null() || !ptr::eq(self.frame, frame) || !self.is_current() {
+            return Ok(false);
+        }
+        let current = unsafe { self.target.has_current_class_status(env)? };
+        Ok(current && self.is_current())
+    }
+
+    /// Capture values are read from the exact actual receiver, not from Java
+    /// getters, a supplied class name, or values decoded from an opaque frame.
+    /// The expected references must come from the actual PACK queue callsite.
+    pub(crate) unsafe fn captures_match(
+        &self,
+        env: *mut JNIEnv,
+        frame: &SourceCaptureToken,
+        actual_receiver: jobject,
+        expected_captured_objects: &[jobject],
+    ) -> Result<bool> {
+        if actual_receiver.is_null()
+            || expected_captured_objects.len() != self.captures.len()
+            || expected_captured_objects
+                .iter()
+                .any(|object| object.is_null())
+            || !unsafe { self.recheck(env, frame)? }
+        {
+            return Ok(false);
+        }
+        let actual_class = unsafe { ffi::object_class(env, actual_receiver)? };
+        let joined =
+            unsafe { ffi::same_object(env, actual_class, self.hidden_class_handle as jclass) };
+        let closed = unsafe { ffi::delete_local(env, actual_class) };
+        let joined = joined?;
+        closed?;
+        if !joined || !unsafe { self.recheck(env, frame)? } {
+            return Ok(false);
+        }
+        for (capture, expected) in self.captures.iter().zip(expected_captured_objects) {
+            if !unsafe { self.recheck(env, frame)? } {
+                return Ok(false);
+            }
+            let name = CString::new(capture.name()).map_err(|_| ProducerError::StateUnavailable)?;
+            let descriptor =
+                CString::new(capture.descriptor()).map_err(|_| ProducerError::StateUnavailable)?;
+            let field = unsafe {
+                ffi::field_id(env, self.hidden_class_handle as jclass, &name, &descriptor)?
+            };
+            let Some(actual) = (unsafe { ffi::object_field(env, actual_receiver, field)? }) else {
+                return Ok(false);
+            };
+            let same = unsafe { ffi::same_object(env, actual, *expected) };
+            // Delete this one local even when comparison preserved an actual
+            // pending Throwable; do not replace that first error with cleanup.
+            let closed = unsafe { ffi::delete_local(env, actual) };
+            let same = same?;
+            closed?;
+            if !same || !unsafe { self.recheck(env, frame)? } {
+                return Ok(false);
+            }
+        }
+        unsafe { self.recheck(env, frame) }
+    }
+}
+
+/// Separately authenticate a supported PACK captured shape. The generic
+/// zero-capture matcher/resolver and its descriptive wire format are unchanged.
+/// A returned token is not source admission, command permission or proof that
+/// the actual captures match; the caller must use captures_match in this frame.
+pub(crate) unsafe fn pack_captured_forwarder<'frame>(
+    env: *mut JNIEnv,
+    frame: &'frame SourceCaptureToken,
+    actual_hidden_class: jclass,
+    actual_expected_code_owner_class: jclass,
+    kind: PackCapturedRecipeKind,
+) -> Result<Option<PackCapturedMethodToken<'frame>>> {
+    if env.is_null()
+        || actual_hidden_class.is_null()
+        || actual_expected_code_owner_class.is_null()
+        || !pack_frame_current(frame)
+    {
+        return Ok(None);
+    }
+    if unsafe { ffi::exception(env)? } {
+        return Err(FfiError::PendingException.into());
+    }
+    // Reuse the existing bounded snapshot/matcher reservation. The source
+    // frame pins Classes after this temporary parsing reservation is released.
+    let _matching =
+        Operation::acquire(SNAPSHOT_RESERVATION).ok_or(ProducerError::StateUnavailable)?;
+    let Some(context) = (unsafe { resolution_context(env, actual_hidden_class)? }) else {
+        return Ok(None);
+    };
+    let Some(owner_id) = (unsafe {
+        existing_identity(env, actual_expected_code_owner_class, ReferenceKind::Class)?
+    }) else {
+        return Ok(None);
+    };
+    if owner_id != context.lookup_class_id || !context.is_current() || !frame.is_current() {
+        return Ok(None);
+    }
+    let ti = JVMTI.load(Ordering::Acquire);
+    let hidden_signature = unsafe { ffi::class_signature(ti, actual_hidden_class)? };
+    let Some(hidden_name) =
+        class_internal(&hidden_signature).and_then(|name| std::str::from_utf8(name).ok())
+    else {
+        return Ok(None);
+    };
+    let matched = core(|core| {
+        Ok(core.with_hidden_source(
+            context.hidden_class_id,
+            context.generation,
+            |recipe, snapshot| match_pack_captured_forwarder(recipe, snapshot, kind, hidden_name),
+        ))
+    })?;
+    let Some(Ok(matched)) = matched else {
+        return Ok(None);
+    };
+    let owner_signature = unsafe { ffi::class_signature(ti, actual_expected_code_owner_class)? };
+    if class_internal(&owner_signature) != Some(matched.target().owner().as_bytes())
+        || unsafe { actual_loader(env, ti, actual_expected_code_owner_class)? }
+            != context.defining_loader_id
+        || !unsafe { ffi::class_prepared(ti, actual_expected_code_owner_class)? }
+        || !context.is_current()
+        || !frame.is_current()
+    {
+        return Ok(None);
+    }
+    let Some(owner_generation) = core(|core| Ok(core.ordinary_generation(owner_id)))? else {
+        return Ok(None);
+    };
+    let (hidden_handle, owner_handle, game_handle) = {
+        let state = STATE
+            .get()
+            .ok_or(ProducerError::StateUnavailable)?
+            .lock()
+            .map_err(|_| ProducerError::StateUnavailable)?;
+        if state.closed {
+            return Ok(None);
+        }
+        let hidden = state.references.iter().find(|reference| {
+            reference.kind == ReferenceKind::Class && reference.id == context.hidden_class_id
+        });
+        let owner = state
+            .references
+            .iter()
+            .find(|reference| reference.kind == ReferenceKind::Class && reference.id == owner_id);
+        let game = state.references.iter().find(|reference| {
+            reference.kind == ReferenceKind::Class && reference.id == frame.classes[3].0
+        });
+        let (Some(hidden), Some(owner), Some(game)) = (hidden, owner, game) else {
+            return Ok(None);
+        };
+        (hidden.handle, owner.handle, game.handle)
+    };
+    // The same-named code owner in another loader is not the game owner pinned
+    // by this source frame, even if it defined its own matching hidden recipe.
+    let Some(game_loader) = (unsafe { existing_source_loader(env, ti, game_handle as jclass)? })
+    else {
+        return Ok(None);
+    };
+    if game_loader == 0
+        || game_loader != context.defining_loader_id
+        || !context.is_current()
+        || !frame.is_current()
+    {
+        return Ok(None);
+    }
+    let owner_status = unsafe { ffi::class_status(ti, actual_expected_code_owner_class)? };
+    let mut method_handle = None;
+    for method in unsafe { ffi::class_methods(ti, actual_expected_code_owner_class)? } {
+        let (name, descriptor) = unsafe { ffi::method_name(ti, method)? };
+        if name != matched.target().name().as_bytes()
+            || descriptor != matched.target().descriptor().as_bytes()
+        {
+            continue;
+        }
+        // Private concrete owners cannot be overridden. Synthetic is accepted
+        // as descriptive metadata only, never an authority or finality bit.
+        let modifiers = unsafe { ffi::method_modifiers(ti, method)? };
+        let expected = match kind {
+            PackCapturedRecipeKind::TaskProvider => 0x000a,
+            PackCapturedRecipeKind::EntryAction => 0x0002,
+        };
+        if modifiers & !0x1000 != expected || method_handle.is_some() {
+            return Ok(None);
+        }
+        let declaring = unsafe { ffi::method_declaring_class(ti, method)? };
+        let joined = unsafe { ffi::same_object(env, declaring, actual_expected_code_owner_class) };
+        let closed = unsafe { ffi::delete_local(env, declaring) };
+        let joined = joined?;
+        closed?;
+        if !joined {
+            return Ok(None);
+        }
+        method_handle = Some(method as usize);
+    }
+    let Some(method_handle) = method_handle else {
+        return Ok(None);
+    };
+    let token = PackCapturedMethodToken {
+        frame,
+        same_thread: std::marker::PhantomData,
+        target: ResolvedMethodToken {
+            class_id: owner_id,
+            target_class_handle: owner_handle,
+            method_handle,
+            issuer_epoch: context.issuer_epoch,
+            definition_generation: owner_generation,
+            class_status_at_resolution: owner_status,
+            hidden_source_class_id: context.hidden_class_id,
+            hidden_source_generation: context.generation,
+        },
+        hidden_class_handle: hidden_handle,
+        kind: matched.kind(),
+        captures: matched.captures().to_vec(),
+        context,
+    };
+    Ok(unsafe { token.recheck(env, frame)? }.then_some(token))
+}
+
 /// Optional description from the native owner's current hidden source. A match
 /// and loaded static method identity do not admit SAM selection, reference
 /// linkage, access, source, initialization policy, or the startup pipeline.
@@ -2376,4 +2650,44 @@ fn encode_hidden_forwarder(
         writer.text(reference)?;
     }
     Some(writer.0)
+}
+
+#[cfg(test)]
+mod pack_recipe_frame_tests {
+    use super::*;
+
+    struct RestoreOperations(Option<LocalOperations>);
+    impl Drop for RestoreOperations {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                OPERATIONS.with(|operations| *operations.borrow_mut() = previous);
+            }
+        }
+    }
+
+    #[test]
+    fn captured_recipe_requires_the_source_lease_on_this_thread() {
+        let source = u64::MAX - 2;
+        let nested = u64::MAX - 1;
+        let previous = OPERATIONS.with(|operations| {
+            let mut replacement = LocalOperations {
+                ids: [0; 64],
+                count: 2,
+            };
+            replacement.ids[0] = source;
+            replacement.ids[1] = nested;
+            std::mem::replace(&mut *operations.borrow_mut(), replacement)
+        });
+        let _restore = RestoreOperations(Some(previous));
+        assert!(pack_operation_on_current_thread(source));
+        assert!(pack_operation_on_current_thread(nested));
+        assert!(!pack_operation_on_current_thread(0));
+        assert!(
+            !std::thread::spawn(move || pack_operation_on_current_thread(source))
+                .join()
+                .unwrap()
+        );
+        OPERATIONS.with(|operations| operations.borrow_mut().count = 0);
+        assert!(!pack_operation_on_current_thread(source));
+    }
 }

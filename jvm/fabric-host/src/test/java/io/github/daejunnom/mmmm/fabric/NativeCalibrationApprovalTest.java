@@ -487,6 +487,87 @@ final class NativeCalibrationApprovalTest {
         assertEquals("ORIGINAL_CHECKPOINT", nativeFailure.code()); assertTrue(nativeFailure.effectsMayExist()); assertSame(actual, nativeFailure.getCause());
     }
 
+    @Test void packRunReceiptFramingRejectsUnavailableCrossPhaseAndTruncatedResults() throws Exception {
+        // Framing comparison only: even a status-1 fixture is no native event, completed run or issuer.
+        byte[] framed = privatePackRunReceipt(47, 1, new byte[] { '{', '}' });
+        byte[] retained = NativeFunctionLoadObservation.requirePackReceipt(framed, 47);
+        assertNotSame(framed, retained); assertArrayEquals(framed, retained);
+        retained[0] ^= 1; assertEquals((byte) 'M', framed[0]);
+        for (int phase : List.of(43, 46, 48, 49))
+            assertEquals("CAPABILITY_UNAVAILABLE", assertThrows(ContractException.class,
+                    () -> NativeFunctionLoadObservation.requirePackReceipt(framed, phase)).code());
+        for (int size : List.of(0, 8, 9, 10, 11, 12, framed.length - 1, framed.length + 1)) {
+            byte[] malformed = java.util.Arrays.copyOf(framed, size);
+            assertThrows(ContractException.class, () -> NativeFunctionLoadObservation.requirePackReceipt(malformed, 47));
+        }
+        for (int offset : List.of(0, 7, 8, 9, 10, 11)) {
+            byte[] malformed = framed.clone(); malformed[offset] ^= 1;
+            assertThrows(ContractException.class, () -> NativeFunctionLoadObservation.requirePackReceipt(malformed, 47));
+        }
+        byte[] unavailable = privatePackRunReceipt(48, 0, new byte[] { '{', '}' });
+        ContractException failure = assertThrows(ContractException.class,
+                () -> NativeFunctionLoadObservation.requirePackReceipt(unavailable, 48));
+        var original = assertInstanceOf(NativeFunctionLoadObservation.PackObservationFailure.class, failure.getCause());
+        assertArrayEquals(unavailable, original.originalReceipt());
+        byte[] copy = original.originalReceipt(); copy[0] ^= 1;
+        assertArrayEquals(unavailable, original.originalReceipt());
+        assertThrows(ContractException.class, () -> NativeFunctionLoadObservation.requirePackReceipt(new byte[65537], 48));
+        assertThrows(ContractException.class, () -> NativeFunctionLoadObservation.requirePackReceipt(null, 47));
+    }
+
+    @Test void packLoadReadinessPortRetainsTheActualOriginalDigestWithoutAFutureRun() throws Exception {
+        // Private constructor/getter comparison only. No loader JNI, native witness or game object is invoked.
+        try (Harness harness = new Harness(null, false)) {
+            Invocation actual = new Invocation(contracts, harness.wire(0));
+            var constructor = NativeFunctionLoadObservation.class.getDeclaredConstructor(Object.class, Object.class,
+                    Object.class, Object.class, Object.class, java.util.Collection.class);
+            constructor.setAccessible(true);
+            Object observation = constructor.newInstance(new Object(), new Object(), actual, new Object(), new Object(), List.of());
+            Class<?> callClass = Class.forName(NativeFunctionLoadObservation.class.getName() + "$NativeCall");
+            var callConstructor = callClass.getDeclaredConstructor(NativeFunctionLoadObservation.class,
+                    NativeFunctionLoadObservation.Phase.class, Object.class); callConstructor.setAccessible(true);
+            Object loadOnly = callConstructor.newInstance(observation, NativeFunctionLoadObservation.Phase.PACK_RUN_READINESS, new Object());
+            var loadDigest = callClass.getDeclaredMethod("nativeLoadInvocationDigest"); loadDigest.setAccessible(true);
+            var runDigest = callClass.getDeclaredMethod("nativeRunInvocationDigest"); runDigest.setAccessible(true);
+            var operation = callClass.getDeclaredMethod("nativeOperation"); operation.setAccessible(true);
+            assertEquals(ContractJson.digest(actual.wire()), loadDigest.invoke(loadOnly));
+            assertNull(runDigest.invoke(loadOnly)); assertNull(operation.invoke(loadOnly));
+            Object untyped = constructor.newInstance(new Object(), new Object(), ContractJson.digest(actual.wire()),
+                    new Object(), new Object(), List.of());
+            Object untypedCall = callConstructor.newInstance(untyped, NativeFunctionLoadObservation.Phase.PACK_RUN_READINESS, new Object());
+            assertNull(loadDigest.invoke(untypedCall), "A caller-provided digest string cannot become the actual SDK Invocation digest");
+        }
+    }
+
+    @Test void packRunApprovalCompletionRejectsOtherPurposesAndChangedOriginalIdentity() {
+        ObjectNode offer = ContractJson.newObject().put("purpose", NativePackCalibrationRun.PURPOSE).put("nonce", "pack-run-test");
+        offer.putObject("hostHello").putObject("environment").put("sessionEpoch", "host-test"); offer.putArray("contextIds").add("context-test");
+        ObjectNode complete = ContractJson.newObject().put("kind", "host_apply_approval_complete").put("protocolVersion", ContractJson.VERSION)
+                .put("nonce", "pack-run-test").put("ready", true).put("coordinatorEpoch", "coordinator-test").put("hostEpoch", "host-test")
+                .put("contextId", "context-test").put("purpose", NativePackCalibrationRun.PURPOSE)
+                .put("selectionDigest", "a".repeat(64)).put("manifestDigest", "b".repeat(64));
+        assertDoesNotThrow(() -> ManualHostConnection.validatePackRunCompletion(offer, complete, "a".repeat(64), "b".repeat(64)));
+        for (String purpose : List.of(NativeCalibrationApproval.PURPOSE, NativeCalibrationBootstrap.PURPOSE,
+                NativeCalibrationBootstrap.PACK_PURPOSE)) {
+            ObjectNode crossed = complete.deepCopy().put("purpose", purpose);
+            assertThrows(ContractException.class, () -> ManualHostConnection.validatePackRunCompletion(offer, crossed, "a".repeat(64), "b".repeat(64)));
+        }
+        for (String field : List.of("nonce", "hostEpoch", "contextId", "selectionDigest", "manifestDigest")) {
+            ObjectNode changed = complete.deepCopy().put(field, "changed");
+            assertThrows(ContractException.class, () -> ManualHostConnection.validatePackRunCompletion(offer, changed, "a".repeat(64), "b".repeat(64)));
+        }
+        for (ObjectNode changed : List.of(complete.deepCopy().put("ready", false), complete.deepCopy().put("ready", "true"),
+                complete.deepCopy().put("jobHandle", "future-run")))
+            assertThrows(ContractException.class, () -> ManualHostConnection.validatePackRunCompletion(offer, changed, "a".repeat(64), "b".repeat(64)));
+    }
+
+    private static byte[] privatePackRunReceipt(int phase, int status, byte[] opaque) throws IOException {
+        try (var bytes = new ByteArrayOutputStream(); var out = new DataOutputStream(bytes)) {
+            out.write("MMMMPR01".getBytes(StandardCharsets.US_ASCII)); out.writeByte(phase); out.writeByte(status);
+            out.writeShort(opaque.length); out.write(opaque); return bytes.toByteArray();
+        }
+    }
+
     private static ObjectNode privateSourceTransport(boolean pack) {
         ObjectNode source = ContractJson.newObject(); var entries = source.putArray("entries");
         List<String> paths = pack ? List.of("data/mmmm_calibration/function/pack/dependency.mcfunction",

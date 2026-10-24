@@ -29,8 +29,8 @@ use crate::{
     workspace_bootstrap::NativeOwnerWitness,
 };
 use mmmm_contracts::{
-    ContextId, JsonLimits, PlanId, ProjectId, ResourceId, ResourceLocation, Sha256Digest,
-    TargetProfileId, encode_json, parse_json_with_limits,
+    ContextId, JsonLimits, OperationId, PlanId, ProjectId, ResourceId, ResourceLocation,
+    Sha256Digest, TargetProfileId, encode_json, parse_json_with_limits,
 };
 use mmmm_runtime::storage::{
     DurableStore, StorageError, StoreConfig,
@@ -239,6 +239,7 @@ enum CalibrationPlanKind {
     NumericRun,
     NumericBootstrap,
     PackBootstrap,
+    PackRun,
 }
 
 impl CalibrationPlanKind {
@@ -247,6 +248,7 @@ impl CalibrationPlanKind {
             Self::NumericRun => crate::peer_management::CALIBRATION_PLAN_PURPOSE,
             Self::NumericBootstrap => crate::calibration_bootstrap::PURPOSE,
             Self::PackBootstrap => crate::calibration_bootstrap::PACK_PURPOSE,
+            Self::PackRun => crate::calibration_pack_run::PURPOSE,
         }
     }
 
@@ -255,6 +257,29 @@ impl CalibrationPlanKind {
             Self::NumericRun => "calibration_plan_prepared",
             Self::NumericBootstrap => "calibration_bootstrap_plan_prepared",
             Self::PackBootstrap => "calibration_pack_bootstrap_plan_prepared",
+            Self::PackRun => "calibration_pack_run_plan_prepared",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CalibrationApprovalKind {
+    NumericRun,
+    PackRun,
+}
+
+impl CalibrationApprovalKind {
+    fn purpose(self) -> &'static str {
+        match self {
+            Self::NumericRun => crate::bootstrap::calibration_approval::PURPOSE,
+            Self::PackRun => crate::calibration_pack_run::PURPOSE,
+        }
+    }
+
+    fn result_kind(self) -> &'static str {
+        match self {
+            Self::NumericRun => "calibration_owner_selected",
+            Self::PackRun => "calibration_pack_run_owner_selected",
         }
     }
 }
@@ -310,11 +335,13 @@ enum Command {
         project: ProjectId,
         plan: PlanId,
         hash: Sha256Digest,
+        kind: CalibrationApprovalKind,
     },
     CalibrationPlan {
         root: PathBuf,
         selection: mmmm_application::SetupSelection,
         kind: CalibrationPlanKind,
+        origin_bootstrap_operation: Option<OperationId>,
     },
     HostBridge {
         approval: bool,
@@ -426,6 +453,7 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
             root,
             selection,
             kind,
+            origin_bootstrap_operation,
         } => {
             use crate::{
                 credential::CredentialRef,
@@ -433,20 +461,34 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
                 peer::PeerHostAttach,
                 peer_management::{HostOffer, PublicFrame},
             };
+            if (kind == CalibrationPlanKind::PackRun) != origin_bootstrap_operation.is_some() {
+                return Err(EntryError::Arguments);
+            }
             let deadline = started + crate::peer_management::BOOTSTRAP_LIMIT;
             let endpoint = host_relay::ExistingCoordinator
                 .ensure_endpoint(&root, &selection.project_id, deadline)
                 .map_err(EntryError::Relay)?;
             let purpose = kind.purpose();
-            let nonce = format!("calibration-plan-{}", mmmm_contracts::canonical_digest(&json!({
+            let mut locators = json!({
                 "purpose":purpose,"projectId":selection.project_id,"expectedRevision":selection.expected_revision,"contextId":selection.context_id
-            })).map_err(|_| EntryError::Arguments)?);
-            let offer = PublicFrame::from_value(json!({
+            });
+            if let Some(origin) = &origin_bootstrap_operation {
+                locators["originBootstrapOperation"] = json!(origin);
+            }
+            let nonce = format!(
+                "calibration-plan-{}",
+                mmmm_contracts::canonical_digest(&locators).map_err(|_| EntryError::Arguments)?
+            );
+            let mut offer = json!({
                 "kind":"native_calibration_plan_offer", "protocolVersion":mmmm_contracts::CONTRACT_VERSION,
                 "nonce":nonce,
                 "purpose":purpose, "dataRoot":root,
                 "projectId":selection.project_id, "expectedRevision":selection.expected_revision, "contextId":selection.context_id
-            })).map_err(|_| EntryError::Arguments)?;
+            });
+            if let Some(origin) = &origin_bootstrap_operation {
+                offer["originBootstrapOperation"] = json!(origin);
+            }
+            let offer = PublicFrame::from_value(offer).map_err(|_| EntryError::Arguments)?;
             let offer =
                 HostOffer::calibration_plan(offer).map_err(|_| EntryError::OutputInvalid)?;
             let reference = CredentialRef::new(&endpoint.credential_ref)
@@ -478,9 +520,12 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
             )
             .map_err(|_| EntryError::OutputInvalid)?;
             let checkpoint_failed = prepared.value()["outcome"] == "committed_checkpoint_failed";
-            let result = json!({"kind":kind.result_kind(),
+            let mut result = json!({"kind":kind.result_kind(),
                 "purpose":purpose,"projectId":selection.project_id,
                 "planId":plan,"planHash":hash,"outcome":prepared.value()["outcome"]});
+            if let Some(origin) = &origin_bootstrap_operation {
+                result["originBootstrapOperation"] = json!(origin);
+            }
             let delivery = pending
                 .complete_calibration_plan()
                 .map_err(EntryError::Peer)
@@ -510,6 +555,7 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
             project,
             plan,
             hash,
+            kind,
         } => {
             use crate::{
                 credential::CredentialRef,
@@ -522,9 +568,10 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
                 .ensure_endpoint(&root, &project, deadline)
                 .map_err(EntryError::Relay)?;
             let nonce = format!("calibration-{}", random_suffix()?);
+            let purpose = kind.purpose();
             let offer = PublicFrame::from_value(json!({"kind":"native_calibration_owner_offer",
                 "protocolVersion":mmmm_contracts::CONTRACT_VERSION,"nonce":nonce,
-                "purpose":crate::bootstrap::calibration_approval::PURPOSE,
+                "purpose":purpose,
                 "dataRoot":root,"projectId":project,"planId":plan,"planHash":hash}))
             .map_err(|_| EntryError::Arguments)?;
             let offer = HostOffer::owner_selection(offer).map_err(|_| EntryError::OutputInvalid)?;
@@ -537,14 +584,26 @@ pub fn dispatch(args: &[String]) -> Result<bool, EntryError> {
                 deadline,
             )
             .map_err(EntryError::Peer)?;
+            if selected.value()["kind"] != "native_calibration_owner_selected"
+                || selected.value()["purpose"] != purpose
+                || selected.value()["projectId"] != project.as_str()
+                || selected.value()["planId"] != plan.as_str()
+                || selected.value()["planHash"] != hash.as_str()
+                || selected.value()["nonce"] != nonce
+            {
+                return Err(EntryError::OutputInvalid);
+            }
             let selection_digest = Sha256Digest::new(
                 selected.value()["selectionDigest"]
                     .as_str()
                     .ok_or(EntryError::OutputInvalid)?,
             )
             .map_err(|_| EntryError::OutputInvalid)?;
-            let result = json!({"kind":"calibration_owner_selected","projectId":project,"planId":plan,"planHash":hash,
+            let mut result = json!({"kind":kind.result_kind(),"projectId":project,"planId":plan,"planHash":hash,
                 "selectionDigest":selection_digest,"approvalRef":selected.value()["approvalRef"],"expiresAt":selected.value()["expiresAt"]});
+            if kind == CalibrationApprovalKind::PackRun {
+                result["purpose"] = json!(purpose);
+            }
             let delivered = pending
                 .complete_owner_selection()
                 .map_err(EntryError::Peer)
@@ -952,19 +1011,27 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
             | "catalog-source-use"
             | "compatibility-profile-approve"
             | "calibration-approve"
+            | "calibration-pack-run-approve"
             | "calibration-plan"
             | "calibration-bootstrap-plan"
             | "calibration-pack-bootstrap-plan"
+            | "calibration-pack-run-plan"
     ) {
         return Ok(None);
     }
     if matches!(
         command,
         "calibration-approve"
+            | "calibration-pack-run-approve"
             | "calibration-plan"
             | "calibration-bootstrap-plan"
             | "calibration-pack-bootstrap-plan"
     ) && (args.len() != 9 || args.iter().any(|arg| arg.len() > 4096))
+    {
+        return Err(EntryError::Arguments);
+    }
+    if command == "calibration-pack-run-plan"
+        && (args.len() != 11 || args.iter().any(|arg| arg.len() > 4096))
     {
         return Err(EntryError::Arguments);
     }
@@ -1065,35 +1132,54 @@ fn parse(args: &[String]) -> Result<Option<Command>, EntryError> {
         return Err(EntryError::Arguments);
     }
     let parsed = match command {
-        "calibration-plan" | "calibration-bootstrap-plan" | "calibration-pack-bootstrap-plan" => {
-            Command::CalibrationPlan {
-                root,
-                kind: match command {
-                    "calibration-plan" => CalibrationPlanKind::NumericRun,
-                    "calibration-bootstrap-plan" => CalibrationPlanKind::NumericBootstrap,
-                    "calibration-pack-bootstrap-plan" => CalibrationPlanKind::PackBootstrap,
-                    _ => return Err(EntryError::Arguments),
-                },
-                selection: mmmm_application::SetupSelection {
-                    project_id: ProjectId::new(
-                        options.remove("--project").ok_or(EntryError::Arguments)?,
-                    )
-                    .map_err(|_| EntryError::Arguments)?,
-                    expected_revision: Sha256Digest::new(
+        "calibration-plan"
+        | "calibration-bootstrap-plan"
+        | "calibration-pack-bootstrap-plan"
+        | "calibration-pack-run-plan" => Command::CalibrationPlan {
+            root,
+            kind: match command {
+                "calibration-plan" => CalibrationPlanKind::NumericRun,
+                "calibration-bootstrap-plan" => CalibrationPlanKind::NumericBootstrap,
+                "calibration-pack-bootstrap-plan" => CalibrationPlanKind::PackBootstrap,
+                "calibration-pack-run-plan" => CalibrationPlanKind::PackRun,
+                _ => return Err(EntryError::Arguments),
+            },
+            origin_bootstrap_operation: if command == "calibration-pack-run-plan" {
+                Some(
+                    OperationId::new(
                         options
-                            .remove("--expected-revision")
+                            .remove("--bootstrap-operation")
                             .ok_or(EntryError::Arguments)?,
                     )
                     .map_err(|_| EntryError::Arguments)?,
-                    context_id: ContextId::new(
-                        options.remove("--context").ok_or(EntryError::Arguments)?,
-                    )
-                    .map_err(|_| EntryError::Arguments)?,
-                },
-            }
-        }
-        "calibration-approve" => Command::CalibrationApprove {
+                )
+            } else {
+                None
+            },
+            selection: mmmm_application::SetupSelection {
+                project_id: ProjectId::new(
+                    options.remove("--project").ok_or(EntryError::Arguments)?,
+                )
+                .map_err(|_| EntryError::Arguments)?,
+                expected_revision: Sha256Digest::new(
+                    options
+                        .remove("--expected-revision")
+                        .ok_or(EntryError::Arguments)?,
+                )
+                .map_err(|_| EntryError::Arguments)?,
+                context_id: ContextId::new(
+                    options.remove("--context").ok_or(EntryError::Arguments)?,
+                )
+                .map_err(|_| EntryError::Arguments)?,
+            },
+        },
+        "calibration-approve" | "calibration-pack-run-approve" => Command::CalibrationApprove {
             root,
+            kind: match command {
+                "calibration-approve" => CalibrationApprovalKind::NumericRun,
+                "calibration-pack-run-approve" => CalibrationApprovalKind::PackRun,
+                _ => return Err(EntryError::Arguments),
+            },
             project: ProjectId::new(options.remove("--project").ok_or(EntryError::Arguments)?)
                 .map_err(|_| EntryError::Arguments)?,
             plan: PlanId::new(options.remove("--plan-id").ok_or(EntryError::Arguments)?)
@@ -1869,12 +1955,43 @@ mod tests {
                 ..
             }))
         ));
+        let mut pack_run_planning = planning.clone();
+        pack_run_planning[0] = "calibration-pack-run-plan".into();
+        assert!(parse(&pack_run_planning).is_err());
+        pack_run_planning.extend(args(&["--bootstrap-operation", "operation-pack-bootstrap"]));
+        assert!(matches!(
+            parse(&pack_run_planning),
+            Ok(Some(Command::CalibrationPlan {
+                kind: CalibrationPlanKind::PackRun,
+                origin_bootstrap_operation: Some(origin),
+                ..
+            })) if origin.as_str() == "operation-pack-bootstrap"
+        ));
+        for original in [&planning, &bootstrap_planning, &pack_planning] {
+            let mut forged = (*original).clone();
+            forged.extend(args(&["--bootstrap-operation", "operation-pack-bootstrap"]));
+            assert!(parse(&forged).is_err());
+        }
+        for (position, replacement) in [
+            (9, "--origin-operation"),
+            (9, "--admin"),
+            (10, ""),
+            (10, "../operation-pack-bootstrap"),
+        ] {
+            let mut forged = pack_run_planning.clone();
+            forged[position] = replacement.into();
+            assert!(parse(&forged).is_err());
+        }
+        let mut duplicate_origin = pack_run_planning.clone();
+        duplicate_origin[7] = "--bootstrap-operation".into();
+        assert!(parse(&duplicate_origin).is_err());
         for extra in [
             ["--purpose", "numeric_calibration_bootstrap/1"],
             ["--purpose", "pack_calibration_bootstrap/1"],
+            ["--purpose", "pack_calibration_run/1"],
             ["--admin", "true"],
         ] {
-            for original in [&bootstrap_planning, &pack_planning] {
+            for original in [&bootstrap_planning, &pack_planning, &pack_run_planning] {
                 let mut forged = (*original).clone();
                 forged.extend(args(&extra));
                 assert!(parse(&forged).is_err());
@@ -1918,7 +2035,19 @@ mod tests {
         ]);
         assert!(matches!(
             parse(&calibration),
-            Ok(Some(Command::CalibrationApprove { .. }))
+            Ok(Some(Command::CalibrationApprove {
+                kind: CalibrationApprovalKind::NumericRun,
+                ..
+            }))
+        ));
+        let mut pack_run_approval = calibration.clone();
+        pack_run_approval[0] = "calibration-pack-run-approve".into();
+        assert!(matches!(
+            parse(&pack_run_approval),
+            Ok(Some(Command::CalibrationApprove {
+                kind: CalibrationApprovalKind::PackRun,
+                ..
+            }))
         ));
         for field in [
             "--principal",
@@ -1927,10 +2056,21 @@ mod tests {
             "--manifest",
             "--expected-revision",
         ] {
-            let mut forged = calibration.clone();
-            forged.extend(args(&[field, "true"]));
-            assert!(matches!(parse(&forged), Err(EntryError::Arguments)));
+            for original in [&calibration, &pack_run_approval] {
+                let mut forged = (*original).clone();
+                forged.extend(args(&[field, "true"]));
+                assert!(matches!(parse(&forged), Err(EntryError::Arguments)));
+            }
         }
+        let mut forged = pack_run_approval.clone();
+        forged.extend(args(&["--purpose", "numeric_calibration_normative47/1"]));
+        assert!(parse(&forged).is_err());
+        let mut forged = pack_run_approval.clone();
+        forged.extend(args(&["--bootstrap-operation", "operation-pack-bootstrap"]));
+        assert!(parse(&forged).is_err());
+        let mut duplicate_pack_approval = pack_run_approval;
+        duplicate_pack_approval[7] = "--project".into();
+        assert!(parse(&duplicate_pack_approval).is_err());
         let mut duplicate = calibration.clone();
         duplicate[7] = "--project".into();
         assert!(matches!(parse(&duplicate), Err(EntryError::Arguments)));

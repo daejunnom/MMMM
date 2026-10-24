@@ -44,7 +44,12 @@ const TOTAL_BYTES: usize = 1024 * 1024;
 const RECEIPT_BYTES: usize = 64 * 1024;
 const FRAME_LOCALS: usize = 1024;
 const NATIVE_CAUSES: usize = 16;
-const PHASES: usize = 47;
+// Explicit private observer protocol extension: phase 47 is load-only PACK
+// readiness; phase 48 requires the actual new run/closure objects.
+const PHASES: usize = 49;
+fn fresh_phase(phase: jint) -> bool {
+    matches!(phase, 43 | 47 | 48)
+}
 fn object_limit(first_cause: bool, historical_cause_present: bool) -> usize {
     if first_cause && !historical_cause_present {
         OBJECTS
@@ -102,6 +107,26 @@ struct EntryFunction {
     ticket: FunctionTicket,
     compiled: Option<ObjectId>,
 }
+struct PackFunctionPin {
+    function_id: String,
+    resource_id: String,
+    raw_sha256: [u8; 32],
+}
+struct PackLoadFacts {
+    load_invocation_digest: [u8; 32],
+    source_bundle_digest: [u8; 32],
+    logical_program_digest: [u8; 32],
+    selected_function_source_digest: [u8; 32],
+    functions: [PackFunctionPin; 2],
+}
+struct NativeReply {
+    selection: u8,
+    // Call-local correlation established only by actual Operation identity;
+    // never inferred from the six historical load objects or receipt bytes.
+    pack_run_binding: Option<(CaptureId, ObjectId)>,
+    pack_load: Option<PackLoadFacts>,
+    pack_run: Option<([u8; 32], jint, core::PackRunFacts)>,
+}
 struct SelectedEntry {
     name: String,
     function: ObjectId,
@@ -139,6 +164,10 @@ enum NativeCause {
     Throwable(Option<ObjectId>),
     Post(Box<NativeCause>, Box<NativeCause>),
     Boundary(&'static str),
+    ObservedReason {
+        engine: Option<String>,
+        observer: Option<String>,
+    },
     Ffi(ffi::FfiError),
     Fact(Failure),
 }
@@ -146,6 +175,11 @@ struct Capture {
     id: Option<CaptureId>,
     // All six fields are compared against actual interned callback objects.
     binding: Option<CaptureBinding>,
+    // Cached by the admitted Java observer from the actual original Invocation
+    // object, retained only beside the six actual native identity bindings.
+    load_invocation_digest: Option<[u8; 32]>,
+    pack_run_invocation: Option<ObjectId>,
+    pack_run_digest: Option<[u8; 32]>,
     original: Option<[ObjectId; 6]>,
     selection: Option<ObjectId>,
     stamp: [(u64, u64); 4],
@@ -246,7 +280,7 @@ impl Registry {
         if self.active >= ACTIVE_FRAMES {
             // No port/class/capture admission has occurred. Only the raw input
             // category is recorded; this cannot name or fail a capture.
-            if raw_phase == 43 {
+            if fresh_phase(raw_phase) {
                 self.current_frame_rejections.record(raw_phase);
             } else {
                 self.historical_frame_rejections.record(raw_phase);
@@ -908,8 +942,17 @@ enum Field {
     Reader,
     SourcePack,
     Entry,
+    Callee,
+    CallSource,
+    ExecutionContext,
+    ParentFrame,
+    ChildFrame,
+    Entries,
+    Provider,
+    QueueEntry,
+    Action,
 }
-const GETTERS: [&CStr; 24] = [
+const GETTERS: [&CStr; 33] = [
     c"nativeServer",
     c"nativeAttempt",
     c"nativeInvocation",
@@ -934,9 +977,20 @@ const GETTERS: [&CStr; 24] = [
     c"nativeReader",
     c"nativeSourcePack",
     c"nativeEntry",
+    c"nativeCallee",
+    c"nativeSource",
+    c"nativeContext",
+    c"nativeParentFrame",
+    c"nativeChildFrame",
+    c"nativeEntries",
+    c"nativeProvider",
+    c"nativeQueueEntry",
+    c"nativeAction",
 ];
 struct Frame {
-    objects: [Option<jobject>; 24],
+    objects: [Option<jobject>; 33],
+    load_digest: Option<[u8; 32]>,
+    run_digest: Option<[u8; 32]>,
     fresh: Option<jobject>,
     throwable: Option<jobject>,
     observation_throwable: Option<jobject>,
@@ -983,6 +1037,25 @@ fn path(units: Vec<u16>) -> Result<PathBuf> {
     }
     Ok(path)
 }
+fn cached_digest(locals: &mut Locals, port: jobject, name: &CStr) -> Result<Option<[u8; 32]>> {
+    let Some(value) = locals.zero(port, name, c"()Ljava/lang/String;")? else {
+        return Ok(None);
+    };
+    let text = locals.text(value, 64)?;
+    if text.len() != 64 {
+        return Err(Failure::Identity.into());
+    }
+    let mut bytes = [0; 32];
+    for (output, pair) in bytes.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
+        let digit = |value| match value {
+            b'0'..=b'9' => Ok(value - b'0'),
+            b'a'..=b'f' => Ok(value - b'a' + 10),
+            _ => Err(Error::Fact(Failure::Identity)),
+        };
+        *output = (digit(pair[0])? << 4) | digit(pair[1])?;
+    }
+    Ok(Some(bytes))
+}
 fn read_frame(
     locals: &mut Locals,
     port: jobject,
@@ -998,7 +1071,7 @@ fn read_frame(
     {
         return Err(Failure::Identity.into());
     }
-    let mut objects = [None; 24];
+    let mut objects = [None; 33];
     for (slot, getter) in objects.iter_mut().zip(GETTERS) {
         *slot = locals.zero(port, getter, c"()Ljava/lang/Object;")?;
     }
@@ -1015,8 +1088,13 @@ fn read_frame(
     if scalar_phase != phase {
         return Err(Failure::Identity.into());
     }
+    let load_digest = cached_digest(locals, port, c"nativeLoadInvocationDigest")?;
+    let run_digest = cached_digest(locals, port, c"nativeRunInvocationDigest")?;
+    if phase != 48 && run_digest.is_some() {
+        return Err(Failure::Identity.into());
+    }
     let fresh = locals.zero(port, c"nativeFreshCurrentPort", c"()Ljava/lang/Object;")?;
-    if (phase == 43) != fresh.is_some() {
+    if fresh_phase(phase) != fresh.is_some() {
         return Err(Failure::Identity.into());
     }
     let throwable = locals.zero(port, c"nativeThrowable", c"()Ljava/lang/Throwable;")?;
@@ -1052,11 +1130,24 @@ fn read_frame(
             && original_offset >= 0 => {}
         22 if amount == -1 && requested > 0 && length == 0 && original_offset >= 0 => {}
         21 | 22 => return Err(Failure::ReadFailed.into()),
+        48 if (0..=14).contains(&original_offset)
+            && amount == 0
+            && requested == 0
+            && length
+                == match original_offset {
+                    11 => 8,
+                    12 => 16,
+                    _ => 0,
+                } => {}
+        47 if original_offset == 0 && amount == 0 && requested == 0 && length == 0 => {}
+        47 | 48 => return Err(Failure::Identity.into()),
         _ if length != 0 => return Err(Failure::Identity.into()),
         _ => {}
     }
     Ok(Frame {
         objects,
+        load_digest,
+        run_digest,
         fresh,
         throwable,
         observation_throwable,
@@ -1142,6 +1233,9 @@ fn reserve_capture(stamp: [(u64, u64); 4], deadline: Instant, started_ms: u64) -
     registry.captures.push(Capture {
         id: None,
         binding: None,
+        load_invocation_digest: None,
+        pack_run_invocation: None,
+        pack_run_digest: None,
         original: None,
         selection: None,
         stamp,
@@ -1428,7 +1522,7 @@ fn check_common(
             .close_admission(Failure::GenerationChanged, token.generation());
         return Err(Failure::GenerationChanged.into());
     }
-    let ids = if frame.phase == 43 {
+    let ids = if fresh_phase(frame.phase) {
         let (ids, references) = {
             let registry = state()?;
             let binding = registry.captures[index]
@@ -1489,13 +1583,19 @@ fn check_common(
         binding.root_anchor,
         binding.selection,
     ];
+    if matches!(frame.phase, 47 | 48)
+        && (capture.load_invocation_digest.is_none()
+            || capture.load_invocation_digest != frame.load_digest)
+    {
+        return Err(Failure::Identity.into());
+    }
     if capture.original != Some(ids) || expected != ids {
         registry
             .core
             .close_admission(Failure::Identity, token.generation());
         return Err(Failure::Identity.into());
     }
-    if matches!(frame.phase, 38 | 43) {
+    if frame.phase == 38 || fresh_phase(frame.phase) {
         // Retirement is a lifecycle fact; a fresh read is a new bounded frame.
         // Neither rewrites a previously completed observation's clock/work.
         return Ok(Checkpoint {
@@ -1540,6 +1640,9 @@ fn arm(locals: &mut Locals, index: usize, frame: &Frame, token: &SourceCaptureTo
         return Err(Failure::GenerationChanged.into());
     }
     let expected = ExpectedSources::for_kind(root.kind)?;
+    if root.kind == CalibrationSourceKind::PackCase && frame.load_digest.is_none() {
+        return Err(Failure::Identity.into());
+    }
     let mut registry = state()?;
     let started_ms = registry.captures[index].started_ms;
     let binding = CaptureBinding {
@@ -1558,6 +1661,7 @@ fn arm(locals: &mut Locals, index: usize, frame: &Frame, token: &SourceCaptureTo
             .ok_or(Failure::ResourceLimit)?,
     };
     registry.captures[index].binding = Some(binding.clone());
+    registry.captures[index].load_invocation_digest = frame.load_digest;
     registry.captures[index].id = Some(registry.core.arm(binding, expected)?);
     Ok(())
 }
@@ -1733,9 +1837,15 @@ fn record_error(
     index: Option<usize>,
     error: Error,
     phase: jint,
+    run_binding: Option<(CaptureId, ObjectId)>,
 ) -> &'static str {
     let code = error_code(&error);
-    let current = phase == 43;
+    let run_failure = match &error {
+        Error::Fact(failure) => *failure,
+        Error::Root(owned_pack_files::Failure::ObservationDeadline) => Failure::Deadline,
+        _ => Failure::Identity,
+    };
+    let current = fresh_phase(phase);
     if let Some(index) = index {
         if let Ok(mut registry) = state() {
             if current {
@@ -1745,6 +1855,34 @@ fn record_error(
             }
         }
         let cause = error_cause(locals, index, error, current);
+        if phase == 48 {
+            fn actual_throwable(cause: &NativeCause) -> Option<ObjectId> {
+                match cause {
+                    NativeCause::Throwable(actual) => *actual,
+                    NativeCause::Post(first, post) => {
+                        actual_throwable(first).or_else(|| actual_throwable(post))
+                    }
+                    _ => None,
+                }
+            }
+            if let Ok(mut registry) = state() {
+                let capture = &registry.captures[index];
+                if let (Some(id), Some(run)) = (capture.id, capture.pack_run_invocation) {
+                    let _ = registry.core.pack_run_event(
+                        id,
+                        run,
+                        core::PackRunEvent::Failed {
+                            failure: run_failure,
+                            cause: if run_binding == Some((id, run)) {
+                                actual_throwable(&cause)
+                            } else {
+                                None
+                            },
+                        },
+                    );
+                }
+            }
+        }
         retain_native_cause(index, cause, current);
         if let Ok(Some(pending)) = cleanup_jni(|| unsafe { ffi::take_exception(locals.env) })
             && !pending.is_null()
@@ -1752,6 +1890,25 @@ fn record_error(
         {
             if current {
                 let cause = current_cause_object(locals, index, actual).ok();
+                if phase == 48
+                    && let Ok(mut registry) = state()
+                {
+                    let capture = &registry.captures[index];
+                    if let (Some(id), Some(run)) = (capture.id, capture.pack_run_invocation) {
+                        let _ = registry.core.pack_run_event(
+                            id,
+                            run,
+                            core::PackRunEvent::Failed {
+                                failure: run_failure,
+                                cause: if run_binding == Some((id, run)) {
+                                    cause
+                                } else {
+                                    None
+                                },
+                            },
+                        );
+                    }
+                }
                 retain_native_cause(index, NativeCause::Throwable(cause), true);
             } else {
                 let _ = native_cause(locals, index, Failure::Identity, actual);
@@ -2260,11 +2417,22 @@ fn dispatch(
     token: &SourceCaptureToken,
     classes: CallbackClasses,
     check: Checkpoint,
-    selection_reply: &mut u8,
+    reply: &mut NativeReply,
 ) -> Result<()> {
     if frame.phase == 46 {
-        *selection_reply = select_entry(locals, index, frame, token)?;
+        reply.selection = select_entry(locals, index, frame, token)?;
         return Ok(());
+    }
+    if fresh_phase(frame.phase) {
+        return observe_current(
+            locals,
+            index,
+            frame,
+            token,
+            classes.bridge,
+            classes.port,
+            reply,
+        );
     }
     if matches!(frame.phase, 5..=8) && frame.optional(Field::Library).is_some() {
         return preparation_event(locals, index, frame, token);
@@ -2688,7 +2856,6 @@ fn dispatch(
             let ticket = ticket(index, identifier)?;
             fact(state()?.core.lines_returned(ticket, reader, lines, check))?;
         }
-        43 => observe_current(locals, index, frame, token, classes.bridge, classes.port)?,
         44 => {
             let (_, identifier) = selected.ok_or(Failure::Identity)?;
             let stream = field_id(locals, index, frame, Field::Stream)?;
@@ -2977,6 +3144,7 @@ fn observe_current(
     token: &SourceCaptureToken,
     bridge: jclass,
     port_class: jclass,
+    reply: &mut NativeReply,
 ) -> Result<()> {
     {
         let mut registry = state()?;
@@ -3049,6 +3217,40 @@ fn observe_current(
                 }
                 capture.current_functions_observed = true;
                 drop(registry);
+                if matches!(frame.phase, 47 | 48) {
+                    let capture_id = capture_id(index)?;
+                    let proof = state()?.core.pack_source_witness(capture_id)?;
+                    let view = core::InstalledSourceView {
+                        server: binding.server,
+                        manager: actual.manager,
+                        resources: actual.resources,
+                        library: actual.library,
+                        published_map: actual.map,
+                        entries: &actual.entries,
+                    };
+                    if !proof.matches_current(&view)
+                        || state()?.captures[index].source_pack != Some(proof.source_pack())
+                    {
+                        return Err(Failure::SourceMismatch.into());
+                    }
+                    let load = pack_load_facts(&mut current_locals, index, frame, &proof)?;
+                    if frame.phase == 48 {
+                        let run = pack_run_event(
+                            &mut current_locals,
+                            index,
+                            frame,
+                            token,
+                            &proof,
+                            reply,
+                        )?;
+                        reply.pack_run = Some((
+                            frame.run_digest.ok_or(Failure::Identity)?,
+                            frame.original_offset,
+                            run,
+                        ));
+                    }
+                    reply.pack_load = Some(load);
+                }
                 for stamp in current_locals.observed.clone() {
                     retain_class_stamp(index, token, stamp)?;
                 }
@@ -3097,11 +3299,947 @@ fn native_cause_json(cause: &NativeCause) -> Value {
             json!({"kind":"post","primary":native_cause_json(primary),"post":native_cause_json(post)})
         }
         NativeCause::Boundary(kind) => json!({"kind":"root_boundary","failure":kind}),
+        NativeCause::ObservedReason { engine, observer } => {
+            json!({"kind":"observed_reason","engine":engine,"observer":observer})
+        }
         NativeCause::Ffi(error) => json!({"kind":"jni","failure":format!("{error:?}")}),
         NativeCause::Fact(failure) => {
             json!({"kind":"fact_boundary","failure":failure_name(*failure)})
         }
     }
+}
+fn function_pin_json(pin: &PackFunctionPin) -> Value {
+    json!({"functionId":pin.function_id,"resourceId":pin.resource_id,"rawSha256":hex(&pin.raw_sha256)})
+}
+fn pack_reference(id: ObjectId) -> Result<jobject> {
+    state()?.reference(id)
+}
+
+fn pack_typed(
+    locals: &mut Locals,
+    index: usize,
+    token: &SourceCaptureToken,
+    object: jobject,
+    signature: &'static [u8],
+) -> Result<ObjectId> {
+    locals.exact_class(object, signature)?;
+    stamp_object(locals, index, token, object, signature)?;
+    intern(locals, index, object)
+}
+
+fn pack_object_field(
+    locals: &mut Locals,
+    index: usize,
+    token: &SourceCaptureToken,
+    receiver: jobject,
+    owner: &'static [u8],
+    name: &CStr,
+    descriptor: &CStr,
+) -> Result<jobject> {
+    locals.exact_class(receiver, owner)?;
+    let stamp = stamp_object(locals, index, token, receiver, owner)?;
+    let class = stamp
+        .actual_class(token)
+        .ok_or(Failure::GenerationChanged)?;
+    locals.live()?;
+    let field = locals.finish(
+        unsafe { ffi::field_id(locals.env, class, name, descriptor) }.map_err(Error::Ffi),
+    )?;
+    locals.live()?;
+    let result = unsafe { ffi::object_field(locals.env, receiver, field) }
+        .map_err(Error::Ffi)
+        .and_then(|value| value.ok_or(Error::Fact(Failure::Identity)))
+        .and_then(|value| locals.adopt(value));
+    locals.finish(result)
+}
+
+fn pack_source(
+    locals: &mut Locals,
+    index: usize,
+    frame: &Frame,
+    token: &SourceCaptureToken,
+) -> Result<ObjectId> {
+    let source = frame.object(Field::CallSource)?;
+    let id = pack_typed(
+        locals,
+        index,
+        token,
+        source,
+        b"Lnet/minecraft/commands/CommandSourceStack;",
+    )?;
+    let server = locals.required_zero(
+        source,
+        c"getServer",
+        c"()Lnet/minecraft/server/MinecraftServer;",
+    )?;
+    if !locals.same(server, frame.object(Field::Server)?)? {
+        return Err(Failure::Identity.into());
+    }
+    Ok(id)
+}
+
+fn pack_entries(
+    locals: &mut Locals,
+    index: usize,
+    token: &SourceCaptureToken,
+    plain: jobject,
+    supplied: Option<jobject>,
+    role: core::PackRunRole,
+) -> Result<Vec<ObjectId>> {
+    pack_typed(
+        locals,
+        index,
+        token,
+        plain,
+        b"Lnet/minecraft/commands/functions/PlainTextFunction;",
+    )?;
+    let entries = locals.required_zero(plain, c"entries", c"()Ljava/util/List;")?;
+    if supplied.is_some_and(|value| value.is_null()) {
+        return Err(Failure::Identity.into());
+    }
+    if let Some(supplied) = supplied {
+        if !locals.same(entries, supplied)? {
+            return Err(Failure::Identity.into());
+        }
+    }
+    let expected = match role {
+        core::PackRunRole::Entry => 3,
+        core::PackRunRole::Dependency => 2,
+    };
+    if locals.collection_size(token, entries)? != expected {
+        return Err(Failure::MissingFunction.into());
+    }
+    let array = locals.collection_array(token, entries)?;
+    let values = locals.array_values(array, FUNCTIONS)?;
+    if values.len() != expected as usize || locals.collection_size(token, entries)? != expected {
+        return Err(Failure::MissingFunction.into());
+    }
+    values
+        .into_iter()
+        .map(|value| intern(locals, index, value))
+        .collect()
+}
+
+fn pack_captured(
+    locals: &mut Locals,
+    index: usize,
+    token: &SourceCaptureToken,
+    receiver: jobject,
+    kind: native_producer::PackCapturedRecipeKind,
+    captures: &[jobject],
+) -> Result<()> {
+    let owner = match kind {
+        native_producer::PackCapturedRecipeKind::TaskProvider => {
+            b"Lnet/minecraft/commands/execution/tasks/CallFunction;".as_slice()
+        }
+        native_producer::PackCapturedRecipeKind::EntryAction => {
+            b"Lnet/minecraft/commands/execution/UnboundEntryAction;".as_slice()
+        }
+    };
+    let stamp = stamp_named(locals, index, token, owner)?;
+    let class = stamp
+        .actual_class(token)
+        .ok_or(Failure::GenerationChanged)?;
+    let actual = locals.class(receiver)?;
+    locals.live()?;
+    let recipe =
+        unsafe { native_producer::pack_captured_forwarder(locals.env, token, actual, class, kind) }
+            .map_err(|_| Error::Gap("pack_captured_code_unavailable"))?
+            .ok_or(Error::Gap("pack_captured_recipe_unsupported"))?;
+    if recipe.kind() != kind
+        || !recipe.is_current()
+        || !unsafe { recipe.captures_match(locals.env, token, receiver, captures) }
+            .map_err(|_| Error::Gap("pack_captured_refs_unavailable"))?
+        || !unsafe { recipe.recheck(locals.env, token) }
+            .map_err(|_| Error::Gap("pack_captured_postcheck_unavailable"))?
+    {
+        return Err(Failure::Identity.into());
+    }
+    locals.live()
+}
+
+fn pack_queue(
+    locals: &mut Locals,
+    index: usize,
+    token: &SourceCaptureToken,
+    queue: jobject,
+    expected_frame: ObjectId,
+    expected_action: ObjectId,
+) -> Result<ObjectId> {
+    let id = pack_typed(
+        locals,
+        index,
+        token,
+        queue,
+        b"Lnet/minecraft/commands/execution/CommandQueueEntry;",
+    )?;
+    let actual_frame = pack_object_field(
+        locals,
+        index,
+        token,
+        queue,
+        b"Lnet/minecraft/commands/execution/CommandQueueEntry;",
+        c"frame",
+        c"Lnet/minecraft/commands/execution/Frame;",
+    )?;
+    let actual_action = pack_object_field(
+        locals,
+        index,
+        token,
+        queue,
+        b"Lnet/minecraft/commands/execution/CommandQueueEntry;",
+        c"action",
+        c"Lnet/minecraft/commands/execution/EntryAction;",
+    )?;
+    if !locals.same(actual_frame, pack_reference(expected_frame)?)?
+        || !locals.same(actual_action, pack_reference(expected_action)?)?
+    {
+        return Err(Failure::Identity.into());
+    }
+    Ok(id)
+}
+
+fn pack_binding_recheck(
+    locals: &mut Locals,
+    index: usize,
+    token: &SourceCaptureToken,
+    binding: &core::PackScheduleBinding,
+    role: core::PackRunRole,
+) -> Result<()> {
+    let current = pack_entries(
+        locals,
+        index,
+        token,
+        pack_reference(binding.plain)?,
+        None,
+        role,
+    )?;
+    if current != binding.entries {
+        return Err(Failure::Identity.into());
+    }
+    pack_captured(
+        locals,
+        index,
+        token,
+        pack_reference(binding.provider)?,
+        native_producer::PackCapturedRecipeKind::TaskProvider,
+        &[pack_reference(binding.source)?],
+    )
+}
+
+fn pack_run_event(
+    locals: &mut Locals,
+    index: usize,
+    frame: &Frame,
+    token: &SourceCaptureToken,
+    proof: &core::PackSourceWitness,
+    reply: &mut NativeReply,
+) -> Result<core::PackRunFacts> {
+    use core::{PackRunEvent as Event, PackRunRole as Role};
+    let id = capture_id(index)?;
+    let actual_run = field_id(locals, index, frame, Field::Operation)?;
+    let digest = frame.run_digest.ok_or(Failure::Identity)?;
+    if frame.original_offset == 0 {
+        {
+            let mut registry = state()?;
+            let capture = &mut registry.captures[index];
+            if capture.pack_run_invocation.is_some() {
+                return Err(Failure::Duplicate.into());
+            }
+            capture.pack_run_invocation = Some(actual_run);
+            capture.pack_run_digest = Some(digest);
+            reply.pack_run_binding = Some((id, actual_run));
+            registry.core.begin_pack_run(id, actual_run, proof)?;
+        }
+        if !locals.same(frame.object(Field::Owner)?, frame.object(Field::Server)?)?
+            || !locals.same(frame.object(Field::Callee)?, frame.object(Field::Input)?)?
+        {
+            return Err(Failure::Identity.into());
+        }
+        pack_source(locals, index, frame, token)?;
+    } else {
+        let registry = state()?;
+        let capture = &registry.captures[index];
+        if capture.pack_run_invocation != Some(actual_run)
+            || capture.pack_run_digest != Some(digest)
+        {
+            return Err(Failure::Identity.into());
+        }
+        reply.pack_run_binding = Some((id, actual_run));
+    }
+    if frame.reason.is_some() || frame.observation_reason.is_some() {
+        retain_native_cause(
+            index,
+            NativeCause::ObservedReason {
+                engine: frame.reason.clone(),
+                observer: frame.observation_reason.clone(),
+            },
+            true,
+        );
+    }
+    for throwable in [frame.throwable, frame.observation_throwable]
+        .into_iter()
+        .flatten()
+    {
+        let cause = current_cause_object(locals, index, throwable)?;
+        let _ = state()?.core.pack_run_event(
+            id,
+            actual_run,
+            Event::Failed {
+                failure: Failure::Identity,
+                cause: Some(cause),
+            },
+        );
+        retain_native_cause(index, NativeCause::Throwable(Some(cause)), true);
+    }
+    if frame.throwable.is_some() || frame.observation_throwable.is_some() {
+        return Err(Failure::Identity.into());
+    }
+    if frame.reason.is_some() || frame.observation_reason.is_some() {
+        return Err(Error::Gap("pack_current_observation_failed"));
+    }
+    if frame.original_offset == 0 {
+        // Named-class/current-generation metadata and a hidden SAM recipe do
+        // not establish the original ordinary method bodies/callsite. Until
+        // native semantic witnesses for FunctionCommand's actual instantiate
+        // call, PlainTextFunction.instantiate and the two forwarding targets
+        // exist, no verified run gate may release the original provider/body
+        // effect. Retain this attempted run and its failure; do not retry it
+        // under a second Invocation or manufacture a completed receipt.
+        return Err(Error::Gap("pack_original_callsite_body_unproven"));
+    }
+    let kind = frame.original_offset;
+    let event = match kind {
+        0 => None,
+        14 => {
+            let plain = field_id(locals, index, frame, Field::Owner)?;
+            let role = state()?.core.pack_plain_role(id, plain)?;
+            let callee = field_id(locals, index, frame, Field::Callee)?;
+            // The supported actual PlainTextFunction implementation returns
+            // this. An actual instantiate callback is independently mandatory.
+            if callee != plain {
+                return Err(Failure::Identity.into());
+            }
+            let entries = pack_entries(
+                locals,
+                index,
+                token,
+                frame.object(Field::Owner)?,
+                frame.optional(Field::Entries),
+                role,
+            )?;
+            let source = pack_source(locals, index, frame, token)?;
+            let control = frame.object(Field::ExecutionContext)?;
+            pack_typed(
+                locals,
+                index,
+                token,
+                control,
+                b"Lnet/minecraft/commands/execution/ExecutionControl$1;",
+            )?;
+            let actual_parent = locals.required_zero(
+                control,
+                c"currentFrame",
+                c"()Lnet/minecraft/commands/execution/Frame;",
+            )?;
+            let parent = field_id(locals, index, frame, Field::ParentFrame)?;
+            if !locals.same(actual_parent, pack_reference(parent)?)? {
+                return Err(Failure::Identity.into());
+            }
+            let trigger_entry = optional_id(locals, index, frame.optional(Field::Entry))?;
+            if role == Role::Dependency {
+                let queue = field_id(locals, index, frame, Field::QueueEntry)?;
+                let action = field_id(locals, index, frame, Field::Action)?;
+                let position = state()?
+                    .core
+                    .pack_queue_position(id, actual_run, queue, parent, action)?;
+                if position.role != Role::Entry
+                    || position.index != 1
+                    || trigger_entry != Some(position.entry)
+                {
+                    return Err(Failure::Identity.into());
+                }
+                let active =
+                    state()?
+                        .core
+                        .pack_active_position(id, actual_run, position.entry, parent)?;
+                if active != position {
+                    return Err(Failure::Identity.into());
+                }
+                let binding = state()?
+                    .core
+                    .pack_schedule_binding(id, actual_run, Role::Entry)?;
+                if field_id(locals, index, frame, Field::Provider)? != binding.provider
+                    || source != binding.source
+                {
+                    return Err(Failure::Identity.into());
+                }
+                pack_queue(
+                    locals,
+                    index,
+                    token,
+                    frame.object(Field::QueueEntry)?,
+                    parent,
+                    action,
+                )?;
+                pack_captured(
+                    locals,
+                    index,
+                    token,
+                    pack_reference(action)?,
+                    native_producer::PackCapturedRecipeKind::EntryAction,
+                    &[pack_reference(position.entry)?, pack_reference(source)?],
+                )?;
+            } else if trigger_entry.is_some()
+                || frame.optional(Field::QueueEntry).is_some()
+                || frame.optional(Field::Action).is_some()
+            {
+                return Err(Failure::Identity.into());
+            }
+            Some(Event::Instantiated {
+                role,
+                plain,
+                instantiated: callee,
+                entries,
+                trigger_entry,
+                parent_frame: Some(parent),
+                source,
+            })
+        }
+        1 | 2 if frame.optional(Field::Entry).is_none() => {
+            let call = pack_typed(
+                locals,
+                index,
+                token,
+                frame.object(Field::Owner)?,
+                b"Lnet/minecraft/commands/execution/tasks/CallFunction;",
+            )?;
+            let actual_callee = pack_object_field(
+                locals,
+                index,
+                token,
+                frame.object(Field::Owner)?,
+                b"Lnet/minecraft/commands/execution/tasks/CallFunction;",
+                c"function",
+                c"Lnet/minecraft/commands/functions/InstantiatedFunction;",
+            )?;
+            let callee = field_id(locals, index, frame, Field::Callee)?;
+            if !locals.same(actual_callee, pack_reference(callee)?)? {
+                return Err(Failure::Identity.into());
+            }
+            let role = state()?
+                .core
+                .pack_instantiated_role(id, actual_run, callee)?;
+            let source = pack_source(locals, index, frame, token)?;
+            let context = pack_typed(
+                locals,
+                index,
+                token,
+                frame.object(Field::ExecutionContext)?,
+                b"Lnet/minecraft/commands/execution/ExecutionContext;",
+            )?;
+            let parent_frame = pack_typed(
+                locals,
+                index,
+                token,
+                frame.object(Field::ParentFrame)?,
+                b"Lnet/minecraft/commands/execution/Frame;",
+            )?;
+            if kind == 1 {
+                Some(Event::FunctionCall {
+                    role,
+                    call,
+                    instantiated: callee,
+                    context,
+                    parent_frame,
+                    source,
+                })
+            } else {
+                let entries = pack_entries(
+                    locals,
+                    index,
+                    token,
+                    actual_callee,
+                    frame.optional(Field::Entries),
+                    role,
+                )?;
+                if entries
+                    != state()?
+                        .core
+                        .pack_instantiated_entries(id, actual_run, role)?
+                {
+                    return Err(Failure::Identity.into());
+                }
+                let provider = field_id(locals, index, frame, Field::Provider)?;
+                pack_captured(
+                    locals,
+                    index,
+                    token,
+                    frame.object(Field::Provider)?,
+                    native_producer::PackCapturedRecipeKind::TaskProvider,
+                    &[pack_reference(source)?],
+                )?;
+                let child_frame = pack_typed(
+                    locals,
+                    index,
+                    token,
+                    frame.object(Field::ChildFrame)?,
+                    b"Lnet/minecraft/commands/execution/Frame;",
+                )?;
+                Some(Event::Schedule {
+                    role,
+                    call,
+                    context,
+                    parent_frame,
+                    child_frame,
+                    provider,
+                })
+            }
+        }
+        2 | 3 => {
+            let provider = field_id(locals, index, frame, Field::Provider)?;
+            let child = pack_typed(
+                locals,
+                index,
+                token,
+                frame.object(Field::ChildFrame)?,
+                b"Lnet/minecraft/commands/execution/Frame;",
+            )?;
+            let entry = field_id(locals, index, frame, Field::Entry)?;
+            let position = state()?
+                .core
+                .pack_provider_position(id, actual_run, provider, child, entry)?;
+            let binding = state()?
+                .core
+                .pack_schedule_binding(id, actual_run, position.role)?;
+            pack_binding_recheck(locals, index, token, &binding, position.role)?;
+            if kind == 2 {
+                None
+            } else {
+                if field_id(locals, index, frame, Field::Owner)? != provider {
+                    return Err(Failure::Identity.into());
+                }
+                let action = field_id(locals, index, frame, Field::Action)?;
+                let queue_entry = pack_queue(
+                    locals,
+                    index,
+                    token,
+                    frame.object(Field::QueueEntry)?,
+                    child,
+                    action,
+                )?;
+                pack_captured(
+                    locals,
+                    index,
+                    token,
+                    frame.object(Field::Action)?,
+                    native_producer::PackCapturedRecipeKind::EntryAction,
+                    &[pack_reference(entry)?, pack_reference(binding.source)?],
+                )?;
+                Some(Event::TaskCreated {
+                    position,
+                    provider,
+                    frame: child,
+                    queue_entry,
+                    action,
+                })
+            }
+        }
+        4 | 5 => {
+            let context = pack_typed(
+                locals,
+                index,
+                token,
+                frame.object(Field::ExecutionContext)?,
+                b"Lnet/minecraft/commands/execution/ExecutionContext;",
+            )?;
+            if field_id(locals, index, frame, Field::Owner)? != context {
+                return Err(Failure::Identity.into());
+            }
+            let parent = pack_typed(
+                locals,
+                index,
+                token,
+                frame.object(Field::ParentFrame)?,
+                b"Lnet/minecraft/commands/execution/Frame;",
+            )?;
+            let queue = field_id(locals, index, frame, Field::QueueEntry)?;
+            let action = field_id(locals, index, frame, Field::Action)?;
+            let position = state()?
+                .core
+                .pack_queue_position(id, actual_run, queue, parent, action)?;
+            let binding = state()?
+                .core
+                .pack_schedule_binding(id, actual_run, position.role)?;
+            pack_binding_recheck(locals, index, token, &binding, position.role)?;
+            pack_queue(
+                locals,
+                index,
+                token,
+                frame.object(Field::QueueEntry)?,
+                parent,
+                action,
+            )?;
+            pack_captured(
+                locals,
+                index,
+                token,
+                frame.object(Field::Action)?,
+                native_producer::PackCapturedRecipeKind::EntryAction,
+                &[
+                    pack_reference(position.entry)?,
+                    pack_reference(binding.source)?,
+                ],
+            )?;
+            Some(if kind == 4 {
+                Event::QueueEnter {
+                    context,
+                    frame: parent,
+                    queue_entry: queue,
+                    action,
+                }
+            } else {
+                Event::QueueExit {
+                    context,
+                    frame: parent,
+                    queue_entry: queue,
+                    action,
+                }
+            })
+        }
+        6..=10 => {
+            let entry = field_id(locals, index, frame, Field::Entry)?;
+            let parent = pack_typed(
+                locals,
+                index,
+                token,
+                frame.object(Field::ParentFrame)?,
+                b"Lnet/minecraft/commands/execution/Frame;",
+            )?;
+            let position = state()?
+                .core
+                .pack_active_position(id, actual_run, entry, parent)?;
+            let source = pack_source(locals, index, frame, token)?;
+            let context = pack_typed(
+                locals,
+                index,
+                token,
+                frame.object(Field::ExecutionContext)?,
+                b"Lnet/minecraft/commands/execution/ExecutionContext;",
+            )?;
+            let owner = field_id(locals, index, frame, Field::Owner)?;
+            Some(match kind {
+                6 => Event::EntryBegin {
+                    position,
+                    source,
+                    context,
+                    frame: parent,
+                },
+                7 => Event::HandlerEnter {
+                    position,
+                    handler: owner,
+                    source,
+                    context,
+                    frame: parent,
+                },
+                8 => Event::HandlerReturn {
+                    position,
+                    handler: owner,
+                    source,
+                    context,
+                    frame: parent,
+                },
+                9 => Event::CustomEnter {
+                    position,
+                    custom: owner,
+                    source,
+                    context,
+                    frame: parent,
+                },
+                10 => Event::CustomExit {
+                    position,
+                    custom: owner,
+                    source,
+                    context,
+                    frame: parent,
+                },
+                _ => return Err(Failure::Identity.into()),
+            })
+        }
+        11 => {
+            let parent = pack_typed(
+                locals,
+                index,
+                token,
+                frame.object(Field::ParentFrame)?,
+                b"Lnet/minecraft/commands/execution/Frame;",
+            )?;
+            let mut matched = None;
+            for role in [Role::Entry, Role::Dependency] {
+                let binding = state()?.core.pack_schedule_binding(id, actual_run, role)?;
+                if binding.child_frame == parent {
+                    if matched.replace(role).is_some() {
+                        return Err(Failure::Identity.into());
+                    }
+                }
+            }
+            let bytes = locals.bytes(frame.payload_array, 8)?;
+            if bytes.len() != 8 {
+                return Err(Failure::Identity.into());
+            }
+            let value = i32::from_be_bytes(bytes[0..4].try_into().map_err(|_| Failure::Identity)?);
+            let presence =
+                i32::from_be_bytes(bytes[4..8].try_into().map_err(|_| Failure::Identity)?);
+            let returned = match presence {
+                0 if value == 0 => None,
+                1 => Some(value),
+                _ => return Err(Failure::Identity.into()),
+            };
+            Some(Event::FrameReturn {
+                role: matched.ok_or(Failure::Identity)?,
+                frame: parent,
+                returned,
+            })
+        }
+        12 => {
+            let context = pack_typed(
+                locals,
+                index,
+                token,
+                frame.object(Field::ExecutionContext)?,
+                b"Lnet/minecraft/commands/execution/ExecutionContext;",
+            )?;
+            let bytes = locals.bytes(frame.payload_array, 16)?;
+            if bytes.len() != 16 {
+                return Err(Failure::Identity.into());
+            }
+            let mut values = [0i32; 4];
+            for (value, bytes) in values.iter_mut().zip(bytes.chunks_exact(4)) {
+                *value = i32::from_be_bytes(bytes.try_into().map_err(|_| Failure::Identity)?);
+            }
+            let [quota, overflow, queued, new_top] = values;
+            if !matches!(overflow, 0 | 1) || queued < 0 || new_top < 0 {
+                return Err(Failure::Identity.into());
+            }
+            Some(Event::QueueTerminal {
+                context,
+                quota: i64::from(quota),
+                overflow: overflow == 1,
+                queued: queued as usize,
+                new_top: new_top as usize,
+            })
+        }
+        13 => {
+            for role in [Role::Entry, Role::Dependency] {
+                let binding = state()?.core.pack_schedule_binding(id, actual_run, role)?;
+                pack_binding_recheck(locals, index, token, &binding, role)?;
+            }
+            let tasks = state()?.core.pack_task_bindings(id, actual_run)?;
+            for task in tasks {
+                let binding =
+                    state()?
+                        .core
+                        .pack_schedule_binding(id, actual_run, task.position.role)?;
+                pack_queue(
+                    locals,
+                    index,
+                    token,
+                    pack_reference(task.queue_entry)?,
+                    task.frame,
+                    task.action,
+                )?;
+                pack_captured(
+                    locals,
+                    index,
+                    token,
+                    pack_reference(task.action)?,
+                    native_producer::PackCapturedRecipeKind::EntryAction,
+                    &[
+                        pack_reference(task.position.entry)?,
+                        pack_reference(binding.source)?,
+                    ],
+                )?;
+            }
+            Some(Event::Complete)
+        }
+        _ => return Err(Failure::Identity.into()),
+    };
+    if let Some(event) = event {
+        state()?.core.pack_run_event(id, actual_run, event)?;
+    }
+    locals.live()?;
+    let facts = state()?
+        .core
+        .pack_run_facts(id)?
+        .ok_or(Failure::InvalidTicket)?;
+    if let Some(failure) = facts.failure {
+        return Err(failure.into());
+    }
+    if facts.completed != (kind == 13) {
+        return Err(Failure::UnexpectedOrder.into());
+    }
+    Ok(facts)
+}
+fn pack_load_facts(
+    locals: &mut Locals,
+    index: usize,
+    frame: &Frame,
+    proof: &core::PackSourceWitness,
+) -> Result<PackLoadFacts> {
+    if frame.phase == 47 {
+        if frame.reason.is_some() || frame.observation_reason.is_some() {
+            retain_native_cause(
+                index,
+                NativeCause::ObservedReason {
+                    engine: frame.reason.clone(),
+                    observer: frame.observation_reason.clone(),
+                },
+                true,
+            );
+        }
+        for throwable in [frame.throwable, frame.observation_throwable]
+            .into_iter()
+            .flatten()
+        {
+            let cause = current_cause_object(locals, index, throwable)?;
+            retain_native_cause(index, NativeCause::Throwable(Some(cause)), true);
+        }
+        if frame.throwable.is_some()
+            || frame.observation_throwable.is_some()
+            || frame.reason.is_some()
+            || frame.observation_reason.is_some()
+        {
+            return Err(Error::Gap("pack_current_observation_failed"));
+        }
+    }
+    if frame.phase == 47
+        && (frame.optional(Field::Operation).is_some() || frame.run_digest.is_some())
+    {
+        return Err(Failure::Identity.into());
+    }
+    for (identifier, field) in [
+        ("mmmm_calibration:pack/entry", Field::Input),
+        ("mmmm_calibration:pack/dependency", Field::Result),
+    ] {
+        let expected = proof
+            .functions()
+            .iter()
+            .find(|function| function.identifier == identifier)
+            .ok_or(Failure::MissingFunction)?;
+        let actual = frame.object(field)?;
+        locals.exact_class(
+            actual,
+            b"Lnet/minecraft/commands/functions/PlainTextFunction;",
+        )?;
+        let held = state()?.reference(expected.function)?;
+        if !locals.same(actual, held)? {
+            return Err(Failure::Identity.into());
+        }
+    }
+    let load_invocation_digest = state()?.captures[index]
+        .load_invocation_digest
+        .ok_or(Failure::Identity)?;
+    if frame.load_digest != Some(load_invocation_digest) {
+        return Err(Failure::Identity.into());
+    }
+    let functions = proof
+        .functions()
+        .iter()
+        .map(|function| PackFunctionPin {
+            function_id: function.identifier.clone(),
+            resource_id: function.resource.clone(),
+            raw_sha256: function.sha256,
+        })
+        .collect::<Vec<_>>();
+    let selected_function_source_digest = mmmm_contracts::canonical_digest(&Value::Array(
+        functions.iter().map(function_pin_json).collect(),
+    ))
+    .map_err(|_| Failure::SourceMismatch)?
+    .to_bytes();
+    let program = mmmm_compiler::calibration::CalibrationPackProgram::java_26_3()
+        .map_err(|_| Failure::SourceMismatch)?;
+    Ok(PackLoadFacts {
+        load_invocation_digest,
+        source_bundle_digest: proof.binding().bundle_digest,
+        logical_program_digest: program.program_digest().to_bytes(),
+        selected_function_source_digest,
+        functions: functions.try_into().map_err(|_| Failure::MissingFunction)?,
+    })
+}
+fn pack_load_json(load: &PackLoadFacts) -> Value {
+    json!({"format":"mmmm.native.pack-run-readiness/1","loadOnly":true,"sourceKind":"pack_case",
+        "loadInvocationDigest":hex(&load.load_invocation_digest),"sourceBundleDigest":hex(&load.source_bundle_digest),
+        "logicalProgramDigest":hex(&load.logical_program_digest),
+        "selectedFunctionSourceDigest":hex(&load.selected_function_source_digest),
+        "functions":load.functions.iter().map(function_pin_json).collect::<Vec<_>>()})
+}
+fn pack_run_json(
+    load: &PackLoadFacts,
+    run_digest: &[u8; 32],
+    event: jint,
+    facts: &core::PackRunFacts,
+) -> Value {
+    let terminal = if facts.queue_terminal {
+        json!({"commandQuota":facts.queue_remaining_quota,
+        "overflow":facts.queue_overflow,"queued":facts.queued_entries,"newTopCommands":facts.new_top_entries})
+    } else {
+        Value::Null
+    };
+    json!({"format":"mmmm.native.pack-run-facts/1","loadOnly":false,"sourceKind":"pack_case",
+        "loadInvocationDigest":hex(&load.load_invocation_digest),"runInvocationDigest":hex(run_digest),
+        "sourceBundleDigest":hex(&load.source_bundle_digest),"logicalProgramDigest":hex(&load.logical_program_digest),
+        "selectedFunctionSourceDigest":hex(&load.selected_function_source_digest),
+        "functions":load.functions.iter().map(function_pin_json).collect::<Vec<_>>(),
+        "eventKind":event,"completed":facts.completed,"eventsObserved":facts.event_count,
+        "instantiations":facts.instantiations,"functionCalls":facts.function_calls,"scheduledFunctions":facts.scheduled_functions,
+        "tasksCreated":facts.tasks_created,"entriesExecuted":facts.entries_executed,"framesReturned":facts.frames_returned,
+        "queueTerminal":terminal,"closureWitnesses":{
+            "taskProvider":{"recipe":"call_function_task_provider","bindingsVerified":facts.task_provider_bindings_verified},
+            "entryAction":{"recipe":"unbound_entry_action","bindingsVerified":facts.entry_action_bindings_verified}},
+        "failure":facts.failure.map(failure_name)})
+}
+fn pack_reply(
+    index: Option<usize>,
+    phase: jint,
+    error: Option<&'static str>,
+    reply: &NativeReply,
+) -> Vec<u8> {
+    let value = if error.is_none() {
+        match (&reply.pack_load, &reply.pack_run, phase) {
+            (Some(load), None, 47) => Some(pack_load_json(load)),
+            (Some(load), Some((digest, event, facts)), 48) => {
+                Some(pack_run_json(load, digest, *event, facts))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let (mut verified, mut payload) = match value {
+        Some(value) => match serde_json::to_vec(&value) {
+            Ok(bytes) => (true, bytes),
+            Err(_) => (
+                false,
+                receipt(index, phase, Some("pack_reply_encoding_failed")),
+            ),
+        },
+        None => (
+            false,
+            receipt(index, phase, error.or(Some("pack_witness_unavailable"))),
+        ),
+    };
+    // The 12-byte private envelope stays inside the existing 64 KiB receipt
+    // bound. A failed/oversize payload never leaves a verified status byte.
+    if payload.len() > RECEIPT_BYTES - 12 {
+        verified = false;
+        payload = br#"{"error":"pack_reply_bound_exceeded"}"#.to_vec();
+    }
+    let mut bytes = Vec::with_capacity(payload.len() + 12);
+    bytes.extend_from_slice(b"MMMMPR01");
+    bytes.extend_from_slice(&[phase as u8, u8::from(verified)]);
+    bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    bytes.extend_from_slice(&payload);
+    bytes
 }
 fn hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -3204,7 +4342,7 @@ fn run(
     input: CallbackInputs,
     index: &mut Option<usize>,
     turn: &mut Option<Turn>,
-    selection_reply: &mut u8,
+    reply: &mut NativeReply,
 ) -> Result<()> {
     let CallbackInputs {
         bridge,
@@ -3224,7 +4362,7 @@ fn run(
     locals.source = Some(token.snapshot());
     let frame = read_frame(locals, port, bytes, offset, length, phase)?;
     *index = find_capture(locals, &frame)?;
-    if phase == 43
+    if fresh_phase(phase)
         && let Some(index) = *index
     {
         let mut registry = state()?;
@@ -3249,13 +4387,13 @@ fn run(
         arm(locals, capture, &frame, &token)?;
     }
     let capture = index.ok_or(Error::Gap("original_capture_not_armed"))?;
-    if phase != 43 {
+    if !fresh_phase(phase) {
         locals.observer = Some(capture);
         locals.deadline = state()?.captures[capture].deadline;
     }
     let check = check_common(locals, capture, &frame, &token)?;
     check_class_stamps(capture, token.generation())?;
-    if !matches!(phase, 43 | 46) {
+    if !fresh_phase(phase) && phase != 46 {
         observation_failure(locals, capture, &frame)?;
     }
     if phase != 0 {
@@ -3269,7 +4407,7 @@ fn run(
                 port: port_class,
             },
             check,
-            selection_reply,
+            reply,
         )?;
     }
     for stamp in locals.observed.clone() {
@@ -3305,7 +4443,12 @@ pub(crate) unsafe fn call(
     };
     let mut index = None;
     let mut turn = None;
-    let mut selection_reply = 2;
+    let mut reply = NativeReply {
+        selection: 2,
+        pack_run_binding: None,
+        pack_load: None,
+        pack_run: None,
+    };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run(
             &mut locals,
@@ -3319,7 +4462,7 @@ pub(crate) unsafe fn call(
             },
             &mut index,
             &mut turn,
-            &mut selection_reply,
+            &mut reply,
         )
     }))
     .unwrap_or_else(|_| {
@@ -3330,12 +4473,20 @@ pub(crate) unsafe fn call(
     });
     let mut error = result
         .err()
-        .map(|error| record_error(&mut locals, index, error, phase));
+        .map(|error| record_error(&mut locals, index, error, phase, reply.pack_run_binding));
     if let Err(cleanup) = locals.close() {
-        error = Some(record_error(&mut locals, index, Error::Ffi(cleanup), phase));
+        error = Some(record_error(
+            &mut locals,
+            index,
+            Error::Ffi(cleanup),
+            phase,
+            reply.pack_run_binding,
+        ));
     }
     let bytes = if phase == 46 {
-        vec![1, if error.is_some() { 2 } else { selection_reply }]
+        vec![1, if error.is_some() { 2 } else { reply.selection }]
+    } else if matches!(phase, 47 | 48) {
+        pack_reply(index, phase, error, &reply)
     } else {
         receipt(index, phase, error)
     };
@@ -3404,6 +4555,86 @@ pub(crate) fn on_unload() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pack_load_fixture() -> PackLoadFacts {
+        PackLoadFacts {
+            load_invocation_digest: [1; 32],
+            source_bundle_digest: [2; 32],
+            logical_program_digest: [3; 32],
+            selected_function_source_digest: [4; 32],
+            functions: [
+                PackFunctionPin {
+                    function_id: "mmmm_calibration:pack/dependency".into(),
+                    resource_id: "mmmm_calibration:function/pack/dependency.mcfunction".into(),
+                    raw_sha256: [5; 32],
+                },
+                PackFunctionPin {
+                    function_id: "mmmm_calibration:pack/entry".into(),
+                    resource_id: "mmmm_calibration:function/pack/entry.mcfunction".into(),
+                    raw_sha256: [6; 32],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn pack_readiness_envelope_is_load_only_and_inside_original_bound() {
+        let reply = NativeReply {
+            selection: 2,
+            pack_run_binding: None,
+            pack_load: Some(pack_load_fixture()),
+            pack_run: None,
+        };
+        let bytes = pack_reply(None, 47, None, &reply);
+        assert!(bytes.len() <= RECEIPT_BYTES);
+        assert_eq!(&bytes[..10], b"MMMMPR01\x2f\x01");
+        assert_eq!(
+            usize::from(u16::from_be_bytes([bytes[10], bytes[11]])),
+            bytes.len() - 12
+        );
+        let value: Value =
+            serde_json::from_slice(&bytes[12..]).unwrap_or_else(|_| panic!("native packet JSON"));
+        assert_eq!(value["format"], "mmmm.native.pack-run-readiness/1");
+        assert_eq!(value["loadOnly"], true);
+        assert!(value.get("runInvocationDigest").is_none());
+        assert!(value.get("completed").is_none());
+        assert_eq!(value["functions"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn oversize_pack_envelope_never_preserves_verified_status() {
+        let mut load = pack_load_fixture();
+        load.functions[0].function_id = "x".repeat(RECEIPT_BYTES);
+        let reply = NativeReply {
+            selection: 2,
+            pack_run_binding: None,
+            pack_load: Some(load),
+            pack_run: None,
+        };
+        let bytes = pack_reply(None, 47, None, &reply);
+        assert!(bytes.len() <= RECEIPT_BYTES);
+        assert_eq!(&bytes[..10], b"MMMMPR01\x2f\x00");
+        assert_eq!(
+            usize::from(u16::from_be_bytes([bytes[10], bytes[11]])),
+            bytes.len() - 12
+        );
+    }
+
+    #[test]
+    fn only_current_source_and_closed_pack_phases_use_fresh_lane() {
+        for phase in 0..PHASES as jint {
+            assert_eq!(fresh_phase(phase), matches!(phase, 43 | 47 | 48));
+        }
+        assert!(!fresh_phase(-1));
+        assert!(!fresh_phase(PHASES as jint));
+        let mut registry = Registry::new();
+        registry.active = ACTIVE_FRAMES;
+        for phase in [43, 47, 48] {
+            assert!(registry.admit_frame(phase, 0).is_err());
+        }
+        assert_eq!(registry.current_frame_rejections.count, 3);
+        assert_eq!(registry.historical_frame_rejections.count, 0);
+    }
 
     #[test]
     fn selection_uses_compiler_function_ids_and_ignores_unrelated_ids() {
