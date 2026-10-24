@@ -30,6 +30,9 @@ use std::{
 };
 
 const CAPTURES: usize = 8;
+// Independent observer admission policy, not a Java thread or executor bound.
+// At most 64 outer Locals sets and the sole Turn owner's current inner set exist.
+const ACTIVE_FRAMES: usize = 64;
 const OBJECTS: usize = 512;
 const OPENED_PACKS: usize = 256;
 const FUNCTIONS: usize = 47;
@@ -185,6 +188,26 @@ struct Capture {
     last_gap: Option<&'static str>,
     last_scalars: [i64; 3],
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FrameLimitRejections {
+    // This count saturates; a value of u64::MAX is a lower bound, not a wrap.
+    count: u64,
+    first_raw_phase: Option<jint>,
+}
+impl FrameLimitRejections {
+    fn record(&mut self, raw_phase: jint) {
+        self.count = self.count.saturating_add(1);
+        self.first_raw_phase.get_or_insert(raw_phase);
+    }
+}
+
+fn frame_entry_open(producer_status: jint, closed: bool) -> Result<()> {
+    if producer_status < 0 || closed {
+        return Err(Failure::AdmissionClosed.into());
+    }
+    Ok(())
+}
+
 struct Registry {
     core: RecordingCore,
     captures: Vec<Capture>,
@@ -193,6 +216,8 @@ struct Registry {
     origin: Instant,
     closed: bool,
     active: usize,
+    historical_frame_rejections: FrameLimitRejections,
+    current_frame_rejections: FrameLimitRejections,
     turn: Option<ThreadId>,
     vm_owned_refs: usize,
 }
@@ -206,12 +231,50 @@ impl Registry {
             origin: Instant::now(),
             closed: false,
             active: 0,
+            historical_frame_rejections: FrameLimitRejections::default(),
+            current_frame_rejections: FrameLimitRejections::default(),
             turn: None,
             vm_owned_refs: 0,
         }
     }
     fn now_ms(&self) -> u64 {
         self.origin.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+    }
+    fn admit_frame(&mut self, raw_phase: jint, producer_status: jint) -> Result<()> {
+        frame_entry_open(producer_status, self.closed)?;
+        if self.active >= ACTIVE_FRAMES {
+            // No port/class/capture admission has occurred. Only the raw input
+            // category is recorded; this cannot name or fail a capture.
+            if raw_phase == 43 {
+                self.current_frame_rejections.record(raw_phase);
+            } else {
+                self.historical_frame_rejections.record(raw_phase);
+            }
+            return Err(Failure::ResourceLimit.into());
+        }
+        self.active = self.active.checked_add(1).ok_or(Failure::ResourceLimit)?;
+        Ok(())
+    }
+    fn release_frame(&mut self) {
+        self.active = self.active.saturating_sub(1);
+    }
+    fn take_turn(&mut self, thread: ThreadId) -> Result<bool> {
+        if self.closed {
+            return Err(Failure::AdmissionClosed.into());
+        }
+        if self.turn.is_none() {
+            self.turn = Some(thread);
+            return Ok(true);
+        }
+        if self.turn == Some(thread) {
+            return Err(Error::Gap("reentrant_native_event"));
+        }
+        Ok(false)
+    }
+    fn release_turn(&mut self, thread: ThreadId) {
+        if self.turn == Some(thread) {
+            self.turn = None;
+        }
     }
     fn reference(&self, id: ObjectId) -> Result<jobject> {
         self.globals
@@ -352,21 +415,51 @@ fn state() -> Result<MutexGuard<'static, Registry>> {
         .lock()
         .map_err(|_| Error::Gap("native_registry_poisoned"))
 }
+
+// Only direct JNI operations without Java callbacks may run here. The module
+// VMDeath/Unload close is serialized with the operation; producer status is
+// sampled after locking because its negative publication precedes that close.
+// This does not serialize every producer-status transition or Java getter.
+fn with_cleanup_lifetime<T>(
+    registry: &Mutex<Registry>,
+    producer_status: impl FnOnce() -> jint,
+    operation: impl FnOnce() -> std::result::Result<T, ffi::FfiError>,
+) -> std::result::Result<Option<T>, ffi::FfiError> {
+    let Ok(registry) = registry.lock() else {
+        return Ok(None);
+    };
+    if frame_entry_open(producer_status(), registry.closed).is_err() {
+        return Ok(None);
+    }
+    let result = operation().map(Some);
+    drop(registry);
+    result
+}
+
+fn cleanup_jni<T>(
+    operation: impl FnOnce() -> std::result::Result<T, ffi::FfiError>,
+) -> std::result::Result<Option<T>, ffi::FfiError> {
+    let Some(shared) = SHARED.get() else {
+        return Ok(None);
+    };
+    with_cleanup_lifetime(&shared.state, native_producer::status, operation)
+}
+
 struct Active;
 impl Active {
-    fn enter() -> Result<Self> {
+    fn enter(raw_phase: jint) -> Result<Self> {
+        // Producer VMDeath/Unload publishes its negative status before these
+        // module hooks. A late entry must not initialize SHARED or use JNI.
+        frame_entry_open(native_producer::status(), false)?;
         let mut state = state()?;
-        if state.closed {
-            return Err(Failure::AdmissionClosed.into());
-        }
-        state.active = state.active.checked_add(1).ok_or(Failure::ResourceLimit)?;
+        state.admit_frame(raw_phase, native_producer::status())?;
         Ok(Self)
     }
 }
 impl Drop for Active {
     fn drop(&mut self) {
         if let Ok(mut state) = shared().state.lock() {
-            state.active = state.active.saturating_sub(1);
+            state.release_frame();
             // No JNI here: a frame surviving VMDeath leaves refs VM-owned.
         }
         shared().wake.notify_all();
@@ -378,15 +471,8 @@ impl Turn {
         let thread = std::thread::current().id();
         let mut registry = state()?;
         loop {
-            if registry.closed {
-                return Err(Failure::AdmissionClosed.into());
-            }
-            if registry.turn.is_none() {
-                registry.turn = Some(thread);
+            if registry.take_turn(thread)? {
                 return Ok(Self(thread));
-            }
-            if registry.turn == Some(thread) {
-                return Err(Error::Gap("reentrant_native_event"));
             }
             let remaining = deadline
                 .checked_duration_since(Instant::now())
@@ -404,10 +490,8 @@ impl Turn {
 }
 impl Drop for Turn {
     fn drop(&mut self) {
-        if let Ok(mut state) = shared().state.lock()
-            && state.turn == Some(self.0)
-        {
-            state.turn = None;
+        if let Ok(mut state) = shared().state.lock() {
+            state.release_turn(self.0);
         }
         shared().wake.notify_all();
     }
@@ -441,8 +525,17 @@ impl<'a> Locals<'a> {
             state()?.core.close_admission(Failure::GenerationChanged, 1);
             return Err(Failure::GenerationChanged.into());
         }
-        if unsafe { ffi::exception(self.env)? } {
-            let actual = unsafe { ffi::take_exception(self.env)? };
+        let Some(pending) = cleanup_jni(|| unsafe {
+            if ffi::exception(self.env)? {
+                ffi::take_exception(self.env).map(Some)
+            } else {
+                Ok(None)
+            }
+        })?
+        else {
+            return Err(Failure::AdmissionClosed.into());
+        };
+        if let Some(actual) = pending {
             return if actual.is_null() {
                 Err(Error::Ffi(ffi::FfiError::PendingException))
             } else {
@@ -522,7 +615,8 @@ impl<'a> Locals<'a> {
             return Err(Failure::Identity.into());
         }
         if self.values.len() == FRAME_LOCALS {
-            unsafe { ffi::delete_local(self.env, value)? };
+            // A rejected local stays VM-owned if shutdown has been observed.
+            cleanup_jni(|| unsafe { ffi::delete_local(self.env, value) })?;
             return Err(Failure::ResourceLimit.into());
         }
         self.values.push(value);
@@ -585,7 +679,7 @@ impl<'a> Locals<'a> {
         if values.len() > FRAME_LOCALS - self.values.len() {
             let mut first = None;
             for value in values {
-                if let Err(error) = unsafe { ffi::delete_local(self.env, value) } {
+                if let Err(error) = cleanup_jni(|| unsafe { ffi::delete_local(self.env, value) }) {
                     first.get_or_insert(error);
                 }
             }
@@ -769,19 +863,11 @@ impl<'a> Locals<'a> {
         }
     }
     fn close(&mut self) -> std::result::Result<(), ffi::FfiError> {
-        let Ok(registry) = shared().state.lock() else {
-            self.values.clear();
-            return Ok(());
-        };
-        if registry.closed {
-            // An active frame surviving VMDeath does not perform late JNI.
-            // These actual local refs are now left to VM destruction.
-            self.values.clear();
-            return Ok(());
-        }
         let mut first = None;
         for value in self.values.drain(..).rev() {
-            if let Err(error) = unsafe { ffi::delete_local(self.env, value) } {
+            // Each no-callback deletion holds the module lifetime lock and
+            // resamples producer status. Skipped actual refs remain VM-owned.
+            if let Err(error) = cleanup_jni(|| unsafe { ffi::delete_local(self.env, value) }) {
                 first.get_or_insert(error);
             }
         }
@@ -1126,6 +1212,7 @@ fn existing_id(locals: &mut Locals, object: jobject) -> Result<ObjectId> {
 }
 fn cause_object(locals: &mut Locals, index: usize, object: jobject) -> Result<ObjectId> {
     let mut registry = state()?;
+    frame_entry_open(native_producer::status(), registry.closed)?;
     let cause = unsafe { registry.register(locals.env, index, object, true, None)? };
     registry.captures[index]
         .first_throwable
@@ -1135,7 +1222,9 @@ fn cause_object(locals: &mut Locals, index: usize, object: jobject) -> Result<Ob
 fn current_cause_object(locals: &mut Locals, index: usize, object: jobject) -> Result<ObjectId> {
     // Current read failures never consume the source's reserved first-cause
     // slot or set its first_throwable. Full general capacity stays explicit.
-    unsafe { state()?.register(locals.env, index, object, false, None) }
+    let mut registry = state()?;
+    frame_entry_open(native_producer::status(), registry.closed)?;
+    unsafe { registry.register(locals.env, index, object, false, None) }
 }
 fn field_id(locals: &mut Locals, index: usize, frame: &Frame, field: Field) -> Result<ObjectId> {
     intern(locals, index, frame.object(field)?)
@@ -1648,7 +1737,7 @@ fn record_error(
         }
         let cause = error_cause(locals, index, error, current);
         retain_native_cause(index, cause, current);
-        if let Ok(pending) = unsafe { ffi::take_exception(locals.env) }
+        if let Ok(Some(pending)) = cleanup_jni(|| unsafe { ffi::take_exception(locals.env) })
             && !pending.is_null()
             && let Ok(actual) = locals.adopt(pending)
         {
@@ -3033,6 +3122,11 @@ fn capture_json(facts: core::CaptureFacts) -> Value {
         "failuresOmitted":facts.failures_omitted,"retired":facts.retired,
         "consumedParsePublicationObserved":facts.consumed_parse_publication_observed})
 }
+fn frame_rejections_json(rejections: FrameLimitRejections) -> Value {
+    json!({"reason":rejections.first_raw_phase.map(|_|failure_name(Failure::ResourceLimit)),
+        "count":rejections.count,"firstRawPhase":rejections.first_raw_phase})
+}
+
 fn receipt(index: Option<usize>, phase: jint, error: Option<&'static str>) -> Vec<u8> {
     let value = match state() {
         Ok(registry) => {
@@ -3067,6 +3161,9 @@ fn receipt(index: Option<usize>, phase: jint, error: Option<&'static str>) -> Ve
                 "historicalFacts":facts,"nativeFacts":native,
                 "admissionClosed":admission.closed,"coreCapturesRetained":admission.retained_captures,
                 "nativeCaptureSlotsRetained":registry.captures.len(),"vmOwnedRefs":registry.vm_owned_refs,
+                "frameAdmissionRejections":{
+                    "historical":frame_rejections_json(registry.historical_frame_rejections),
+                    "current":frame_rejections_json(registry.current_frame_rejections)},
                 "firstAdmissionFailure":admission.first_failure.map(|(failure,_)|failure_name(failure))})
         }
         Err(_) => {
@@ -3190,7 +3287,7 @@ pub(crate) unsafe fn call(
     length: jint,
     phase: jint,
 ) -> jobject {
-    let Ok(_active) = Active::enter() else {
+    let Ok(_active) = Active::enter(phase) else {
         // No attached active lifetime was admitted. In particular VMDeath or
         // AgentUnload must never trigger a fresh reply allocation on this env.
         return ptr::null_mut();
@@ -3239,7 +3336,7 @@ pub(crate) unsafe fn call(
     let Ok(registry) = state() else {
         return ptr::null_mut();
     };
-    if registry.closed {
+    if frame_entry_open(native_producer::status(), registry.closed).is_err() {
         return ptr::null_mut();
     }
     // Direct JNI allocation is bounded; no Java callback runs under this lock.
@@ -3353,5 +3450,281 @@ mod tests {
         assert!(object_slot(normal, false, false).is_ok());
         assert_eq!(OBJECTS - 1 - normal, 15);
         assert!(object_slot(OBJECTS - 1, true, false).is_ok());
+    }
+
+    fn full_frame_registry() -> Registry {
+        let mut registry = Registry::new();
+        for _ in 0..ACTIVE_FRAMES {
+            // Nonnegative status is only the lifetime input to this budget,
+            // never JVM/class/source admission or an actual attached frame.
+            assert!(registry.admit_frame(1, 0).is_ok());
+        }
+        registry
+    }
+
+    #[test]
+    fn frame_limit_is_64_and_only_admitted_owners_release_capacity() {
+        let mut registry = full_frame_registry();
+        assert_eq!(registry.active, 64);
+        assert!(matches!(
+            registry.admit_frame(43, 0),
+            Err(Error::Fact(Failure::ResourceLimit))
+        ));
+        assert_eq!(registry.active, 64);
+        assert_eq!(registry.current_frame_rejections.count, 1);
+        assert_eq!(registry.historical_frame_rejections.count, 0);
+        registry.release_frame();
+        assert!(registry.admit_frame(43, 0).is_ok());
+        assert_eq!(registry.active, 64);
+        assert_eq!(registry.current_frame_rejections.count, 1);
+        for _ in 0..ACTIVE_FRAMES {
+            registry.release_frame();
+        }
+        assert_eq!(registry.active, 0);
+    }
+
+    #[test]
+    fn frame_rejection_categories_preserve_first_raw_phase_without_capture_facts() {
+        let mut registry = full_frame_registry();
+        for phase in [46, -17, 43, 43] {
+            assert!(matches!(
+                registry.admit_frame(phase, 0),
+                Err(Error::Fact(Failure::ResourceLimit))
+            ));
+        }
+        assert_eq!(registry.historical_frame_rejections.count, 2);
+        assert_eq!(
+            registry.historical_frame_rejections.first_raw_phase,
+            Some(46)
+        );
+        assert_eq!(registry.current_frame_rejections.count, 2);
+        assert_eq!(registry.current_frame_rejections.first_raw_phase, Some(43));
+        assert!(registry.captures.is_empty());
+        assert!(registry.globals.is_empty());
+        assert_eq!(registry.next_object, 1);
+        assert!(!registry.core.admission_facts().closed);
+        assert!(registry.core.admission_facts().first_failure.is_none());
+        let mut saturated = FrameLimitRejections {
+            count: u64::MAX,
+            first_raw_phase: Some(19),
+        };
+        saturated.record(21);
+        assert_eq!(saturated.count, u64::MAX);
+        assert_eq!(saturated.first_raw_phase, Some(19));
+    }
+
+    #[test]
+    fn closed_or_negative_producer_entry_does_not_change_frame_diagnostics() {
+        let mut registry = full_frame_registry();
+        let historical = registry.historical_frame_rejections;
+        let current = registry.current_frame_rejections;
+        for status in [-1, -5, jint::MIN] {
+            assert!(matches!(
+                frame_entry_open(status, false),
+                Err(Error::Fact(Failure::AdmissionClosed))
+            ));
+            assert!(matches!(
+                registry.admit_frame(43, status),
+                Err(Error::Fact(Failure::AdmissionClosed))
+            ));
+        }
+        registry.closed = true;
+        assert!(matches!(
+            registry.admit_frame(19, 0),
+            Err(Error::Fact(Failure::AdmissionClosed))
+        ));
+        assert_eq!(registry.active, ACTIVE_FRAMES);
+        assert_eq!(registry.historical_frame_rejections, historical);
+        assert_eq!(registry.current_frame_rejections, current);
+        // These are bookkeeping checks, not a synthetic JNI/VMDeath run.
+        for _ in 0..ACTIVE_FRAMES {
+            registry.release_frame();
+        }
+        assert_eq!(registry.active, 0);
+        assert_eq!(registry.historical_frame_rejections, historical);
+        assert_eq!(registry.current_frame_rejections, current);
+    }
+
+    #[test]
+    fn cleanup_lifetime_skips_closed_negative_and_poisoned_without_jni() {
+        use std::cell::Cell;
+
+        let registry = Mutex::new(Registry::new());
+        let calls = Cell::new(0);
+        for status in [-1, -5, jint::MIN] {
+            let result = with_cleanup_lifetime(
+                &registry,
+                || status,
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+            );
+            assert!(matches!(result, Ok(None)));
+        }
+        registry.lock().expect("test registry").closed = true;
+        let result = with_cleanup_lifetime(
+            &registry,
+            || 0,
+            || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Ok(None)));
+        assert_eq!(calls.get(), 0);
+        let state = registry.lock().expect("test registry");
+        assert!(state.captures.is_empty());
+        assert!(state.globals.is_empty());
+        assert_eq!(state.next_object, 1);
+        assert_eq!(
+            state.historical_frame_rejections,
+            FrameLimitRejections::default()
+        );
+        assert_eq!(
+            state.current_frame_rejections,
+            FrameLimitRejections::default()
+        );
+        assert!(state.core.admission_facts().first_failure.is_none());
+        drop(state);
+
+        let poisoned = Mutex::new(Registry::new());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = poisoned.lock().expect("unpoisoned test registry");
+            panic!("test-only registry poison");
+        }));
+        assert!(panic.is_err());
+        let result = with_cleanup_lifetime(
+            &poisoned,
+            || 0,
+            || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Ok(None)));
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn cleanup_lifetime_holds_close_lock_and_preserves_operation_result() {
+        let registry = Mutex::new(Registry::new());
+        // The operation is a pure stand-in, not JNI or a synthetic VM event.
+        let success = with_cleanup_lifetime(
+            &registry,
+            || 0,
+            || {
+                assert!(matches!(
+                    registry.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                Ok(17u8)
+            },
+        );
+        assert!(matches!(success, Ok(Some(17))));
+        let no_pending = with_cleanup_lifetime(&registry, || 0, || Ok(None::<u8>));
+        // Live query with no pending value differs from a skipped query.
+        assert!(matches!(no_pending, Ok(Some(None))));
+        let failure = with_cleanup_lifetime(
+            &registry,
+            || 0,
+            || {
+                assert!(matches!(
+                    registry.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                Err::<(), _>(ffi::FfiError::PendingException)
+            },
+        );
+        assert!(matches!(failure, Err(ffi::FfiError::PendingException)));
+        // The action's guard is gone before adopt/cause retention may relock.
+        assert!(registry.try_lock().is_ok());
+    }
+
+    #[test]
+    fn concurrent_frame_admission_remains_bounded_and_closed_owners_can_drain() {
+        use std::sync::mpsc;
+
+        let registry = Arc::new(Mutex::new(Registry::new()));
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let mut releases = Vec::new();
+            let mut workers = Vec::new();
+            for _ in 0..4 {
+                let registry = Arc::clone(&registry);
+                let done = done_tx.clone();
+                let (release_tx, release_rx) = mpsc::channel();
+                releases.push(release_tx);
+                workers.push(scope.spawn(move || {
+                    let mut admitted = 0;
+                    for _ in 0..17 {
+                        let result = registry.lock().expect("test registry").admit_frame(21, 0);
+                        match result {
+                            Ok(()) => admitted += 1,
+                            Err(Error::Fact(Failure::ResourceLimit)) => {}
+                            Err(_) => panic!("unexpected frame admission failure"),
+                        }
+                    }
+                    done.send((std::thread::current().id(), admitted))
+                        .expect("test channel");
+                    let released = release_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+                    let mut state = registry.lock().expect("test registry");
+                    for _ in 0..admitted {
+                        state.release_frame();
+                    }
+                    assert!(released, "bounded owner-release signal");
+                    admitted
+                }));
+            }
+            let owners = (0..4)
+                .map(|_| {
+                    done_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("bounded admission signal")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                owners.iter().map(|(_, count)| count).sum::<usize>(),
+                ACTIVE_FRAMES
+            );
+            {
+                let mut state = registry.lock().expect("test registry");
+                assert_eq!(state.active, ACTIVE_FRAMES);
+                assert_eq!(state.historical_frame_rejections.count, 4);
+                assert_eq!(state.current_frame_rejections.count, 0);
+                assert!(matches!(state.take_turn(owners[0].0), Ok(true)));
+                assert!(matches!(state.take_turn(owners[1].0), Ok(false)));
+                assert!(matches!(
+                    state.take_turn(owners[0].0),
+                    Err(Error::Gap("reentrant_native_event"))
+                ));
+                state.release_turn(owners[1].0);
+                assert_eq!(state.turn, Some(owners[0].0));
+                state.closed = true;
+                assert!(matches!(
+                    state.take_turn(owners[1].0),
+                    Err(Error::Fact(Failure::AdmissionClosed))
+                ));
+                assert!(matches!(
+                    state.admit_frame(43, 0),
+                    Err(Error::Fact(Failure::AdmissionClosed))
+                ));
+                assert_eq!(state.active, ACTIVE_FRAMES);
+                assert_eq!(state.current_frame_rejections.count, 0);
+                state.release_turn(owners[0].0);
+                assert!(state.turn.is_none());
+            }
+            for release in releases {
+                release.send(()).expect("test release channel");
+            }
+            for worker in workers {
+                assert!(worker.join().is_ok());
+            }
+        });
+        let state = registry.lock().expect("test registry");
+        assert_eq!(state.active, 0);
+        assert!(state.closed);
+        assert_eq!(state.historical_frame_rejections.count, 4);
+        assert_eq!(state.current_frame_rejections.count, 0);
     }
 }

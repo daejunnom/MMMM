@@ -2980,6 +2980,47 @@ Clippy는 PASS다. 전후 source manifest는 620과 같고 command 0·자연 종
 출력·export·scratch 정리·lease 해제와 감독/정리 오류 0을 확인했다. 새 projection의
 실행 검사는 여전히 미실행이며 이후 동일 source CI 또는 허용된 대체 실행으로 확인한다.
 
+후속 observer는 `Locals` 생성과 `Turn` 대기 전 native 동시 입장을 독립 정책값 64로
+제한한다. 단일 Turn과 내부 current 조회를 함께 세면 바깥 Locals 64세트와 내부 1세트가
+경계다. Java의 사전 복사·전체 thread/stack·입구의 잠금 대기까지 제한한다는 뜻은 아니다.
+한도 거절은 JNI 없는 null이며 historical/non43과 fresh43의 고정 크기 거절 진단을
+분리한다. core·capture first cause·ObjectId와 연결하거나 입장 없는 reply를 만들지 않는다.
+
+리뷰에서 기존 종료 후 오류 처리의 직접 exception 조회를 확인해 보완했다. 관측한
+closed·negative·poisoned 상태에서는 callback 없는 pending exception/local 정리 JNI를
+시작하지 않으며 실행하지 않은 정리는 VM 소유로 남긴다. 원 오류와 historical/current
+원인 분리를 유지한다. Throwable 등록과 마지막 reply도 같은 상태를 다시 확인한다.
+Java getter를 registry mutex 안으로 옮기지 않았으며, producer의 atomic 전환과 모든
+JNI slot 사이 race나 실제 VMDeath 동작 전체를 입증한 것은 아니다.
+
+Windows623에서 정확한 JNI 소스 하나만 포맷한 뒤, Windows624의 현재 checkout에서
+observer 86 tests PASS·실패/ignored/filtered 0을 확인했다. 기존 80개와 새 admission·
+cleanup guard 6개를 포함한다. 625의 observer lib/tests strict Clippy도 PASS다.
+포맷 후 소스는 136,620 bytes·SHA
+`72e3fdfeb087191ac85d2d61eb0f61ec97248c9c3c537f7d403d9ee577ab23d4`다.
+선택 source closure 117개·1,782,988 bytes의 전후 manifest SHA는 두 실행에서
+`3dbf6a0c7b533dc5b479a5492d7ef4f2bf2642559f4b50863fbd309b204927a5`로 같았다.
+이는 before/after bytes 검사이며 원자적인 snapshot·전체 dependency/toolchain 증명은
+아니다. 624는 command 0·16,999 ms·peak 597,553,152 bytes·7 processes·gap 128 ms·
+owned tail 정리 뒤 drain, 625는 command 0·8,084 ms·peak 393,990,144 bytes·
+8 processes·gap 120 ms·자연 종료다. 각각 output/export·scratch 정리·lease 해제와
+감독/정리 오류 0이며 실제 JNI/게임/source 인수로 확대하지 않는다.
+
+고정 `41831234f08348d88789bbad61cfd65d9a249c57`의
+[Rust105](https://github.com/daejunnom/MMMM/actions/runs/39992422456)는 Windows·macOS
+tests/lint 성공, Linux test 실패·lint skipped·전체 실패 metadata를 확인했다. Windows
+원 ZIP 55,073 bytes·SHA
+`9945e371b145443e3ae87b4321023d0f5cbe4ca24352bf53a69c0bceb24785df`를 API digest와
+대조하고 ci-context의 실제 source·expected·PR head를 확인했다. 원 stdout 140,400 bytes·
+SHA `e949e389c5b950e91fe6b2fb64d68724048ecd4c1a79db1b8ea1ea66f75e569c`에서 display
+projection 네 검사의 실제 `ok`와 Coordinator 396 PASS·기존 1 ignored를 확인했다.
+이 CI 실행 근거는 로컬 619/620의 never-executed와 별도다. 원 test의 command 0·
+580,279 ms·Job peak 1,713,373,184 bytes·9 processes·gap 149 ms·owned tail 정리 뒤
+drain·output/export·scratch 정리·lease 해제와 감독/정리 오류 0을 확인했다.
+동일 source의 [JVM96](https://github.com/daejunnom/MMMM/actions/runs/39992422469)은 세 OS
+JVM/native/header/startup와 집계 성공 metadata다. Linux Rust 실패와 JVM 원 기록의
+세부 감사는 별도로 진행하며, 이 고정 CI에는 이후 JNI 입장·cleanup 변경이 포함되지 않는다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.
