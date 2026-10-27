@@ -4406,3 +4406,7 @@ component 깊이와 NotFound 숫자 errno만 기록한다. 경로·구성요소 
 증거가 아니며 다른 오류가 우선하면 최종 출력에 없을 수 있다. 순수 주입 회귀를 작성했으나
 실행은 후속 CI 대상이다. 실제 canonicalize/junction 경합, case-sensitive NTFS 및 오류
 export 전체 경로와 Rust154 원인이나 복구는 미검증이다.
+Rust155 Linux는 격리 `pack_inputs` 자원 scope·CAS, feature origin 및 schema 소유 자원
+회귀를 포함한 test 명령이 성공했다. 이어 Clippy는 테스트의 기본 구조체 생성 뒤 필드
+대입에 대한 `field_reassign_with_default` 한 건으로 실패했다. 원 ZIP과 2 GiB 상한·
+정리 기록을 보존하고 해당 초기화식만 바꿨으며 후속 Clippy는 아직 미실행이다.

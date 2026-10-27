@@ -511,8 +511,10 @@ fn owned_pack_origin_receipt_ignores_opaque_resource_shapes() {
             .inspect_owned(auth.principal.principal(), &project, 32 * 1024 * 1024)
             .unwrap()
     };
-    let mut origin = FeatureOrigin::default();
-    origin.objects = owned.iter().map(|(pin, _)| pin.clone()).collect();
+    let mut origin = FeatureOrigin {
+        objects: owned.iter().map(|(pin, _)| pin.clone()).collect(),
+        ..FeatureOrigin::default()
+    };
     for (pin, value) in &owned {
         gather_owned_resources(pin.kind, value, &mut origin.resources, &auth.budget).unwrap();
     }
