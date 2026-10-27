@@ -109,7 +109,6 @@ impl ProjectSourceRpcContext for PermitRpc<'_> {
 }
 struct StagedDocument {
     pin: OwnedDocumentPin,
-    value: Value,
     blob: BlobRef,
 }
 /// A document being prepared is not yet a publication record. Physics bytes
@@ -833,7 +832,6 @@ fn prepare(
         };
         staged_documents.push(StagedDocument {
             pin: document.pin,
-            value: document.value,
             blob,
         });
     }

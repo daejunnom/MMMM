@@ -4095,6 +4095,11 @@ Store는 신규 Physics와 raw resource를 내부 pending 상태로 유지해 �
 동시 자원 ACL 거절·정수 위반의 우선순위 및 CAS/SQL 수명을 검사하도록 작성했으며 실제
 컴파일·테스트는 후속 CI에서 확인한다. 일반 ResourceRef 등록 metadata 자체의 `N.0` 지원은
 여전히 별도 미완료다.
+Rust132 Linux는 테스트 command 0 뒤 `StagedDocument.value`의 dead-code 경고가 엄격
+Clippy에서 실패했다. 후속 소스는 사용하지 않는 staged 필드만 제거하고, 관계·원문 검사에
+쓰는 pending 값은 유지한다. macOS는 Coordinator 검사 439개 통과 후 `native_stdio`의 내부
+종료 확인에서 EPERM과 `IdentityNotTerminal`로 실패했으며, 바깥 관리 실행의 정상 drain과
+구분한다. 두 원 실패는 보존하고 후속 검사나 과거 실패와 같은 원인으로 재분류하지 않는다.
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.
