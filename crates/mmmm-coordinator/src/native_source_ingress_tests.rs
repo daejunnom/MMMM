@@ -857,6 +857,266 @@ fn physics_mesh_integral_float_size_matches_current_retained_integer_resource() 
     );
 }
 
+// The authored mesh needs one actual byte so that an exact fraction can round
+// to the same parsed Value, projected pin, and valid ResourceRef as 1.0.
+// This derives from the original box fixture and asserts nothing about mesh
+// topology, selection, a solver, or game behavior.
+fn physics_mesh_with_rounded_fraction() -> (Value, Value, Vec<u8>, Vec<u8>) {
+    let bytes = b"x";
+    let (physics, resource, valid) = mesh_physics_with_integral_float_size(bytes);
+    let original = String::from_utf8(valid.clone()).unwrap();
+    let target = "\"sizeBytes\":1.0";
+    assert_eq!(original.matches(target).count(), 1);
+    let invalid = original
+        .replacen(target, "\"sizeBytes\":1.0000000000000001", 1)
+        .into_bytes();
+    let parsed = parse_json(&invalid).unwrap();
+    assert_eq!(
+        parsed, physics,
+        "The existing Value boundary must see the same physics document"
+    );
+    assert_eq!(
+        projected_digest("PhysicsDefinition", &parsed)
+            .unwrap()
+            .as_str(),
+        physics["revision"].as_str().unwrap()
+    );
+    (physics, resource, valid, invalid)
+}
+
+#[test]
+fn physics_mesh_raw_fraction_is_rejected_without_rewriting_the_original_pin() {
+    let fixture = Fixture::new();
+    let before = fixture.store.project(&fixture.project).unwrap();
+    let (physics, resource, _, invalid) = physics_mesh_with_rounded_fraction();
+    let resource_bytes = b"x";
+    let metadata = encode_json(&resource).unwrap();
+    let documents = [NativeSourceDocument {
+        kind: NativeSourceKind::PhysicsDefinition,
+        bytes: &invalid,
+    }];
+    let raw = [NativeRawSourceResource {
+        metadata: &metadata,
+        bytes: resource_bytes,
+    }];
+    let error = fixture.prepare_raw(&documents, &[], &raw).err().unwrap();
+    assert_eq!(error.code, "INVALID_INPUT");
+    assert!(matches!(
+        std::error::Error::source(&error).and_then(|cause| {
+            cause.downcast_ref::<
+            mmmm_contracts::validation::ControlledContractError<mmmm_application::AppError>
+        >()
+        }),
+        Some(
+            mmmm_contracts::validation::ControlledContractError::ExactInteger { collider: Some(0) }
+        )
+    ));
+    assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
+    assert_eq!(parse_json(&invalid).unwrap(), physics);
+}
+
+#[test]
+fn physics_raw_exact_checks_preserve_original_digest_collision_and_cancel_errors() {
+    let fixture = Fixture::new();
+    let before = fixture.store.project(&fixture.project).unwrap();
+    let (physics, resource, valid, invalid) = physics_mesh_with_rounded_fraction();
+    let metadata = encode_json(&resource).unwrap();
+    let raw = [NativeRawSourceResource {
+        metadata: &metadata,
+        bytes: b"x",
+    }];
+
+    let original = String::from_utf8(invalid.clone()).unwrap();
+    let revision = physics["revision"].as_str().unwrap();
+    assert_eq!(original.matches(revision).count(), 1);
+    let wrong_pin = original.replacen(revision, &"0".repeat(64), 1).into_bytes();
+    let wrong = [NativeSourceDocument {
+        kind: NativeSourceKind::PhysicsDefinition,
+        bytes: &wrong_pin,
+    }];
+    assert_eq!(
+        fixture.prepare_raw(&wrong, &[], &raw).err().unwrap().code,
+        "INPUT_DIGEST_MISMATCH"
+    );
+
+    let repeated = [
+        NativeSourceDocument {
+            kind: NativeSourceKind::PhysicsDefinition,
+            bytes: &valid,
+        },
+        NativeSourceDocument {
+            kind: NativeSourceKind::PhysicsDefinition,
+            bytes: &invalid,
+        },
+    ];
+    assert_eq!(
+        fixture
+            .prepare_raw(&repeated, &[], &raw)
+            .err()
+            .unwrap()
+            .code,
+        "ID_COLLISION"
+    );
+
+    fixture.cancelled.store(true, Ordering::Release);
+    let cancelled = [NativeSourceDocument {
+        kind: NativeSourceKind::PhysicsDefinition,
+        bytes: &invalid,
+    }];
+    assert_eq!(
+        fixture
+            .prepare_raw(&cancelled, &[], &raw)
+            .err()
+            .unwrap()
+            .code,
+        "CANCELLED"
+    );
+    assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
+
+    let revoked = Fixture::new();
+    let revoked_before = revoked.store.project(&revoked.project).unwrap();
+    revoked
+        .authority
+        .revoke_project(revoked.owner.principal(), &revoked.project)
+        .unwrap();
+    assert_eq!(
+        revoked
+            .prepare_raw(&cancelled, &[], &raw)
+            .err()
+            .unwrap()
+            .code,
+        "PERMISSION_REQUIRED"
+    );
+    assert_eq!(
+        revoked.store.project(&revoked.project).unwrap(),
+        revoked_before
+    );
+}
+
+// Resource metadata is kept as authored bytes at the Coordinator boundary.
+// The byte content is deliberately not a mesh/topology fixture.
+fn rounded_resource_metadata() -> (Value, Vec<u8>, Vec<u8>) {
+    let bytes = b"x";
+    let resource = json!({
+        "resourceId":"resource-rounded-metadata", "sha256":raw_digest(bytes),
+        "mediaType":"application/octet-stream", "sizeBytes":bytes.len()
+    });
+    let valid = encode_json(&resource).unwrap();
+    let original = String::from_utf8(valid.clone()).unwrap();
+    let target = "\"sizeBytes\":1";
+    assert_eq!(original.matches(target).count(), 1);
+    let invalid = original
+        .replacen(target, "\"sizeBytes\":1.0000000000000001", 1)
+        .into_bytes();
+    let parsed = parse_json(&invalid).unwrap();
+    assert_eq!(parsed["sizeBytes"].as_f64(), Some(1.0));
+    assert_eq!(parsed["resourceId"], resource["resourceId"]);
+    assert_eq!(parsed["sha256"], resource["sha256"]);
+    assert_eq!(parsed["mediaType"], resource["mediaType"]);
+    (resource, valid, invalid)
+}
+
+#[test]
+fn raw_resource_metadata_rejects_rounded_fraction_after_digest_and_id_checks() {
+    let fixture = Fixture::new();
+    let before = fixture.store.project(&fixture.project).unwrap();
+    let (_, valid, invalid) = rounded_resource_metadata();
+    let raw = [NativeRawSourceResource {
+        metadata: &invalid,
+        bytes: b"x",
+    }];
+    let error = fixture.prepare_raw(&[], &[], &raw).err().unwrap();
+    assert_eq!(error.code, "INVALID_INPUT");
+    assert!(matches!(
+        std::error::Error::source(&error).and_then(|cause| {
+            cause.downcast_ref::<
+            mmmm_contracts::validation::ControlledContractError<mmmm_application::AppError>
+        >()
+        }),
+        Some(mmmm_contracts::validation::ControlledContractError::ExactInteger { collider: None })
+    ));
+
+    let wrong = [NativeRawSourceResource {
+        metadata: &invalid,
+        bytes: b"wrong",
+    }];
+    assert_eq!(
+        fixture.prepare_raw(&[], &[], &wrong).err().unwrap().code,
+        "INPUT_DIGEST_MISMATCH"
+    );
+    let repeated = [
+        NativeRawSourceResource {
+            metadata: &valid,
+            bytes: b"x",
+        },
+        NativeRawSourceResource {
+            metadata: &invalid,
+            bytes: b"x",
+        },
+    ];
+    assert_eq!(
+        fixture.prepare_raw(&[], &[], &repeated).err().unwrap().code,
+        "REVISION_CONFLICT"
+    );
+    assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
+}
+
+#[test]
+fn submitted_retained_resource_metadata_rejects_rounded_fraction() {
+    let mut fixture = Fixture::new();
+    let (_, valid, invalid) = rounded_resource_metadata();
+    let first = fixture
+        .prepare_raw(
+            &[],
+            &[],
+            &[NativeRawSourceResource {
+                metadata: &valid,
+                bytes: b"x",
+            }],
+        )
+        .unwrap()
+        .commit(&mut fixture.store)
+        .unwrap();
+    let authority = LocalAuthority::new(HostBridge::default());
+    let workspace = prepare_workspace(
+        &fixture.store,
+        &authority,
+        &fixture.project,
+        fixture.budget.deadline(),
+    )
+    .unwrap();
+    let before = fixture.store.project(&fixture.project).unwrap();
+    let error = prepare_native_sources(
+        &fixture.store,
+        &workspace.witness,
+        &authority,
+        &fixture.budget,
+        &NativeSourceInput {
+            project: &fixture.project,
+            expected_revision: &first.project_revision,
+            documents: &[],
+            retained_resources: &[&invalid],
+            raw_resources: &[],
+        },
+    )
+    .err()
+    .unwrap();
+    // Existing ProjectResourceReader's integer metadata gate rejects the
+    // submitted f64 Value before the new raw exact check can be reached.
+    // The newly submitted bytes do not prove the original lexeme of the
+    // previously registered Value-only resource.
+    assert_eq!(error.code, "SOURCE_UNAVAILABLE");
+    assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
+    assert_eq!(
+        fixture
+            .store
+            .read_blob(&first.resources[0].1)
+            .unwrap()
+            .as_slice(),
+        b"x"
+    );
+}
+
 #[test]
 fn command_module_is_stored_with_its_actual_same_batch_owner_and_original_bytes() {
     let mut fixture = Fixture::new();

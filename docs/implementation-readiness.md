@@ -4081,6 +4081,20 @@ HTTP 429와 Linux의 프로세스 RSS 관측 `ESRCH`·감독 종료도 보존하
 원 bytes·schema 경로의 내부 결속은 외부에 재사용 가능한 witness로 내보내지 않는다.
 기존 Value 전용 API는 그대로이며 Coordinator·Store의 실제 입구에는 아직 연결하지 않았다.
 기존 파싱 오류 우선순위, 취소와 serde 숫자 visitor 연결의 실제 회귀 검사는 후속 CI로 확인한다.
+원 decimal controlled API를 Coordinator와 Store의 Physics 원 bytes 및 제출된 ResourceRef
+metadata bytes에 연결했다. 기존 schema·pin·권한·현재 head·resource 관계를 확인하고 같은
+bytes의 정확 토큰을 검사하며, 원 `Control`과 숫자 위반·capture 운영 실패를 구분한다.
+보유 Physics는 권한 있는 reader가 반환한 현재 CAS bytes를 사용하되 그것이 최초 작성자
+표기라고 단정하지 않는다. Value만 있는 보유 metadata에 원문 검증 증거를 발급하지 않는다.
+
+Store는 신규 Physics와 raw resource를 내부 pending 상태로 유지해 현재 자원·관계 검사와
+원문 검사 후 실제 CAS 저장 및 digest·길이 대조를 완료한 뒤 staged로 전환한다. 이 변경으로
+일부 validation 실패 시 이전에는 남을 수 있던 Physics/raw CAS가 남지 않는다. 선행 일반
+문서 CAS는 남을 수 있고, publication 직전 transaction 재조회는 별도 후행 gate다. CAS I/O
+실패와 후속 validation 실패가 함께 있으면 과거와 관측 오류 순서가 달라질 수 있다.
+동시 자원 ACL 거절·정수 위반의 우선순위 및 CAS/SQL 수명을 검사하도록 작성했으며 실제
+컴파일·테스트는 후속 CI에서 확인한다. 일반 ResourceRef 등록 metadata 자체의 `N.0` 지원은
+여전히 별도 미완료다.
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

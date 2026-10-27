@@ -10,6 +10,9 @@ pub enum StorageError {
     Io(io::Error),
     Sqlite(rusqlite::Error),
     Contract(String),
+    /// Raw numeric token capture could not be bounded or matched to its parse.
+    /// This is an operational failure, not malformed input or stored corruption.
+    RawExactCaptureUnavailable,
     InvalidInput(String),
     Busy,
     NonLocalFilesystem,
@@ -46,6 +49,9 @@ impl fmt::Display for StorageError {
             Self::Io(e) => write!(f, "Storage I/O failed: {e}"),
             Self::Sqlite(e) => write!(f, "Durable journal failed: {e}"),
             Self::Contract(e) => write!(f, "Invalid storage contract: {e}"),
+            Self::RawExactCaptureUnavailable => {
+                f.write_str("Raw exact-integer capture is unavailable")
+            }
             Self::InvalidInput(e) => write!(f, "Invalid storage input: {e}"),
             Self::Busy => f.write_str("A Coordinator already owns this data root"),
             Self::NonLocalFilesystem => {

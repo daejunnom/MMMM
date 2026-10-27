@@ -175,6 +175,8 @@ struct ScopeState {
     cancelled: Cell<bool>,
     authorizations: Cell<usize>,
     final_rows_observed: Cell<bool>,
+    deny_mesh_after_actual_checks: Cell<bool>,
+    mesh_denial_observed: Cell<bool>,
     failure: FinalFailure,
 }
 impl ScopeState {
@@ -270,6 +272,14 @@ impl ProjectResourceAuthority for SqlReadAuthority {
                 "Authored immutable resource metadata",
             ));
         }
+        // This optional test restriction runs only after the actual SQL owner,
+        // Project and immutable resource metadata checks have succeeded.
+        if self.0.deny_mesh_after_actual_checks.get()
+            && resource.resource["resourceId"].as_str() == Some("resource-physics-mesh")
+        {
+            self.0.mesh_denial_observed.set(true);
+            return Err(StorageError::Conflict("Authored scoped resource denied"));
+        }
         Ok(())
     }
 }
@@ -338,6 +348,8 @@ impl TestPermit {
             cancelled: Cell::new(false),
             authorizations: Cell::new(0),
             final_rows_observed: Cell::new(false),
+            deny_mesh_after_actual_checks: Cell::new(false),
+            mesh_denial_observed: Cell::new(false),
             failure,
         }))
     }
@@ -1066,6 +1078,178 @@ fn integral_float_mesh_size_preserves_original_through_batch_and_retained_reads(
             project_revision: second_receipt.project_revision,
         }
     );
+}
+
+fn rounded_fraction_mesh_batch(base: &Value, preceding_documents: bool) -> (Batch, usize) {
+    let (mut physics, resource, bytes) = physics_mesh_fixture();
+    let integral_decimal = format!("{}.0", bytes.len());
+    physics["colliders"][0]["shape"]["shape"]["geometry"]["sizeBytes"] =
+        serde_json::from_str::<Value>(&integral_decimal).unwrap();
+    revise("PhysicsDefinition", &mut physics);
+
+    // The original example is a box. This derived mesh covers a ResourceRef
+    // whose raw decimal rounds to the same binary64 Value as the accepted N.0.
+    let mut sources = Vec::new();
+    let mut resources = Vec::new();
+    if preceding_documents {
+        let initial = Batch::initial(base);
+        sources.extend(
+            initial
+                .pins
+                .iter()
+                .zip(&initial.documents)
+                .map(|(pin, document)| (pin.kind, parse_json(document).unwrap())),
+        );
+        resources.extend(initial.resources);
+    }
+    let index = sources.len();
+    sources.push((OwnedDocumentKind::PhysicsDefinition, physics));
+    resources.push((resource, bytes.clone()));
+    let mut batch = Batch::from_sources(base, sources, resources);
+    let original = batch.documents[index].clone();
+    let original_value = parse_json(&original).unwrap();
+    let text = String::from_utf8(original.clone()).unwrap();
+    let needle = format!("\"sizeBytes\": {integral_decimal}");
+    assert_eq!(text.matches(&needle).count(), 1);
+    let fraction = format!("\"sizeBytes\": {}.0000000000000000000001", bytes.len());
+    batch.documents[index] = text.replacen(&needle, &fraction, 1).into_bytes();
+    assert_ne!(batch.documents[index], original);
+    let parsed = parse_json(&batch.documents[index]).unwrap();
+    assert_eq!(
+        parsed, original_value,
+        "the strict Value has already rounded the raw fraction"
+    );
+    assert_eq!(
+        verify_projected_digest("PhysicsDefinition", &parsed).unwrap(),
+        batch.pins[index].revision
+    );
+    assert!(PhysicsDefinition::from_value(&parsed).is_ok());
+    (batch, index)
+}
+
+#[test]
+fn raw_physics_fraction_that_rounds_to_integer_is_rejected_before_its_staging() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let (batch, index) = rounded_fraction_mesh_batch(&base, true);
+    assert!(index > 0);
+    let (_, mesh_bytes) = batch
+        .resources
+        .iter()
+        .find(|(resource, _)| resource["resourceId"].as_str() == Some("resource-physics-mesh"))
+        .unwrap();
+    let mesh_blob = BlobRef {
+        digest: raw_digest(mesh_bytes),
+        byte_length: mesh_bytes.len() as u64,
+    };
+    let rejected_physics_blob = BlobRef {
+        digest: raw_digest(&batch.documents[index]),
+        byte_length: batch.documents[index].len() as u64,
+    };
+    let prior = BlobRef {
+        digest: raw_digest(&batch.documents[0]),
+        byte_length: batch.documents[0].len() as u64,
+    };
+    assert_ne!(mesh_blob.digest, rejected_physics_blob.digest);
+    assert_ne!(prior.digest, mesh_blob.digest);
+    assert_ne!(prior.digest, rejected_physics_blob.digest);
+    for blob in [&mesh_blob, &rejected_physics_blob, &prior] {
+        assert!(matches!(
+            store.read_blob(blob),
+            Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+    let baseline = metadata_snapshot(&store);
+    let permit = TestPermit::new(&root, &initial);
+    let error = batch.commit(&mut store, &permit, &base).unwrap_err();
+    assert!(matches!(
+        error,
+        StorageError::Contract(message)
+            if message.contains("Physics collider 0 mesh sizeBytes is not an exact safe JSON integer")
+    ));
+    assert_unchanged(&store, &baseline, &base);
+    assert!(!permit.0.final_rows_observed.get());
+
+    // The rejected Physics and new mesh resource remain absent from CAS.
+    // A previous non-Physics document was already staged; unchanged metadata
+    // does not imply that its unreferenced CAS was removed.
+    for blob in [&mesh_blob, &rejected_physics_blob] {
+        assert!(matches!(
+            store.read_blob(blob),
+            Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+    assert_eq!(store.read_blob(&prior).unwrap(), batch.documents[0]);
+}
+
+#[test]
+fn raw_physics_fraction_does_not_replace_pin_or_original_cancel_error() {
+    for bad_pin in [true, false] {
+        let root = TestRoot::new();
+        let mut store = root.store();
+        let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+        let (mut batch, index) = rounded_fraction_mesh_batch(&base, false);
+        let permit = TestPermit::new(&root, &initial);
+        if bad_pin {
+            batch.pins[index].revision = raw_digest(b"different owned revision");
+            batch.next["ownedResources"][index] = json!(batch.pins[index]);
+            revise("Project", &mut batch.next);
+        } else {
+            permit.0.cancelled.set(true);
+        }
+        let baseline = metadata_snapshot(&store);
+        let error = batch.commit(&mut store, &permit, &base).unwrap_err();
+        if bad_pin {
+            assert!(
+                matches!(
+                    error,
+                    StorageError::Contract(message)
+                        if message == "Owned document differs from its canonical identity/revision pin"
+                ),
+                "the original pin failure must precede the added exact check"
+            );
+        } else {
+            assert!(matches!(
+                error,
+                StorageError::InvalidTransition(message) if message.contains("cancelled")
+            ));
+        }
+        assert_unchanged(&store, &baseline, &base);
+    }
+}
+
+#[test]
+fn actual_scoped_mesh_denial_precedes_same_request_raw_physics_fraction() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let (_, mesh_resource, mesh_bytes) = physics_mesh_fixture();
+    let first = Batch::from_sources(&base, vec![], vec![(mesh_resource, mesh_bytes)]);
+    let first_receipt = first
+        .commit(&mut store, &TestPermit::new(&root, &initial), &base)
+        .unwrap();
+    assert_eq!(first_receipt.project_revision, revision(&first.next));
+
+    // The same requested Physics document has a schema-valid parsed Value but
+    // a fractional raw size token. Its mesh is already registered, so resource
+    // authorization must run against the actual current Project membership.
+    let (mut batch, _) = rounded_fraction_mesh_batch(&first.next, false);
+    batch.resources.clear();
+    let ids = batch.next["resourceIds"].as_array_mut().unwrap();
+    let removed = ids.pop().unwrap();
+    assert_eq!(removed.as_str(), Some("resource-physics-mesh"));
+    revise("Project", &mut batch.next);
+
+    let permit = TestPermit::new(&root, &initial);
+    permit.0.deny_mesh_after_actual_checks.set(true);
+    let baseline = metadata_snapshot(&store);
+    assert!(matches!(
+        batch.commit(&mut store, &permit, &first.next),
+        Err(StorageError::Conflict("Authored scoped resource denied"))
+    ));
+    assert!(permit.0.mesh_denial_observed.get());
+    assert_unchanged(&store, &baseline, &first.next);
 }
 
 #[test]

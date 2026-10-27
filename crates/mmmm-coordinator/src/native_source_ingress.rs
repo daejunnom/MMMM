@@ -10,6 +10,7 @@ use mmmm_contracts::{
     ContextId, ContractValidator, JsonLimits, PrincipalId, ProjectId, ResourceId, Sha256Digest,
     encode_json, projected_digest, raw_digest,
     strict_json::{ControlledJsonError, parse_json_with_control},
+    validation::{ControlledContractError, ExactSelector},
     verify_projected_digest,
 };
 use mmmm_domain::{
@@ -768,7 +769,8 @@ pub fn prepare_native_sources(
                 OwnedKind::Prefab,
                 owner_id.as_str(),
                 &mut retained_total,
-            )?;
+            )?
+            .value;
             let prefab: Prefab = decode_domain(&value)?;
             // Recheck the actual owner's declared resources through the same
             // current ACL/CAS reader used for other admitted source documents.
@@ -795,6 +797,10 @@ pub fn prepare_native_sources(
     // ResourceRefs in retained physics follow the same current source reader
     // and finite budget as those in newly authored physics documents.
     let mut physics_bodies = BTreeMap::<String, BTreeSet<String>>::new();
+    // Move, rather than copy, each authorized retained CAS body into this
+    // finite collection. Their original read already counts against the same
+    // MAX_RETAINED_TOTAL budget as the other retained source bytes.
+    let mut retained_physics_bytes = Vec::new();
     for document in &documents {
         if document.pin.kind != OwnedDocumentKind::Prefab {
             continue;
@@ -808,7 +814,7 @@ pub fn prepare_native_sources(
             if let std::collections::btree_map::Entry::Vacant(entry) =
                 physics_bodies.entry(physics_id.to_owned())
             {
-                let value = authoring_source(
+                let source = authoring_source(
                     store,
                     &access,
                     &catalog,
@@ -817,6 +823,7 @@ pub fn prepare_native_sources(
                     physics_id,
                     &mut retained_total,
                 )?;
+                let value = source.value;
                 let physics = PhysicsDefinition::from_value(&value).map_err(domain_error)?;
                 access.check_store(store)?;
                 if physics.physics_id().as_str() != physics_id {
@@ -824,6 +831,12 @@ pub fn prepare_native_sources(
                         "REFERENCE_UNRESOLVED",
                         "Native Prefab physics identity differs from its actual source",
                     ));
+                }
+                if let Some(bytes) = source.retained_bytes {
+                    // These are the currently authorized CAS bytes, which may
+                    // have been re-encoded by a prior registration path; they
+                    // do not prove the author's original numeric lexemes.
+                    retained_physics_bytes.push(bytes);
                 }
                 collect_physics_resources(store, &access, &value, &mut resources)?;
                 let mut bodies = BTreeSet::new();
@@ -900,7 +913,8 @@ pub fn prepare_native_sources(
                         kind,
                         id.as_str().ok_or_else(invalid)?,
                         &mut retained_total,
-                    )?;
+                    )?
+                    .value;
                     if kind == OwnedKind::Clip {
                         let clip: AnimationClip = decode_domain(&value)?;
                         let prefab: Prefab = decode_domain(&document.value)?;
@@ -1003,12 +1017,67 @@ pub fn prepare_native_sources(
         policy,
     };
     prepared.check_current(store)?;
+    // Run new original-token checks only after the original prepare path,
+    // including authorization, membership, and exact source rechecks, has
+    // succeeded. This preserves those failures when both are present.
+    for raw in input.retained_resources {
+        prepared.access.check_store(store)?;
+        let expected = parse_checked(&prepared.access, raw, MAX_RESOURCE_METADATA)?;
+        require_exact_source(
+            &prepared.access,
+            raw,
+            MAX_RESOURCE_METADATA,
+            ExactSelector::ResourceRef,
+            &expected,
+        )?;
+    }
+    for resource in &prepared.raw_resources {
+        prepared.access.check_store(store)?;
+        require_exact_source(
+            &prepared.access,
+            &resource.metadata_bytes,
+            MAX_RESOURCE_METADATA,
+            ExactSelector::ResourceRef,
+            &resource.resource,
+        )?;
+    }
+    for document in &prepared.documents {
+        if document.pin.kind == OwnedDocumentKind::PhysicsDefinition {
+            prepared.access.check_store(store)?;
+            require_exact_source(
+                &prepared.access,
+                &document.original_bytes,
+                MAX_DOCUMENT,
+                ExactSelector::PhysicsDefinition,
+                &document.value,
+            )?;
+        }
+    }
+    for bytes in &retained_physics_bytes {
+        prepared.access.check_store(store)?;
+        let expected = parse_checked(&prepared.access, bytes, MAX_DOCUMENT)?;
+        require_exact_source(
+            &prepared.access,
+            bytes,
+            MAX_DOCUMENT,
+            ExactSelector::PhysicsDefinition,
+            &expected,
+        )?;
+    }
+    prepared.access.check_store(store)?;
     Ok(prepared)
 }
 
 /// Resolve a same-batch immutable document or an actual current Project pin.
 /// Existing source bytes always traverse the original owner/current read scope
 /// and count against the same finite retained-source budget.
+struct AuthoringSource {
+    value: Value,
+    // Present only for an actual authorized retained CAS read, not a proof of
+    // the originally authored representation before any prior re-encoding.
+    retained_bytes: Option<Vec<u8>>,
+}
+
 fn authoring_source(
     store: &DurableStore,
     access: &NativeSourceAccess,
@@ -1017,7 +1086,7 @@ fn authoring_source(
     kind: OwnedKind,
     id: &str,
     retained_total: &mut u64,
-) -> AppResult<Value> {
+) -> AppResult<AuthoringSource> {
     access.check_store(store)?;
     let stored_kind = match kind {
         OwnedKind::Prefab => OwnedDocumentKind::Prefab,
@@ -1036,7 +1105,10 @@ fn authoring_source(
         .find(|document| document.pin.kind == stored_kind && document.pin.object_id.as_str() == id)
     {
         access.check_local()?;
-        return Ok(document.value.clone());
+        return Ok(AuthoringSource {
+            value: document.value.clone(),
+            retained_bytes: None,
+        });
     }
     let pin = catalog.owned_pin(kind, id).map_err(|cause| {
         AppError::caused_by(
@@ -1056,7 +1128,10 @@ fn authoring_source(
     )?;
     *retained_total = add_retained(*retained_total, loaded.bytes.len() as u64)?;
     access.check_store(store)?;
-    Ok(loaded.document)
+    Ok(AuthoringSource {
+        value: loaded.document,
+        retained_bytes: Some(loaded.bytes),
+    })
 }
 
 fn validate_clip_owner(clip: &AnimationClip, prefab: &Prefab) -> AppResult<()> {
@@ -1201,6 +1276,79 @@ fn parse_checked(access: &NativeSourceAccess, bytes: &[u8], maximum: usize) -> A
         ),
     })
 }
+
+#[derive(Debug)]
+struct ExactSourceMismatch;
+impl std::fmt::Display for ExactSourceMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Raw exact validation returned a different parsed value")
+    }
+}
+impl std::error::Error for ExactSourceMismatch {}
+
+/// Check the same immutable bytes only after their existing strict JSON,
+/// schema, identity, digest and authoring checks have completed. This result
+/// is tied to those bytes; it is not proof about a Value-only registration.
+fn require_exact_source(
+    access: &NativeSourceAccess,
+    bytes: &[u8],
+    maximum: usize,
+    selector: ExactSelector,
+    expected: &Value,
+) -> AppResult<()> {
+    let validator = ContractValidator::shared().map_err(|error| {
+        AppError::caused_by(
+            "CAPABILITY_UNAVAILABLE",
+            "Native exact source validation is unavailable",
+            error,
+        )
+    })?;
+    let actual = validator
+        .parse_validate_exact_with_control(
+            selector,
+            bytes,
+            JsonLimits {
+                max_bytes: maximum,
+                max_depth: 64,
+                max_nodes: 100_000,
+            },
+            || access.check_local(),
+        )
+        .map_err(|error| match error {
+            ControlledContractError::Control(error) => error,
+            ControlledContractError::Contract(mmmm_contracts::ContractError::Json(error)) => {
+                AppError::caused_by(
+                    "INVALID_INPUT",
+                    "Native source is not bounded strict JSON",
+                    error,
+                )
+            }
+            ControlledContractError::Contract(error) => AppError::caused_by(
+                "INVALID_INPUT",
+                "Native source violates the canonical contract",
+                error,
+            ),
+            error @ ControlledContractError::ExactInteger { .. } => AppError::caused_by(
+                "INVALID_INPUT",
+                "Native source has an invalid exact decimal integer",
+                error,
+            ),
+            error @ ControlledContractError::CaptureUnavailable => AppError::caused_by(
+                "CAPABILITY_UNAVAILABLE",
+                "Native exact source capture is unavailable",
+                error,
+            ),
+        })?;
+    if actual != *expected {
+        return Err(AppError::caused_by(
+            "CAPABILITY_UNAVAILABLE",
+            "Native exact source validation could not confirm the parsed value",
+            ExactSourceMismatch,
+        ));
+    }
+    Ok(())
+}
+
 fn read_owned(
     store: &DurableStore,
     access: &NativeSourceAccess,

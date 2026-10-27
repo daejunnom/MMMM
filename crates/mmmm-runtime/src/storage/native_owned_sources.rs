@@ -21,6 +21,7 @@ use mmmm_contracts::{
     ContextId, JsonLimits, ObjectId, PrincipalId, ProjectId, ResourceId, Sha256Digest, encode_json,
     projected_digest, raw_digest,
     strict_json::{ControlledJsonError, parse_json_with_control},
+    validation::{ControlledContractError, ExactSelector},
     verify_projected_digest,
 };
 use mmmm_domain::physics::{PhysicsDefinition, normalize_mesh_resource_ref};
@@ -111,11 +112,36 @@ struct StagedDocument {
     value: Value,
     blob: BlobRef,
 }
+/// A document being prepared is not yet a publication record. Physics bytes
+/// remain pending until all current resource and reference checks complete;
+/// only an actual verified CAS write can produce its final StagedDocument.
+struct PendingDocument<'a> {
+    pin: OwnedDocumentPin,
+    value: Value,
+    bytes: &'a [u8],
+    staged_blob: Option<BlobRef>,
+}
 struct StagedResource {
     id: ResourceId,
     resource: Value,
     blob: BlobRef,
     previous: Option<RegisteredProjectResource>,
+}
+/// A resource candidate is either an authorized existing registration or raw
+/// input whose metadata and bytes were checked but which is not yet in CAS.
+/// The latter's expected pin is only a comparison target, never provenance.
+struct PendingResource<'a> {
+    id: ResourceId,
+    resource: Value,
+    source: PendingResourceSource<'a>,
+}
+enum PendingResourceSource<'a> {
+    Existing(RegisteredProjectResource),
+    Raw {
+        metadata: &'a [u8],
+        bytes: &'a [u8],
+        expected: BlobRef,
+    },
 }
 struct CheckedPhysics {
     physics_id: String,
@@ -444,7 +470,14 @@ fn prepare(
             ));
         }
         account(&mut remaining, document.bytes.len() as u64)?;
-        let blob = stage_bytes(store, permit, document.bytes)?;
+        // Preserve ordinary document staging order. Physics remains pending
+        // until the current resources, retained sources and their authored
+        // relationships are checked; a predicted hash is not a CAS receipt.
+        let staged_blob = if document.pin.kind == OwnedDocumentKind::PhysicsDefinition {
+            None
+        } else {
+            Some(stage_bytes(store, permit, document.bytes)?)
+        };
         after_pins.insert(
             (document.pin.kind, document.pin.object_id.clone()),
             document.pin.clone(),
@@ -466,10 +499,11 @@ fn prepare(
             "ownedResources",
             serde_json::to_value(document.pin).map_err(contract)?,
         )?;
-        documents.push(StagedDocument {
+        documents.push(PendingDocument {
             pin: document.pin.clone(),
             value,
-            blob,
+            bytes: document.bytes,
+            staged_blob,
         });
     }
     let mut resources = BTreeMap::new();
@@ -491,16 +525,16 @@ fn prepare(
         account(&mut remaining, source.blob.byte_length)?;
         resources.insert(
             id.clone(),
-            StagedResource {
+            PendingResource {
                 id: id.clone(),
                 resource: source.resource.clone(),
-                blob: source.blob.clone(),
-                previous: Some(source),
+                source: PendingResourceSource::Existing(source),
             },
         );
     }
     let mut new_resource_ids = Vec::new();
     let mut input_resources = BTreeSet::new();
+    let mut existing_raw_metadata = Vec::new();
     for input in request.resources {
         checkpoint(store, permit, request.project, &scope)?;
         let resource = match input {
@@ -518,7 +552,13 @@ fn prepare(
             return Err(invalid("Native source repeats an input resource ID"));
         }
         if let Some(existing) = resources.get(&id) {
-            if existing.resource != resource || existing.blob != blob {
+            let actual = match &existing.source {
+                PendingResourceSource::Existing(actual) => actual,
+                PendingResourceSource::Raw { .. } => {
+                    return Err(invalid("Native source repeats an input resource ID"));
+                }
+            };
+            if existing.resource != resource || actual.blob != blob {
                 return Err(conflict("Native source would replace a current resource"));
             }
             if let NativeOwnedResourceSource::Raw { bytes, .. } = input
@@ -526,10 +566,13 @@ fn prepare(
             {
                 return Err(invalid("Native raw resource digest or size differs"));
             }
+            if let NativeOwnedResourceSource::Raw { metadata, .. } = input {
+                existing_raw_metadata.push((id, *metadata));
+            }
             continue;
         }
         account(&mut remaining, blob.byte_length)?;
-        let previous = match input {
+        let source = match input {
             NativeOwnedResourceSource::Retained { .. } => {
                 let query = ProjectResourceQuery::RegisteredImmutable {
                     resource_id: id.clone(),
@@ -545,9 +588,9 @@ fn prepare(
                     },
                 )?;
                 require_project_resource(request.project, &actual)?;
-                Some(actual)
+                PendingResourceSource::Existing(actual)
             }
-            NativeOwnedResourceSource::Raw { bytes, .. } => {
+            NativeOwnedResourceSource::Raw { metadata, bytes } => {
                 // Raw bytes are new input, not an alternate read-grant path
                 // for an existing hidden/out-of-scope resource registration.
                 require_new_resource_id(store, &id)?;
@@ -559,21 +602,21 @@ fn prepare(
                         "Native raw resource digest, size or ceiling differs",
                     ));
                 }
-                if stage_bytes(store, permit, bytes)? != blob {
-                    return Err(conflict("Native raw resource actual CAS pin differs"));
+                PendingResourceSource::Raw {
+                    metadata,
+                    bytes,
+                    expected: blob,
                 }
-                None
             }
         };
         append(&mut expected, "resourceIds", json!(id))?;
         new_resource_ids.push(id.clone());
         resources.insert(
             id.clone(),
-            StagedResource {
+            PendingResource {
                 id,
                 resource,
-                blob,
-                previous,
+                source,
             },
         );
     }
@@ -618,6 +661,7 @@ fn prepare(
     let mut retained = BTreeMap::new();
     let mut owned_reader = permit.owned_document_reader(MAX_OWNED_DOCUMENT_BYTES)?;
     let mut carried_documents = Vec::new();
+    let mut retained_physics_bytes = Vec::new();
     for pin in base_pins.values() {
         checkpoint(store, permit, request.project, &scope)?;
         let loaded = owned_reader.read_known_history_bytes(
@@ -640,6 +684,7 @@ fn prepare(
                     &loaded.document,
                     &resources,
                 )?;
+                retained_physics_bytes.push((pin.object_id.clone(), loaded.bytes));
                 physics_documents.insert(pin.object_id.clone(), definition);
             }
             retained.insert((pin.kind, pin.object_id.clone()), loaded.document);
@@ -692,6 +737,131 @@ fn prepare(
             _ => (),
         }
     }
+    // Existing resource ACL, current Project membership and document relation
+    // failures must remain observable before a newly added exact-decimal error.
+    // Earlier ordinary document CAS files may already exist; raw resources and
+    // Physics documents remain pending without a storage/provenance claim.
+    let needs_exact = !retained_physics_bytes.is_empty()
+        || documents
+            .iter()
+            .any(|document| document.pin.kind == OwnedDocumentKind::PhysicsDefinition)
+        || !existing_raw_metadata.is_empty()
+        || resources
+            .values()
+            .any(|resource| matches!(&resource.source, PendingResourceSource::Raw { .. }));
+    if needs_exact {
+        if checkpoint(store, permit, request.project, &scope)? != current_owner
+            || permit.authorize_commit(store, &initial_view)? != current_owner
+        {
+            return Err(conflict("Native source write permission is not current"));
+        }
+        guard_head(
+            store,
+            request.project,
+            request.expected_revision,
+            Some(&base_blob),
+        )?;
+    }
+    for (id, bytes) in retained_physics_bytes {
+        checkpoint(store, permit, request.project, &scope)?;
+        let value = retained
+            .get(&(OwnedDocumentKind::PhysicsDefinition, id))
+            .ok_or_else(|| invalid("Native retained physics source is missing"))?;
+        check_exact_input(
+            store,
+            permit,
+            &bytes,
+            MAX_OWNED_DOCUMENT_BYTES as usize,
+            ExactSelector::PhysicsDefinition,
+            value,
+        )?;
+    }
+    for document in &documents {
+        if document.pin.kind == OwnedDocumentKind::PhysicsDefinition {
+            checkpoint(store, permit, request.project, &scope)?;
+            check_exact_input(
+                store,
+                permit,
+                document.bytes,
+                MAX_OWNED_DOCUMENT_BYTES as usize,
+                ExactSelector::PhysicsDefinition,
+                &document.value,
+            )?;
+        }
+    }
+    for (id, metadata) in existing_raw_metadata {
+        checkpoint(store, permit, request.project, &scope)?;
+        let resource = resources
+            .get(&id)
+            .ok_or_else(|| invalid("Native current resource is missing"))?;
+        check_exact_input(
+            store,
+            permit,
+            metadata,
+            MAX_METADATA,
+            ExactSelector::ResourceRef,
+            &resource.resource,
+        )?;
+    }
+    for resource in resources.values() {
+        if let PendingResourceSource::Raw { metadata, .. } = &resource.source {
+            checkpoint(store, permit, request.project, &scope)?;
+            check_exact_input(
+                store,
+                permit,
+                metadata,
+                MAX_METADATA,
+                ExactSelector::ResourceRef,
+                &resource.resource,
+            )?;
+        }
+    }
+    let mut staged_documents = Vec::with_capacity(documents.len());
+    for document in documents {
+        let blob = match document.staged_blob {
+            Some(blob) => blob,
+            None => {
+                checkpoint(store, permit, request.project, &scope)?;
+                let actual = stage_bytes(store, permit, document.bytes)?;
+                if actual.byte_length != document.bytes.len() as u64
+                    || actual.digest != raw_digest(document.bytes)
+                {
+                    return Err(conflict("Native Physics actual CAS pin differs"));
+                }
+                actual
+            }
+        };
+        staged_documents.push(StagedDocument {
+            pin: document.pin,
+            value: document.value,
+            blob,
+        });
+    }
+    let mut staged_resources = BTreeMap::new();
+    for (id, resource) in resources {
+        let (blob, previous) = match resource.source {
+            PendingResourceSource::Existing(actual) => (actual.blob.clone(), Some(actual)),
+            PendingResourceSource::Raw {
+                bytes, expected, ..
+            } => {
+                checkpoint(store, permit, request.project, &scope)?;
+                let actual = stage_bytes(store, permit, bytes)?;
+                if actual != expected {
+                    return Err(conflict("Native raw resource actual CAS pin differs"));
+                }
+                (actual, None)
+            }
+        };
+        staged_resources.insert(
+            id,
+            StagedResource {
+                id: resource.id,
+                resource: resource.resource,
+                blob,
+                previous,
+            },
+        );
+    }
     let project_blob = stage_bytes(store, permit, request.project_bytes)?;
     checkpoint(store, permit, request.project, &scope)?;
     guard_head(
@@ -706,9 +876,9 @@ fn prepare(
         next_project,
         next_revision,
         project_blob,
-        documents,
+        documents: staged_documents,
         carried_documents,
-        resources,
+        resources: staged_resources,
         new_resource_ids,
         scope,
     })
@@ -787,7 +957,7 @@ fn recheck_sources(
 fn related_document<'a>(
     kind: OwnedDocumentKind,
     id: &ObjectId,
-    documents: &'a [StagedDocument],
+    documents: &'a [PendingDocument<'_>],
     retained: &'a BTreeMap<(OwnedDocumentKind, ObjectId), Value>,
 ) -> StorageResult<&'a Value> {
     documents
@@ -867,7 +1037,7 @@ fn require_physics_binding(binding: &Value, physics: &CheckedPhysics) -> Storage
 
 fn require_exact_resource(
     value: &Value,
-    resources: &BTreeMap<ResourceId, StagedResource>,
+    resources: &BTreeMap<ResourceId, PendingResource<'_>>,
 ) -> StorageResult<()> {
     let id: ResourceId = decode(&value["resourceId"])?;
     if resources
@@ -887,7 +1057,7 @@ fn require_physics_mesh_resources(
     project: &ProjectId,
     scope: &WriteScope,
     physics: &Value,
-    resources: &BTreeMap<ResourceId, StagedResource>,
+    resources: &BTreeMap<ResourceId, PendingResource<'_>>,
 ) -> StorageResult<()> {
     // Normalize only a comparison copy of the mesh ResourceRef. The authored
     // Physics bytes and projected pin are unchanged. This storage association
@@ -909,7 +1079,7 @@ fn require_physics_mesh_resources(
 fn require_references(
     document: &Value,
     pins: &BTreeMap<(OwnedDocumentKind, ObjectId), OwnedDocumentPin>,
-    resources: &BTreeMap<ResourceId, StagedResource>,
+    resources: &BTreeMap<ResourceId, PendingResource<'_>>,
 ) -> StorageResult<()> {
     if let Some(id) = document
         .get("prefabId")
@@ -1126,6 +1296,45 @@ fn parse(
         ControlledJsonError::Control(cause) => cause,
         ControlledJsonError::Json(cause) => contract(cause),
     })
+}
+
+/// Check only bytes from this request or the authorized retained CAS read.
+/// The returned Value is compared to the earlier strict parse; this does not
+/// establish a separate witness for retained ResourceRef metadata that exists
+/// only as a Value or prove that retained CAS bytes are an author's first input.
+fn check_exact_input(
+    store: &DurableStore,
+    permit: &dyn NativeOwnedSourceCommitPermit,
+    bytes: &[u8],
+    maximum: usize,
+    selector: ExactSelector,
+    expected: &Value,
+) -> StorageResult<()> {
+    let actual = store
+        .validator
+        .parse_validate_exact_with_control(
+            selector,
+            bytes,
+            JsonLimits {
+                max_bytes: maximum,
+                max_depth: 64,
+                max_nodes: 100_000,
+            },
+            || {
+                permit.check_store(store)?;
+                permit.check()
+            },
+        )
+        .map_err(|cause| match cause {
+            ControlledContractError::Control(cause) => cause,
+            ControlledContractError::Contract(cause) => contract(cause),
+            cause @ ControlledContractError::ExactInteger { .. } => contract(cause),
+            ControlledContractError::CaptureUnavailable => StorageError::RawExactCaptureUnavailable,
+        })?;
+    if &actual != expected {
+        return Err(StorageError::RawExactCaptureUnavailable);
+    }
+    Ok(())
 }
 fn stage_bytes(
     store: &DurableStore,
