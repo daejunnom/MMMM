@@ -4039,6 +4039,14 @@ Prefab의 모듈 ID와 모듈의 origin node를 확인한다. 기존 소유 문�
 발급하지 않는다. 실패 시 metadata transaction은 보호하지만 사전 저장한 미참조 CAS가
 남을 수 있다. 같은 배치의 정상 반영, 잘못된 관계, 취소와 기존 문서 재검사를 위한
 검사를 작성했으며 실제 컴파일·테스트 결과는 별도로 기록한다.
+### 물리 정의 검증 정본의 분리
+
+물리 정의의 DTO와 좌표·그래프·예산 검증을 도메인 계층에서 소유하도록 분리하고,
+Exchange는 기존 공개 메서드·직렬화·오류 및 selection 검증을 호환 계층으로 유지한다.
+원 schema → 예산 → 역직렬화 → 그래프 검사 순서를 원본과 대조했다. 재내보낸 DTO는
+일반 Rust 사용 경로를 유지하지만 `std::any::type_name`의 정의 경로는 달라진다.
+이 변경만으로 PhysicsDefinition의 native source import, 실제 selection·mesh 바이트,
+solver 또는 게임 권한이 구현된 것은 아니다. 컴파일과 기존 회귀 검사 결과는 별도다.
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

@@ -3,10 +3,9 @@
 //! solver invocation and preserves source declarations and runtime intent.
 
 use crate::{ExchangeError, ExchangeResult, coordinates::CoordinateSystem, validate};
-use mmmm_contracts::{
-    BodyId, ColliderId, InstanceId, JointId, MaterialId, NodeId, PhysicsId, ProjectId, ResourceId,
-    ResourceLocation, SelectionId, Sha256Digest,
-};
+#[cfg(test)]
+use mmmm_contracts::InstanceId;
+use mmmm_contracts::{NodeId, PhysicsId, ProjectId, ResourceLocation, SelectionId, Sha256Digest};
 use mmmm_domain::{
     graph::world_transforms,
     transform::{Matrix4, Transform},
@@ -16,13 +15,101 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ObjectNodeRef {
-    pub instance_id: InstanceId,
-    pub node_id: NodeId,
-}
+pub use mmmm_domain::physics::{
+    BodyMode, CapsuleAxis, CollisionShape, InertiaPolicy, JointKind, JointLimitUnit, JointLimits,
+    MaterialSource, ObjectNodeRef, PhysicsBody, PhysicsCollider, PhysicsJoint,
+    PhysicsMaterialAssignment, RuntimeIntent, ShapeDefinition, ShapeExactness, ShapeProvenance,
+    ShapeSpace, VisualBinding,
+};
 
+/// Typed immutable model input. Validation does not issue game or solver authority.
+#[derive(Clone)]
+pub struct PhysicsDefinition {
+    model: mmmm_domain::physics::PhysicsDefinition,
+    coordinates: CoordinateSystem,
+}
+impl std::fmt::Debug for PhysicsDefinition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.model, f)
+    }
+}
+impl Serialize for PhysicsDefinition {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.model.serialize(serializer)
+    }
+}
+fn from_domain_error(error: mmmm_domain::types::DomainError) -> ExchangeError {
+    ExchangeError::new(error.code, error.message)
+}
+impl PhysicsDefinition {
+    pub fn from_value(value: &Value) -> ExchangeResult<Self> {
+        let model = mmmm_domain::physics::PhysicsDefinition::from_value(value)
+            .map_err(from_domain_error)?;
+        let coordinates = CoordinateSystem::from_domain(model.coordinates());
+        Ok(Self { model, coordinates })
+    }
+    pub fn to_value(&self) -> ExchangeResult<Value> {
+        self.model.to_value().map_err(from_domain_error)
+    }
+    pub fn physics_id(&self) -> &PhysicsId {
+        self.model.physics_id()
+    }
+    pub fn revision(&self) -> &Sha256Digest {
+        self.model.revision()
+    }
+    pub fn selection_id(&self) -> &SelectionId {
+        self.model.selection_id()
+    }
+    pub fn coordinates(&self) -> &CoordinateSystem {
+        &self.coordinates
+    }
+    pub fn gravity_meters_per_second_squared(&self) -> [f64; 3] {
+        self.model.gravity_meters_per_second_squared()
+    }
+    pub fn materials(&self) -> &[PhysicsMaterialAssignment] {
+        self.model.materials()
+    }
+    pub fn bodies(&self) -> &[PhysicsBody] {
+        self.model.bodies()
+    }
+    pub fn colliders(&self) -> &[PhysicsCollider] {
+        self.model.colliders()
+    }
+    pub fn joints(&self) -> &[PhysicsJoint] {
+        self.model.joints()
+    }
+    pub fn runtime_intent(&self) -> RuntimeIntent {
+        self.model.runtime_intent()
+    }
+    pub fn required_capabilities(&self) -> &[ResourceLocation] {
+        self.model.required_capabilities()
+    }
+    pub fn validate_selection(&self, selection: &Value) -> ExchangeResult<()> {
+        self.validate_selection_index(&SelectionIndex::from_value(selection)?)
+    }
+    pub fn validate_selection_index(&self, selection: &SelectionIndex) -> ExchangeResult<()> {
+        if self.selection_id() != selection.selection_id() {
+            return Err(ExchangeError::new(
+                "SELECTION_MISMATCH",
+                "physics selection ID differs",
+            ));
+        }
+        for body in self.bodies() {
+            for binding in &body.visual_bindings {
+                if !selection.contains(&binding.node) {
+                    return Err(ExchangeError::new(
+                        "REFERENCE_UNRESOLVED",
+                        format!(
+                            "visual node {}/{} is outside the qualified selection",
+                            binding.node.instance_id, binding.node.node_id
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct SelectionWire {
@@ -199,293 +286,6 @@ impl SelectionIndex {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MaterialSource {
-    UserDeclared,
-    ApprovedPreset,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct PhysicsMaterialAssignment {
-    pub material_id: MaterialId,
-    pub source: MaterialSource,
-    pub friction: f64,
-    pub restitution: f64,
-    pub linear_damping: f64,
-    pub angular_damping: f64,
-    pub semantics: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BodyMode {
-    Static,
-    Kinematic,
-    Dynamic,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InertiaPolicy {
-    Explicit,
-    DeriveFromColliders,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct VisualBinding {
-    pub node: ObjectNodeRef,
-    pub body_to_node: Transform,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct PhysicsBody {
-    pub body_id: BodyId,
-    pub mode: BodyMode,
-    pub transform: Transform,
-    pub mass_kg: Option<f64>,
-    pub center_of_mass_local: [f64; 3],
-    pub inertia_policy: InertiaPolicy,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inertia_diagonal: Option<[f64; 3]>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inertia_orientation_xyzw: Option<[f64; 4]>,
-    pub initial_linear_velocity_meters_per_second: [f64; 3],
-    pub initial_angular_velocity_radians_per_second: [f64; 3],
-    pub visual_bindings: Vec<VisualBinding>,
-    pub collider_ids: Vec<ColliderId>,
-    pub material_id: MaterialId,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ShapeSpace {
-    NodeLocal,
-    BodyLocal,
-    World,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ShapeExactness {
-    Exact,
-    Approximated,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ShapeProvenance {
-    Observed,
-    Extracted,
-    UserDeclared,
-    Estimated,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CapsuleAxis {
-    X,
-    Y,
-    Z,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum CollisionShape {
-    Box {
-        #[serde(rename = "halfExtents")]
-        half_extents: [f64; 3],
-    },
-    Sphere {
-        radius: f64,
-    },
-    Capsule {
-        radius: f64,
-        #[serde(rename = "halfHeight")]
-        half_height: f64,
-        axis: CapsuleAxis,
-    },
-    Mesh {
-        geometry: ResourceRef,
-        #[serde(rename = "topologyDigest")]
-        topology_digest: Sha256Digest,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ShapeDefinition {
-    pub shape: CollisionShape,
-    pub space: ShapeSpace,
-    pub exactness: ShapeExactness,
-    pub provenance: ShapeProvenance,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct PhysicsCollider {
-    pub collider_id: ColliderId,
-    pub body_id: BodyId,
-    pub shape: ShapeDefinition,
-    pub transform: Transform,
-    pub is_sensor: bool,
-    #[serde(deserialize_with = "deserialize_safe_u64")]
-    pub collision_group: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JointKind {
-    Fixed,
-    Hinge,
-    Slider,
-    Ball,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JointLimitUnit {
-    Radians,
-    Meters,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct JointLimits {
-    pub lower: f64,
-    pub upper: f64,
-    pub unit: JointLimitUnit,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct PhysicsJoint {
-    pub joint_id: JointId,
-    pub kind: JointKind,
-    pub body_a: BodyId,
-    pub body_b: BodyId,
-    pub frame_a: Transform,
-    pub frame_b: Transform,
-    pub limits: Option<JointLimits>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeIntent {
-    BakeOnly,
-    RuntimeRequired,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct PhysicsWire {
-    contract_version: String,
-    physics_id: PhysicsId,
-    revision: Sha256Digest,
-    selection_id: SelectionId,
-    coordinates: CoordinateSystem,
-    gravity_meters_per_second_squared: [f64; 3],
-    materials: Vec<PhysicsMaterialAssignment>,
-    bodies: Vec<PhysicsBody>,
-    colliders: Vec<PhysicsCollider>,
-    joints: Vec<PhysicsJoint>,
-    runtime_intent: RuntimeIntent,
-    required_capabilities: Vec<ResourceLocation>,
-}
-
-/// Typed immutable model input. Successful validation makes no claim about a
-/// solver, payload codec, game carrier, native material, or runtime capability.
-#[derive(Debug, Clone, Serialize)]
-#[serde(transparent)]
-pub struct PhysicsDefinition(PhysicsWire);
-
-impl PhysicsDefinition {
-    /// Validate an authored candidate's schema and model relationships. This
-    /// supports editing before a revision is allocated and never rewrites one.
-    /// Immutable prepare/inspect/bake callers must separately verify the raw
-    /// PhysicsDefinition projected digest and source pins before accepting it.
-    pub fn from_value(value: &Value) -> ExchangeResult<Self> {
-        validate("PhysicsDefinition", value)?;
-        physics_budget(value)?;
-        let wire: PhysicsWire = serde_json::from_value(value.clone())
-            .map_err(|error| ExchangeError::new("SCHEMA_INVALID", error.to_string()))?;
-        validate_graph(&wire)?;
-        Ok(Self(wire))
-    }
-
-    pub fn to_value(&self) -> ExchangeResult<Value> {
-        let value = serde_json::to_value(self)
-            .map_err(|error| ExchangeError::new("SCHEMA_INVALID", error.to_string()))?;
-        validate("PhysicsDefinition", &value)?;
-        Ok(value)
-    }
-
-    pub fn physics_id(&self) -> &PhysicsId {
-        &self.0.physics_id
-    }
-    pub fn revision(&self) -> &Sha256Digest {
-        &self.0.revision
-    }
-    pub fn selection_id(&self) -> &SelectionId {
-        &self.0.selection_id
-    }
-    pub fn coordinates(&self) -> &CoordinateSystem {
-        &self.0.coordinates
-    }
-    pub fn gravity_meters_per_second_squared(&self) -> [f64; 3] {
-        self.0.gravity_meters_per_second_squared
-    }
-    pub fn materials(&self) -> &[PhysicsMaterialAssignment] {
-        &self.0.materials
-    }
-    pub fn bodies(&self) -> &[PhysicsBody] {
-        &self.0.bodies
-    }
-    pub fn colliders(&self) -> &[PhysicsCollider] {
-        &self.0.colliders
-    }
-    pub fn joints(&self) -> &[PhysicsJoint] {
-        &self.0.joints
-    }
-    pub fn runtime_intent(&self) -> RuntimeIntent {
-        self.0.runtime_intent
-    }
-    pub fn required_capabilities(&self) -> &[ResourceLocation] {
-        &self.0.required_capabilities
-    }
-
-    pub fn validate_selection(&self, selection: &Value) -> ExchangeResult<()> {
-        self.validate_selection_index(&SelectionIndex::from_value(selection)?)
-    }
-
-    pub fn validate_selection_index(&self, selection: &SelectionIndex) -> ExchangeResult<()> {
-        if self.0.selection_id != *selection.selection_id() {
-            return Err(ExchangeError::new(
-                "SELECTION_MISMATCH",
-                "physics selection ID differs",
-            ));
-        }
-        for body in &self.0.bodies {
-            for binding in &body.visual_bindings {
-                if !selection.contains(&binding.node) {
-                    return Err(ExchangeError::new(
-                        "REFERENCE_UNRESOLVED",
-                        format!(
-                            "visual node {}/{} is outside the qualified selection",
-                            binding.node.instance_id, binding.node.node_id
-                        ),
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
 /// Structural validation of an authored physics candidate and qualified
 /// selection. The manifest pipeline owns byte hashes and revision acceptance.
 pub fn validate_physics_definition(
@@ -508,194 +308,6 @@ pub fn visual_world_pose(
         .multiply(&offset)
         .map(Transform::from_matrix)
         .map_err(transform_error)
-}
-
-fn validate_graph(physics: &PhysicsWire) -> ExchangeResult<()> {
-    if physics.contract_version != "0.2.0" {
-        return Err(ExchangeError::new(
-            "SCHEMA_INVALID",
-            "invalid physics contract version",
-        ));
-    }
-    finite(&physics.gravity_meters_per_second_squared, "gravity")?;
-    let mut materials = BTreeSet::new();
-    for material in &physics.materials {
-        unique(&mut materials, material.material_id.clone(), "material")?;
-        nonnegative(
-            &[
-                material.friction,
-                material.restitution,
-                material.linear_damping,
-                material.angular_damping,
-            ],
-            "material coefficients",
-        )?;
-    }
-    let mut bodies = BTreeMap::new();
-    let mut collider_owners = BTreeMap::new();
-    let mut writers = BTreeSet::new();
-    for body in &physics.bodies {
-        if bodies.insert(body.body_id.clone(), body).is_some() {
-            return Err(ExchangeError::new("DUPLICATE_ID", "duplicate body ID"));
-        }
-        body.transform.validate().map_err(transform_error)?;
-        finite(&body.center_of_mass_local, "center of mass")?;
-        finite(
-            &body.initial_linear_velocity_meters_per_second,
-            "linear velocity",
-        )?;
-        finite(
-            &body.initial_angular_velocity_radians_per_second,
-            "angular velocity",
-        )?;
-        if body
-            .mass_kg
-            .is_some_and(|mass| !mass.is_finite() || mass <= 0.0)
-            || (body.mode == BodyMode::Dynamic && body.mass_kg.is_none())
-        {
-            return Err(ExchangeError::new(
-                "INVALID_PHYSICS",
-                "dynamic mass must be finite and positive",
-            ));
-        }
-        if body.inertia_policy == InertiaPolicy::Explicit
-            && (body.inertia_diagonal.is_none() || body.inertia_orientation_xyzw.is_none())
-        {
-            return Err(ExchangeError::new(
-                "INVALID_PHYSICS",
-                "explicit inertia requires moments and principal orientation",
-            ));
-        }
-        if let Some(moments) = body.inertia_diagonal {
-            positive(&moments, "principal moments in kg·m²")?;
-        }
-        if let Some(orientation) = body.inertia_orientation_xyzw {
-            Transform::Trs {
-                translation: [0.0; 3],
-                rotation_xyzw: orientation,
-                scale: [1.0; 3],
-            }
-            .validate()
-            .map_err(transform_error)?;
-        }
-        if body.mode == BodyMode::Dynamic
-            && body.inertia_policy == InertiaPolicy::DeriveFromColliders
-            && body.collider_ids.is_empty()
-        {
-            return Err(ExchangeError::new(
-                "INVALID_PHYSICS",
-                "dynamic collider-derived inertia requires colliders",
-            ));
-        }
-        if !materials.contains(&body.material_id) {
-            return Err(ExchangeError::new(
-                "REFERENCE_UNRESOLVED",
-                "body material is absent",
-            ));
-        }
-        let mut body_colliders = BTreeSet::new();
-        for collider in &body.collider_ids {
-            unique(&mut body_colliders, collider.clone(), "body collider")?;
-        }
-        collider_owners.insert(body.body_id.clone(), body_colliders);
-        for binding in &body.visual_bindings {
-            binding.body_to_node.validate().map_err(transform_error)?;
-            if !writers.insert(binding.node.clone()) {
-                return Err(ExchangeError::new(
-                    "POSE_WRITER_CONFLICT",
-                    "multiple bindings write the same qualified visual node",
-                ));
-            }
-        }
-    }
-    let mut colliders = BTreeMap::new();
-    let mut mesh_pins = BTreeMap::<ResourceId, &ResourceRef>::new();
-    for collider in &physics.colliders {
-        if colliders
-            .insert(collider.collider_id.clone(), collider)
-            .is_some()
-        {
-            return Err(ExchangeError::new("DUPLICATE_ID", "duplicate collider ID"));
-        }
-        let owned_ids = collider_owners
-            .get(&collider.body_id)
-            .ok_or_else(|| ExchangeError::new("REFERENCE_UNRESOLVED", "collider body is absent"))?;
-        if !owned_ids.contains(&collider.collider_id) {
-            return Err(ExchangeError::new(
-                "REFERENCE_UNRESOLVED",
-                "collider is not listed by its owning body",
-            ));
-        }
-        collider.transform.validate().map_err(transform_error)?;
-        match &collider.shape.shape {
-            CollisionShape::Box { half_extents } => positive(half_extents, "box half extents")?,
-            CollisionShape::Sphere { radius } => positive(&[*radius], "sphere radius")?,
-            CollisionShape::Capsule {
-                radius,
-                half_height,
-                ..
-            } => {
-                positive(&[*radius], "capsule radius")?;
-                nonnegative(&[*half_height], "capsule half height")?;
-            }
-            CollisionShape::Mesh { geometry, .. } => {
-                if let Some(previous) = mesh_pins.insert(geometry.resource_id.clone(), geometry)
-                    && (previous.sha256 != geometry.sha256
-                        || previous.size_bytes != geometry.size_bytes
-                        || previous.media_type != geometry.media_type)
-                {
-                    return Err(ExchangeError::new(
-                        "RESOURCE_PIN_CONFLICT",
-                        "mesh resource ID has inconsistent pins",
-                    ));
-                }
-            }
-        }
-    }
-    for body in &physics.bodies {
-        for collider_id in &body.collider_ids {
-            let collider = colliders.get(collider_id).ok_or_else(|| {
-                ExchangeError::new("REFERENCE_UNRESOLVED", "body collider is absent")
-            })?;
-            if collider.body_id != body.body_id {
-                return Err(ExchangeError::new(
-                    "REFERENCE_UNRESOLVED",
-                    "body references another body's collider",
-                ));
-            }
-        }
-    }
-    let mut joints = BTreeSet::new();
-    for joint in &physics.joints {
-        unique(&mut joints, joint.joint_id.clone(), "joint")?;
-        if !bodies.contains_key(&joint.body_a) || !bodies.contains_key(&joint.body_b) {
-            return Err(ExchangeError::new(
-                "REFERENCE_UNRESOLVED",
-                "joint body is absent",
-            ));
-        }
-        if joint.body_a == joint.body_b {
-            return Err(ExchangeError::new(
-                "INVALID_PHYSICS",
-                "joint endpoints must be different bodies",
-            ));
-        }
-        joint.frame_a.validate().map_err(transform_error)?;
-        joint.frame_b.validate().map_err(transform_error)?;
-        if let Some(limits) = &joint.limits {
-            finite(&[limits.lower, limits.upper], "joint limits")?;
-            if limits.lower > limits.upper
-                || (joint.kind == JointKind::Hinge && limits.unit != JointLimitUnit::Radians)
-                || (joint.kind == JointKind::Slider && limits.unit != JointLimitUnit::Meters)
-            {
-                return Err(ExchangeError::new(
-                    "INVALID_PHYSICS",
-                    "joint limit range or unit is invalid",
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn validate_overrides(instance: &Instance, prefab: &Prefab) -> ExchangeResult<()> {
@@ -771,111 +383,6 @@ fn selection_budget(value: &Value) -> ExchangeResult<()> {
                 "selection exceeds definition node budget",
             ));
         }
-    }
-    Ok(())
-}
-
-fn physics_budget(value: &Value) -> ExchangeResult<()> {
-    for (field, limit) in [
-        ("materials", 4096),
-        ("bodies", 16384),
-        ("colliders", 65536),
-        ("joints", 65536),
-        ("requiredCapabilities", 4096),
-    ] {
-        if crate::array(value, field)?.len() > limit {
-            return Err(ExchangeError::new(
-                "BUDGET_EXCEEDED",
-                format!("physics {field} exceeds its budget"),
-            ));
-        }
-    }
-    let mut bindings = 0_usize;
-    let mut collider_links = 0_usize;
-    for body in crate::array(value, "bodies")? {
-        bindings = bindings
-            .checked_add(crate::array(body, "visualBindings")?.len())
-            .ok_or_else(|| {
-                ExchangeError::new("BUDGET_EXCEEDED", "physics visual binding count overflow")
-            })?;
-        if bindings > 65536 {
-            return Err(ExchangeError::new(
-                "BUDGET_EXCEEDED",
-                "physics exceeds visual binding budget",
-            ));
-        }
-        collider_links = collider_links
-            .checked_add(crate::array(body, "colliderIds")?.len())
-            .ok_or_else(|| {
-                ExchangeError::new(
-                    "BUDGET_EXCEEDED",
-                    "physics collider reference count overflow",
-                )
-            })?;
-        if collider_links > 65536 {
-            return Err(ExchangeError::new(
-                "BUDGET_EXCEEDED",
-                "physics exceeds collider reference budget",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn deserialize_safe_u64<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<u64, D::Error> {
-    let value = serde_json::Number::deserialize(deserializer)?;
-    let number = value
-        .as_f64()
-        .ok_or_else(|| serde::de::Error::custom("collision group must be numeric"))?;
-    if number.is_finite() && number.fract() == 0.0 && (0.0..=9007199254740991.0).contains(&number) {
-        Ok(number as u64)
-    } else {
-        Err(serde::de::Error::custom(
-            "collision group must be a nonnegative safe JSON integer",
-        ))
-    }
-}
-
-fn unique<T: Ord>(set: &mut BTreeSet<T>, item: T, kind: &str) -> ExchangeResult<()> {
-    if !set.insert(item) {
-        return Err(ExchangeError::new(
-            "DUPLICATE_ID",
-            format!("duplicate {kind} ID"),
-        ));
-    }
-    Ok(())
-}
-
-fn finite(values: &[f64], field: &str) -> ExchangeResult<()> {
-    if values.iter().any(|value| !value.is_finite()) {
-        return Err(ExchangeError::new(
-            "INVALID_PHYSICS",
-            format!("{field} must be finite"),
-        ));
-    }
-    Ok(())
-}
-
-fn positive(values: &[f64], field: &str) -> ExchangeResult<()> {
-    finite(values, field)?;
-    if values.iter().any(|value| *value <= 0.0) {
-        return Err(ExchangeError::new(
-            "INVALID_PHYSICS",
-            format!("{field} must be positive"),
-        ));
-    }
-    Ok(())
-}
-
-fn nonnegative(values: &[f64], field: &str) -> ExchangeResult<()> {
-    finite(values, field)?;
-    if values.iter().any(|value| *value < 0.0) {
-        return Err(ExchangeError::new(
-            "INVALID_PHYSICS",
-            format!("{field} must be nonnegative"),
-        ));
     }
     Ok(())
 }

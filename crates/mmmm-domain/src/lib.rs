@@ -3,8 +3,10 @@
 //! canonical validator before they become typed immutable domain inputs.
 
 pub mod commands;
+pub mod coordinates;
 pub mod graph;
 pub mod instance;
+pub mod physics;
 pub mod prefab;
 pub mod state;
 pub mod time;
