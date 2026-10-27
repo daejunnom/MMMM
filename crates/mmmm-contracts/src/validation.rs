@@ -1,12 +1,13 @@
 //! Schema validation is a format boundary, not authorization or a claim that a
 //! referenced object, world, vendor, or release evidence exists.
 
-pub use crate::strict_json::ExactSelector;
+pub use crate::strict_json::{ExactSelector, PrefabExactLocation};
 use crate::{
     CANONICAL_SCHEMA, CANONICAL_SCHEMA_ID, CONTRACT_VERSION, FUNCTION_INDEX, RationalTime,
     strict_json::{
-        ControlledJsonError, JsonError, JsonLimits, RawExactError, check_value, parse_json,
-        parse_json_with_exact_capture,
+        ControlledJsonError, JsonError, JsonLimits, RawExactError, RawPrefabExactError,
+        check_value, parse_json, parse_json_with_exact_capture,
+        parse_prefab_json_with_exact_capture,
     },
 };
 use jsonschema::{
@@ -105,6 +106,70 @@ impl<E: Error + 'static> Error for ControlledContractError<E> {
             Self::Control(error) => Some(error),
             Self::ExactInteger { .. } | Self::CaptureUnavailable => None,
         }
+    }
+}
+
+/// Exact Prefab numeric validation is opt-in and does not change existing
+/// ResourceRef or Physics errors. The selected location never exposes the
+/// input's original numeric token.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ControlledPrefabContractError<E> {
+    Contract(ContractError),
+    ExactInteger { location: PrefabExactLocation },
+    CaptureUnavailable,
+    Control(E),
+}
+
+impl<E: fmt::Display> fmt::Display for ControlledPrefabContractError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Contract(error) => error.fmt(f),
+            Self::ExactInteger { location } => match location {
+                PrefabExactLocation::Resource(index) => write!(
+                    f,
+                    "Prefab resource {index} sizeBytes is not an exact safe JSON integer"
+                ),
+                PrefabExactLocation::Geometry(index) => write!(
+                    f,
+                    "Prefab node {index} geometry sizeBytes is not an exact safe JSON integer"
+                ),
+            },
+            Self::CaptureUnavailable => f.write_str("Bounded raw numeric capture is unavailable"),
+            Self::Control(error) => error.fmt(f),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for ControlledPrefabContractError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Contract(error) => Some(error),
+            Self::Control(error) => Some(error),
+            Self::ExactInteger { .. } | Self::CaptureUnavailable => None,
+        }
+    }
+}
+
+fn controlled_prefab_json_error<E>(
+    error: ControlledJsonError<E>,
+) -> ControlledPrefabContractError<E> {
+    match error {
+        ControlledJsonError::Json(error) => ControlledPrefabContractError::Contract(error.into()),
+        ControlledJsonError::Control(error) => ControlledPrefabContractError::Control(error),
+    }
+}
+
+fn controlled_prefab_exact_error<E>(
+    error: RawPrefabExactError<E>,
+) -> ControlledPrefabContractError<E> {
+    match error {
+        RawPrefabExactError::ExactInteger { location } => {
+            ControlledPrefabContractError::ExactInteger { location }
+        }
+        RawPrefabExactError::CaptureUnavailable => {
+            ControlledPrefabContractError::CaptureUnavailable
+        }
+        RawPrefabExactError::Control(error) => ControlledPrefabContractError::Control(error),
     }
 }
 
@@ -339,6 +404,31 @@ impl ContractValidator {
         Ok(parsed.into_value())
     }
 
+    /// Strictly parse and validate a Prefab, then check the original decimal
+    /// lexemes of `resources[*].sizeBytes` and `nodes[*].geometryResource`
+    /// `sizeBytes` against the same immutable bytes. The returned Value does
+    /// not attest a different input, resource availability or authorization.
+    /// The caller's parsing limits and the existing private capture and schema
+    /// budgets apply; checkpoints are cooperative, including around schema
+    /// validation, and cannot preempt one validation call.
+    pub fn parse_validate_prefab_exact_with_control<E>(
+        &self,
+        bytes: &[u8],
+        limits: JsonLimits,
+        mut checkpoint: impl FnMut() -> Result<(), E>,
+    ) -> Result<Value, ControlledPrefabContractError<E>> {
+        let parsed = parse_prefab_json_with_exact_capture(bytes, limits, &mut checkpoint)
+            .map_err(controlled_prefab_json_error)?;
+        self.validate("Prefab", parsed.value())
+            .map_err(ControlledPrefabContractError::Contract)?;
+        checkpoint().map_err(ControlledPrefabContractError::Control)?;
+        parsed
+            .validate_exact(&mut checkpoint)
+            .map_err(controlled_prefab_exact_error)?;
+        checkpoint().map_err(ControlledPrefabContractError::Control)?;
+        Ok(parsed.into_value())
+    }
+
     pub fn validate(&self, definition: &str, value: &Value) -> Result<(), ContractError> {
         let violations = self.violations(definition, value)?;
         if violations.is_empty() {
@@ -543,6 +633,258 @@ mod tests {
             JsonLimits::default(),
             || Ok::<(), std::convert::Infallible>(()),
         )
+    }
+
+    // Derive these bytes from the existing example, replacing distinct integer
+    // sentinels after serialization so an original decimal lexeme is retained.
+    fn prefab_exact_wire(tokens: [&str; 5], nodes_first: bool, escaped: bool) -> Vec<u8> {
+        let mut prefab = parse_json(include_bytes!("../../../examples/prefab.json")).unwrap();
+        let resource = |id: &str, size: u64| {
+            json!({
+                "resourceId": id,
+                "sha256": "0".repeat(64),
+                "mediaType": "application/octet-stream",
+                "sizeBytes": size,
+            })
+        };
+        prefab["resources"] = json!([
+            resource("resource-one", 610001),
+            resource("resource-two", 610002),
+        ]);
+        let nodes = prefab["nodes"].as_array_mut().unwrap();
+        nodes.truncate(1);
+        let mut second = nodes[0].clone();
+        second["nodeId"] = json!("node-exact-second");
+        nodes.push(second);
+        nodes[0]["geometryResource"] = resource("resource-one", 610003);
+        nodes[1]["geometryResource"] = resource("resource-two", 610004);
+        nodes[0]["extensions"]["test:opaque"] = json!({
+            "resourceId": "opaque",
+            "sha256": "0".repeat(64),
+            "mediaType": "application/octet-stream",
+            "sizeBytes": 610005,
+        });
+        nodes[0]["display"] = json!({
+            "kind": "block", "payload": {}, "resourceRefs": ["resource-one"]
+        });
+        let root = prefab.as_object_mut().unwrap();
+        let nodes = root.remove("nodes").unwrap();
+        let resources = root.remove("resources").unwrap();
+        let mut text = serde_json::to_string(&prefab).unwrap();
+        assert_eq!(text.pop(), Some('}'));
+        let (first_name, first, second_name, second) = if nodes_first {
+            ("nodes", &nodes, "resources", &resources)
+        } else {
+            ("resources", &resources, "nodes", &nodes)
+        };
+        text.push_str(&format!(
+            ",\"{}\":{},\"{}\":{}}}",
+            first_name,
+            serde_json::to_string(first).unwrap(),
+            second_name,
+            serde_json::to_string(second).unwrap(),
+        ));
+        for (sentinel, token) in ["610001", "610002", "610003", "610004", "610005"]
+            .into_iter()
+            .zip(tokens)
+        {
+            assert_eq!(text.matches(sentinel).count(), 1);
+            text = text.replacen(sentinel, token, 1);
+        }
+        if escaped {
+            text = text.replacen("\"resources\":", "\"\\u0072esources\":", 1);
+            let start = if nodes_first {
+                text.find("\"geometryResource\":").unwrap()
+            } else {
+                0
+            };
+            let key = "\"sizeBytes\":";
+            let index = start + text[start..].find(key).unwrap();
+            text.replace_range(index..index + key.len(), "\"\\u0073izeBytes\":");
+        }
+        text.into_bytes()
+    }
+
+    fn exact_prefab(
+        bytes: &[u8],
+    ) -> Result<Value, ControlledPrefabContractError<std::convert::Infallible>> {
+        validator().parse_validate_prefab_exact_with_control(bytes, JsonLimits::default(), || {
+            Ok::<(), std::convert::Infallible>(())
+        })
+    }
+
+    #[test]
+    fn prefab_exact_checks_both_paths_in_either_root_key_order() {
+        for nodes_first in [false, true] {
+            for escaped in [false, true] {
+                let wire = prefab_exact_wire(
+                    [
+                        "1.0",
+                        "1e0",
+                        "-0.0",
+                        "9007199254740991",
+                        "1.0000000000000001",
+                    ],
+                    nodes_first,
+                    escaped,
+                );
+                let ordinary = validator().parse_and_validate("Prefab", &wire).unwrap();
+                assert_eq!(exact_prefab(&wire).unwrap(), ordinary);
+                for (position, location) in [
+                    (0, PrefabExactLocation::Resource(0)),
+                    (1, PrefabExactLocation::Resource(1)),
+                    (2, PrefabExactLocation::Geometry(0)),
+                    (3, PrefabExactLocation::Geometry(1)),
+                ] {
+                    let mut tokens = ["1", "1", "1", "1", "1"];
+                    tokens[position] = "1.0000000000000001";
+                    let wire = prefab_exact_wire(tokens, nodes_first, escaped);
+                    assert!(validator().parse_and_validate("Prefab", &wire).is_ok());
+                    let error = exact_prefab(&wire).unwrap_err();
+                    assert!(
+                        matches!(&error, ControlledPrefabContractError::ExactInteger { location: actual } if *actual == location)
+                    );
+                    assert!(!error.to_string().contains("1.0000000000000001"));
+                }
+            }
+        }
+        for (position, token) in [(0, "0.5"), (1, "9007199254740992"), (2, "-1")] {
+            let mut tokens = ["1"; 5];
+            tokens[position] = token;
+            let wire = prefab_exact_wire(tokens, false, false);
+            assert!(
+                exact_prefab(&wire).is_err(),
+                "position {position}, token {token}"
+            );
+        }
+        let valid = prefab_exact_wire(["1"; 5], false, false);
+        let mut value = parse_json(&valid).unwrap();
+        value["resources"] = json!([]);
+        for node in value["nodes"].as_array_mut().unwrap() {
+            node.as_object_mut().unwrap().remove("geometryResource");
+        }
+        let wire = serde_json::to_vec(&value).unwrap();
+        assert_eq!(exact_prefab(&wire).unwrap(), value);
+    }
+
+    #[test]
+    fn prefab_exact_preserves_strict_schema_limits_and_control_errors() {
+        let wire = prefab_exact_wire(["1.0000000000000001", "1", "1", "1", "1"], false, false);
+        let text = std::str::from_utf8(&wire).unwrap();
+        let duplicate = text.replacen(
+            "\"sizeBytes\":1.0000000000000001",
+            "\"sizeBytes\":1.0000000000000001,\"\\u0073izeBytes\":1",
+            1,
+        );
+        assert_ne!(duplicate, text);
+        let strict = parse_json(duplicate.as_bytes()).unwrap_err();
+        assert_eq!(
+            exact_prefab(duplicate.as_bytes()),
+            Err(ControlledPrefabContractError::Contract(
+                ContractError::Json(strict)
+            ))
+        );
+        let malformed = text.replacen("1.0000000000000001", "1e+", 1);
+        let strict = parse_json(malformed.as_bytes()).unwrap_err();
+        assert_eq!(
+            exact_prefab(malformed.as_bytes()),
+            Err(ControlledPrefabContractError::Contract(
+                ContractError::Json(strict)
+            ))
+        );
+        let invalid_schema = text.replacen(
+            "\"resourceId\":\"resource-one\"",
+            "\"resourceId\":\"resource-one\",\"extra\":true",
+            1,
+        );
+        assert_ne!(invalid_schema, text);
+        let schema = validator()
+            .parse_and_validate("Prefab", invalid_schema.as_bytes())
+            .unwrap_err();
+        assert!(matches!(schema, ContractError::Violations(_)));
+        assert_eq!(
+            exact_prefab(invalid_schema.as_bytes()),
+            Err(ControlledPrefabContractError::Contract(schema))
+        );
+        for limits in [
+            JsonLimits {
+                max_bytes: wire.len() - 1,
+                ..JsonLimits::default()
+            },
+            JsonLimits {
+                max_depth: 0,
+                ..JsonLimits::default()
+            },
+            JsonLimits {
+                max_nodes: 3,
+                ..JsonLimits::default()
+            },
+        ] {
+            let strict = crate::strict_json::parse_json_with_limits(&wire, limits).unwrap_err();
+            assert_eq!(
+                validator().parse_validate_prefab_exact_with_control(
+                    &wire,
+                    limits,
+                    || Ok::<(), ()>(())
+                ),
+                Err(ControlledPrefabContractError::Contract(
+                    ContractError::Json(strict)
+                ))
+            );
+        }
+        let long_integer = format!("1.{}", "0".repeat(16 * 1024));
+        let wire = prefab_exact_wire(
+            [
+                &long_integer,
+                &long_integer,
+                &long_integer,
+                &long_integer,
+                "1",
+            ],
+            true,
+            false,
+        );
+        let parse_checks = Cell::new(0usize);
+        let parsed = parse_prefab_json_with_exact_capture(&wire, JsonLimits::default(), || {
+            parse_checks.set(parse_checks.get() + 1);
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        validator().validate("Prefab", parsed.value()).unwrap();
+        let checks = Cell::new(0usize);
+        validator()
+            .parse_validate_prefab_exact_with_control(&wire, JsonLimits::default(), || {
+                checks.set(checks.get() + 1);
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+        let mid_token = parse_checks.get() + 3;
+        assert!(mid_token < checks.get());
+        for stop_at in [1usize, mid_token, checks.get()] {
+            let mut calls = 0usize;
+            let mut original = Some(Box::new(stop_at));
+            let address = original.as_ref().unwrap().as_ref() as *const usize;
+            let result = validator().parse_validate_prefab_exact_with_control(
+                &wire,
+                JsonLimits::default(),
+                || {
+                    calls += 1;
+                    assert!(calls <= stop_at);
+                    if calls == stop_at {
+                        Err(original.take().unwrap())
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            match result {
+                Err(ControlledPrefabContractError::Control(error)) => {
+                    assert_eq!(error.as_ref() as *const usize, address)
+                }
+                other => panic!("Expected original control failure, got {other:?}"),
+            }
+            assert_eq!(calls, stop_at);
+        }
     }
 
     #[test]

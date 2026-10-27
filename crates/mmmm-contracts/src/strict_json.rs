@@ -98,6 +98,16 @@ pub enum ExactSelector {
     PhysicsDefinition,
 }
 
+/// Position of a ResourceRef whose original Prefab number is not an exact safe
+/// integer. Indices refer to the corresponding arrays in that Prefab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefabExactLocation {
+    /// `resources[index].sizeBytes`.
+    Resource(usize),
+    /// `nodes[index].geometryResource.sizeBytes`.
+    Geometry(usize),
+}
+
 #[derive(Clone, Copy)]
 enum RawPath {
     Ignore,
@@ -110,6 +120,14 @@ enum RawPath {
     InnerShape(usize),
     Geometry(usize),
     GeometrySize(usize),
+    PrefabRoot,
+    PrefabResources,
+    PrefabResource(usize),
+    PrefabResourceSize(usize),
+    PrefabNodes,
+    PrefabNode(usize),
+    PrefabGeometry(usize),
+    PrefabGeometrySize(usize),
 }
 
 impl RawPath {
@@ -121,6 +139,11 @@ impl RawPath {
             (Self::OuterShape(index), "shape") => Self::InnerShape(index),
             (Self::InnerShape(index), "geometry") => Self::Geometry(index),
             (Self::Geometry(index), "sizeBytes") => Self::GeometrySize(index),
+            (Self::PrefabRoot, "resources") => Self::PrefabResources,
+            (Self::PrefabRoot, "nodes") => Self::PrefabNodes,
+            (Self::PrefabResource(index), "sizeBytes") => Self::PrefabResourceSize(index),
+            (Self::PrefabNode(index), "geometryResource") => Self::PrefabGeometry(index),
+            (Self::PrefabGeometry(index), "sizeBytes") => Self::PrefabGeometrySize(index),
             _ => Self::Ignore,
         }
     }
@@ -128,6 +151,8 @@ impl RawPath {
     fn array_child(self, index: usize) -> Self {
         match self {
             Self::Colliders => Self::Collider(index),
+            Self::PrefabResources => Self::PrefabResource(index),
+            Self::PrefabNodes => Self::PrefabNode(index),
             _ => Self::Ignore,
         }
     }
@@ -135,6 +160,7 @@ impl RawPath {
 
 struct RawCandidate {
     collider: Option<usize>,
+    prefab: Option<PrefabExactLocation>,
     span: Range<usize>,
 }
 
@@ -183,16 +209,26 @@ impl RawCapture {
             self.invalid.set(true);
             return;
         };
-        let collider = match path {
-            RawPath::ResourceSize => None,
-            RawPath::GeometrySize(index) => Some(index),
+        let (collider, prefab) = match path {
+            RawPath::ResourceSize => (None, None),
+            RawPath::GeometrySize(index) => (Some(index), None),
+            RawPath::PrefabResourceSize(index) => {
+                (None, Some(PrefabExactLocation::Resource(index)))
+            }
+            RawPath::PrefabGeometrySize(index) => {
+                (None, Some(PrefabExactLocation::Geometry(index)))
+            }
             _ => return,
         };
         let mut candidates = self.candidates.borrow_mut();
         if candidates.len() >= self.maximum || candidates.try_reserve(1).is_err() {
             self.invalid.set(true);
         } else {
-            candidates.push(RawCandidate { collider, span });
+            candidates.push(RawCandidate {
+                collider,
+                prefab,
+                span,
+            });
         }
     }
 }
@@ -295,6 +331,150 @@ impl RawExactParsed<'_> {
             });
         }
         Ok(())
+    }
+}
+
+/// The Prefab capture is bound to the same bytes and strict parse that supplied
+/// its Value; callers cannot construct or transfer a witness independently.
+pub(crate) struct RawPrefabExactParsed<'a> {
+    bytes: &'a [u8],
+    value: Value,
+    capture: RawCapture,
+}
+
+#[derive(Debug)]
+pub(crate) enum RawPrefabExactError<E> {
+    CaptureUnavailable,
+    ExactInteger { location: PrefabExactLocation },
+    Control(E),
+}
+
+impl RawPrefabExactParsed<'_> {
+    pub(crate) fn value(&self) -> &Value {
+        &self.value
+    }
+
+    pub(crate) fn into_value(self) -> Value {
+        self.value
+    }
+
+    /// Call only after validating `value()` against Prefab. The two arrays can
+    /// occur in either source-key order; each expected location must appear
+    /// exactly once, while an unexpected or duplicate capture fails closed.
+    pub(crate) fn validate_exact<E>(
+        &self,
+        checkpoint: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<(), RawPrefabExactError<E>> {
+        let unavailable = || RawPrefabExactError::CaptureUnavailable;
+        if self.capture.invalid.get()
+            || self.capture.cursor.get() != self.capture.spans.borrow().len()
+        {
+            return Err(unavailable());
+        }
+        let resources = self
+            .value
+            .get("resources")
+            .and_then(Value::as_array)
+            .ok_or_else(unavailable)?;
+        let nodes = self
+            .value
+            .get("nodes")
+            .and_then(Value::as_array)
+            .ok_or_else(unavailable)?;
+        if resources
+            .len()
+            .checked_add(nodes.len())
+            .is_none_or(|count| count > self.capture.maximum)
+        {
+            return Err(unavailable());
+        }
+        let candidates = self.capture.candidates.borrow();
+        let mut resource_candidates: Vec<Option<&RawCandidate>> = Vec::new();
+        let mut geometry_candidates: Vec<Option<&RawCandidate>> = Vec::new();
+        resource_candidates
+            .try_reserve_exact(resources.len())
+            .map_err(|_| unavailable())?;
+        geometry_candidates
+            .try_reserve_exact(nodes.len())
+            .map_err(|_| unavailable())?;
+        resource_candidates.resize(resources.len(), None);
+        geometry_candidates.resize(nodes.len(), None);
+        for (index, candidate) in candidates.iter().enumerate() {
+            if index % 128 == 0 {
+                checkpoint().map_err(RawPrefabExactError::Control)?;
+            }
+            let slot = match candidate.prefab {
+                Some(PrefabExactLocation::Resource(index)) => resource_candidates.get_mut(index),
+                Some(PrefabExactLocation::Geometry(index)) => geometry_candidates.get_mut(index),
+                None => None,
+            }
+            .ok_or_else(unavailable)?;
+            if slot.replace(candidate).is_some() {
+                return Err(unavailable());
+            }
+        }
+        for (index, candidate) in resource_candidates.into_iter().enumerate() {
+            if index % 128 == 0 {
+                checkpoint().map_err(RawPrefabExactError::Control)?;
+            }
+            self.validate_candidate(candidate.ok_or_else(unavailable)?, checkpoint)?;
+        }
+        for (index, (node, candidate)) in nodes.iter().zip(geometry_candidates).enumerate() {
+            if index % 128 == 0 {
+                checkpoint().map_err(RawPrefabExactError::Control)?;
+            }
+            match (node.get("geometryResource"), candidate) {
+                (Some(_), Some(candidate)) => self.validate_candidate(candidate, checkpoint)?,
+                (None, None) => (),
+                _ => return Err(unavailable()),
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_candidate<E>(
+        &self,
+        candidate: &RawCandidate,
+        checkpoint: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<(), RawPrefabExactError<E>> {
+        let unavailable = || RawPrefabExactError::CaptureUnavailable;
+        let location = candidate.prefab.ok_or_else(unavailable)?;
+        let token = self
+            .bytes
+            .get(candidate.span.clone())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .ok_or_else(unavailable)?;
+        if crate::number::exact_safe_u64_json_lexeme_with_control(token, checkpoint)
+            .map_err(RawPrefabExactError::Control)?
+            .is_none()
+        {
+            return Err(RawPrefabExactError::ExactInteger { location });
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn parse_prefab_json_with_exact_capture<E>(
+    bytes: &[u8],
+    limits: JsonLimits,
+    checkpoint: impl FnMut() -> Result<(), E>,
+) -> Result<RawPrefabExactParsed<'_>, ControlledJsonError<E>> {
+    let control = ParseControl {
+        checkpoint: RefCell::new(checkpoint),
+        failure: RefCell::new(None),
+    };
+    let capture = RawCapture::new(limits, bytes.len());
+    let result =
+        parse_json_controlled(bytes, limits, &control, Some(&capture), RawPath::PrefabRoot);
+    match control.failure.into_inner() {
+        Some(error) => Err(ControlledJsonError::Control(error)),
+        None => result
+            .map(|value| RawPrefabExactParsed {
+                bytes,
+                value,
+                capture,
+            })
+            .map_err(ControlledJsonError::Json),
     }
 }
 
@@ -915,6 +1095,49 @@ mod tests {
             parsed.validate_exact(&mut || Ok::<(), Infallible>(())),
             Err(RawExactError::ExactInteger { collider: None })
         ));
+    }
+
+    #[test]
+    fn prefab_capture_rejects_missing_duplicate_and_unexpected_locations() {
+        // Exercise impossible capture inconsistencies directly. The public
+        // wrapper additionally performs Prefab schema validation first.
+        let bytes =
+            br#"{"nodes":[{"geometryResource":{"sizeBytes":2}}],"resources":[{"sizeBytes":1}]}"#;
+        let parsed = parse_prefab_json_with_exact_capture(bytes, JsonLimits::default(), || {
+            Ok::<(), Infallible>(())
+        })
+        .unwrap();
+        parsed
+            .validate_exact(&mut || Ok::<(), Infallible>(()))
+            .unwrap();
+
+        for fault in 0..3 {
+            let parsed = parse_prefab_json_with_exact_capture(bytes, JsonLimits::default(), || {
+                Ok::<(), Infallible>(())
+            })
+            .unwrap();
+            {
+                let mut candidates = parsed.capture.candidates.borrow_mut();
+                match fault {
+                    0 => {
+                        assert!(candidates.pop().is_some());
+                    }
+                    1 => {
+                        let duplicate = RawCandidate {
+                            collider: candidates[0].collider,
+                            prefab: candidates[0].prefab,
+                            span: candidates[0].span.clone(),
+                        };
+                        candidates.push(duplicate);
+                    }
+                    _ => candidates[0].prefab = Some(PrefabExactLocation::Geometry(1)),
+                }
+            }
+            assert!(matches!(
+                parsed.validate_exact(&mut || Ok::<(), Infallible>(())),
+                Err(RawPrefabExactError::CaptureUnavailable)
+            ));
+        }
     }
 
     #[test]

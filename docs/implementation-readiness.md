@@ -4177,3 +4177,10 @@ Runtime source의 Prefab display `resourceRefs`는 정본에 따라 문자열 Re
 commit 진입점의 정상·미등록·미선언·reader 권한 거절 검사를 작성했으며 실행 결과는
 후속 CI에서 확인한다. 원인 실패 전에 일반 문서 CAS가 prestage될 수 있고 게임 렌더링이나
 SourceAdmission을 검증하는 변경은 아니다.
+
+Prefab의 `resources[*].sizeBytes`와 `nodes[*].geometryResource.sizeBytes` 원 숫자를
+검사하는 별도 opt-in 계약 API를 작성했다. 실제 원 bytes의 strict parse와 schema 뒤에
+키 순서와 무관한 각 배열 위치를 대조하며 capture 누락·중복·예상 밖 위치는 거절한다.
+기존 selector와 오류 enum은 유지하고 display ID와 불투명 확장은 선택하지 않는다.
+검사는 작성했으나 실제 실행은 후속 CI에서 확인한다. 이 단계는 Coordinator/Runtime
+진입점, 현재 자원 권한이나 제품 인수에 아직 연결되지 않았다.
