@@ -27,6 +27,7 @@ policies/default-policy.json -text
 policies/vendor-registry.json -text
 tests/*-index.json -text
 tests/digest-fixtures.json -text
+jvm/provider-sdk/src/test/resources/action-descriptor-canonical.json -text
 docs/reference/** -text
 tests/**/fixtures/** -text
 crates/**/tests/fixtures/** -text

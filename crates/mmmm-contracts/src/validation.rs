@@ -374,6 +374,157 @@ mod tests {
         }
     }
 
+    const ACTION_DESCRIPTOR_FIELDS: [&str; 21] = [
+        "actionId",
+        "contractVersion",
+        "title",
+        "summary",
+        "semanticKind",
+        "inputSchema",
+        "outputSchema",
+        "side",
+        "requiredContext",
+        "effect",
+        "planning",
+        "completion",
+        "cancellation",
+        "recovery",
+        "idempotency",
+        "guarantees",
+        "limitations",
+        "requiredPermissions",
+        "verificationRequirement",
+        "implementationDigest",
+        "versionEvidence",
+    ];
+
+    fn original_action_descriptor() -> Value {
+        let provider = validator()
+            .parse_and_validate(
+                "ProviderDescriptor",
+                include_bytes!("../../../examples/provider-supported.json"),
+            )
+            .unwrap();
+        provider["actions"][0].clone()
+    }
+
+    #[test]
+    fn original_action_descriptor_matches_shared_canonical_bytes() {
+        let original = original_action_descriptor();
+        validator().validate("ActionDescriptor", &original).unwrap();
+        let fields = original.as_object().unwrap();
+        assert_eq!(fields.len(), ACTION_DESCRIPTOR_FIELDS.len());
+        for name in ACTION_DESCRIPTOR_FIELDS {
+            assert!(fields.contains_key(name), "missing original field {name}");
+        }
+
+        // The same fixed bytes are consumed by the Java test. This shared
+        // reference does not itself execute a Rust/Java process exchange.
+        let golden = include_bytes!(
+            "../../../jvm/provider-sdk/src/test/resources/action-descriptor-canonical.json"
+        );
+        let canonical = crate::canonical_bytes(&original).unwrap();
+        assert_eq!(canonical.as_slice(), golden.as_slice());
+        let reparsed = validator()
+            .parse_and_validate("ActionDescriptor", golden)
+            .unwrap();
+        assert_eq!(reparsed, original);
+        assert_eq!(crate::canonical_bytes(&reparsed).unwrap(), canonical);
+        assert_eq!(
+            crate::projected_digest("ActionDescriptor", &original).unwrap(),
+            crate::canonical_digest(&original).unwrap()
+        );
+        assert_eq!(
+            crate::canonical_digest(&original).unwrap(),
+            crate::raw_digest(golden)
+        );
+    }
+
+    #[test]
+    fn action_descriptor_required_fields_and_closed_enums_are_enforced() {
+        let original = original_action_descriptor();
+        for name in ACTION_DESCRIPTOR_FIELDS {
+            let mut missing = original.clone();
+            missing.as_object_mut().unwrap().remove(name);
+            assert!(
+                validator().validate("ActionDescriptor", &missing).is_err(),
+                "{name}"
+            );
+            let mut null = original.clone();
+            null[name] = Value::Null;
+            assert!(
+                validator().validate("ActionDescriptor", &null).is_err(),
+                "{name}"
+            );
+        }
+        let mut unknown = original.clone();
+        unknown["undeclared"] = json!(true);
+        assert!(validator().validate("ActionDescriptor", &unknown).is_err());
+        for name in [
+            "side",
+            "effect",
+            "planning",
+            "completion",
+            "cancellation",
+            "recovery",
+            "idempotency",
+            "verificationRequirement",
+            "versionEvidence",
+        ] {
+            let mut invalid = original.clone();
+            invalid[name] = json!("unknown_enum_value");
+            assert!(
+                validator().validate("ActionDescriptor", &invalid).is_err(),
+                "{name}"
+            );
+        }
+        let mut unknown_context = original.clone();
+        unknown_context["requiredContext"] = json!(["not_a_context"]);
+        assert!(
+            validator()
+                .validate("ActionDescriptor", &unknown_context)
+                .is_err()
+        );
+        let mut invalid_version = original;
+        invalid_version["contractVersion"] = json!("1.2");
+        assert!(
+            validator()
+                .validate("ActionDescriptor", &invalid_version)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn action_descriptor_preserves_schema_permitted_arrays_and_nested_values() {
+        let original = original_action_descriptor();
+        for name in ["requiredContext", "guarantees", "requiredPermissions"] {
+            let mut duplicate = original.clone();
+            let values = duplicate[name].as_array_mut().unwrap();
+            values.push(values.first().unwrap().clone());
+            assert!(
+                validator()
+                    .validate("ActionDescriptor", &duplicate)
+                    .is_err(),
+                "{name}"
+            );
+        }
+
+        let mut allowed = original;
+        allowed["contractVersion"] = json!("1.2.3");
+        allowed["limitations"] = json!(["same limitation", "same limitation"]);
+        allowed["inputSchema"]["x-fixture"] = json!({"nested": [1, {"keep": true}]});
+        allowed["outputSchema"]["x-fixture"] =
+            json!({"description": "preserve unknown schema content"});
+        validator().validate("ActionDescriptor", &allowed).unwrap();
+        let encoded = crate::canonical_bytes(&allowed).unwrap();
+        assert_eq!(
+            validator()
+                .parse_and_validate("ActionDescriptor", &encoded)
+                .unwrap(),
+            allowed
+        );
+    }
+
     #[test]
     fn unknown_fields_version_drift_and_unreduced_time_are_rejected() {
         assert!(

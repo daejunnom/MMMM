@@ -5,6 +5,7 @@ package io.github.daejunnom.mmmm.fixture.provider;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.daejunnom.mmmm.fixture.legacy.LegacyCounterApi;
 import io.github.daejunnom.mmmm.fixture.legacy.LegacyCounterException;
+import io.github.daejunnom.mmmm.sdk.ActionDescriptor;
 import io.github.daejunnom.mmmm.sdk.ContractException;
 import io.github.daejunnom.mmmm.sdk.ContractJson;
 import io.github.daejunnom.mmmm.sdk.Invocation;
@@ -37,7 +38,7 @@ public final class FixtureProvider implements Provider {
         // Per-registration transient host callback state. The original host
         // handle binds each entry to one binding/session/context; no journal.
         ActionSet actions = new ActionSet(contracts, digest, counter);
-        registrar.action(read, (invocation, local) -> {
+        registrar.registerAction(new ActionDescriptor(contracts, read), (invocation, local) -> {
             actions.verify(invocation, read);
             return local.onGameThread(() -> actions.read(local));
         }, new OptionalCallbacks(actions.prepare(read), null, null, (request, local) -> {

@@ -6,6 +6,13 @@ import com.fasterxml.jackson.databind.JsonNode;
 @FunctionalInterface
 public interface Registrar {
     void action(JsonNode descriptor, ActionHandler handler, OptionalCallbacks callbacks);
+
+    /** Registers an immutable typed descriptor through the host's existing registration boundary. */
+    default void registerAction(ActionDescriptor descriptor, ActionHandler handler, OptionalCallbacks callbacks) {
+        if (descriptor == null) throw new ContractException("CONTRACT_INVALID", "Action descriptor is required");
+        action(descriptor.wire(), handler, callbacks);
+    }
+
     /**
      * Explicit source-to-undo relationship in the same trusted provider binding. Finish all
      * registrations before trusted role inspection seals the host Registrar generation. An

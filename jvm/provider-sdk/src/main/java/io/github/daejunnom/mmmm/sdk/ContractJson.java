@@ -195,6 +195,9 @@ public final class ContractJson {
         catch (NoSuchAlgorithmException exception) { throw new AssertionError(exception); }
     }
 
+    // Reuse the exact validation tree policy for snapshot copies without serialization.
+    static void checkSnapshotTree(JsonNode value) { checkTree(value, new int[] {0, 0}, 0); }
+
     private static void checkTree(JsonNode node, int[] count, int depth) {
         if (++count[0] > 100_000 || depth > 96) throw invalid("JSON exceeds the structural limit");
         if (node.isPojo() || node.isBinary() || node.isMissingNode()) throw invalid("Only JSON tree values are accepted");
