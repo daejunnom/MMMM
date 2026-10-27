@@ -263,6 +263,8 @@ final class ImmutableWireSnapshotsTest {
         private static final long serialVersionUID = 1L;
 
         private SelfCopyingObjectNode() { super(com.fasterxml.jackson.databind.node.JsonNodeFactory.instance); }
+        // Jackson's generic deepCopy contract makes this covariant test override unchecked.
+        @SuppressWarnings("unchecked")
         @Override public ObjectNode deepCopy() { return this; }
     }
 
