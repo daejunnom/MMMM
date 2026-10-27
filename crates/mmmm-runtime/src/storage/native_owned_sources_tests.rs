@@ -1264,7 +1264,8 @@ fn raw_physics_fraction_that_rounds_to_integer_is_rejected_before_its_staging() 
     let mut store = root.store();
     let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
     let (batch, index) = rounded_fraction_mesh_batch(&base, true);
-    assert!(index > 0);
+    assert_eq!(index, 3);
+    assert_eq!(batch.pins[2].kind, OwnedDocumentKind::AnimationClip);
     let (_, mesh_bytes) = batch
         .resources
         .iter()
@@ -1278,14 +1279,28 @@ fn raw_physics_fraction_that_rounds_to_integer_is_rejected_before_its_staging() 
         digest: raw_digest(&batch.documents[index]),
         byte_length: batch.documents[index].len() as u64,
     };
-    let prior = BlobRef {
+    assert_eq!(batch.pins[0].kind, OwnedDocumentKind::Prefab);
+    assert_eq!(batch.pins[1].kind, OwnedDocumentKind::Instance);
+    let pending_prefab = BlobRef {
         digest: raw_digest(&batch.documents[0]),
         byte_length: batch.documents[0].len() as u64,
     };
-    assert_ne!(mesh_blob.digest, rejected_physics_blob.digest);
-    assert_ne!(prior.digest, mesh_blob.digest);
-    assert_ne!(prior.digest, rejected_physics_blob.digest);
-    for blob in [&mesh_blob, &rejected_physics_blob, &prior] {
+    let prior_instance = BlobRef {
+        digest: raw_digest(&batch.documents[1]),
+        byte_length: batch.documents[1].len() as u64,
+    };
+    let blobs = [
+        &mesh_blob,
+        &rejected_physics_blob,
+        &pending_prefab,
+        &prior_instance,
+    ];
+    for (index, blob) in blobs.iter().enumerate() {
+        for other in blobs.iter().skip(index + 1) {
+            assert_ne!(blob.digest, other.digest);
+        }
+    }
+    for blob in blobs {
         assert!(matches!(
             store.read_blob(blob),
             Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
@@ -1302,16 +1317,19 @@ fn raw_physics_fraction_that_rounds_to_integer_is_rejected_before_its_staging() 
     assert_unchanged(&store, &baseline, &base);
     assert!(!permit.0.final_rows_observed.get());
 
-    // The rejected Physics and new mesh resource remain absent from CAS.
-    // A previous non-Physics document was already staged; unchanged metadata
-    // does not imply that its unreferenced CAS was removed.
-    for blob in [&mesh_blob, &rejected_physics_blob] {
+    // The Prefab now stays pending until exact validation, like Physics and
+    // the raw resource. The earlier ordinary Instance is still prestaged;
+    // unchanged metadata does not mean its unreferenced CAS was removed.
+    for blob in [&mesh_blob, &rejected_physics_blob, &pending_prefab] {
         assert!(matches!(
             store.read_blob(blob),
             Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
         ));
     }
-    assert_eq!(store.read_blob(&prior).unwrap(), batch.documents[0]);
+    assert_eq!(
+        store.read_blob(&prior_instance).unwrap(),
+        batch.documents[1]
+    );
 }
 
 #[test]

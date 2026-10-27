@@ -4205,3 +4205,12 @@ Prefab 두 ResourceRef 위치의 `1.0`·`1e0`에 대해 Coordinator prepare→Ru
 receipt·원 digest/길이와 실제 CAS bytes, 새 workspace scope, 보유 Prefab의 Instance prepare,
 Project 권한 철회 뒤 거절을 연결하는 검사를 작성했다. Instance commit·resource별 ACL·게임은
 그 범위가 아니며, 실제 검사 실행 결과는 후속 CI에서 확인한다.
+
+`57a5e3a`의 Rust140 Linux·macOS 원 테스트는 기존 Physics fraction 검사의 Prefab
+선행 CAS 기대에서 `NotFound`로 실패했다. Prefab은 새 경로에서 exact 이후 stage하므로,
+수정 검사는 고유 digest의 Prefab·Physics·mesh 부재와 일반 Instance의 선행 CAS bytes를
+각각 확인한다. 원 분수 오류와 SQL/head 불변 검사는 유지하며 수정 후 재검사는 별도다.
+같은 head JVM134 Windows는 JVM 결과 메타데이터의 447개 검사와 observer build 뒤,
+vswhere 실행 전 executable hash 8,055ms가 5,000ms 기한을 넘어 실패했다. process·compiler
+선택·ABI witness는 시작되지 않았고 해시 지연 원인은 확정되지 않았다. 두 실패의 원 로그와
+정상 drain/export·scratch 제거·lease 해제 결과를 보존하며 성공으로 재분류하지 않는다.
