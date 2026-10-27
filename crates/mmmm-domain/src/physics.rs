@@ -242,7 +242,12 @@ impl PhysicsDefinition {
     pub fn from_value(value: &Value) -> DomainResult<Self> {
         validate("PhysicsDefinition", value)?;
         physics_budget(value)?;
-        let wire: PhysicsWire = serde_json::from_value(value.clone())
+        // ResourceRef accepts mathematical JSON integers. Limit conversion to
+        // the validated mesh geometry fields on a private copy; callers retain
+        // the original authored Value and own its raw bytes and revision pin.
+        let mut typed = value.clone();
+        normalize_mesh_resource_lengths(&mut typed)?;
+        let wire: PhysicsWire = serde_json::from_value(typed)
             .map_err(|error| DomainError::new("SCHEMA_INVALID", error.to_string()))?;
         validate_graph(&wire)?;
         Ok(Self(wire))
@@ -525,6 +530,55 @@ fn physics_budget(value: &Value) -> DomainResult<()> {
     Ok(())
 }
 
+/// Validate and normalize one mesh geometry ResourceRef on an independent
+/// copy. The authored value, raw bytes, and its projected pin remain owned by
+/// the caller. This is not an assertion that the referenced resource exists.
+pub fn normalize_mesh_resource_ref(value: &Value) -> Result<Value, DomainError> {
+    validate("ResourceRef", value)?;
+    let size = value
+        .get("sizeBytes")
+        .and_then(Value::as_f64)
+        .filter(|size| {
+            size.is_finite()
+                && size.fract() == 0.0
+                && (0.0..=9_007_199_254_740_991.0).contains(size)
+        })
+        .ok_or_else(|| {
+            DomainError::new(
+                "SCHEMA_INVALID",
+                "mesh resource size must be a nonnegative safe JSON integer",
+            )
+        })?;
+    let mut normalized = value.clone();
+    let fields = normalized
+        .as_object_mut()
+        .ok_or_else(|| DomainError::new("SCHEMA_INVALID", "mesh resource must be an object"))?;
+    fields.insert("sizeBytes".into(), Value::from(size as u64));
+    Ok(normalized)
+}
+
+fn normalize_mesh_resource_lengths(value: &mut Value) -> DomainResult<()> {
+    let colliders = value
+        .get_mut("colliders")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| DomainError::new("SCHEMA_INVALID", "Missing array colliders"))?;
+    for collider in colliders {
+        let shape = collider
+            .get_mut("shape")
+            .and_then(|outer| outer.get_mut("shape"))
+            .ok_or_else(|| DomainError::new("SCHEMA_INVALID", "mesh collider shape is missing"))?;
+        if shape.get("kind").and_then(Value::as_str) != Some("mesh") {
+            continue;
+        }
+        let geometry = shape.get_mut("geometry").ok_or_else(|| {
+            DomainError::new("SCHEMA_INVALID", "mesh geometry resource is missing")
+        })?;
+        let normalized = normalize_mesh_resource_ref(geometry)?;
+        *geometry = normalized;
+    }
+    Ok(())
+}
+
 fn deserialize_safe_u64<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<u64, D::Error> {
@@ -585,4 +639,95 @@ fn nonnegative(values: &[f64], field: &str) -> DomainResult<()> {
 
 fn transform_error(error: crate::transform::TransformError) -> DomainError {
     DomainError::new(error.code(), error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CollisionShape, PhysicsDefinition, normalize_mesh_resource_ref, validate};
+    use serde_json::{Value, json};
+
+    fn physics_with_mesh(size: Value) -> Value {
+        // The original authored physics example uses a box. Derive a mesh
+        // shape to cover its nested ResourceRef without inventing a fixture.
+        let mut physics: Value =
+            serde_json::from_slice(include_bytes!("../../../examples/physics-definition.json"))
+                .unwrap();
+        physics["colliders"][0]["shape"]["shape"] = json!({
+            "kind": "mesh",
+            "geometry": {
+                "resourceId": "resource-mesh",
+                "sha256": "0".repeat(64),
+                "mediaType": "application/octet-stream",
+                "sizeBytes": size
+            },
+            "topologyDigest": "1".repeat(64)
+        });
+        physics
+    }
+
+    #[test]
+    fn mesh_resource_size_accepts_mathematical_integers_without_mutating_authored_value() {
+        for (number, expected) in [
+            ("1", 1_u64),
+            ("1.0", 1),
+            ("1e0", 1),
+            ("-0.0", 0),
+            ("9007199254740991.0", 9_007_199_254_740_991),
+        ] {
+            let number: Value = serde_json::from_str(number).unwrap();
+            let physics = physics_with_mesh(number);
+            let before = physics.clone();
+            let geometry = &physics["colliders"][0]["shape"]["shape"]["geometry"];
+            let original_geometry = geometry.clone();
+            let normalized = normalize_mesh_resource_ref(geometry).unwrap();
+            assert_eq!(normalized["sizeBytes"], Value::from(expected));
+            assert_eq!(normalized["resourceId"], geometry["resourceId"]);
+            assert_eq!(normalized["sha256"], geometry["sha256"]);
+            assert_eq!(normalized["mediaType"], geometry["mediaType"]);
+            assert_eq!(*geometry, original_geometry);
+            let before_revision =
+                mmmm_contracts::projected_digest("PhysicsDefinition", &physics).unwrap();
+            validate("PhysicsDefinition", &physics).unwrap();
+            let result = PhysicsDefinition::from_value(&physics).unwrap();
+            let CollisionShape::Mesh { geometry, .. } = &result.colliders()[0].shape.shape else {
+                panic!("the derived collider must remain a mesh");
+            };
+            assert_eq!(geometry.size_bytes, expected);
+            assert_eq!(physics, before);
+            assert_eq!(
+                mmmm_contracts::projected_digest("PhysicsDefinition", &physics).unwrap(),
+                before_revision
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_resource_size_rejects_values_outside_schema_integer_range() {
+        for number in ["-1", "0.5", "9007199254740992", "\"1\""] {
+            let number: Value = serde_json::from_str(number).unwrap();
+            let physics = physics_with_mesh(number);
+            let before = physics.clone();
+            let geometry = &physics["colliders"][0]["shape"]["shape"]["geometry"];
+            assert!(normalize_mesh_resource_ref(geometry).is_err());
+            assert!(validate("PhysicsDefinition", &physics).is_err());
+            assert!(PhysicsDefinition::from_value(&physics).is_err());
+            assert_eq!(physics, before);
+        }
+    }
+
+    #[test]
+    fn mesh_resource_normalizer_rejects_non_resource_objects_without_mutation() {
+        let physics = physics_with_mesh(json!(1));
+        let geometry = &physics["colliders"][0]["shape"]["shape"]["geometry"];
+        let mut missing = geometry.clone();
+        missing.as_object_mut().unwrap().remove("sha256");
+        let mut extra = geometry.clone();
+        extra["unexpected"] = json!(true);
+        for input in [json!(false), missing, extra] {
+            let before = input.clone();
+            let error = normalize_mesh_resource_ref(&input).unwrap_err();
+            assert_eq!(error.code, "SCHEMA_INVALID");
+            assert_eq!(input, before);
+        }
+    }
 }

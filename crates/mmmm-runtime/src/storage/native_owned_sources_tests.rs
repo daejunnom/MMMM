@@ -954,6 +954,121 @@ fn retained_physics_mesh_is_checked_when_new_prefab_binds_its_body() {
 }
 
 #[test]
+fn integral_float_mesh_size_preserves_original_through_batch_and_retained_reads() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let (mut physics, resource, bytes) = physics_mesh_fixture();
+    // 원 ResourceRef의 N.0과 등록 metadata의 정수 N은 수학적으로 같지만
+    // 원 Physics 원문과 projected pin은 정규화된 복사본과 분리해 보존한다.
+    let decimal = format!("{}.0", bytes.len());
+    physics["colliders"][0]["shape"]["shape"]["geometry"]["sizeBytes"] =
+        serde_json::from_str::<Value>(&decimal).unwrap();
+    assert!(resource["sizeBytes"].is_u64());
+    revise("PhysicsDefinition", &mut physics);
+    store
+        .validator
+        .validate("PhysicsDefinition", &physics)
+        .unwrap();
+
+    let first = Batch::from_sources(
+        &base,
+        vec![(OwnedDocumentKind::PhysicsDefinition, physics)],
+        vec![(resource.clone(), bytes.clone())],
+    );
+    let original = parse_json(&first.documents[0]).unwrap();
+    assert!(original["colliders"][0]["shape"]["shape"]["geometry"]["sizeBytes"].is_f64());
+    assert!(
+        std::str::from_utf8(&first.documents[0])
+            .unwrap()
+            .contains(&format!("\"sizeBytes\": {decimal}"))
+    );
+    assert_eq!(
+        verify_projected_digest("PhysicsDefinition", &original).unwrap(),
+        first.pins[0].revision
+    );
+    let permit = TestPermit::new(&root, &initial);
+    let first_receipt = first.commit(&mut store, &permit, &base).unwrap();
+    let mut owned = permit
+        .owned_document_reader(MAX_OWNED_DOCUMENT_BYTES)
+        .unwrap();
+    let loaded = owned
+        .read_known_history_bytes(
+            &store,
+            &permit,
+            &initial.project_id,
+            &first_receipt.project_revision,
+            &first.pins[0],
+        )
+        .unwrap();
+    assert_eq!(loaded.bytes, first.documents[0]);
+    assert_eq!(loaded.document, original);
+    let query = ProjectResourceQuery::Current {
+        resource_id: ResourceId::new("resource-physics-mesh").unwrap(),
+    };
+    let mut resources = permit.resource_reader(MAX_SOURCE_TOTAL).unwrap();
+    let loaded = resources
+        .read(
+            &store,
+            &permit,
+            &ProjectResourceRequest {
+                project: &initial.project_id,
+                current_project_revision: &first_receipt.project_revision,
+                query: &query,
+                expected: Some(&resource),
+            },
+            MAX_SOURCE_TOTAL,
+        )
+        .unwrap();
+    assert_eq!(loaded.bytes, bytes);
+    assert_eq!(loaded.registered.blob.digest, raw_digest(&bytes));
+
+    let second = physics_batch(&first.next, false, false, |_, _| ());
+    let second_receipt = second.commit(&mut store, &permit, &first.next).unwrap();
+    assert_eq!(second_receipt.base_revision, first_receipt.project_revision);
+    let mut owned = permit
+        .owned_document_reader(MAX_OWNED_DOCUMENT_BYTES)
+        .unwrap();
+    let retained = owned
+        .read_known_history_bytes(
+            &store,
+            &permit,
+            &initial.project_id,
+            &second_receipt.project_revision,
+            &first.pins[0],
+        )
+        .unwrap();
+    assert_eq!(retained.bytes, first.documents[0]);
+    assert_eq!(retained.document, original);
+    assert_eq!(
+        verify_projected_digest("PhysicsDefinition", &retained.document).unwrap(),
+        first.pins[0].revision
+    );
+    let mut resources = permit.resource_reader(MAX_SOURCE_TOTAL).unwrap();
+    let retained_geometry = resources
+        .read(
+            &store,
+            &permit,
+            &ProjectResourceRequest {
+                project: &initial.project_id,
+                current_project_revision: &second_receipt.project_revision,
+                query: &query,
+                expected: Some(&resource),
+            },
+            MAX_SOURCE_TOTAL,
+        )
+        .unwrap();
+    assert_eq!(retained_geometry.bytes, bytes);
+    assert_eq!(retained_geometry.registered.blob.digest, raw_digest(&bytes));
+    assert_eq!(
+        retained_geometry.registered.provenance,
+        ProjectResourceProvenance::CurrentProject {
+            project_revision: second_receipt.project_revision,
+        }
+    );
+}
+
+#[test]
 fn retained_physics_mesh_missing_current_resource_provenance_fails_closed() {
     let root = TestRoot::new();
     let mut store = root.store();

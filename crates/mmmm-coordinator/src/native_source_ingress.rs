@@ -16,7 +16,7 @@ use mmmm_domain::{
     Instance, Prefab,
     commands::CommandModule,
     instance::require_source,
-    physics::PhysicsDefinition,
+    physics::{PhysicsDefinition, normalize_mesh_resource_ref},
     prefab::semantic_diagnostics,
     time::{AnimationClip, validate_clip},
 };
@@ -34,8 +34,9 @@ use mmmm_runtime::storage::{
         OwnedDocumentAuthority, OwnedDocumentKind, OwnedDocumentPin, OwnedDocumentReader,
     },
     project_resources::{
-        ProjectResourceAuthority, ProjectResourceQuery, ProjectResourceReader,
-        ProjectResourceRequest, ProjectSourceRpcContext, RegisteredProjectResource,
+        ProjectResourceAuthority, ProjectResourceProvenance, ProjectResourceQuery,
+        ProjectResourceReader, ProjectResourceRequest, ProjectSourceRpcContext,
+        RegisteredProjectResource,
     },
 };
 use serde_json::{Value, json};
@@ -225,13 +226,30 @@ impl PreparedNativeSources {
         for resource in &self.retained_resources {
             self.access.check_store(store)?;
             let id: ResourceId = decode(&resource.resource["resourceId"])?;
-            let query = if catalog.resource_ids().contains(&id) {
-                ProjectResourceQuery::Exact {
-                    resource_id: id,
-                    digest: resource.blob.digest.clone(),
+            // Retain the actual authority anchor chosen by the original read.
+            // A transaction may add another revision for the same immutable
+            // resource before its final authorization callback. Re-running
+            // Exact would then choose a possibly different historical anchor.
+            // The pinned Historical query rechecks current membership as well.
+            let query = match &resource.provenance {
+                ProjectResourceProvenance::HistoricalProject { project_revision }
+                    if catalog.resource_ids().contains(&id) =>
+                {
+                    ProjectResourceQuery::Historical {
+                        project_revision: project_revision.clone(),
+                        resource_id: id,
+                        digest: resource.blob.digest.clone(),
+                    }
                 }
-            } else {
-                ProjectResourceQuery::RegisteredImmutable { resource_id: id }
+                ProjectResourceProvenance::CurrentProject { .. }
+                    if catalog.resource_ids().contains(&id) =>
+                {
+                    ProjectResourceQuery::Current { resource_id: id }
+                }
+                ProjectResourceProvenance::ImmutableProjectArtifact => {
+                    ProjectResourceQuery::RegisteredImmutable { resource_id: id }
+                }
+                _ => return Err(conflict()),
             };
             let request = ProjectResourceRequest {
                 project: &self.access.project,
@@ -1219,7 +1237,10 @@ fn collect_physics_resources(
             .ok_or_else(invalid)?;
         if text(shape, "kind")? == "mesh" {
             let geometry = shape.get("geometry").ok_or_else(invalid)?;
-            insert_resource(resources, geometry.clone())?;
+            // Normalize only the copied mesh ResourceRef for metadata identity;
+            // the original authored document and projected/raw pins stay intact.
+            let normalized = normalize_mesh_resource_ref(geometry).map_err(domain_error)?;
+            insert_resource(resources, normalized)?;
         }
     }
     access.check_store(store)

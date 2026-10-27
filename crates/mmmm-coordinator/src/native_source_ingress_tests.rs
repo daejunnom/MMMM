@@ -664,6 +664,199 @@ fn newly_authored_physics_resolves_a_previously_admitted_mesh_resource() {
     );
 }
 
+fn mesh_physics_with_integral_float_size(bytes: &[u8]) -> (Value, Value, Vec<u8>) {
+    // Only the authored PhysicsDefinition's mesh ResourceRef uses the
+    // schema-permitted N.0 spelling. The independently registered resource
+    // metadata remains the original integer N; this fixture does not claim
+    // general ResourceRef metadata accepts floating-point number syntax.
+    let (mut physics, resource) = mesh_physics(bytes);
+    physics["colliders"][0]["shape"]["shape"]["geometry"]["sizeBytes"] = json!(bytes.len() as f64);
+    physics["revision"] = json!(projected_digest("PhysicsDefinition", &physics).unwrap());
+    // Preserve the authored numeric spelling rather than a canonical encoder
+    // that may represent the same mathematical integer as N without `.0`.
+    let encoded = serde_json::to_vec(&physics).unwrap();
+    let decoded = parse_json(&encoded).unwrap();
+    assert!(decoded["colliders"][0]["shape"]["shape"]["geometry"]["sizeBytes"].is_f64());
+    assert_eq!(
+        decoded["colliders"][0]["shape"]["shape"]["geometry"]["sizeBytes"].as_f64(),
+        Some(bytes.len() as f64)
+    );
+    let expected_spelling = format!("\"sizeBytes\":{}.0", bytes.len());
+    assert!(
+        encoded
+            .windows(expected_spelling.len())
+            .any(|window| window == expected_spelling.as_bytes())
+    );
+    assert!(resource["sizeBytes"].is_u64());
+    (physics, resource, encoded)
+}
+
+#[test]
+fn physics_mesh_integral_float_size_matches_same_batch_integer_resource_metadata() {
+    let mut fixture = Fixture::new();
+    let bytes = b"float-sized same batch mesh\n";
+    let (physics, resource, physics_bytes) = mesh_physics_with_integral_float_size(bytes);
+    let metadata = encode_json(&resource).unwrap();
+    let documents = [NativeSourceDocument {
+        kind: NativeSourceKind::PhysicsDefinition,
+        bytes: &physics_bytes,
+    }];
+    let receipt = fixture
+        .prepare_raw(
+            &documents,
+            &[],
+            &[NativeRawSourceResource {
+                metadata: &metadata,
+                bytes,
+            }],
+        )
+        .unwrap()
+        .commit(&mut fixture.store)
+        .unwrap();
+    let stored = receipt
+        .documents
+        .iter()
+        .find(|(pin, _)| pin.kind == OwnedDocumentKind::PhysicsDefinition)
+        .unwrap();
+    assert_eq!(
+        stored.0.revision.as_str(),
+        physics["revision"].as_str().unwrap()
+    );
+    assert_eq!(fixture.store.read_blob(&stored.1).unwrap(), physics_bytes);
+    assert_eq!(
+        mmmm_runtime::storage::owned_documents::read_owned_document(
+            &fixture.store,
+            &fixture.project,
+            &receipt.project_revision,
+            &stored.0,
+        )
+        .unwrap(),
+        physics
+    );
+    assert_eq!(receipt.resources.len(), 1);
+    assert_eq!(
+        receipt.resources[0].0.as_str(),
+        resource["resourceId"].as_str().unwrap()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .read_blob(&receipt.resources[0].1)
+            .unwrap()
+            .as_slice(),
+        bytes.as_slice()
+    );
+    assert!(
+        fixture.store.project(&fixture.project).unwrap()["resourceIds"]
+            .as_array()
+            .unwrap()
+            .contains(&resource["resourceId"])
+    );
+}
+
+#[test]
+fn physics_mesh_integral_float_size_matches_current_retained_integer_resource() {
+    let mut fixture = Fixture::new();
+    let bytes = b"float-sized retained mesh\n";
+    let (physics, resource, physics_bytes) = mesh_physics_with_integral_float_size(bytes);
+    let metadata = encode_json(&resource).unwrap();
+    let first = fixture
+        .prepare_raw(
+            &[],
+            &[],
+            &[NativeRawSourceResource {
+                metadata: &metadata,
+                bytes,
+            }],
+        )
+        .unwrap()
+        .commit(&mut fixture.store)
+        .unwrap();
+    assert_eq!(first.resources.len(), 1);
+    let authority = LocalAuthority::new(HostBridge::default());
+    let workspace = prepare_workspace(
+        &fixture.store,
+        &authority,
+        &fixture.project,
+        fixture.budget.deadline(),
+    )
+    .unwrap();
+    assert!(
+        workspace.context["scope"]["resourceIds"]
+            .as_array()
+            .unwrap()
+            .contains(&resource["resourceId"])
+    );
+    let documents = [NativeSourceDocument {
+        kind: NativeSourceKind::PhysicsDefinition,
+        bytes: &physics_bytes,
+    }];
+    let prepared = prepare_native_sources(
+        &fixture.store,
+        &workspace.witness,
+        &authority,
+        &fixture.budget,
+        &NativeSourceInput {
+            project: &fixture.project,
+            expected_revision: &first.project_revision,
+            documents: &documents,
+            retained_resources: &[],
+            raw_resources: &[],
+        },
+    )
+    .unwrap();
+    assert_eq!(prepared.retained_resources.len(), 1);
+    let retained = &prepared.retained_resources[0];
+    assert_eq!(retained.resource, resource);
+    assert_eq!(retained.blob, first.resources[0].1);
+    assert!(matches!(
+        &retained.provenance,
+        mmmm_runtime::storage::project_resources::ProjectResourceProvenance::HistoricalProject { project_revision }
+            if project_revision == &first.project_revision
+    ));
+    let receipt = prepared.commit(&mut fixture.store).unwrap();
+    let stored = receipt
+        .documents
+        .iter()
+        .find(|(pin, _)| pin.kind == OwnedDocumentKind::PhysicsDefinition)
+        .unwrap();
+    assert_eq!(
+        stored.0.revision.as_str(),
+        physics["revision"].as_str().unwrap()
+    );
+    assert_eq!(fixture.store.read_blob(&stored.1).unwrap(), physics_bytes);
+    assert_eq!(
+        mmmm_runtime::storage::owned_documents::read_owned_document(
+            &fixture.store,
+            &fixture.project,
+            &receipt.project_revision,
+            &stored.0,
+        )
+        .unwrap(),
+        physics
+    );
+    // A retained source is not a newly created resource in this receipt.
+    assert!(receipt.resources.is_empty());
+    assert_eq!(
+        first.resources[0].0.as_str(),
+        resource["resourceId"].as_str().unwrap()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .read_blob(&first.resources[0].1)
+            .unwrap()
+            .as_slice(),
+        bytes.as_slice()
+    );
+    assert!(
+        fixture.store.project(&fixture.project).unwrap()["resourceIds"]
+            .as_array()
+            .unwrap()
+            .contains(&resource["resourceId"])
+    );
+}
+
 #[test]
 fn command_module_is_stored_with_its_actual_same_batch_owner_and_original_bytes() {
     let mut fixture = Fixture::new();

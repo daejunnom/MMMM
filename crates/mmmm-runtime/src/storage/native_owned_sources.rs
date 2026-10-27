@@ -23,7 +23,7 @@ use mmmm_contracts::{
     strict_json::{ControlledJsonError, parse_json_with_control},
     verify_projected_digest,
 };
-use mmmm_domain::physics::PhysicsDefinition;
+use mmmm_domain::physics::{PhysicsDefinition, normalize_mesh_resource_ref};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -889,8 +889,9 @@ fn require_physics_mesh_resources(
     physics: &Value,
     resources: &BTreeMap<ResourceId, StagedResource>,
 ) -> StorageResult<()> {
-    // Apply the same storage admission rule as Prefab ResourceRefs to the
-    // original authored values. This does not attest mesh topology or a solver.
+    // Normalize only a comparison copy of the mesh ResourceRef. The authored
+    // Physics bytes and projected pin are unchanged. This storage association
+    // does not attest mesh topology or a solver.
     for collider in array(physics, "colliders")? {
         checkpoint(store, permit, project, scope)?;
         let shape = &collider["shape"]["shape"];
@@ -898,7 +899,8 @@ fn require_physics_mesh_resources(
             let geometry = shape
                 .get("geometry")
                 .ok_or_else(|| invalid("Native mesh geometry reference missing"))?;
-            require_exact_resource(geometry, resources)?;
+            let comparable = normalize_mesh_resource_ref(geometry).map_err(contract)?;
+            require_exact_resource(&comparable, resources)?;
         }
     }
     Ok(())
