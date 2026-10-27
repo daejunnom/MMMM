@@ -156,3 +156,33 @@ fn typed_and_cas_codecs_preserve_large_finite_float_wire_spelling() {
     let typed: mmmm_domain::types::ResourceRef = decode("ResourceRef", &resource).unwrap();
     assert_eq!(typed.size_bytes, 1);
 }
+
+#[test]
+fn prefab_comparison_preserves_original_and_value_only_requires_integer_lengths() {
+    let original = parse_json(include_bytes!("../../../examples/prefab.json")).unwrap();
+    require_value_only_prefab_integer_lengths(&original).unwrap();
+    let resource_length = original["resources"][0]["sizeBytes"].as_u64().unwrap();
+    let mut decimal = original.clone();
+    decimal["resources"][0]["sizeBytes"] = json!(resource_length as f64);
+    assert_eq!(
+        require_value_only_prefab_integer_lengths(&decimal)
+            .unwrap_err()
+            .code,
+        "CAPABILITY_UNAVAILABLE"
+    );
+    let before = decimal.clone();
+    let typed = decode_prefab_scoped(&decimal, || Ok(())).unwrap();
+    assert_eq!(typed.resources[0].size_bytes, resource_length);
+    assert_eq!(decimal, before);
+    let mut calls = 0;
+    let error = decode_prefab_scoped(&original, || {
+        calls += 1;
+        if calls == 2 {
+            Err(AppError::new("CANCELLED", "test cancellation"))
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap_err();
+    assert_eq!(error.code, "CANCELLED");
+}

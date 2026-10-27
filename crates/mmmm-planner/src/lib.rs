@@ -46,6 +46,78 @@ pub(crate) fn decode<T: DeserializeOwned>(name: &str, value: &Value) -> AppResul
         .map_err(|_| AppError::new("INVALID_INPUT", "Typed planning input is invalid"))
 }
 
+/// Decode an already validated Prefab by normalizing only its schema-owned
+/// ResourceRef positions. The caller must first establish the numeric lexemes
+/// from the same original bytes, or reject non-integer Value-only lengths.
+pub(crate) fn decode_prefab_scoped(
+    value: &Value,
+    mut check: impl FnMut() -> AppResult<()>,
+) -> AppResult<mmmm_domain::Prefab> {
+    check()?;
+    validate("Prefab", value)?;
+    mmmm_contracts::encode_json(value).map_err(|_| {
+        AppError::new(
+            "INVALID_INPUT",
+            "Planning input cannot be encoded within its wire budget",
+        )
+    })?;
+    let mut typed = value.clone();
+    check()?;
+    let resources = typed
+        .get_mut("resources")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| AppError::new("INVALID_INPUT", "Prefab resources are absent"))?;
+    for (index, resource) in resources.iter_mut().enumerate() {
+        if index % 128 == 0 {
+            check()?;
+        }
+        *resource = mmmm_domain::physics::normalize_mesh_resource_ref(resource).map_err(domain)?;
+    }
+    let nodes = typed
+        .get_mut("nodes")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| AppError::new("INVALID_INPUT", "Prefab nodes are absent"))?;
+    for (index, node) in nodes.iter_mut().enumerate() {
+        if index % 128 == 0 {
+            check()?;
+        }
+        if let Some(resource) = node.get_mut("geometryResource") {
+            *resource =
+                mmmm_domain::physics::normalize_mesh_resource_ref(resource).map_err(domain)?;
+        }
+    }
+    check()?;
+    serde_json::from_value(typed)
+        .map_err(|_| AppError::new("INVALID_INPUT", "Typed planning input is invalid"))
+}
+
+/// A Value-only port has no original token witness. Its existing integer JSON
+/// values can be used; decimal representations cannot establish exactness.
+pub(crate) fn require_value_only_prefab_integer_lengths(value: &Value) -> AppResult<()> {
+    let is_integer =
+        |reference: &Value| reference.get("sizeBytes").and_then(Value::as_u64).is_some();
+    for reference in array(value, "resources")? {
+        if !is_integer(reference) {
+            return Err(AppError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "Original Prefab resource bytes are required",
+            ));
+        }
+    }
+    for node in array(value, "nodes")? {
+        if node
+            .get("geometryResource")
+            .is_some_and(|reference| !is_integer(reference))
+        {
+            return Err(AppError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "Original Prefab resource bytes are required",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// ResourceRef.sizeBytes is mathematically integral in JSON Schema. Its Rust
 /// u64 field accepts the same safe values without JCS reencoding unrelated f64
 /// authoring numbers. Wire/CAS bytes always retain their original float tags.

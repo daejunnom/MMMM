@@ -20,6 +20,7 @@ pub(crate) struct PreparedChange {
 pub(crate) struct Sources {
     pub objects: BTreeMap<(OwnedKind, String, Sha256Digest), Value>,
     pub resources: BTreeMap<(String, Sha256Digest), ResourceRef>,
+    exact_prefabs: BTreeSet<(OwnedKind, String, Sha256Digest)>,
     bytes: u64,
 }
 
@@ -76,21 +77,112 @@ impl NativePlanner<'_> {
         if sources.objects.len() >= 4096 {
             return Err(budget());
         }
-        let value = self.source.owned_object(
-            principal,
-            project,
-            pin,
-            Some(context),
-            self.options
-                .max_source_bytes
-                .checked_sub(sources.bytes)
-                .ok_or_else(budget)?,
-        )?;
+        let remaining = self
+            .options
+            .max_source_bytes
+            .checked_sub(sources.bytes)
+            .ok_or_else(budget)?;
+        // Only Prefabs have this raw witness requirement. Other owned source
+        // reads keep their existing path and ordering.
+        let raw = if pin.kind == OwnedKind::Prefab {
+            self.source
+                .owned_object_bytes(principal, project, pin, Some(context), remaining)?
+        } else {
+            None
+        };
+        let (value, accounted, exact_prefab) = if let Some(raw) = raw {
+            if raw.bytes.len() as u64 > remaining || raw.bytes.len() > 8 * 1024 * 1024 {
+                return Err(budget());
+            }
+            self.source
+                .check_owned_source(principal, project, pin, Some(context))?;
+            if raw_digest(&raw.bytes) != raw.digest {
+                return Err(conflict());
+            }
+            let validator = mmmm_contracts::ContractValidator::shared().map_err(|_| {
+                AppError::new(
+                    "CAPABILITY_UNAVAILABLE",
+                    "Prefab exact validation is unavailable",
+                )
+            })?;
+            let actual = validator.parse_validate_prefab_exact_with_control(
+                &raw.bytes,
+                mmmm_contracts::JsonLimits::default(),
+                || self.source.checkpoint_source(),
+            ).map_err(|error| match error {
+                mmmm_contracts::validation::ControlledPrefabContractError::Control(error) => error,
+                error @ mmmm_contracts::validation::ControlledPrefabContractError::CaptureUnavailable => {
+                    AppError::caused_by("CAPABILITY_UNAVAILABLE", "Prefab source capture is unavailable", error)
+                }
+                error => AppError::caused_by("INVALID_INPUT", "Prefab source exact validation failed", error),
+            })?;
+            if actual != raw.value {
+                return Err(conflict());
+            }
+            self.source
+                .check_owned_source(principal, project, pin, Some(context))?;
+            // This is a cumulative source-input budget, not a heap limit.
+            // Each source contributes the larger of original and encoded
+            // lengths. The raw and encoded operations are separately bounded;
+            // their simultaneously live allocations are not summed here.
+            let encoded_len = mmmm_contracts::encode_json(&raw.value)
+                .map_err(|_| budget())?
+                .len();
+            (raw.value, raw.bytes.len().max(encoded_len), true)
+        } else {
+            let value =
+                self.source
+                    .owned_object(principal, project, pin, Some(context), remaining)?;
+            validate_owned_value(pin, &value)?;
+            if pin.kind == OwnedKind::Prefab {
+                require_value_only_prefab_integer_lengths(&value)?;
+            }
+            let length = mmmm_contracts::encode_json(&value)
+                .map_err(|_| budget())?
+                .len();
+            (value, length, false)
+        };
         validate_owned_value(pin, &value)?;
-        let bytes = mmmm_contracts::encode_json(&value).map_err(|_| budget())?;
-        sources.account(bytes.len(), self.options.max_source_bytes)?;
+        if exact_prefab {
+            // Identity/digest validation also consumes input; do not return a
+            // checked source if current authority changed during that work.
+            self.source
+                .check_owned_source(principal, project, pin, Some(context))?;
+        }
+        sources.account(accounted, self.options.max_source_bytes)?;
+        if exact_prefab {
+            sources.exact_prefabs.insert(key.clone());
+        }
         sources.objects.insert(key, value.clone());
         Ok(value)
+    }
+
+    fn decode_owned_prefab(
+        &mut self,
+        principal: &PrincipalId,
+        project: &ProjectCatalog,
+        pin: &ObjectPin,
+        context: &Value,
+        sources: &mut Sources,
+    ) -> AppResult<Prefab> {
+        let value = self.load_owned(principal, project, pin, context, sources)?;
+        let key = (
+            pin.kind,
+            pin.object_id.as_str().to_owned(),
+            pin.revision.clone(),
+        );
+        if sources.exact_prefabs.contains(&key) {
+            self.source
+                .check_owned_source(principal, project, pin, Some(context))?;
+            let decoded = decode_prefab_scoped(&value, || self.source.checkpoint_source())?;
+            self.source
+                .check_owned_source(principal, project, pin, Some(context))?;
+            Ok(decoded)
+        } else {
+            // Existing Value-only adapters have no checkpoint or raw witness.
+            // Their schema-owned integer values retain the original path.
+            decode("Prefab", &value)
+        }
     }
     pub(crate) fn load_current(
         &mut self,
@@ -218,10 +310,7 @@ impl NativePlanner<'_> {
             instance.prefab_id.as_str(),
             &instance.prefab_revision,
         )?;
-        let definition: Prefab = decode(
-            "Prefab",
-            &self.load_owned(principal, project, &pin, context, sources)?,
-        )?;
+        let definition = self.decode_owned_prefab(principal, project, &pin, context, sources)?;
         mmmm_domain::instance::require_source(&instance, &definition).map_err(domain)?;
         Ok((instance, definition))
     }
@@ -420,10 +509,8 @@ impl NativePlanner<'_> {
                     text(intent, "prefabId")?,
                     &revision,
                 )?;
-                let definition: Prefab = decode(
-                    "Prefab",
-                    &self.load_owned(principal, project, &pin, context, &mut sources)?,
-                )?;
+                let definition =
+                    self.decode_owned_prefab(principal, project, &pin, context, &mut sources)?;
                 let id = self.source.allocate_instance_id(
                     principal,
                     project,

@@ -15,6 +15,14 @@ pub struct PinnedResourceBytes {
     pub resource: ResourceRef,
     pub bytes: Vec<u8>,
 }
+/// One authorized read of an owned document and its actual current CAS bytes.
+/// The consumer must validate bytes, digest and value for its own purpose;
+/// this data alone does not grant current access or prove original authorship.
+pub struct PinnedOwnedObjectBytes {
+    pub value: Value,
+    pub bytes: Vec<u8>,
+    pub digest: Sha256Digest,
+}
 pub struct PinnedStateSnapshot {
     pub resource: ResourceRef,
     pub snapshot: ResolvedStateSnapshot,
@@ -59,6 +67,53 @@ pub trait ProjectSourcePort {
         context: Option<&Value>,
         max_bytes: u64,
     ) -> AppResult<Value>;
+    /// Optional raw-aware owned read. A Value-only implementation supplies no
+    /// original numeric lexeme witness and must leave this default unchanged.
+    fn owned_object_bytes(
+        &mut self,
+        _principal: &PrincipalId,
+        _project: &ProjectCatalog,
+        _pin: &ObjectPin,
+        _context: Option<&Value>,
+        _max_bytes: u64,
+    ) -> AppResult<Option<PinnedOwnedObjectBytes>> {
+        Ok(None)
+    }
+    /// Check the current call and source authority during bounded raw parsing.
+    /// Value-only adapters do not provide this capability by default.
+    fn check_source(
+        &mut self,
+        _principal: &PrincipalId,
+        _project: &ProjectCatalog,
+        _context: Option<&Value>,
+    ) -> AppResult<()> {
+        Err(mmmm_application::AppError::new(
+            "CAPABILITY_UNAVAILABLE",
+            "Controlled owned source validation is unavailable",
+        ))
+    }
+    /// Cooperative cancellation/deadline checkpoint during bounded parsing.
+    /// Current Project and object authorization must also be checked before
+    /// and after validation with the corresponding source-check method.
+    fn checkpoint_source(&mut self) -> AppResult<()> {
+        Err(mmmm_application::AppError::new(
+            "CAPABILITY_UNAVAILABLE",
+            "Controlled source checkpoint is unavailable",
+        ))
+    }
+    /// Recheck an owned object's current scope while validating its raw bytes.
+    fn check_owned_source(
+        &mut self,
+        _principal: &PrincipalId,
+        _project: &ProjectCatalog,
+        _pin: &ObjectPin,
+        _context: Option<&Value>,
+    ) -> AppResult<()> {
+        Err(mmmm_application::AppError::new(
+            "CAPABILITY_UNAVAILABLE",
+            "Controlled owned object validation is unavailable",
+        ))
+    }
     fn resource_pin(
         &mut self,
         principal: &PrincipalId,

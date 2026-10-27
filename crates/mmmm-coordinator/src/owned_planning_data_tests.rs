@@ -253,10 +253,19 @@ fn register_static_resource(
     value: &Value,
 ) -> ResourceRef {
     let bytes = encode_json(value).unwrap();
-    let blob = store.put_blob(&bytes).unwrap();
+    register_static_resource_bytes(store, owner, id, &bytes)
+}
+
+fn register_static_resource_bytes(
+    store: &mut DurableStore,
+    owner: &ProjectId,
+    id: &str,
+    bytes: &[u8],
+) -> ResourceRef {
+    let blob = store.put_blob(bytes).unwrap();
     let resource = ResourceRef {
         resource_id: ResourceId::new(id).unwrap(),
-        sha256: raw_digest(&bytes),
+        sha256: raw_digest(bytes),
         media_type: "application/json".into(),
         size_bytes: bytes.len() as u64,
     };
@@ -358,12 +367,49 @@ fn static_inputs(fixture: &mut OwnedFixture, case: &str) -> StaticInputs {
         }
         _ => artifact.clone(),
     };
-    let artifact_pin = register_static_resource(
-        store,
-        fixture.catalog.project_id(),
-        STATIC_RESOURCES[0],
-        &artifact_value,
-    );
+    let artifact_pin = if case == "artifact_fraction" {
+        let bytes = encode_json(&artifact_value).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text.matches("\"sizeBytes\":16236.0").count(), 2);
+        let fractional = text
+            .replacen(
+                "\"sizeBytes\":16236.0",
+                "\"sizeBytes\":16236.0000000000001",
+                1,
+            )
+            .into_bytes();
+        let parsed = parse_json(&fractional).unwrap();
+        assert_eq!(parsed, artifact_value);
+        assert_eq!(
+            projected_digest("Prefab", &parsed).unwrap(),
+            projected_digest("Prefab", &artifact_value).unwrap()
+        );
+        let resource = register_static_resource_bytes(
+            store,
+            fixture.catalog.project_id(),
+            STATIC_RESOURCES[0],
+            &fractional,
+        );
+        assert_eq!(resource.sha256, raw_digest(&fractional));
+        assert_eq!(resource.size_bytes, fractional.len() as u64);
+        assert_eq!(
+            store
+                .read_blob(&BlobRef {
+                    digest: resource.sha256.clone(),
+                    byte_length: resource.size_bytes
+                })
+                .unwrap(),
+            fractional
+        );
+        resource
+    } else {
+        register_static_resource(
+            store,
+            fixture.catalog.project_id(),
+            STATIC_RESOURCES[0],
+            &artifact_value,
+        )
+    };
     let mut patch = json!({"contractVersion":"0.2.0","patchId":"patch-owned-static-proposal",
         "projectId":fixture.catalog.project_id(),"baseRevision":fixture.catalog.revision(),
         "sourceArtifact":artifact_pin,"sourceMap":map_pin,"entries":[
@@ -720,6 +766,136 @@ fn owned_static_scene_uses_actual_current_prefab_and_original_instance_history_w
 }
 
 #[test]
+fn owned_static_scene_preserves_decimal_prefab_bytes_and_rechecks_current_authority() {
+    let mut fixture = OwnedFixture::new_with_decimal_prefab(STATIC_RESOURCES, true);
+    let original = fixture.prefab.clone();
+    let original_bytes = encode_json(&original).unwrap();
+    assert_eq!(
+        std::str::from_utf8(&original_bytes)
+            .unwrap()
+            .matches("\"sizeBytes\":16236.0")
+            .count(),
+        2
+    );
+    let original_blob = BlobRef {
+        digest: raw_digest(&original_bytes),
+        byte_length: original_bytes.len() as u64,
+    };
+    assert_eq!(
+        fixture
+            .service
+            .management_store()
+            .read_blob(&original_blob)
+            .unwrap(),
+        original_bytes
+    );
+    let inputs = static_inputs(&mut fixture, "prefab");
+    let mut data = fixture.data();
+    let principal = fixture.principal.principal().clone();
+    let catalog = fixture.catalog.clone();
+    let context = fixture.context.clone();
+    let authority = fixture.authority.clone();
+    fixture
+        .call(move |store, witness| {
+            let borrowed = PlanningStore::read(store);
+            let source = data.scene_source_with_store(
+                &borrowed,
+                &principal,
+                &catalog,
+                &inputs.patch,
+                &context,
+                witness.budget(),
+            )?;
+            assert_eq!(
+                source.selection.value()["prefabs"],
+                json!([original.clone()])
+            );
+            assert!(source.selection.value()["prefabs"][0]["resources"][0]["sizeBytes"].is_f64());
+            assert!(
+                source.selection.value()["prefabs"][0]["nodes"][0]["geometryResource"]["sizeBytes"]
+                    .is_f64()
+            );
+            assert_eq!(
+                source.selection.value()["instances"][0]["prefabRevision"],
+                original["revision"]
+            );
+            borrowed.with_read(|store| {
+                assert_eq!(store.read_blob(&original_blob).unwrap(), original_bytes);
+                Ok(())
+            })?;
+            data.validate_scene_provenance_with_store(
+                &borrowed,
+                &principal,
+                &catalog,
+                &inputs.patch,
+                &source,
+                &context,
+                witness.budget(),
+            )?;
+            authority.revoke_project(&principal, catalog.project_id())?;
+            let error = data
+                .validate_scene_provenance_with_store(
+                    &borrowed,
+                    &principal,
+                    &catalog,
+                    &inputs.patch,
+                    &source,
+                    &context,
+                    witness.budget(),
+                )
+                .expect_err("A scene source does not retain revoked Project authority");
+            assert_eq!(error.code, "PERMISSION_REQUIRED");
+            Ok(json!({"decimalSourcePreserved":true,"revokedReadDenied":true}))
+        })
+        .unwrap();
+}
+
+#[test]
+fn owned_static_scene_rejects_fractional_artifact_even_when_its_parsed_value_rounds() {
+    let mut fixture = OwnedFixture::new_with_decimal_prefab(STATIC_RESOURCES, true);
+    let inputs = static_inputs(&mut fixture, "artifact_fraction");
+    let mut data = fixture.data();
+    let principal = fixture.principal.principal().clone();
+    let catalog = fixture.catalog.clone();
+    let context = fixture.context.clone();
+    let error = fixture
+        .call(move |store, witness| {
+            let borrowed = PlanningStore::read(store);
+            let pin: ResourceRef = decode(&inputs.patch["sourceArtifact"])?;
+            let blob = BlobRef {
+                digest: pin.sha256,
+                byte_length: pin.size_bytes,
+            };
+            borrowed.with_read(|store| {
+                let bytes = store.read_blob(&blob).unwrap();
+                assert_eq!(raw_digest(&bytes), blob.digest);
+                assert!(
+                    std::str::from_utf8(&bytes)
+                        .unwrap()
+                        .contains("16236.0000000000001")
+                );
+                assert_eq!(parse_json(&bytes).unwrap(), inputs.artifact);
+                Ok(())
+            })?;
+            data.scene_source_with_store(
+                &borrowed,
+                &principal,
+                &catalog,
+                &inputs.patch,
+                &context,
+                witness.budget(),
+            )
+            .map(|_| json!({"unexpectedAdmission":true}))
+        })
+        .expect_err("An inexact artifact token must not be admitted by Value rounding");
+    assert_eq!(error.code, "INVALID_INPUT");
+    let cause = std::error::Error::source(&error)
+        .and_then(|source| source.downcast_ref::<AppError>())
+        .expect("Service preserves the actual artifact admission error");
+    assert_eq!(cause.message, "Prefab artifact failed exact validation");
+}
+
+#[test]
 fn owned_static_scene_rejects_wrong_metadata_foreign_owner_ambiguous_maps_and_bake_escalation() {
     for case in [
         "size",
@@ -777,11 +953,24 @@ struct OwnedFixture {
 }
 impl OwnedFixture {
     fn new(resource_ids: &[&str]) -> Self {
+        Self::new_with_decimal_prefab(resource_ids, false)
+    }
+
+    fn new_with_decimal_prefab(resource_ids: &[&str], decimal: bool) -> Self {
         let root = OwnedRoot::new();
         let mut store = root.open();
         let selection = owned_example("scene-selection.json");
-        let prefab = selection["prefabs"][0].clone();
-        let instance = selection["instances"][0].clone();
+        let mut prefab = selection["prefabs"][0].clone();
+        let mut instance = selection["instances"][0].clone();
+        if decimal {
+            // Keep both schema-owned ResourceRefs as decimal Values in the
+            // real stored Prefab, with the same metadata for graph consistency.
+            prefab["resources"][0]["sizeBytes"] = json!(16236.0);
+            prefab["nodes"][0]["geometryResource"] = prefab["resources"][0].clone();
+            prefab["revision"] = json!(projected_digest("Prefab", &prefab).unwrap());
+            instance["prefabRevision"] = prefab["revision"].clone();
+            instance["revision"] = json!(projected_digest("Instance", &instance).unwrap());
+        }
         let mut project = owned_example("project.json");
         project["prefabIds"] = json!([prefab["prefabId"]]);
         project["instanceIds"] = json!([instance["instanceId"]]);

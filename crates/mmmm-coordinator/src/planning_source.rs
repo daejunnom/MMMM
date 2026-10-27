@@ -23,9 +23,9 @@ use mmmm_domain::{
 };
 use mmmm_planner::{
     InstanceProjection, NativeActionRoute, NativeKind, NativePlanner, NativeTargetSnapshot,
-    ObjectPin, OwnedKind, PinnedResourceBytes, PinnedStateSnapshot, PlannerOptions,
-    PlanningEnvironmentPort, PreparedNativeChange, ProjectCatalog, ProjectSourcePort,
-    RegisteredActionFootprint, SceneSource, VerifiedNativeTarget,
+    ObjectPin, OwnedKind, PinnedOwnedObjectBytes, PinnedResourceBytes, PinnedStateSnapshot,
+    PlannerOptions, PlanningEnvironmentPort, PreparedNativeChange, ProjectCatalog,
+    ProjectSourcePort, RegisteredActionFootprint, SceneSource, VerifiedNativeTarget,
 };
 use mmmm_runtime::storage::{DurableStore, StorageError, WriteScope};
 use mmmm_runtime::storage::{
@@ -1229,6 +1229,89 @@ impl ProjectSourcePort for BorrowedProjectSource<'_> {
         })?;
         self.authorize(principal, project, context)?;
         Ok(value)
+    }
+    fn owned_object_bytes(
+        &mut self,
+        principal: &PrincipalId,
+        project: &ProjectCatalog,
+        pin: &ObjectPin,
+        context: Option<&Value>,
+        max_bytes: u64,
+    ) -> AppResult<Option<PinnedOwnedObjectBytes>> {
+        if max_bytes == 0 {
+            return Err(source_budget());
+        }
+        self.authorize(principal, project, context)?;
+        project.owned_pin(pin.kind, pin.object_id.as_str())?;
+        let request = SourceRequest::new(self.access.clone(), context, self.store.issued.clone())?;
+        let mut reader = OwnedDocumentReader::new(
+            Box::new(SourceReadAuthority(request.clone())),
+            max_bytes.min(MAX_DOCUMENT_BYTES),
+        )
+        .map_err(storage_error)?;
+        let pin = document_pin(pin);
+        let actual = self.store.with_read(|store| {
+            reader
+                .read_known_history_bytes(
+                    store,
+                    &request,
+                    project.project_id(),
+                    project.revision(),
+                    &pin,
+                )
+                .map_err(storage_error)
+        })?;
+        self.authorize(principal, project, context)?;
+        Ok(Some(PinnedOwnedObjectBytes {
+            value: actual.document,
+            bytes: actual.bytes,
+            digest: actual.blob.digest,
+        }))
+    }
+    fn check_source(
+        &mut self,
+        principal: &PrincipalId,
+        project: &ProjectCatalog,
+        context: Option<&Value>,
+    ) -> AppResult<()> {
+        self.authorize(principal, project, context)
+    }
+    fn checkpoint_source(&mut self) -> AppResult<()> {
+        self.access.check()
+    }
+    fn check_owned_source(
+        &mut self,
+        principal: &PrincipalId,
+        project: &ProjectCatalog,
+        pin: &ObjectPin,
+        context: Option<&Value>,
+    ) -> AppResult<()> {
+        self.authorize(principal, project, context)?;
+        project.authorize_pin(pin.kind, pin.object_id.as_str(), &pin.revision)?;
+        let live = self
+            .access
+            .authority
+            .project_scope(principal, project.project_id())?;
+        if !source_scope_contains(&live, "objectIds", pin.object_id.as_str())
+            || context.is_some_and(|value| {
+                !source_scope_contains(&value["scope"], "objectIds", pin.object_id.as_str())
+            })
+        {
+            return Err(forbidden());
+        }
+        self.authorize(principal, project, context)?;
+        let live = self
+            .access
+            .authority
+            .project_scope(principal, project.project_id())?;
+        if !source_scope_contains(&live, "objectIds", pin.object_id.as_str())
+            || context.is_some_and(|value| {
+                !source_scope_contains(&value["scope"], "objectIds", pin.object_id.as_str())
+            })
+        {
+            return Err(forbidden());
+        }
+        self.access.check()
     }
     fn resource_pin(
         &mut self,

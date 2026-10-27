@@ -154,7 +154,19 @@ impl NativePlanner<'_> {
         {
             return Err(conflict());
         }
-        validate_artifact(&artifact, project)?;
+        let prefab_artifact =
+            artifact.get("artifactId").is_none() && artifact.get("prefabId").is_some();
+        if prefab_artifact {
+            self.source
+                .check_source(principal, project, Some(context))?;
+        }
+        validate_artifact(&artifact, &artifact_bytes, project, &mut || {
+            self.source.checkpoint_source()
+        })?;
+        if prefab_artifact {
+            self.source
+                .check_source(principal, project, Some(context))?;
+        }
         self.source
             .validate_scene_provenance(principal, project, patch, &source, context)?;
         mmmm_exchange::patch::validate_scene_patch(patch, &source.selection, &source.delta_policy)
@@ -474,7 +486,7 @@ impl NativePlanner<'_> {
             let definition = PhysicsDefinition::from_value(&value).map_err(exchange)?;
             if let Some(selection) = selection {
                 definition
-                    .validate_selection(selection.value())
+                    .validate_selection_index(selection.physics_index())
                     .map_err(exchange)?;
             }
             for collider in array(&value, "colliders")? {
@@ -514,11 +526,45 @@ impl NativePlanner<'_> {
     }
 }
 
-fn validate_artifact(artifact: &Value, project: &ProjectCatalog) -> AppResult<()> {
+fn validate_artifact(
+    artifact: &Value,
+    artifact_bytes: &[u8],
+    project: &ProjectCatalog,
+    checkpoint: &mut impl FnMut() -> AppResult<()>,
+) -> AppResult<()> {
     if artifact.get("artifactId").is_some() {
         validate("BakeArtifact", artifact)?;
     } else if artifact.get("prefabId").is_some() {
-        let prefab: Prefab = decode("Prefab", artifact)?;
+        // A resource's parsed Value can hide an inexact raw fraction rounded
+        // to a binary64 integer. Check this artifact's own authorized bytes;
+        // another Prefab's CAS or a re-encoded Value cannot attest its tokens.
+        let validator = ContractValidator::shared().map_err(|error| {
+            AppError::caused_by(
+                "CAPABILITY_UNAVAILABLE",
+                "Prefab source exact validation is unavailable",
+                error,
+            )
+        })?;
+        let parsed = validator
+            .parse_validate_prefab_exact_with_control(
+                artifact_bytes,
+                mmmm_contracts::JsonLimits::default(),
+                &mut *checkpoint,
+            )
+            .map_err(|error| match error {
+                mmmm_contracts::validation::ControlledPrefabContractError::Control(error) => error,
+                error @ mmmm_contracts::validation::ControlledPrefabContractError::CaptureUnavailable => {
+                    AppError::caused_by("CAPABILITY_UNAVAILABLE", "Prefab source capture is unavailable", error)
+                }
+                error => AppError::caused_by("INVALID_INPUT", "Prefab source has an invalid contract or exact integer", error),
+            })?;
+        if parsed != *artifact {
+            return Err(AppError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "Prefab source exact validation returned a different parsed value",
+            ));
+        }
+        let prefab = crate::decode_prefab_scoped(artifact, checkpoint)?;
         mmmm_contracts::verify_projected_digest("Prefab", artifact).map_err(|_| conflict())?;
         mmmm_domain::prefab::require_valid(&prefab).map_err(domain)?;
     } else if artifact.get("instances").is_some() && artifact.get("prefabs").is_some() {
@@ -1419,6 +1465,55 @@ mod tests {
     use super::*;
     use crate::preparation::{empty_change, update_project};
     use mmmm_domain::types::SymbolBinding;
+
+    #[test]
+    fn prefab_artifact_binds_exact_resource_lexeme_to_its_own_bytes() {
+        let project = ProjectCatalog::from_project(
+            &serde_json::from_str(include_str!("../../../examples/project.json")).unwrap(),
+        )
+        .unwrap();
+        let mut prefab: Value =
+            serde_json::from_str(include_str!("../../../examples/prefab.json")).unwrap();
+        prefab["resources"][0]["sizeBytes"] = json!(1.0);
+        prefab["revision"] = json!(projected_digest("Prefab", &prefab).unwrap());
+        let raw = serde_json::to_vec(&prefab).unwrap();
+        let text = std::str::from_utf8(&raw).unwrap();
+        let needle = "\"sizeBytes\":1.0";
+        assert_eq!(text.matches(needle).count(), 1);
+        validate_artifact(&prefab, &raw, &project, &mut || Ok(())).unwrap();
+
+        let fraction = text.replacen(needle, "\"sizeBytes\":1.0000000000000001", 1);
+        assert_eq!(
+            mmmm_contracts::parse_json(fraction.as_bytes()).unwrap(),
+            prefab
+        );
+        let error =
+            validate_artifact(&prefab, fraction.as_bytes(), &project, &mut || Ok(())).unwrap_err();
+        assert_eq!(error.code, "INVALID_INPUT");
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .to_string()
+                .contains("Prefab resource 0 sizeBytes is not an exact safe JSON integer")
+        );
+
+        let mismatch = text.replacen(needle, "\"sizeBytes\":2.0", 1);
+        assert_eq!(
+            validate_artifact(&prefab, mismatch.as_bytes(), &project, &mut || Ok(()))
+                .unwrap_err()
+                .code,
+            "CAPABILITY_UNAVAILABLE"
+        );
+        let stopped = validate_artifact(&prefab, &raw, &project, &mut || {
+            Err(AppError::new(
+                "TEST_CANCELLED",
+                "Original test cancellation",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(stopped.code, "TEST_CANCELLED");
+        assert_eq!(stopped.message, "Original test cancellation");
+    }
 
     fn source() -> (Instance, Prefab, CommandModule, AnimationClip) {
         (

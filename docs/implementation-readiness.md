@@ -4214,3 +4214,20 @@ Project 권한 철회 뒤 거절을 연결하는 검사를 작성했다. Instanc
 vswhere 실행 전 executable hash 8,055ms가 5,000ms 기한을 넘어 실패했다. process·compiler
 선택·ABI witness는 시작되지 않았고 해시 지연 원인은 확정되지 않았다. 두 실패의 원 로그와
 정상 drain/export·scratch 제거·lease 해제 결과를 보존하며 성공으로 재분류하지 않는다.
+
+보유 Prefab의 `sizeBytes` 원문 검증은 scene source와 planner까지 확장한다. 동일한
+권한 있는 owned-document 읽기에서 얻은 bytes·Value·digest를 각 Prefab의 exact 검사 및
+원 projected pin과 결속하며 원 Selection Value·node를 유지한다. 독립 Prefab artifact는
+자신의 bytes로 검사하고 physics는 검증된 typed selection index를 재사용한다. 별도
+Selection artifact 내부의 raw selector는 미구현이다. 원 bytes를 제공하지 않는 Value-only
+Prefab port의 decimal 표기는 이제 `CAPABILITY_UNAVAILABLE`로 거절한다. 이는 기존 허용
+범위의 축소이며 정수 경로는 유지한다. 새 Selection 경로는 복사 전에 8 MiB 전체 입력과
+기존 객체·node 한도를 확인한다. 원 bytes와 인코딩 길이의 큰 값을 source 입력 예산에
+계상하며 동시 heap 전체의 상한은 아니다.
+
+긴 검사 후 Project/context/object와 artifact·sourceMap resource를 재확인한다. 후자 두
+재검사는 각각 최대 32 MiB CAS 해시 I/O가 추가되고 기존 누적 보유 바이트 예산과 별개다.
+현재 권한 관측은 원자적 snapshot이 아니며 원문 검사 실패 시 후행 권한 오류를 관측했다고
+주장하지 않는다. native reader의 기존 오류 문자열 변환도 원 오류 identity 전체를 보장하지
+않는다. Native source commit→Factory data adapter와 별도 artifact 분수 거절 검사를 작성했으나
+실행 전이며 실제 정상 scene plan·물리·게임을 검증한 것은 아니다.

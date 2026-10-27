@@ -14,7 +14,7 @@ use crate::{
 use mmmm_application::{Access, AppError, AppResult};
 use mmmm_contracts::{
     ContextId, ContractValidator, PrincipalId, ProjectId, Sha256Digest, StateId, canonical_digest,
-    encode_json, parse_json, verify_projected_digest,
+    encode_json, parse_json, validation::ControlledPrefabContractError, verify_projected_digest,
 };
 use mmmm_domain::{
     Instance, Prefab,
@@ -23,7 +23,7 @@ use mmmm_domain::{
 };
 use mmmm_exchange::{
     patch::{DeltaKind, DeltaPolicy, validate_scene_patch},
-    selection::{ObjectNode, Selection},
+    selection::{ControlledSelectionError, ObjectNode, Selection},
 };
 use mmmm_planner::{OwnedKind, ProjectCatalog, SceneSource};
 use mmmm_runtime::storage::{
@@ -293,7 +293,8 @@ impl OwnedPlanningData {
         let session = self.session(store, principal, project, context, budget)?;
         let artifact_pin: ResourceRef = decode(&patch["sourceArtifact"])?;
         let map_pin: ResourceRef = decode(&patch["sourceMap"])?;
-        let artifact = parse_json(&session.resource(store, &artifact_pin)?).map_err(json_error)?;
+        let artifact_bytes = session.resource(store, &artifact_pin)?;
+        let artifact = parse_json(&artifact_bytes).map_err(json_error)?;
         let source_map = parse_json(&session.resource(store, &map_pin)?).map_err(json_error)?;
         validate("SourceMap", &source_map)?;
         if source_map["inputRevision"] != project.revision().as_str() {
@@ -322,6 +323,43 @@ impl OwnedPlanningData {
             policy.allow(target, kind).map_err(exchange_error)?;
         }
         let selection = if artifact.get("prefabId").is_some() {
+            // The artifact is an independent byte source. Equality of parsed
+            // Values does not prove its numeric lexemes match the owned CAS.
+            let validator = ContractValidator::shared().map_err(|error| {
+                AppError::caused_by(
+                    "CAPABILITY_UNAVAILABLE",
+                    "Prefab validation is unavailable",
+                    error,
+                )
+            })?;
+            let verified = validator
+                .parse_validate_prefab_exact_with_control(
+                    &artifact_bytes,
+                    mmmm_contracts::JsonLimits {
+                        max_bytes: MAX_DOCUMENT as usize,
+                        max_depth: 64,
+                        max_nodes: 100_000,
+                    },
+                    || session.check_local(),
+                )
+                .map_err(|error| match error {
+                    ControlledPrefabContractError::Control(error) => error,
+                    error @ ControlledPrefabContractError::CaptureUnavailable => {
+                        AppError::caused_by(
+                            "CAPABILITY_UNAVAILABLE",
+                            "Prefab artifact capture is unavailable",
+                            error,
+                        )
+                    }
+                    error => AppError::caused_by(
+                        "INVALID_INPUT",
+                        "Prefab artifact failed exact validation",
+                        error,
+                    ),
+                })?;
+            if verified != artifact {
+                return Err(revision_conflict());
+            }
             let pin = owned_pin(project, OwnedKind::Prefab, &artifact)?;
             if session.document(store, &pin)?.document != artifact {
                 return Err(revision_conflict());
@@ -353,6 +391,14 @@ impl OwnedPlanningData {
             )?;
         }
         validate_scene_patch(patch, &selection, &policy).map_err(exchange_error)?;
+        session.check_context()?;
+        session.check_project(store)?;
+        // Parsing and selection verification may have taken time. Re-resolve
+        // both actual resources with current Project and resource authority.
+        // Metadata verification hashes the bounded CAS again without retaining
+        // another body; it is cooperative and not an atomic authority snapshot.
+        session.check_resource(store, &artifact_pin)?;
+        session.check_resource(store, &map_pin)?;
         session.check_context()?;
         session.check_project(store)?;
         Ok(SceneSource {
@@ -712,6 +758,35 @@ impl OwnedReadSession {
         self.check_local()?;
         Ok(result.bytes)
     }
+    fn check_resource(&self, store: &PlanningStore<'_>, pin: &ResourceRef) -> AppResult<()> {
+        self.check_local()?;
+        let query = if self.project.resource_ids().contains(&pin.resource_id) {
+            ProjectResourceQuery::Exact {
+                resource_id: pin.resource_id.clone(),
+                digest: pin.sha256.clone(),
+            }
+        } else {
+            ProjectResourceQuery::RegisteredImmutable {
+                resource_id: pin.resource_id.clone(),
+            }
+        };
+        let expected = serde_json::to_value(pin).map_err(|_| invalid())?;
+        let request = ProjectResourceRequest {
+            project: self.project.project_id(),
+            current_project_revision: self.project.revision(),
+            query: &query,
+            expected: Some(&expected),
+        };
+        let mut reader =
+            ProjectResourceReader::new(Box::new(self.clone()), MAX_TOTAL).map_err(storage_error)?;
+        store.with_read(|store| {
+            reader
+                .metadata(store, self, &request)
+                .map_err(|error| self.release(error))?;
+            Ok(())
+        })?;
+        self.check_local()
+    }
     fn selection<'a>(
         &self,
         store: &PlanningStore<'_>,
@@ -724,7 +799,7 @@ impl OwnedReadSession {
             return Err(source_budget());
         }
         let mut instances: BTreeMap<String, Value> = BTreeMap::new();
-        let mut prefabs: BTreeMap<String, Value> = BTreeMap::new();
+        let mut prefabs: BTreeMap<String, (Value, Vec<u8>)> = BTreeMap::new();
         for target in &targets {
             if let std::collections::btree_map::Entry::Vacant(instance_entry) =
                 instances.entry(target.instance_id.clone())
@@ -750,10 +825,11 @@ impl OwnedReadSession {
                             object_id: decode(&value["prefabId"])?,
                             revision,
                         };
-                        prefab_entry.insert(self.document(store, &owned)?.document);
+                        let actual = self.document(store, &owned)?;
+                        prefab_entry.insert((actual.document, actual.bytes));
                     }
                     std::collections::btree_map::Entry::Occupied(prefab_entry)
-                        if prefab_entry.get()["revision"] != revision.as_str() =>
+                        if prefab_entry.get().0["revision"] != revision.as_str() =>
                     {
                         return Err(revision_conflict());
                     }
@@ -766,14 +842,47 @@ impl OwnedReadSession {
             .iter()
             .map(|target| target.node_id.clone())
             .collect::<BTreeSet<_>>();
+        let prefab_values: Vec<_> = prefabs.values().map(|(value, _)| value.clone()).collect();
+        let prefab_bytes: Vec<_> = prefabs
+            .values()
+            .map(|(_, bytes)| bytes.as_slice())
+            .collect();
         let value = json!({"contractVersion":mmmm_contracts::CONTRACT_VERSION,"selectionId":id,
             "projectId":self.project.project_id(),"projectRevision":self.project.revision(),
-            "instances":instances.into_values().collect::<Vec<_>>(),"prefabs":prefabs.into_values().collect::<Vec<_>>(),
+            "instances":instances.values().cloned().collect::<Vec<_>>(),"prefabs":prefab_values,
             "selectedNodeIds":selected,"externalReferencePolicy":"preserve","sourceMap":map});
         if encode_json(&value).map_err(json_error)?.len() as u64 > MAX_DOCUMENT {
             return Err(source_budget());
         }
-        let selection = Selection::from_value(&value).map_err(exchange_error)?;
+        let selection = Selection::from_value_with_integral_prefab_resource_comparison(
+            &value,
+            &prefab_bytes,
+            || self.check_local(),
+        )
+        .map_err(|error| match error {
+            ControlledSelectionError::Control(error) => error,
+            ControlledSelectionError::Exchange(error) => exchange_error(error),
+            ControlledSelectionError::Prefab { error, .. } => {
+                let code = match &error {
+                    ControlledPrefabContractError::CaptureUnavailable => "CAPABILITY_UNAVAILABLE",
+                    _ => "INVALID_INPUT",
+                };
+                AppError::caused_by(code, "Owned Prefab source failed exact validation", error)
+            }
+            ControlledSelectionError::PrefabBytesCountMismatch
+            | ControlledSelectionError::PrefabValueMismatch { .. } => AppError::new(
+                "SOURCE_PROVENANCE_INVALID",
+                "Owned Prefab source bytes did not match the selected document",
+            ),
+        })?;
+        // Exact parsing can take time. Recheck current Project/context and the
+        // object scope for every actual document before returning its selection.
+        self.check_context()?;
+        self.check_project(store)?;
+        for id in instances.keys().chain(prefabs.keys()) {
+            self.source_scope("objectIds", id)
+                .map_err(|error| self.release(error))?;
+        }
         if targets
             .iter()
             .any(|target| selection.node(target).is_none())

@@ -357,7 +357,7 @@ fn validate_overrides(instance: &Instance, prefab: &Prefab) -> ExchangeResult<()
     Ok(())
 }
 
-fn selection_budget(value: &Value) -> ExchangeResult<()> {
+pub(crate) fn selection_budget(value: &Value) -> ExchangeResult<()> {
     if crate::array(value, "instances")?.len() > 4096
         || crate::array(value, "prefabs")?.len() > 4096
         || crate::array(value, "selectedNodeIds")?.len() > 16384

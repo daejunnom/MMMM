@@ -693,6 +693,15 @@ fn native_owned_scene(
     handles: &mut DaemonHandles,
     budget: &RequestBudget,
 ) -> NativeOwnedScene {
+    native_owned_scene_with_decimal(store, handles, budget, false)
+}
+
+fn native_owned_scene_with_decimal(
+    store: &mut DurableStore,
+    handles: &mut DaemonHandles,
+    budget: &RequestBudget,
+    decimal: bool,
+) -> NativeOwnedScene {
     // Keep only the original static root/door Nodes: the complete example also
     // requires real blockset, CommandModule and Clip sources. This regression
     // exercises Store forwarding, not those separate admission producers.
@@ -711,15 +720,28 @@ fn native_owned_scene(
     ] {
         prefab[field] = json!([]);
     }
+    let decimal_id = ResourceId::new("resource-factory-decimal").unwrap();
+    let decimal_resource = raw_resource(decimal_id.clone(), b"x");
+    if decimal {
+        prefab["resources"] = json!([decimal_resource.clone()]);
+        prefab["nodes"][0]["geometryResource"] = json!(decimal_resource.clone());
+    }
     prefab["revision"] = json!(projected_digest("Prefab", &prefab).unwrap());
     let original_instance = &selection["instances"][0];
-    let instance = mmmm_domain::instantiate(&json!({
+    let mut instance = mmmm_domain::instantiate(&json!({
         "prefab":prefab,"instanceId":original_instance["instanceId"],
         "worldId":original_instance["worldId"],"dimension":original_instance["dimension"],
         "placement":original_instance["placement"],"statePolicy":"defaults",
     }))
     .unwrap()["instance"]
         .clone();
+    if decimal {
+        prefab["resources"][0]["sizeBytes"] = json!(1.0);
+        prefab["nodes"][0]["geometryResource"]["sizeBytes"] = json!(1.0);
+        prefab["revision"] = json!(projected_digest("Prefab", &prefab).unwrap());
+        instance["prefabRevision"] = prefab["revision"].clone();
+        instance["revision"] = json!(projected_digest("Instance", &instance).unwrap());
+    }
     let prefab_bytes = encode_json(&prefab).unwrap();
     let instance_bytes = encode_json(&instance).unwrap();
     let documents = [
@@ -760,7 +782,8 @@ fn native_owned_scene(
     let preview_map_bytes = encode_json(&map).unwrap();
     let preview_map = raw_resource(map_id.clone(), &preview_map_bytes);
     let preview_map_metadata = encode_json(&json!(preview_map)).unwrap();
-    let preview_raw = [
+    let decimal_metadata = encode_json(&json!(decimal_resource)).unwrap();
+    let mut preview_raw = vec![
         NativeRawSourceResource {
             metadata: &artifact_metadata,
             bytes: &prefab_bytes,
@@ -770,6 +793,12 @@ fn native_owned_scene(
             bytes: &preview_map_bytes,
         },
     ];
+    if decimal {
+        preview_raw.push(NativeRawSourceResource {
+            metadata: &decimal_metadata,
+            bytes: b"x",
+        });
+    }
     let preview = prepare_native_sources(
         store,
         &original_owner,
@@ -784,6 +813,7 @@ fn native_owned_scene(
         },
     )
     .unwrap();
+    assert_eq!(preview.resource_count(), if decimal { 3 } else { 2 });
     let next_revision = preview.proposed_revision().unwrap();
     assert_eq!(store.project(&project_id).unwrap(), before);
     assert_eq!(
@@ -799,7 +829,7 @@ fn native_owned_scene(
     let map_bytes = encode_json(&map).unwrap();
     let map_pin = raw_resource(map_id.clone(), &map_bytes);
     let map_metadata = encode_json(&json!(map_pin)).unwrap();
-    let raw_resources = [
+    let mut raw_resources = vec![
         NativeRawSourceResource {
             metadata: &artifact_metadata,
             bytes: &prefab_bytes,
@@ -809,6 +839,12 @@ fn native_owned_scene(
             bytes: &map_bytes,
         },
     ];
+    if decimal {
+        raw_resources.push(NativeRawSourceResource {
+            metadata: &decimal_metadata,
+            bytes: b"x",
+        });
+    }
     let prepared = prepare_native_sources(
         store,
         &original_owner,
@@ -825,13 +861,23 @@ fn native_owned_scene(
     .unwrap();
     assert_eq!(prepared.proposed_revision().unwrap(), next_revision);
     assert_eq!(prepared.document_count(), 2);
-    assert_eq!(prepared.resource_count(), 2);
+    assert_eq!(prepared.resource_count(), if decimal { 3 } else { 2 });
     let receipt = prepared.commit(store).unwrap();
     assert_eq!(receipt.project_id, project_id);
     assert_eq!(receipt.base_revision, old_revision);
     assert_eq!(receipt.project_revision, next_revision);
     assert_eq!(receipt.documents.len(), 2);
-    assert_eq!(receipt.resources.len(), 2);
+    assert_eq!(receipt.resources.len(), if decimal { 3 } else { 2 });
+    if decimal {
+        let (_, blob) = receipt
+            .resources
+            .iter()
+            .find(|(id, _)| id == &decimal_id)
+            .unwrap();
+        assert_eq!(blob.digest, decimal_resource.sha256);
+        assert_eq!(blob.byte_length, 1);
+        assert_eq!(store.read_blob(blob).unwrap().as_slice(), b"x");
+    }
     for (id, resource, bytes) in [
         (artifact_id.clone(), &artifact, &prefab_bytes),
         (map_id.clone(), &map_pin, &map_bytes),
@@ -912,6 +958,9 @@ fn native_owned_scene(
     let mut expected_resources: BTreeSet<ResourceId> =
         serde_json::from_value(before["resourceIds"].clone()).unwrap();
     expected_resources.extend([artifact_id, map_id]);
+    if decimal {
+        expected_resources.insert(decimal_id);
+    }
     assert_eq!(resources, expected_resources);
     handles.workspace = Some(workspace);
     let catalog = ProjectCatalog::from_project(&project).unwrap();
@@ -1371,6 +1420,76 @@ fn offline_factory_data_trait_reads_same_store_owned_scene_and_keeps_state_unava
     assert_eq!(
         fixture.call().unwrap(),
         json!({"ownedSourceRead":true,"liveStateIssued":false})
+    );
+    assert!(handles.request.occupied_witness().is_err());
+}
+
+#[test]
+fn offline_factory_data_reads_decimal_prefab_from_native_source_commit() {
+    let root = TestRoot::new();
+    let mut store = root.open();
+    let mut handles = handles(&mut store);
+    let budget =
+        RequestBudget::new(Duration::from_secs(30), Arc::new(AtomicBool::new(false))).unwrap();
+    let inputs = native_owned_scene_with_decimal(&mut store, &mut handles, &budget, true);
+    let original_bytes = encode_json(&inputs.prefab).unwrap();
+    assert_eq!(
+        std::str::from_utf8(&original_bytes)
+            .unwrap()
+            .matches("\"sizeBytes\":1.0")
+            .count(),
+        2
+    );
+    let context = handles.workspace.as_ref().unwrap().context.clone();
+    let principal = handles
+        .workspace
+        .as_ref()
+        .unwrap()
+        .witness
+        .principal()
+        .clone();
+    let mut factory = ProductionFactory::offline_owned(binary_digest());
+    let parts = factory.compose(&handles, &store).unwrap();
+    let data = parts.data.clone();
+    let mut fixture = source_fixture(store, &handles, parts, budget, move |store, request| {
+        let frame = PlanningStore::read(store);
+        let mut data = data.try_borrow_mut().unwrap();
+        let source = data.scene_source_with_store(
+            &frame,
+            &principal,
+            &inputs.catalog,
+            &inputs.patch,
+            &context,
+            request.budget(),
+        )?;
+        assert_eq!(source.artifact, inputs.prefab);
+        assert_eq!(
+            source.selection.value()["prefabs"],
+            json!([inputs.prefab.clone()])
+        );
+        assert_eq!(
+            source.selection.value()["instances"],
+            json!([inputs.instance.clone()])
+        );
+        assert!(source.selection.value()["prefabs"][0]["resources"][0]["sizeBytes"].is_f64());
+        assert!(
+            source.selection.value()["prefabs"][0]["nodes"][0]["geometryResource"]["sizeBytes"]
+                .is_f64()
+        );
+        data.validate_scene_provenance_with_store(
+            &frame,
+            &principal,
+            &inputs.catalog,
+            &inputs.patch,
+            &source,
+            &context,
+            request.budget(),
+        )?;
+        Ok(json!({"nativeDecimalSourceRead":true,"gameOrPlanIssued":false}))
+    });
+    assert_eq!(
+        fixture.call().unwrap(),
+        json!({"nativeDecimalSourceRead":true,"gameOrPlanIssued":false})
     );
     assert!(handles.request.occupied_witness().is_err());
 }
