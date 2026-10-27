@@ -4271,3 +4271,9 @@ Selection artifact의 기존 Value-only 정수 성공 경로는 유지한다. Pr
 파싱은 hard preemption이 없고 전후 권한 확인은 원자적 snapshot이 아니다. 독립 artifact의
 반올림 분수와 양성 사례는 작성했으나 보유 CAS만 분수인 역방향 사례 및 개별 resource ACL
 철회는 미검증이다. 실제 테스트·게임 및 인수는 별도다.
+
+`0a84e3a` Rust145 Linux·macOS의 test는 통과했으며 Linux 원 로그에서 실제 source→planner
+준비 sentinel과 이전 decimal 실패 검사도 각각 통과했다. Clippy는 Factory 테스트의
+`.err().expect()`를 `err_expect`로 거절했다. 원 test·lint 출력과 drain/export·scratch·lease
+결과는 보존한다. 수정은 `.expect_err()` 표현만 사용하며 예상치 못한 Ok의 Debug 표시가
+추가된다. 실제 재검사는 후속 CI에서 확인한다.

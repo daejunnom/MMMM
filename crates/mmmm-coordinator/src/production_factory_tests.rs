@@ -1722,8 +1722,7 @@ fn decimal_prefab_reaches_actual_scene_preparation_but_fractional_artifact_does_
                     inputs.catalog.project(),
                     &context,
                 )
-                .err()
-                .expect("fixture stops before a plan is issued");
+                .expect_err("fixture stops before a plan is issued");
             if fractional_artifact {
                 assert_eq!(error.code, "INVALID_INPUT", "{error:?}");
                 assert_eq!(error.message, "Prefab artifact failed exact validation");
