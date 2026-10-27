@@ -23,7 +23,9 @@ use mmmm_domain::{
 };
 use mmmm_exchange::{
     patch::{DeltaKind, DeltaPolicy, validate_scene_patch},
-    selection::{ControlledSelectionError, ObjectNode, Selection},
+    selection::{
+        ControlledSelectionArtifactError, ControlledSelectionError, ObjectNode, Selection,
+    },
 };
 use mmmm_planner::{OwnedKind, ProjectCatalog, SceneSource};
 use mmmm_runtime::storage::{
@@ -372,7 +374,7 @@ impl OwnedPlanningData {
                 &selection_id,
             )?
         } else if artifact.get("instances").is_some() && artifact.get("prefabs").is_some() {
-            session.checked_selection_artifact(store, &artifact, &map_pin)?
+            session.checked_selection_artifact(store, &artifact, &artifact_bytes, &map_pin)?
         } else {
             return Err(AppError::new(
                 "CAPABILITY_UNAVAILABLE",
@@ -896,10 +898,40 @@ impl OwnedReadSession {
         &self,
         store: &PlanningStore<'_>,
         artifact: &Value,
+        artifact_bytes: &[u8],
         map: &ResourceRef,
     ) -> AppResult<Selection> {
-        let selection = Selection::from_value(artifact).map_err(exchange_error)?;
-        selection
+        // Preserve the existing Value-only path for already accepted integer
+        // selections. Only an actual ResourceRef decimal representation may
+        // enter the raw-aware fallback; unrelated failures retain their error.
+        let (initial_selection, raw_decimal) = match Selection::from_value(artifact) {
+            Ok(selection) => (selection, false),
+            Err(error) => {
+                if error.code != "SCHEMA_INVALID" {
+                    return Err(exchange_error(error));
+                }
+                let decimal_only =
+                    Selection::has_only_prefab_decimal_value_failure(artifact, || {
+                        self.check_local()
+                    })
+                    .map_err(selection_artifact_error)?;
+                if !decimal_only {
+                    return Err(exchange_error(error));
+                }
+                // Artifact bytes and owned Prefab CAS bytes are independent
+                // witnesses: a rounded fraction can parse to the same Value.
+                let selection =
+                    Selection::from_selection_artifact_bytes_with_control(artifact_bytes, || {
+                        self.check_local()
+                    })
+                    .map_err(selection_artifact_error)?;
+                if selection.value() != artifact {
+                    return Err(revision_conflict());
+                }
+                (selection, true)
+            }
+        };
+        initial_selection
             .check_revision(
                 self.project.project_id().as_str(),
                 self.project.revision().as_str(),
@@ -925,15 +957,86 @@ impl OwnedReadSession {
                 return Err(revision_conflict());
             }
         }
+        let mut actual_prefab_bytes = Vec::new();
         for prefab in array(artifact, "prefabs")? {
             let pin = owned_pin(&self.project, OwnedKind::Prefab, prefab)?;
-            if self.document(store, &pin)?.document != *prefab {
+            let actual = self.document(store, &pin)?;
+            if actual.document != *prefab {
                 return Err(revision_conflict());
             }
+            if raw_decimal {
+                actual_prefab_bytes.push(actual.bytes);
+            }
         }
+        let selection = if raw_decimal {
+            let bytes = actual_prefab_bytes
+                .iter()
+                .map(Vec::as_slice)
+                .collect::<Vec<_>>();
+            let selection = Selection::from_value_with_integral_prefab_resource_comparison(
+                artifact,
+                &bytes,
+                || self.check_local(),
+            )
+            .map_err(|error| match error {
+                ControlledSelectionError::Control(error) => error,
+                ControlledSelectionError::Exchange(error) => exchange_error(error),
+                ControlledSelectionError::Prefab { error, .. } => {
+                    let code = match &error {
+                        ControlledPrefabContractError::CaptureUnavailable => {
+                            "CAPABILITY_UNAVAILABLE"
+                        }
+                        _ => "INVALID_INPUT",
+                    };
+                    AppError::caused_by(code, "Owned Prefab source failed exact validation", error)
+                }
+                ControlledSelectionError::PrefabBytesCountMismatch
+                | ControlledSelectionError::PrefabValueMismatch { .. } => AppError::new(
+                    "SOURCE_PROVENANCE_INVALID",
+                    "Owned Prefab source bytes did not match the selected document",
+                ),
+            })?;
+            // Recheck the same current Project and the scope of every selected
+            // document after the potentially long exact parsing pass.
+            self.check_context()?;
+            self.check_project(store)?;
+            for document in array(artifact, "instances")? {
+                self.source_scope("objectIds", text(document, "instanceId")?)
+                    .map_err(|error| self.release(error))?;
+            }
+            for document in array(artifact, "prefabs")? {
+                self.source_scope("objectIds", text(document, "prefabId")?)
+                    .map_err(|error| self.release(error))?;
+            }
+            selection
+        } else {
+            initial_selection
+        };
         // Keep original array order and the complete selected base. A partial
         // edit does not discard other selected owned instances or nodes.
         Ok(selection)
+    }
+}
+
+fn selection_artifact_error(error: ControlledSelectionArtifactError<AppError>) -> AppError {
+    match error {
+        ControlledSelectionArtifactError::Control(error) => error,
+        ControlledSelectionArtifactError::Exchange(error) => exchange_error(error),
+        error @ ControlledSelectionArtifactError::ValidatorUnavailable(_) => AppError::caused_by(
+            "CAPABILITY_UNAVAILABLE",
+            "Selection artifact validation is unavailable",
+            error,
+        ),
+        error @ ControlledSelectionArtifactError::CaptureUnavailable => AppError::caused_by(
+            "CAPABILITY_UNAVAILABLE",
+            "Selection artifact capture is unavailable",
+            error,
+        ),
+        error => AppError::caused_by(
+            "INVALID_INPUT",
+            "Selection artifact failed exact validation",
+            error,
+        ),
     }
 }
 impl ProjectSourceRpcContext for OwnedReadSession {

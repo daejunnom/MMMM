@@ -160,10 +160,26 @@ impl NativePlanner<'_> {
             self.source
                 .check_source(principal, project, Some(context))?;
         }
-        validate_artifact(&artifact, &artifact_bytes, project, &mut || {
-            self.source.checkpoint_source()
-        })?;
+        let artifact_validation =
+            validate_artifact(&artifact, &artifact_bytes, project, &mut || {
+                self.source.checkpoint_source()
+            })?;
         if prefab_artifact {
+            self.source
+                .check_source(principal, project, Some(context))?;
+        }
+        if matches!(
+            artifact_validation,
+            ArtifactValidation::RawSelectionRequired
+        ) {
+            // A Selection artifact is a distinct registered byte source. Its
+            // Prefab lexemes cannot be attested by a different owned Prefab's
+            // bytes, even when the parsed Values compare equal.
+            self.source
+                .check_source(principal, project, Some(context))?;
+            validate_selection_artifact_raw(&artifact, &artifact_bytes, project, &mut || {
+                self.source.checkpoint_source()
+            })?;
             self.source
                 .check_source(principal, project, Some(context))?;
         }
@@ -526,12 +542,18 @@ impl NativePlanner<'_> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ArtifactValidation {
+    Checked,
+    RawSelectionRequired,
+}
+
 fn validate_artifact(
     artifact: &Value,
     artifact_bytes: &[u8],
     project: &ProjectCatalog,
     checkpoint: &mut impl FnMut() -> AppResult<()>,
-) -> AppResult<()> {
+) -> AppResult<ArtifactValidation> {
     if artifact.get("artifactId").is_some() {
         validate("BakeArtifact", artifact)?;
     } else if artifact.get("prefabId").is_some() {
@@ -568,7 +590,21 @@ fn validate_artifact(
         mmmm_contracts::verify_projected_digest("Prefab", artifact).map_err(|_| conflict())?;
         mmmm_domain::prefab::require_valid(&prefab).map_err(domain)?;
     } else if artifact.get("instances").is_some() && artifact.get("prefabs").is_some() {
-        let selection = Selection::from_value(artifact).map_err(exchange)?;
+        let selection = match Selection::from_value(artifact) {
+            Ok(selection) => selection,
+            Err(error) => {
+                // A shared diagnostic performs bounded, schema-owned-only
+                // tentative comparison. It emits no lexical proof or authority.
+                // Do not replace unrelated Value-only errors with a new path.
+                if error.code == "SCHEMA_INVALID"
+                    && Selection::has_only_prefab_decimal_value_failure(artifact, &mut *checkpoint)
+                        .map_err(selection_artifact_error)?
+                {
+                    return Ok(ArtifactValidation::RawSelectionRequired);
+                }
+                return Err(exchange(error));
+            }
+        };
         selection
             .check_revision(project.project_id().as_str(), project.revision().as_str())
             .map_err(exchange)?;
@@ -578,7 +614,52 @@ fn validate_artifact(
             "Scene source artifact has no supported canonical authored or sealed bake format",
         ));
     }
-    Ok(())
+    Ok(ArtifactValidation::Checked)
+}
+
+fn selection_artifact_error(
+    error: mmmm_exchange::selection::ControlledSelectionArtifactError<AppError>,
+) -> AppError {
+    use mmmm_exchange::selection::ControlledSelectionArtifactError;
+    match error {
+        ControlledSelectionArtifactError::Control(error) => error,
+        ControlledSelectionArtifactError::Exchange(error) => exchange(error),
+        error @ ControlledSelectionArtifactError::ValidatorUnavailable(_) => AppError::caused_by(
+            "CAPABILITY_UNAVAILABLE",
+            "Selection artifact validator is unavailable",
+            error,
+        ),
+        error @ ControlledSelectionArtifactError::CaptureUnavailable => AppError::caused_by(
+            "CAPABILITY_UNAVAILABLE",
+            "Selection artifact exact capture is unavailable",
+            error,
+        ),
+        error => AppError::caused_by(
+            "INVALID_INPUT",
+            "Selection artifact failed exact validation",
+            error,
+        ),
+    }
+}
+
+fn validate_selection_artifact_raw(
+    artifact: &Value,
+    artifact_bytes: &[u8],
+    project: &ProjectCatalog,
+    checkpoint: &mut impl FnMut() -> AppResult<()>,
+) -> AppResult<()> {
+    let selection =
+        Selection::from_selection_artifact_bytes_with_control(artifact_bytes, checkpoint)
+            .map_err(selection_artifact_error)?;
+    if selection.value() != artifact {
+        return Err(AppError::new(
+            "CAPABILITY_UNAVAILABLE",
+            "Selection artifact exact validation returned a different parsed value",
+        ));
+    }
+    selection
+        .check_revision(project.project_id().as_str(), project.revision().as_str())
+        .map_err(exchange)
 }
 
 /// Every selected imported clip is installed as a whole. Each of its tracks
@@ -1513,6 +1594,113 @@ mod tests {
         .unwrap_err();
         assert_eq!(stopped.code, "TEST_CANCELLED");
         assert_eq!(stopped.message, "Original test cancellation");
+    }
+
+    #[test]
+    fn selection_artifact_raw_fallback_is_narrow_and_checks_its_own_bytes() {
+        let project = ProjectCatalog::from_project(
+            &serde_json::from_str(include_str!("../../../examples/project.json")).unwrap(),
+        )
+        .unwrap();
+        let mut selection: Value =
+            serde_json::from_str(include_str!("../../../examples/scene-selection.json")).unwrap();
+        selection["projectRevision"] = json!(project.revision());
+
+        // Existing integer Selection artifacts retain the legacy path.
+        let integer_bytes = serde_json::to_vec(&selection).unwrap();
+        assert_eq!(
+            validate_artifact(&selection, &integer_bytes, &project, &mut || Ok(())).unwrap(),
+            ArtifactValidation::Checked
+        );
+        let mut only_unrelated = selection.clone();
+        only_unrelated["sourceMap"]["sizeBytes"] = json!(1.0);
+        let unrelated_bytes = serde_json::to_vec(&only_unrelated).unwrap();
+        let original = exchange(Selection::from_value(&only_unrelated).unwrap_err());
+        let actual = validate_artifact(&only_unrelated, &unrelated_bytes, &project, &mut || {
+            Err(AppError::new(
+                "TEST_CANCELLED",
+                "Not a decimal Prefab fallback",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(actual.code, original.code);
+        assert_eq!(actual.message, original.message);
+
+        selection["prefabs"][0]["resources"][0]["sizeBytes"] = json!(1.0);
+        let revision = projected_digest("Prefab", &selection["prefabs"][0]).unwrap();
+        selection["prefabs"][0]["revision"] = json!(revision);
+        selection["instances"][0]["prefabRevision"] = json!(revision);
+        selection["instances"][0]["revision"] =
+            json!(projected_digest("Instance", &selection["instances"][0]).unwrap());
+        let bytes = serde_json::to_vec(&selection).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let needle = "\"sizeBytes\":1.0";
+        assert_eq!(text.matches(needle).count(), 1);
+        assert_eq!(
+            validate_artifact(&selection, &bytes, &project, &mut || Ok(())).unwrap(),
+            ArtifactValidation::RawSelectionRequired
+        );
+        validate_selection_artifact_raw(&selection, &bytes, &project, &mut || Ok(())).unwrap();
+
+        let fraction = text.replacen(needle, "\"sizeBytes\":1.0000000000000001", 1);
+        assert_eq!(
+            mmmm_contracts::parse_json(fraction.as_bytes()).unwrap(),
+            selection
+        );
+        let error =
+            validate_selection_artifact_raw(&selection, fraction.as_bytes(), &project, &mut || {
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "INVALID_INPUT");
+        let cause = std::error::Error::source(&error)
+            .and_then(|source| {
+                source.downcast_ref::<
+                    mmmm_exchange::selection::ControlledSelectionArtifactError<AppError>,
+                >()
+            })
+            .expect("retain the typed artifact failure");
+        assert!(matches!(
+            cause,
+            mmmm_exchange::selection::ControlledSelectionArtifactError::ExactInteger { location }
+                if location.prefab == 0
+                    && location.location == mmmm_contracts::validation::PrefabExactLocation::Resource(0)
+        ));
+
+        let mismatch = text.replacen(
+            "\"selectionId\":\"selection-shop\"",
+            "\"selectionId\":\"selection-other\"",
+            1,
+        );
+        assert_ne!(mismatch, text);
+        assert_eq!(
+            validate_selection_artifact_raw(&selection, mismatch.as_bytes(), &project, &mut || Ok(
+                ()
+            ))
+            .unwrap_err()
+            .code,
+            "CAPABILITY_UNAVAILABLE"
+        );
+        let cancelled = validate_selection_artifact_raw(&selection, &bytes, &project, &mut || {
+            Err(AppError::new(
+                "TEST_CANCELLED",
+                "Original test cancellation",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(cancelled.code, "TEST_CANCELLED");
+        assert_eq!(cancelled.message, "Original test cancellation");
+
+        // A separate Value-only error must not be reclassified just because a
+        // Prefab also contains a decimal length. sourceMap is not a Prefab
+        // numeric witness and remains on its original validation path.
+        let mut unrelated = selection.clone();
+        unrelated["sourceMap"]["sizeBytes"] = json!(1.0);
+        let raw = serde_json::to_vec(&unrelated).unwrap();
+        let original = exchange(Selection::from_value(&unrelated).unwrap_err());
+        let actual = validate_artifact(&unrelated, &raw, &project, &mut || Ok(())).unwrap_err();
+        assert_eq!(actual.code, original.code);
+        assert_eq!(actual.message, original.message);
     }
 
     fn source() -> (Instance, Prefab, CommandModule, AnimationClip) {

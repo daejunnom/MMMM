@@ -4262,3 +4262,12 @@ capture는 거절한다. sourceMap·display·opaque는 선택하지 않고 기�
 통과했다. 뒤이은 strict Clippy는 Selection의 중첩 `if` 한 곳을 `collapsible_if`로 거절했다.
 원 로그와 정상 drain/export·scratch 제거·lease 해제 결과를 보존한다. 수정은 기존 평가·중복
 오류 순서를 유지하는 let-chain이며 lint 완화는 없다. 수정 후 실제 검사는 후속 CI에서 확인한다.
+
+Selection artifact의 기존 Value-only 정수 성공 경로는 유지한다. Prefab 자원의 decimal이
+후보인 경우에만 artifact 자체 원 bytes의 중첩 exact 검사와 각 권한 있는 보유 Prefab CAS의
+별도 exact 검사·Value/pin 대조를 수행하고 원 Selection 및 sourceMap을 유지한다. Planner도
+자신의 artifact bytes와 원 Value·Project revision을 검사한다. 새 fallback에만 8 MiB 제한이
+적용되며, 후보 발견 후 취소·예산 오류가 다른 후행 오류보다 먼저 관측될 수 있다. 동기
+파싱은 hard preemption이 없고 전후 권한 확인은 원자적 snapshot이 아니다. 독립 artifact의
+반올림 분수와 양성 사례는 작성했으나 보유 CAS만 분수인 역방향 사례 및 개별 resource ACL
+철회는 미검증이다. 실제 테스트·게임 및 인수는 별도다.

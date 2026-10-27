@@ -2,12 +2,17 @@
 //! never participate in object identity and an omitted object is not a deletion.
 use crate::{ExchangeError, ExchangeResult, array, text, validate};
 use mmmm_contracts::{
-    ContractValidator, JsonLimits, validation::ControlledPrefabContractError,
+    ContractError, ContractValidator, JsonLimits,
+    validation::{
+        ControlledPrefabContractError, ControlledSelectionContractError, SelectionExactLocation,
+    },
     verify_projected_digest,
 };
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
     io::{self, Write},
     sync::Arc,
 };
@@ -53,9 +58,217 @@ pub enum ControlledSelectionError<E> {
     },
 }
 
+/// Failures while validating one complete Selection artifact's original bytes.
+/// This is not a CAS or authorization witness; callers establish provenance.
+#[derive(Debug)]
+pub enum ControlledSelectionArtifactError<E> {
+    ValidatorUnavailable(ContractError),
+    Contract(ContractError),
+    ExactInteger { location: SelectionExactLocation },
+    CaptureUnavailable,
+    Control(E),
+    Exchange(ExchangeError),
+}
+
+impl<E: fmt::Display> fmt::Display for ControlledSelectionArtifactError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ValidatorUnavailable(error) => error.fmt(f),
+            Self::Contract(error) => error.fmt(f),
+            Self::ExactInteger { location } => write!(
+                f,
+                "Selection Prefab {} {:?} sizeBytes is not an exact safe JSON integer",
+                location.prefab, location.location
+            ),
+            Self::CaptureUnavailable => {
+                f.write_str("Bounded Selection artifact capture is unavailable")
+            }
+            Self::Control(error) => error.fmt(f),
+            Self::Exchange(error) => error.fmt(f),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for ControlledSelectionArtifactError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ValidatorUnavailable(error) => Some(error),
+            Self::Contract(error) => Some(error),
+            Self::Control(error) => Some(error),
+            Self::Exchange(error) => Some(error),
+            Self::ExactInteger { .. } | Self::CaptureUnavailable => None,
+        }
+    }
+}
+
 impl Selection {
     pub fn from_value(value: &Value) -> ExchangeResult<Self> {
         Self::from_comparison(value, value, false)
+    }
+
+    /// Diagnostic classifier for a Value-only decoding failure. It constructs
+    /// no transferable witness: a caller may use `true` only to choose a raw
+    /// path that independently verifies the original artifact bytes. The
+    /// bounded private comparison must pass all of the normal Selection checks,
+    /// so unrelated schema or semantic failures are not treated as decimal
+    /// Prefab failures. Existing Value-only decoding remains unchanged.
+    /// A failed schema or typed comparison is classified as false after its
+    /// checkpoint. Budget, serialization or array-lookup errors are returned
+    /// immediately; a concurrent later cancellation is then unobserved.
+    /// Once a decimal candidate is found, a checkpoint failure may take
+    /// priority over a later unrelated schema or semantic failure.
+    /// Checkpoints cannot preempt one validation or serialization operation.
+    pub fn has_only_prefab_decimal_value_failure<E>(
+        value: &Value,
+        mut checkpoint: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, ControlledSelectionArtifactError<E>> {
+        // Check for a candidate without allocating a clone or imposing the
+        // raw path's byte cap or invoking the raw-path checkpoint on unrelated
+        // Value-only decoding failures. This synchronous scan is bounded to
+        // 4,096 Prefabs and 100,000 immediate resource/node entries.
+        let Some(prefabs) = value.get("prefabs").and_then(Value::as_array) else {
+            return Ok(false);
+        };
+        if prefabs.len() > 4096 {
+            return Ok(false);
+        }
+        let mut found = false;
+        let mut inspected = 0_usize;
+        for prefab in prefabs {
+            let Some(resources) = prefab.get("resources").and_then(Value::as_array) else {
+                return Ok(false);
+            };
+            let Some(nodes) = prefab.get("nodes").and_then(Value::as_array) else {
+                return Ok(false);
+            };
+            inspected = match inspected
+                .checked_add(resources.len())
+                .and_then(|total| total.checked_add(nodes.len()))
+            {
+                Some(total) if total <= 100_000 => total,
+                _ => return Ok(false),
+            };
+            for reference in resources {
+                let size = &reference["sizeBytes"];
+                found |= size.as_u64().is_none() && size.as_f64().is_some();
+            }
+            for node in nodes {
+                if let Some(reference) = node.get("geometryResource") {
+                    let size = &reference["sizeBytes"];
+                    found |= size.as_u64().is_none() && size.as_f64().is_some();
+                }
+            }
+        }
+        if !found {
+            return Ok(false);
+        }
+        checkpoint().map_err(ControlledSelectionArtifactError::Control)?;
+        if validate("SceneSelectionSnapshot", value).is_err() {
+            checkpoint().map_err(ControlledSelectionArtifactError::Control)?;
+            return Ok(false);
+        }
+        crate::physics::selection_budget(value)
+            .map_err(ControlledSelectionArtifactError::Exchange)?;
+        check_comparison_selection_bytes(value)
+            .map_err(ControlledSelectionArtifactError::Exchange)?;
+        checkpoint().map_err(ControlledSelectionArtifactError::Control)?;
+        let prefabs =
+            array(value, "prefabs").map_err(ControlledSelectionArtifactError::Exchange)?;
+        let mut typed_prefabs = Vec::with_capacity(prefabs.len());
+        for prefab in prefabs {
+            checkpoint().map_err(ControlledSelectionArtifactError::Control)?;
+            let typed = match normalize_prefab_comparison(prefab, &mut checkpoint) {
+                Ok(typed) => typed,
+                Err(ControlledSelectionError::Control(error)) => {
+                    return Err(ControlledSelectionArtifactError::Control(error));
+                }
+                Err(ControlledSelectionError::Exchange(_)) => {
+                    checkpoint().map_err(ControlledSelectionArtifactError::Control)?;
+                    return Ok(false);
+                }
+                Err(_) => return Err(ControlledSelectionArtifactError::CaptureUnavailable),
+            };
+            typed_prefabs.push(typed);
+        }
+        checkpoint().map_err(ControlledSelectionArtifactError::Control)?;
+        let mut comparison = value.clone();
+        comparison["prefabs"] = Value::Array(typed_prefabs);
+        let accepted = Self::from_comparison(value, &comparison, false).is_ok();
+        checkpoint().map_err(ControlledSelectionArtifactError::Control)?;
+        Ok(accepted)
+    }
+
+    /// Validate the complete Selection artifact on its own original bytes and
+    /// build private typed comparisons for only the selected Prefab resource
+    /// paths. This retains original values and pins; it does not authorize the
+    /// artifact or other documents with equal Values. The raw artifact and its
+    /// complete serialized Value are each limited to 8 MiB on this opt-in path.
+    /// Synchronous validation failures return without a later checkpoint, so a
+    /// concurrent subsequent cancellation is not observed on that error path.
+    pub fn from_selection_artifact_bytes_with_control<E>(
+        bytes: &[u8],
+        mut checkpoint: impl FnMut() -> Result<(), E>,
+    ) -> Result<Self, ControlledSelectionArtifactError<E>> {
+        checkpoint().map_err(ControlledSelectionArtifactError::Control)?;
+        let validator = ContractValidator::shared()
+            .map_err(ControlledSelectionArtifactError::ValidatorUnavailable)?;
+        let value = validator
+            .parse_validate_selection_exact_with_control(
+                bytes,
+                JsonLimits {
+                    max_bytes: MAX_COMPARISON_SELECTION_BYTES,
+                    max_depth: 64,
+                    max_nodes: 100_000,
+                },
+                &mut checkpoint,
+            )
+            .map_err(|error| match error {
+                ControlledSelectionContractError::Control(error) => {
+                    ControlledSelectionArtifactError::Control(error)
+                }
+                ControlledSelectionContractError::Contract(error) => {
+                    ControlledSelectionArtifactError::Contract(error)
+                }
+                ControlledSelectionContractError::ExactInteger { location } => {
+                    ControlledSelectionArtifactError::ExactInteger { location }
+                }
+                ControlledSelectionContractError::CaptureUnavailable => {
+                    ControlledSelectionArtifactError::CaptureUnavailable
+                }
+            })?;
+        crate::physics::selection_budget(&value)
+            .map_err(ControlledSelectionArtifactError::Exchange)?;
+        check_comparison_selection_bytes(&value)
+            .map_err(ControlledSelectionArtifactError::Exchange)?;
+        checkpoint().map_err(ControlledSelectionArtifactError::Control)?;
+        let prefabs =
+            array(&value, "prefabs").map_err(ControlledSelectionArtifactError::Exchange)?;
+        let mut typed_prefabs = Vec::with_capacity(prefabs.len());
+        for prefab in prefabs {
+            checkpoint().map_err(ControlledSelectionArtifactError::Control)?;
+            typed_prefabs.push(
+                normalize_prefab_comparison(prefab, &mut checkpoint).map_err(
+                    |error| match error {
+                        ControlledSelectionError::Control(error) => {
+                            ControlledSelectionArtifactError::Control(error)
+                        }
+                        ControlledSelectionError::Exchange(error) => {
+                            ControlledSelectionArtifactError::Exchange(error)
+                        }
+                        // This helper only emits Control or Exchange. Reject if that
+                        // implementation changes rather than manufacturing a witness.
+                        _ => ControlledSelectionArtifactError::CaptureUnavailable,
+                    },
+                )?,
+            );
+        }
+        checkpoint().map_err(ControlledSelectionArtifactError::Control)?;
+        let mut comparison = value.clone();
+        comparison["prefabs"] = Value::Array(typed_prefabs);
+        let selection = Self::from_comparison(&value, &comparison, true)
+            .map_err(ControlledSelectionArtifactError::Exchange)?;
+        checkpoint().map_err(ControlledSelectionArtifactError::Control)?;
+        Ok(selection)
     }
 
     /// Construct a selection after binding each Prefab Value to the exact
@@ -458,6 +671,96 @@ mod integral_prefab_tests {
         let instance_revision = projected_digest("Instance", &selection["instances"][0]).unwrap();
         selection["instances"][0]["revision"] = json!(instance_revision);
         selection
+    }
+
+    #[test]
+    fn selection_artifact_uses_its_own_bytes_and_diagnostic_classifier_is_not_a_witness() {
+        let value = selection_with_decimal_prefab();
+        assert!(Selection::from_value(&value).is_err());
+        assert!(
+            Selection::has_only_prefab_decimal_value_failure(&value, || Ok::<_, &'static str>(()))
+                .unwrap()
+        );
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let selection = Selection::from_selection_artifact_bytes_with_control(&bytes, || {
+            Ok::<_, &'static str>(())
+        })
+        .unwrap();
+        assert_eq!(selection.value(), &value);
+        assert_eq!(
+            selection.value()["prefabs"][0]["resources"][0]["sizeBytes"],
+            json!(1.0)
+        );
+
+        let wire = String::from_utf8(bytes).unwrap();
+        let needle = "\"sizeBytes\":1.0";
+        assert_eq!(wire.matches(needle).count(), 1);
+        let exponent = wire.replacen(needle, "\"sizeBytes\":1e0", 1);
+        let parsed =
+            Selection::from_selection_artifact_bytes_with_control(exponent.as_bytes(), || {
+                Ok::<_, &'static str>(())
+            })
+            .unwrap();
+        assert_eq!(parsed.value(), &value);
+        let fraction = wire.replacen(needle, "\"sizeBytes\":1.0000000000000001", 1);
+        assert_eq!(parse_json(fraction.as_bytes()).unwrap(), value);
+        assert!(matches!(
+            Selection::from_selection_artifact_bytes_with_control(fraction.as_bytes(), || Ok::<
+                _,
+                &'static str,
+            >(
+                ()
+            )),
+            Err(ControlledSelectionArtifactError::ExactInteger { .. })
+        ));
+
+        // The classifier returns no source witness and cannot excuse a
+        // separate sourceMap DTO failure or an invalid Selection contract.
+        let mut unrelated = value.clone();
+        unrelated["sourceMap"]["sizeBytes"] = json!(1.0);
+        assert!(
+            !Selection::has_only_prefab_decimal_value_failure(
+                &unrelated,
+                || Ok::<_, &'static str>(())
+            )
+            .unwrap()
+        );
+        let mut invalid = value.clone();
+        invalid["selectionId"] = Value::Null;
+        assert!(
+            !Selection::has_only_prefab_decimal_value_failure(&invalid, || Ok::<_, &'static str>(
+                ()
+            ))
+            .unwrap()
+        );
+        let mut no_candidate = value.clone();
+        no_candidate["prefabs"][0]["resources"][0]["sizeBytes"] = json!(1);
+        no_candidate["prefabs"][0]["nodes"][0]["extensions"]["example:large"] =
+            json!("x".repeat(MAX_COMPARISON_SELECTION_BYTES));
+        assert!(
+            !Selection::has_only_prefab_decimal_value_failure(&no_candidate, || Ok::<
+                _,
+                &'static str,
+            >(()))
+            .unwrap()
+        );
+        assert!(
+            !Selection::has_only_prefab_decimal_value_failure(&no_candidate, || Err::<(), _>(
+                "cancelled"
+            ))
+            .unwrap()
+        );
+        assert!(matches!(
+            Selection::has_only_prefab_decimal_value_failure(&value, || Err::<(), _>("cancelled")),
+            Err(ControlledSelectionArtifactError::Control("cancelled"))
+        ));
+        assert!(matches!(
+            Selection::from_selection_artifact_bytes_with_control(
+                wire.as_bytes(),
+                || Err::<(), _>("cancelled")
+            ),
+            Err(ControlledSelectionArtifactError::Control("cancelled"))
+        ));
     }
 
     #[test]
