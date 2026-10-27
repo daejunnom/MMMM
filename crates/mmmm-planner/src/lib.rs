@@ -96,7 +96,11 @@ pub(crate) fn decode_prefab_scoped(
 pub(crate) fn require_value_only_prefab_integer_lengths(value: &Value) -> AppResult<()> {
     let is_integer =
         |reference: &Value| reference.get("sizeBytes").and_then(Value::as_u64).is_some();
-    for reference in array(value, "resources")? {
+    let resources = value
+        .get("resources")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AppError::new("INVALID_INPUT", "Prefab resources are absent"))?;
+    for reference in resources {
         if !is_integer(reference) {
             return Err(AppError::new(
                 "CAPABILITY_UNAVAILABLE",
@@ -104,7 +108,11 @@ pub(crate) fn require_value_only_prefab_integer_lengths(value: &Value) -> AppRes
             ));
         }
     }
-    for node in array(value, "nodes")? {
+    let nodes = value
+        .get("nodes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AppError::new("INVALID_INPUT", "Prefab nodes are absent"))?;
+    for node in nodes {
         if node
             .get("geometryResource")
             .is_some_and(|reference| !is_integer(reference))

@@ -4231,3 +4231,8 @@ Prefab port의 decimal 표기는 이제 `CAPABILITY_UNAVAILABLE`로 거절한다
 주장하지 않는다. native reader의 기존 오류 문자열 변환도 원 오류 identity 전체를 보장하지
 않는다. Native source commit→Factory data adapter와 별도 artifact 분수 거절 검사를 작성했으나
 실행 전이며 실제 정상 scene plan·물리·게임을 검증한 것은 아니다.
+
+`128788c` Rust142의 Windows·Linux·macOS 원 test 단계는 Planner의 `array` 두 호출이
+모듈 범위에 없어 E0425로 컴파일 전 실패했다. 테스트와 strict는 미실행이며 각 OS 원
+로그와 drain/export·scratch 제거·lease 해제 결과를 보존한다. 수정은 같은 모듈의 명시적
+배열 검사를 사용하며 실제 재컴파일은 후속 CI에서 확인한다.
