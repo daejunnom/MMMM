@@ -26,6 +26,15 @@ pub struct Selection {
     nodes: BTreeMap<ObjectNode, Value>,
     instance_prefabs: BTreeMap<String, String>,
     physics_index: Arc<crate::physics::SelectionIndex>,
+    // Only the raw-byte constructor can populate this private semantic view.
+    // Original Selection Values and expanded nodes remain unchanged.
+    semantic_prefabs: Option<Arc<BTreeMap<String, SemanticPrefab>>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SemanticPrefab {
+    pub(crate) resources: Value,
+    pub(crate) geometry: BTreeMap<String, Value>,
 }
 
 /// Errors from selection construction with each Prefab's original bytes.
@@ -46,7 +55,7 @@ pub enum ControlledSelectionError<E> {
 
 impl Selection {
     pub fn from_value(value: &Value) -> ExchangeResult<Self> {
-        Self::from_comparison(value, value)
+        Self::from_comparison(value, value, false)
     }
 
     /// Construct a selection after binding each Prefab Value to the exact
@@ -132,13 +141,17 @@ impl Selection {
         checkpoint().map_err(ControlledSelectionError::Control)?;
         let mut comparison = value.clone();
         comparison["prefabs"] = Value::Array(typed_prefabs);
-        let selection = Self::from_comparison(value, &comparison)
+        let selection = Self::from_comparison(value, &comparison, true)
             .map_err(ControlledSelectionError::Exchange)?;
         checkpoint().map_err(ControlledSelectionError::Control)?;
         Ok(selection)
     }
 
-    fn from_comparison(value: &Value, comparison: &Value) -> ExchangeResult<Self> {
+    fn from_comparison(
+        value: &Value,
+        comparison: &Value,
+        keep_semantic: bool,
+    ) -> ExchangeResult<Self> {
         validate("SceneSelectionSnapshot", value)?;
         let physics_index = crate::physics::SelectionIndex::from_value(comparison)?;
         let instances = array(value, "instances")?;
@@ -154,6 +167,7 @@ impl Selection {
             ));
         }
         let mut prefab_map = BTreeMap::new();
+        let mut semantic_prefabs = BTreeMap::new();
         let mut total_nodes = 0_usize;
         for (prefab, typed_prefab) in prefabs.iter().zip(typed_prefabs) {
             verify_projected_digest("Prefab", prefab)
@@ -188,6 +202,29 @@ impl Selection {
                     "OBJECT_MAPPING_AMBIGUOUS",
                     "Duplicate prefab ID",
                 ));
+            }
+            if keep_semantic {
+                let mut geometry = BTreeMap::new();
+                for node in array(typed_prefab, "nodes")? {
+                    if let Some(resource) = node.get("geometryResource") {
+                        if geometry
+                            .insert(text(node, "nodeId")?.to_owned(), resource.clone())
+                            .is_some()
+                        {
+                            return Err(ExchangeError::new(
+                                "OBJECT_MAPPING_AMBIGUOUS",
+                                "Duplicate geometry node ID",
+                            ));
+                        }
+                    }
+                }
+                semantic_prefabs.insert(
+                    text(prefab, "prefabId")?.to_owned(),
+                    SemanticPrefab {
+                        resources: typed_prefab["resources"].clone(),
+                        geometry,
+                    },
+                );
             }
         }
         let mut nodes = BTreeMap::new();
@@ -278,6 +315,7 @@ impl Selection {
             nodes,
             instance_prefabs,
             physics_index: Arc::new(physics_index),
+            semantic_prefabs: keep_semantic.then(|| Arc::new(semantic_prefabs)),
         })
     }
     pub fn value(&self) -> &Value {
@@ -288,6 +326,9 @@ impl Selection {
     /// neither path establishes source provenance or current authorization.
     pub fn physics_index(&self) -> &crate::physics::SelectionIndex {
         &self.physics_index
+    }
+    pub(crate) fn semantic_prefab(&self, id: &str) -> Option<&SemanticPrefab> {
+        self.semantic_prefabs.as_ref()?.get(id)
     }
     pub fn node(&self, node: &ObjectNode) -> Option<&Value> {
         self.nodes.get(node)
@@ -552,6 +593,90 @@ mod integral_prefab_tests {
             parsed.value()["prefabs"][0]["nodes"][0]["geometryResource"]["sizeBytes"],
             json!(1.0)
         );
+    }
+
+    #[test]
+    fn patch_semantics_use_verified_prefab_comparison_but_not_new_node_values() {
+        use crate::patch::{DeltaKind, DeltaPolicy, SceneEdit, diff_scene_edits};
+        let mut value = selection_with_decimal_prefab();
+        let door_index = value["prefabs"][0]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|node| node["nodeId"] == "door")
+            .unwrap();
+        value["prefabs"][0]["nodes"][door_index]["geometryResource"] =
+            value["prefabs"][0]["resources"][0].clone();
+        let revision = projected_digest("Prefab", &value["prefabs"][0]).unwrap();
+        value["prefabs"][0]["revision"] = json!(revision);
+        value["instances"][0]["prefabRevision"] = json!(revision);
+        value["instances"][0]["revision"] =
+            json!(projected_digest("Instance", &value["instances"][0]).unwrap());
+        let bytes = serde_json::to_vec(&value["prefabs"][0]).unwrap();
+        let selection = Selection::from_value_with_integral_prefab_resource_comparison(
+            &value,
+            &[&bytes],
+            || Ok::<_, &'static str>(()),
+        )
+        .unwrap();
+        let original = selection.value().clone();
+        let target = ObjectNode {
+            instance_id: value["instances"][0]["instanceId"].as_str().unwrap().into(),
+            node_id: "door".into(),
+        };
+        let mut transform = selection.node(&target).unwrap()["transform"].clone();
+        transform["translation"][0] = json!(2.0);
+        let mut allowed = DeltaPolicy::default();
+        allowed
+            .allow(target.clone(), DeltaKind::UpdateTransform)
+            .unwrap();
+        let resource = &value["sourceMap"];
+        let patch = diff_scene_edits(
+            &selection,
+            &[SceneEdit::Existing {
+                target: target.clone(),
+                transform: Some(transform),
+                display: None,
+            }],
+            resource,
+            resource,
+            &[],
+            "patch-decimal-prefab",
+            &allowed,
+        )
+        .unwrap();
+        assert_eq!(patch["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(selection.value(), &original);
+        assert_eq!(
+            selection.node(&target).unwrap()["geometryResource"]["sizeBytes"],
+            json!(1.0)
+        );
+
+        // A newly submitted node has no exact Prefab byte witness. The cached
+        // comparison may not normalize that new node's own ResourceRef.
+        let mut created = selection.node(&target).unwrap().clone();
+        created["nodeId"] = json!("new-door");
+        let new_target = ObjectNode {
+            instance_id: target.instance_id.clone(),
+            node_id: "new-door".into(),
+        };
+        allowed
+            .allow(new_target.clone(), DeltaKind::CreateNode)
+            .unwrap();
+        let error = diff_scene_edits(
+            &selection,
+            &[SceneEdit::Create {
+                target: new_target,
+                node: created,
+            }],
+            resource,
+            resource,
+            &[],
+            "patch-unwitnessed-node",
+            &allowed,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "REFERENCE_UNRESOLVED");
     }
 
     #[test]

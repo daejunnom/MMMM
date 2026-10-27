@@ -516,11 +516,37 @@ fn validate_result_graph(
             .find(|prefab| prefab["prefabId"].as_str() == Some(prefab_id))
             .ok_or_else(|| ExchangeError::new("REFERENCE_UNRESOLVED", "Edited prefab is absent"))?
             .clone();
+        let semantic = selection.semantic_prefab(prefab_id);
+        if let Some(semantic) = semantic {
+            // These values come only from the same Prefab bytes validated by
+            // Selection; the original selection and its pins stay unchanged.
+            variant["resources"] = semantic.resources.clone();
+        }
         let mut nodes: Vec<Value> = selection
             .nodes()
             .filter(|(target, _)| target.instance_id == instance_id && !deleted.contains(*target))
-            .map(|(_, node)| node.clone())
-            .collect();
+            .map(|(target, node)| {
+                let mut candidate = node.clone();
+                if let Some(semantic) = semantic {
+                    match (
+                        node.get("geometryResource"),
+                        semantic.geometry.get(&target.node_id),
+                    ) {
+                        (Some(_), Some(resource)) => {
+                            candidate["geometryResource"] = resource.clone()
+                        }
+                        (None, None) => {}
+                        _ => {
+                            return Err(ExchangeError::new(
+                                "REFERENCE_UNRESOLVED",
+                                "Validated geometry comparison differs",
+                            ));
+                        }
+                    }
+                }
+                Ok(candidate)
+            })
+            .collect::<ExchangeResult<_>>()?;
         nodes.extend(
             created
                 .iter()

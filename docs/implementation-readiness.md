@@ -4243,3 +4243,10 @@ NativePlanner의 scene 변경 준비를 거쳐 test inventory sentinel까지 도
 exact 오류 원인을 확인한다. `scene.diff` 인증 fixture에서 planner를 직접 호출하고 projection
 참조를 제어하므로 scene.plan Service·완성 plan·physics·실제 게임 성공은 아니다. 실제 실행은
 후속 CI에서 확인한다.
+
+`7f6f1dd` Rust143의 Linux·macOS 원 test에서 Coordinator의 decimal Prefab 양성 검사
+각각 두 개가 원 Prefab의 `N.0`을 scene patch 후보 의미 검사에서 다시 `u64`로 읽어
+실패했다. 원 로그에는 두 실패와 이전 완료 범위, 미실행 후속 테스트·strict가 남아 있다.
+수정은 exact 원 bytes에 결속한 private typed resources·기존 node geometry만 해당 의미
+검사에 적용하고 원 Selection·node·revision과 새 create-node 입력은 변환하지 않는다.
+수정한 양성·새 node의 원문 증거 없는 decimal 거절 검사는 후속 CI에서 확인한다.
