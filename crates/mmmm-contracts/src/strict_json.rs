@@ -8,6 +8,7 @@ use std::{
     error::Error,
     fmt,
     io::{self, Write},
+    ops::Range,
 };
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -86,6 +87,243 @@ fn boundary_error(message: impl Into<String>) -> JsonError {
         message: message.into(),
         line: 0,
         column: 0,
+    }
+}
+
+/// Select the only schema paths whose original decimal integer lexemes are
+/// checked by the raw-input validation API. Other numbers are unaffected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExactSelector {
+    ResourceRef,
+    PhysicsDefinition,
+}
+
+#[derive(Clone, Copy)]
+enum RawPath {
+    Ignore,
+    ResourceRoot,
+    ResourceSize,
+    PhysicsRoot,
+    Colliders,
+    Collider(usize),
+    OuterShape(usize),
+    InnerShape(usize),
+    Geometry(usize),
+    GeometrySize(usize),
+}
+
+impl RawPath {
+    fn map_child(self, key: &str) -> Self {
+        match (self, key) {
+            (Self::ResourceRoot, "sizeBytes") => Self::ResourceSize,
+            (Self::PhysicsRoot, "colliders") => Self::Colliders,
+            (Self::Collider(index), "shape") => Self::OuterShape(index),
+            (Self::OuterShape(index), "shape") => Self::InnerShape(index),
+            (Self::InnerShape(index), "geometry") => Self::Geometry(index),
+            (Self::Geometry(index), "sizeBytes") => Self::GeometrySize(index),
+            _ => Self::Ignore,
+        }
+    }
+
+    fn array_child(self, index: usize) -> Self {
+        match self {
+            Self::Colliders => Self::Collider(index),
+            _ => Self::Ignore,
+        }
+    }
+}
+
+struct RawCandidate {
+    collider: Option<usize>,
+    span: Range<usize>,
+}
+
+/// A private per-parse capture: spans are never a caller-constructible proof.
+/// Malformed input can contain arbitrarily many number-like fragments, so
+/// overflow/allocation failure is deferred until strict parsing has succeeded.
+struct RawCapture {
+    spans: RefCell<Vec<Range<usize>>>,
+    candidates: RefCell<Vec<RawCandidate>>,
+    maximum: usize,
+    cursor: Cell<usize>,
+    invalid: Cell<bool>,
+}
+
+impl RawCapture {
+    fn new(limits: JsonLimits, bytes: usize) -> Self {
+        Self {
+            spans: RefCell::new(Vec::new()),
+            candidates: RefCell::new(Vec::new()),
+            maximum: limits
+                .max_nodes
+                .min(JsonLimits::default().max_nodes)
+                .min(bytes),
+            cursor: Cell::new(0),
+            invalid: Cell::new(false),
+        }
+    }
+
+    fn add_span(&self, span: Range<usize>) {
+        let mut spans = self.spans.borrow_mut();
+        if spans.len() >= self.maximum || spans.try_reserve(1).is_err() {
+            self.invalid.set(true);
+        } else {
+            spans.push(span);
+        }
+    }
+
+    fn consume(&self, path: RawPath) {
+        let position = self.cursor.get();
+        let Some(next) = position.checked_add(1) else {
+            self.invalid.set(true);
+            return;
+        };
+        self.cursor.set(next);
+        let Some(span) = self.spans.borrow().get(position).cloned() else {
+            self.invalid.set(true);
+            return;
+        };
+        let collider = match path {
+            RawPath::ResourceSize => None,
+            RawPath::GeometrySize(index) => Some(index),
+            _ => return,
+        };
+        let mut candidates = self.candidates.borrow_mut();
+        if candidates.len() >= self.maximum || candidates.try_reserve(1).is_err() {
+            self.invalid.set(true);
+        } else {
+            candidates.push(RawCandidate { collider, span });
+        }
+    }
+}
+
+/// Internal immutable pairing of one byte slice and its own strict parse.
+/// It is intentionally not an externally transferable witness.
+pub(crate) struct RawExactParsed<'a> {
+    bytes: &'a [u8],
+    value: Value,
+    selector: ExactSelector,
+    capture: RawCapture,
+}
+
+/// Internal raw-validation failures are separate from JSON syntax failures.
+#[derive(Debug)]
+pub(crate) enum RawExactError<E> {
+    CaptureUnavailable,
+    ExactInteger { collider: Option<usize> },
+    Control(E),
+}
+
+impl RawExactParsed<'_> {
+    pub(crate) fn value(&self) -> &Value {
+        &self.value
+    }
+
+    pub(crate) fn into_value(self) -> Value {
+        self.value
+    }
+
+    /// Call only after schema validation of `value()`. The resulting check is
+    /// limited to the selected paths and is bound to this parse's bytes.
+    pub(crate) fn validate_exact<E>(
+        &self,
+        checkpoint: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<(), RawExactError<E>> {
+        let capture_error = || RawExactError::CaptureUnavailable;
+        if self.capture.invalid.get()
+            || self.capture.cursor.get() != self.capture.spans.borrow().len()
+        {
+            return Err(capture_error());
+        }
+        let candidates = self.capture.candidates.borrow();
+        let mut cursor = 0usize;
+        match self.selector {
+            ExactSelector::ResourceRef => {
+                let candidate = candidates
+                    .first()
+                    .filter(|candidate| candidate.collider.is_none())
+                    .ok_or_else(capture_error)?;
+                self.validate_candidate(candidate, checkpoint)?;
+                cursor = 1;
+            }
+            ExactSelector::PhysicsDefinition => {
+                let colliders = self
+                    .value
+                    .get("colliders")
+                    .and_then(Value::as_array)
+                    .ok_or_else(capture_error)?;
+                for (index, collider) in colliders.iter().enumerate() {
+                    if index % 128 == 0 {
+                        checkpoint().map_err(RawExactError::Control)?;
+                    }
+                    let shape = collider
+                        .get("shape")
+                        .and_then(|value| value.get("shape"))
+                        .ok_or_else(capture_error)?;
+                    if shape.get("kind").and_then(Value::as_str) == Some("mesh") {
+                        let candidate = candidates
+                            .get(cursor)
+                            .filter(|candidate| candidate.collider == Some(index))
+                            .ok_or_else(capture_error)?;
+                        self.validate_candidate(candidate, checkpoint)?;
+                        cursor += 1;
+                    }
+                }
+            }
+        }
+        if cursor != candidates.len() {
+            return Err(capture_error());
+        }
+        Ok(())
+    }
+
+    fn validate_candidate<E>(
+        &self,
+        candidate: &RawCandidate,
+        checkpoint: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<(), RawExactError<E>> {
+        let token = self
+            .bytes
+            .get(candidate.span.clone())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .ok_or(RawExactError::CaptureUnavailable)?;
+        let exact = crate::number::exact_safe_u64_json_lexeme_with_control(token, checkpoint)
+            .map_err(RawExactError::Control)?;
+        if exact.is_none() {
+            return Err(RawExactError::ExactInteger {
+                collider: candidate.collider,
+            });
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn parse_json_with_exact_capture<E>(
+    bytes: &[u8],
+    limits: JsonLimits,
+    selector: ExactSelector,
+    checkpoint: impl FnMut() -> Result<(), E>,
+) -> Result<RawExactParsed<'_>, ControlledJsonError<E>> {
+    let control = ParseControl {
+        checkpoint: RefCell::new(checkpoint),
+        failure: RefCell::new(None),
+    };
+    let capture = RawCapture::new(limits, bytes.len());
+    let path = match selector {
+        ExactSelector::ResourceRef => RawPath::ResourceRoot,
+        ExactSelector::PhysicsDefinition => RawPath::PhysicsRoot,
+    };
+    let result = parse_json_controlled(bytes, limits, &control, Some(&capture), path);
+    match control.failure.into_inner() {
+        Some(error) => Err(ControlledJsonError::Control(error)),
+        None => result
+            .map(|value| RawExactParsed {
+                bytes,
+                value,
+                selector,
+                capture,
+            })
+            .map_err(ControlledJsonError::Json),
     }
 }
 
@@ -170,7 +408,7 @@ pub fn parse_json_with_control<E>(
         checkpoint: RefCell::new(checkpoint),
         failure: RefCell::new(None),
     };
-    let result = parse_json_controlled(bytes, limits, &control);
+    let result = parse_json_controlled(bytes, limits, &control, None, RawPath::Ignore);
     match control.failure.into_inner() {
         Some(error) => Err(ControlledJsonError::Control(error)),
         None => result.map_err(ControlledJsonError::Json),
@@ -211,6 +449,8 @@ fn parse_json_controlled<F: FnMut() -> Result<(), E>, E>(
     bytes: &[u8],
     limits: JsonLimits,
     control: &ParseControl<F, E>,
+    capture: Option<&RawCapture>,
+    path: RawPath,
 ) -> Result<Value, JsonError> {
     if bytes.len() > limits.max_bytes {
         return Err(boundary_error("JSON byte budget exceeded"));
@@ -218,7 +458,7 @@ fn parse_json_controlled<F: FnMut() -> Result<(), E>, E>(
     control.check_json()?;
     // Even integer tokens beyond u64 must be rejected before serde can turn them
     // into a rounded f64. Large integer contract fields use decimal strings.
-    check_integer_tokens(bytes, control)?;
+    check_integer_tokens(bytes, control, capture)?;
     let nodes = Cell::new(0);
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let value = ValueSeed {
@@ -226,6 +466,8 @@ fn parse_json_controlled<F: FnMut() -> Result<(), E>, E>(
         nodes: &nodes,
         depth: 0,
         control,
+        capture,
+        path,
     }
     .deserialize(&mut deserializer)?;
     deserializer.end()?;
@@ -236,6 +478,7 @@ fn parse_json_controlled<F: FnMut() -> Result<(), E>, E>(
 fn check_integer_tokens<F: FnMut() -> Result<(), E>, E>(
     bytes: &[u8],
     control: &ParseControl<F, E>,
+    capture: Option<&RawCapture>,
 ) -> Result<(), JsonError> {
     let mut index = 0;
     let mut next_checkpoint = CONTROL_BYTE_INTERVAL;
@@ -279,6 +522,9 @@ fn check_integer_tokens<F: FnMut() -> Result<(), E>, E>(
                 index += 1;
             }
             let token = &bytes[start..index];
+            if let Some(capture) = capture {
+                capture.add_span(start..index);
+            }
             if !has_decimal {
                 let digits = token.strip_prefix(b"-").unwrap_or(token);
                 let maximum = b"9007199254740991";
@@ -302,6 +548,8 @@ struct ValueSeed<'a, F, E> {
     nodes: &'a Cell<usize>,
     depth: usize,
     control: &'a ParseControl<F, E>,
+    capture: Option<&'a RawCapture>,
+    path: RawPath,
 }
 
 impl<'de, F: FnMut() -> Result<(), E>, E> DeserializeSeed<'de> for ValueSeed<'_, F, E> {
@@ -331,12 +579,14 @@ impl<'de, F: FnMut() -> Result<(), E>, E> DeserializeSeed<'de> for ValueSeed<'_,
 struct ValueVisitor<'a, F, E>(ValueSeed<'a, F, E>);
 
 impl<F, E> ValueVisitor<'_, F, E> {
-    fn child(&self) -> ValueSeed<'_, F, E> {
+    fn child(&self, path: RawPath) -> ValueSeed<'_, F, E> {
         ValueSeed {
             limits: self.0.limits,
             nodes: self.0.nodes,
             depth: self.0.depth + 1,
             control: self.0.control,
+            capture: self.0.capture,
+            path,
         }
     }
 }
@@ -357,6 +607,9 @@ impl<'de, F: FnMut() -> Result<(), E>, E> Visitor<'de> for ValueVisitor<'_, F, E
     }
 
     fn visit_i64<D: de::Error>(self, value: i64) -> Result<Value, D> {
+        if let Some(capture) = self.0.capture {
+            capture.consume(self.0.path);
+        }
         if value.unsigned_abs() > MAX_SAFE_INTEGER {
             return Err(D::custom(
                 "Unsafe JSON integer; use a canonical decimal string",
@@ -366,6 +619,9 @@ impl<'de, F: FnMut() -> Result<(), E>, E> Visitor<'de> for ValueVisitor<'_, F, E
     }
 
     fn visit_u64<D: de::Error>(self, value: u64) -> Result<Value, D> {
+        if let Some(capture) = self.0.capture {
+            capture.consume(self.0.path);
+        }
         if value > MAX_SAFE_INTEGER {
             return Err(D::custom(
                 "Unsafe JSON integer; use a canonical decimal string",
@@ -375,6 +631,9 @@ impl<'de, F: FnMut() -> Result<(), E>, E> Visitor<'de> for ValueVisitor<'_, F, E
     }
 
     fn visit_f64<D: de::Error>(self, value: f64) -> Result<Value, D> {
+        if let Some(capture) = self.0.capture {
+            capture.consume(self.0.path);
+        }
         Number::from_f64(value)
             .map(Value::Number)
             .ok_or_else(|| D::custom("Non-finite JSON number"))
@@ -392,7 +651,9 @@ impl<'de, F: FnMut() -> Result<(), E>, E> Visitor<'de> for ValueVisitor<'_, F, E
         let mut array = Vec::new();
         loop {
             self.0.control.check_serde::<A::Error>()?;
-            let Some(value) = access.next_element_seed(self.child())? else {
+            let Some(value) =
+                access.next_element_seed(self.child(self.0.path.array_child(array.len())))?
+            else {
                 break;
             };
             array.push(value);
@@ -410,7 +671,7 @@ impl<'de, F: FnMut() -> Result<(), E>, E> Visitor<'de> for ValueVisitor<'_, F, E
             if object.contains_key(&key) {
                 return Err(de::Error::custom("Duplicate JSON object key"));
             }
-            let value = access.next_value_seed(self.child())?;
+            let value = access.next_value_seed(self.child(self.0.path.map_child(&key)))?;
             object.insert(key, value);
         }
         Ok(Value::Object(object))
@@ -610,5 +871,76 @@ mod tests {
     fn wire_encoding_retains_explicit_float_spelling() {
         let value = parse_json(b"[9007199254740992.0,295147905179352830000.0,1e30]").unwrap();
         assert_eq!(parse_json(&encode_json(&value).unwrap()).unwrap(), value);
+    }
+
+    #[test]
+    fn raw_capture_follows_decoded_keys_and_number_visit_order() {
+        let input =
+            br#"{"other":[1,2.5],"\u0073izeBytes":1.0,"nested":{"sizeBytes":1.0000000000000001}}"#;
+        let mut old_checks = 0;
+        let old = parse_json_with_control(input, JsonLimits::default(), || {
+            old_checks += 1;
+            Ok::<(), Infallible>(())
+        })
+        .unwrap();
+        let mut raw_checks = 0;
+        let parsed = parse_json_with_exact_capture(
+            input,
+            JsonLimits::default(),
+            ExactSelector::ResourceRef,
+            || {
+                raw_checks += 1;
+                Ok::<(), Infallible>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(&old, parsed.value());
+        assert_eq!(
+            old_checks, raw_checks,
+            "capture must not change strict parse checkpoints"
+        );
+        parsed
+            .validate_exact(&mut || Ok::<(), Infallible>(()))
+            .unwrap();
+
+        let input = br#"{"other":1,"sizeBytes":1.0000000000000001}"#;
+        let parsed = parse_json_with_exact_capture(
+            input,
+            JsonLimits::default(),
+            ExactSelector::ResourceRef,
+            || Ok::<(), Infallible>(()),
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed.validate_exact(&mut || Ok::<(), Infallible>(())),
+            Err(RawExactError::ExactInteger { collider: None })
+        ));
+    }
+
+    #[test]
+    fn raw_capture_defers_overflow_until_after_original_parse_errors() {
+        let limits = JsonLimits {
+            max_bytes: 256,
+            max_depth: 8,
+            max_nodes: 2,
+        };
+        for input in [
+            br#"{"a":1,"a":2}"#.as_slice(),
+            b"[1,2,3]",
+            b"[1,2] trailing",
+        ] {
+            let ordinary = parse_json_with_control(input, limits, || Ok::<(), Infallible>(()));
+            let captured =
+                parse_json_with_exact_capture(input, limits, ExactSelector::ResourceRef, || {
+                    Ok::<(), Infallible>(())
+                });
+            let Err(ControlledJsonError::Json(expected)) = ordinary else {
+                panic!("ordinary strict parse must fail");
+            };
+            let Err(ControlledJsonError::Json(actual)) = captured else {
+                panic!("capture must preserve strict failure");
+            };
+            assert_eq!(actual, expected);
+        }
     }
 }

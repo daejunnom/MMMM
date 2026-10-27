@@ -1,9 +1,13 @@
 //! Schema validation is a format boundary, not authorization or a claim that a
 //! referenced object, world, vendor, or release evidence exists.
 
+pub use crate::strict_json::ExactSelector;
 use crate::{
     CANONICAL_SCHEMA, CANONICAL_SCHEMA_ID, CONTRACT_VERSION, FUNCTION_INDEX, RationalTime,
-    strict_json::{JsonError, JsonLimits, check_value, parse_json},
+    strict_json::{
+        ControlledJsonError, JsonError, JsonLimits, RawExactError, check_value, parse_json,
+        parse_json_with_exact_capture,
+    },
 };
 use jsonschema::{
     Draft, Keyword, PatternOptions, Registry, ValidationError, ValidationOptions, Validator,
@@ -54,6 +58,70 @@ impl Error for ContractError {}
 impl From<JsonError> for ContractError {
     fn from(error: JsonError) -> Self {
         Self::Json(error)
+    }
+}
+
+/// Preserve a caller's original cancellation or deadline failure separately
+/// from strict JSON and contract failures at the raw exact-integer boundary.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ControlledContractError<E> {
+    Contract(ContractError),
+    /// A schema-valid selected size is not an exact safe JSON integer in the
+    /// original bytes. None identifies a root ResourceRef; Some identifies the
+    /// selected Physics collider index, without exposing the token itself.
+    ExactInteger {
+        collider: Option<usize>,
+    },
+    /// Bounded private capture could not be produced or matched to the parse.
+    CaptureUnavailable,
+    Control(E),
+}
+
+impl<E: fmt::Display> fmt::Display for ControlledContractError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Contract(error) => error.fmt(f),
+            Self::ExactInteger { collider: None } => {
+                f.write_str("ResourceRef sizeBytes is not an exact safe JSON integer")
+            }
+            Self::ExactInteger {
+                collider: Some(index),
+            } => {
+                write!(
+                    f,
+                    "Physics collider {index} mesh sizeBytes is not an exact safe JSON integer"
+                )
+            }
+            Self::CaptureUnavailable => f.write_str("Bounded raw numeric capture is unavailable"),
+            Self::Control(error) => error.fmt(f),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for ControlledContractError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Contract(error) => Some(error),
+            Self::Control(error) => Some(error),
+            Self::ExactInteger { .. } | Self::CaptureUnavailable => None,
+        }
+    }
+}
+
+fn controlled_raw_exact_error<E>(error: RawExactError<E>) -> ControlledContractError<E> {
+    match error {
+        RawExactError::ExactInteger { collider } => {
+            ControlledContractError::ExactInteger { collider }
+        }
+        RawExactError::CaptureUnavailable => ControlledContractError::CaptureUnavailable,
+        RawExactError::Control(error) => ControlledContractError::Control(error),
+    }
+}
+
+fn controlled_contract_error<E>(error: ControlledJsonError<E>) -> ControlledContractError<E> {
+    match error {
+        ControlledJsonError::Json(error) => ControlledContractError::Contract(error.into()),
+        ControlledJsonError::Control(error) => ControlledContractError::Control(error),
     }
 }
 
@@ -238,6 +306,39 @@ impl ContractValidator {
         Ok(value)
     }
 
+    /// Validate a supported definition and the exact decimal value at its
+    /// selected integer paths against the same immutable input bytes. The
+    /// returned value is not a transferable witness for another input, any
+    /// other field, resource availability, or authorization. Existing
+    /// Value-only validation and parsing methods retain their behavior.
+    ///
+    /// The caller's `limits` bound strict parsing; private numeric capture is
+    /// additionally limited to 100,000 number spans. Schema validation also
+    /// retains the validator's existing constructed-value budget. Checkpoints
+    /// are cooperative and cannot preempt a single schema validation call.
+    pub fn parse_validate_exact_with_control<E>(
+        &self,
+        selector: ExactSelector,
+        bytes: &[u8],
+        limits: JsonLimits,
+        mut checkpoint: impl FnMut() -> Result<(), E>,
+    ) -> Result<Value, ControlledContractError<E>> {
+        let parsed = parse_json_with_exact_capture(bytes, limits, selector, &mut checkpoint)
+            .map_err(controlled_contract_error)?;
+        let definition = match selector {
+            ExactSelector::ResourceRef => "ResourceRef",
+            ExactSelector::PhysicsDefinition => "PhysicsDefinition",
+        };
+        self.validate(definition, parsed.value())
+            .map_err(ControlledContractError::Contract)?;
+        checkpoint().map_err(ControlledContractError::Control)?;
+        parsed
+            .validate_exact(&mut checkpoint)
+            .map_err(controlled_raw_exact_error)?;
+        checkpoint().map_err(ControlledContractError::Control)?;
+        Ok(parsed.into_value())
+    }
+
     pub fn validate(&self, definition: &str, value: &Value) -> Result<(), ContractError> {
         let violations = self.violations(definition, value)?;
         if violations.is_empty() {
@@ -351,11 +452,345 @@ fn schema_violations(validator: &Validator, value: &Value) -> Vec<ContractViolat
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::cell::Cell;
     use std::sync::OnceLock;
 
     fn validator() -> &'static ContractValidator {
         static VALIDATOR: OnceLock<ContractValidator> = OnceLock::new();
         VALIDATOR.get_or_init(|| ContractValidator::embedded().unwrap())
+    }
+
+    fn exact_resource_wire(size: &str, escaped_key: bool) -> Vec<u8> {
+        let key = if escaped_key {
+            r#"\u0073izeBytes"#
+        } else {
+            "sizeBytes"
+        };
+        format!(
+            r#"{{"resourceId":"resource-mesh","sha256":"{}","mediaType":"application/octet-stream","{}":{}}}"#,
+            "0".repeat(64),
+            key,
+            size,
+        )
+        .into_bytes()
+    }
+
+    fn mesh_shape_wire(size: &str, kind_first: bool) -> String {
+        let geometry = format!(
+            r#"{{"resourceId":"resource-mesh","sha256":"{}","mediaType":"application/octet-stream","sizeBytes":{}}}"#,
+            "0".repeat(64),
+            size,
+        );
+        if kind_first {
+            format!(
+                r#"{{"kind":"mesh","geometry":{},"topologyDigest":"{}"}}"#,
+                geometry,
+                "1".repeat(64),
+            )
+        } else {
+            format!(
+                r#"{{"geometry":{},"topologyDigest":"{}","kind":"mesh"}}"#,
+                geometry,
+                "1".repeat(64),
+            )
+        }
+    }
+
+    fn physics_wire_with_meshes(first: &str, second: Option<&str>, kind_first: bool) -> Vec<u8> {
+        // The original PhysicsDefinition example has a box collider. Derive
+        // mesh shapes in memory to exercise ResourceRef paths without adding a
+        // fixture or claiming the bytes are valid mesh topology.
+        let mut physics =
+            parse_json(include_bytes!("../../../examples/physics-definition.json")).unwrap();
+        let first_shape = json!({
+            "kind": "mesh",
+            "geometry": {
+                "resourceId": "resource-mesh",
+                "sha256": "0".repeat(64),
+                "mediaType": "application/octet-stream",
+                "sizeBytes": 77
+            },
+            "topologyDigest": "1".repeat(64)
+        });
+        physics["colliders"][0]["shape"]["shape"] = first_shape.clone();
+        if second.is_some() {
+            let mut collider = physics["colliders"][0].clone();
+            collider["colliderId"] = json!("collider-second");
+            collider["shape"]["shape"]["geometry"]["sizeBytes"] = json!(88);
+            physics["colliders"].as_array_mut().unwrap().push(collider);
+        }
+        let mut encoded = serde_json::to_string(&physics).unwrap();
+        let first_needle = serde_json::to_string(&first_shape).unwrap();
+        assert_eq!(encoded.matches(&first_needle).count(), 1);
+        encoded = encoded.replacen(&first_needle, &mesh_shape_wire(first, kind_first), 1);
+        if let Some(second) = second {
+            let mut second_shape = first_shape;
+            second_shape["geometry"]["sizeBytes"] = json!(88);
+            let second_needle = serde_json::to_string(&second_shape).unwrap();
+            assert_eq!(encoded.matches(&second_needle).count(), 1);
+            encoded = encoded.replacen(&second_needle, &mesh_shape_wire(second, !kind_first), 1);
+        }
+        encoded.into_bytes()
+    }
+
+    fn exact(
+        selector: ExactSelector,
+        bytes: &[u8],
+    ) -> Result<Value, ControlledContractError<std::convert::Infallible>> {
+        validator().parse_validate_exact_with_control(
+            selector,
+            bytes,
+            JsonLimits::default(),
+            || Ok::<(), std::convert::Infallible>(()),
+        )
+    }
+
+    #[test]
+    fn raw_exact_resource_size_is_checked_without_changing_value_only_validation() {
+        for size in ["1", "1.0", "1e0", "100e-2", "-0.0", "9007199254740991"] {
+            let bytes = exact_resource_wire(size, size == "1e0");
+            let ordinary = validator()
+                .parse_and_validate("ResourceRef", &bytes)
+                .unwrap();
+            let checked = exact(ExactSelector::ResourceRef, &bytes).unwrap();
+            assert_eq!(checked, ordinary, "{size}");
+            assert_eq!(
+                crate::canonical_bytes(&checked).unwrap(),
+                crate::canonical_bytes(&ordinary).unwrap()
+            );
+        }
+        let rounded_fraction = exact_resource_wire("1.0000000000000001", false);
+        // Existing Value-only validation is intentionally unchanged; it sees
+        // the parsed binary64 value and cannot prove the original token.
+        assert!(
+            validator()
+                .parse_and_validate("ResourceRef", &rounded_fraction)
+                .is_ok()
+        );
+        let exact_error = exact(ExactSelector::ResourceRef, &rounded_fraction).unwrap_err();
+        assert!(matches!(
+            &exact_error,
+            ControlledContractError::ExactInteger { collider: None }
+        ));
+        assert!(!exact_error.to_string().contains("1.0000000000000001"));
+        for invalid in [
+            "9007199254740991.1",
+            "1e-10000",
+            "-1e-10000",
+            "0.5",
+            "9007199254740992",
+        ] {
+            assert!(
+                exact(
+                    ExactSelector::ResourceRef,
+                    &exact_resource_wire(invalid, false)
+                )
+                .is_err(),
+                "{invalid}"
+            );
+        }
+        // A successful checked call cannot be reused as a witness for another
+        // byte sequence: every invocation performs its own parse and checks.
+        assert!(exact(ExactSelector::ResourceRef, &exact_resource_wire("1", false)).is_ok());
+        assert!(matches!(
+            exact(ExactSelector::ResourceRef, &rounded_fraction),
+            Err(ControlledContractError::ExactInteger { collider: None })
+        ));
+    }
+
+    #[test]
+    fn raw_exact_physics_checks_each_actual_mesh_geometry_in_either_field_order() {
+        for kind_first in [true, false] {
+            let valid = physics_wire_with_meshes("1.0", Some("100e-2"), kind_first);
+            let ordinary = validator()
+                .parse_and_validate("PhysicsDefinition", &valid)
+                .unwrap();
+            assert_eq!(
+                exact(ExactSelector::PhysicsDefinition, &valid).unwrap(),
+                ordinary
+            );
+
+            for (first, second, index) in [
+                ("1.0000000000000001", "1", 0),
+                ("1", "1.0000000000000001", 1),
+            ] {
+                let invalid = physics_wire_with_meshes(first, Some(second), kind_first);
+                assert!(
+                    validator()
+                        .parse_and_validate("PhysicsDefinition", &invalid)
+                        .is_ok()
+                );
+                assert!(matches!(
+                    exact(ExactSelector::PhysicsDefinition, &invalid),
+                    Err(ControlledContractError::ExactInteger { collider: Some(actual) }) if actual == index
+                ));
+            }
+        }
+        // Another schema number and an opaque string containing a same-named
+        // key are outside the selected mesh geometry path.
+        let mut physics =
+            parse_json(include_bytes!("../../../examples/physics-definition.json")).unwrap();
+        physics["materials"][0]["semantics"] = json!(r#"{"sizeBytes":1.0000000000000001}"#);
+        physics["bodies"][0]["massKg"] = json!(123);
+        let encoded = serde_json::to_string(&physics).unwrap();
+        let ordinary_float = encoded.replacen("\"massKg\":123", "\"massKg\":1.0000000000000001", 1);
+        assert_ne!(ordinary_float, encoded);
+        assert!(exact(ExactSelector::PhysicsDefinition, ordinary_float.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn raw_exact_preserves_strict_and_schema_failures_before_exact_checks() {
+        let duplicate = format!(
+            r#"{{"resourceId":"r","sha256":"{}","mediaType":"x","sizeBytes":1.0000000000000001,"\u0073izeBytes":1}}"#,
+            "0".repeat(64),
+        );
+        let strict = parse_json(duplicate.as_bytes()).unwrap_err();
+        assert!(strict.message.contains("Duplicate"));
+        assert_eq!(
+            exact(ExactSelector::ResourceRef, duplicate.as_bytes()),
+            Err(ControlledContractError::Contract(ContractError::Json(
+                strict
+            )))
+        );
+
+        let trailing = [
+            exact_resource_wire("1.0000000000000001", false),
+            b" true".to_vec(),
+        ]
+        .concat();
+        let strict = parse_json(&trailing).unwrap_err();
+        assert_eq!(
+            exact(ExactSelector::ResourceRef, &trailing),
+            Err(ControlledContractError::Contract(ContractError::Json(
+                strict
+            )))
+        );
+        let malformed = exact_resource_wire("1e+", false);
+        let strict = parse_json(&malformed).unwrap_err();
+        assert_eq!(
+            exact(ExactSelector::ResourceRef, &malformed),
+            Err(ControlledContractError::Contract(ContractError::Json(
+                strict
+            )))
+        );
+        let invalid_schema = format!(
+            r#"{{"resourceId":"r","sha256":"{}","mediaType":"x","sizeBytes":1.0000000000000001,"extra":true}}"#,
+            "0".repeat(64),
+        );
+        let schema = validator()
+            .parse_and_validate("ResourceRef", invalid_schema.as_bytes())
+            .unwrap_err();
+        assert!(matches!(schema, ContractError::Violations(_)));
+        assert_eq!(
+            exact(ExactSelector::ResourceRef, invalid_schema.as_bytes()),
+            Err(ControlledContractError::Contract(schema))
+        );
+
+        let bytes = exact_resource_wire("1", false);
+        let limits = JsonLimits {
+            max_bytes: bytes.len() - 1,
+            ..JsonLimits::default()
+        };
+        let strict = crate::strict_json::parse_json_with_limits(&bytes, limits).unwrap_err();
+        assert_eq!(
+            validator().parse_validate_exact_with_control(
+                ExactSelector::ResourceRef,
+                &bytes,
+                limits,
+                || Ok::<(), ()>(())
+            ),
+            Err(ControlledContractError::Contract(ContractError::Json(
+                strict
+            )))
+        );
+        for limits in [
+            JsonLimits {
+                max_depth: 0,
+                ..JsonLimits::default()
+            },
+            JsonLimits {
+                max_nodes: 3,
+                ..JsonLimits::default()
+            },
+        ] {
+            let strict = crate::strict_json::parse_json_with_limits(&bytes, limits).unwrap_err();
+            assert_eq!(
+                validator().parse_validate_exact_with_control(
+                    ExactSelector::ResourceRef,
+                    &bytes,
+                    limits,
+                    || Ok::<(), ()>(())
+                ),
+                Err(ControlledContractError::Contract(ContractError::Json(
+                    strict
+                )))
+            );
+        }
+    }
+
+    #[test]
+    fn raw_exact_preserves_control_failure_during_long_token_and_final_checkpoint() {
+        let long_integer = format!("1.{}", "0".repeat(16 * 1024));
+        let bytes = exact_resource_wire(&long_integer, false);
+        let parse_checks = Cell::new(0usize);
+        let parsed = parse_json_with_exact_capture(
+            &bytes,
+            JsonLimits::default(),
+            ExactSelector::ResourceRef,
+            || {
+                parse_checks.set(parse_checks.get() + 1);
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap();
+        validator().validate("ResourceRef", parsed.value()).unwrap();
+        let checks = Cell::new(0usize);
+        validator()
+            .parse_validate_exact_with_control(
+                ExactSelector::ResourceRef,
+                &bytes,
+                JsonLimits::default(),
+                || {
+                    checks.set(checks.get() + 1);
+                    Ok::<(), ()>(())
+                },
+            )
+            .unwrap();
+        let total = checks.get();
+        let mid_token = parse_checks.get() + 3;
+        assert!(
+            mid_token < total,
+            "A long exact token must have a mid-token checkpoint"
+        );
+        for stop_at in [1usize, mid_token, total] {
+            let mut calls = 0usize;
+            let mut original = Some(Box::new(stop_at));
+            let original_address = original.as_ref().unwrap().as_ref() as *const usize;
+            let result = validator().parse_validate_exact_with_control(
+                ExactSelector::ResourceRef,
+                &bytes,
+                JsonLimits::default(),
+                || {
+                    calls += 1;
+                    assert!(
+                        calls <= stop_at,
+                        "No checkpoints may occur after a control failure"
+                    );
+                    if calls == stop_at {
+                        Err(original.take().unwrap())
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            match result {
+                Err(ControlledContractError::Control(error)) => {
+                    assert_eq!(error.as_ref() as *const usize, original_address);
+                }
+                other => panic!("Expected original control failure, got {other:?}"),
+            }
+            assert_eq!(calls, stop_at);
+        }
     }
 
     #[test]

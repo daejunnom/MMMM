@@ -4075,6 +4075,12 @@ HTTP 429와 Linux의 프로세스 RSS 관측 `ESRCH`·감독 종료도 보존하
 수학적 정수 범위를 검사하도록 구현했다. 이 함수 하나만으로 원 bytes와 schema 경로의
 결속이나 실제 입력 경계 적용을 증명하지 않으며, controlled parser 연결 시 긴 토큰의
 취소·기한 및 오류 우선순위를 별도 검증해야 한다. 실제 테스트는 후속 CI에서 확인한다.
+계약 계층에는 같은 원 bytes의 strict parse·schema 검사 뒤 `ResourceRef.sizeBytes`와
+실제 Physics mesh `geometry.sizeBytes`의 decimal 토큰을 검사하는 controlled 선행 API를
+추가했다. 선택된 경로만 검사하며 raw 숫자 위반·capture 불가·원 취소를 구분한다.
+원 bytes·schema 경로의 내부 결속은 외부에 재사용 가능한 witness로 내보내지 않는다.
+기존 Value 전용 API는 그대로이며 Coordinator·Store의 실제 입구에는 아직 연결하지 않았다.
+기존 파싱 오류 우선순위, 취소와 serde 숫자 visitor 연결의 실제 회귀 검사는 후속 CI로 확인한다.
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.
