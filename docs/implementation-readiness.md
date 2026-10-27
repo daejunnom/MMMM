@@ -4284,3 +4284,10 @@ node의 override 입력 순서를 유지한다. 선택 여부와 존재 확인�
 선택의 비삭제 의미는 유지하며 인덱스 크기에 비례한 추가 메모리가 든다. 동기 schema와
 SelectionIndex 검사에는 새 checkpoint가 없고 hard 실행 시간 상한을 주장하지 않는다.
 256개 노드·2개 instance 및 override/선택 회귀를 작성했으며 실행은 후속 CI에서 확인한다.
+
+실제 Native source commit·인가된 Project scope·Prefab/Physics CAS와 production reader를
+이용해 NativePlanner physics variant 분기에 도달하는 통제 fixture 검사를 작성했다. 운영
+OwnedPlanningData는 구조 편집을 거절하며, 검사는 그 거절을 확인한 뒤 구조 삭제 승인만
+테스트 fixture로 제공한다. 원 decimal Prefab과 Physics bytes·pin, 변형된 body/collider 및
+binding, resource pin과 다른 selection ID의 거절을 검사한다. 이는 scene.plan Service·운영
+SourceAdmission·physics mesh geometry 또는 게임 성공의 증거가 아니며 실행은 후속 CI 대상이다.

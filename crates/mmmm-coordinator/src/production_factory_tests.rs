@@ -684,6 +684,7 @@ fn native_fn36_preserves_actual_journal_source_error_and_original_cancellation()
 struct NativeOwnedScene {
     catalog: ProjectCatalog,
     prefab: Value,
+    prefab_bytes: Vec<u8>,
     instance: Value,
     patch: Value,
     map: Value,
@@ -712,6 +713,17 @@ fn native_owned_scene_with_artifact_fraction(
     decimal: bool,
     artifact_fraction: bool,
 ) -> NativeOwnedScene {
+    native_owned_scene_with_physics(store, handles, budget, decimal, artifact_fraction, false)
+}
+
+fn native_owned_scene_with_physics(
+    store: &mut DurableStore,
+    handles: &mut DaemonHandles,
+    budget: &RequestBudget,
+    decimal: bool,
+    artifact_fraction: bool,
+    physics: bool,
+) -> NativeOwnedScene {
     // Keep only the original static root/door Nodes: the complete example also
     // requires real blockset, CommandModule and Clip sources. This regression
     // exercises Store forwarding, not those separate admission producers.
@@ -729,6 +741,21 @@ fn native_owned_scene_with_artifact_fraction(
         "resources",
     ] {
         prefab[field] = json!([]);
+    }
+    if physics {
+        let nodes = prefab["nodes"].as_array_mut().unwrap();
+        let mut removable = nodes
+            .iter()
+            .find(|node| node["nodeId"] == "door")
+            .unwrap()
+            .clone();
+        removable["nodeId"] = json!("removable");
+        nodes.push(removable);
+        let door = nodes
+            .iter_mut()
+            .find(|node| node["nodeId"] == "door")
+            .unwrap();
+        door["physicsBinding"] = json!({"physicsId":"physics-door","bodyId":"body-door"});
     }
     let decimal_id = ResourceId::new("resource-factory-decimal").unwrap();
     let decimal_resource = raw_resource(decimal_id.clone(), b"x");
@@ -770,7 +797,12 @@ fn native_owned_scene_with_artifact_fraction(
         prefab_bytes.clone()
     };
     let instance_bytes = encode_json(&instance).unwrap();
-    let documents = [
+    let mut physics_definition =
+        parse_json(include_bytes!("../../../examples/physics-definition.json")).unwrap();
+    physics_definition["revision"] =
+        json!(projected_digest("PhysicsDefinition", &physics_definition).unwrap());
+    let physics_bytes = encode_json(&physics_definition).unwrap();
+    let mut documents = vec![
         NativeSourceDocument {
             kind: NativeSourceKind::Prefab,
             bytes: &prefab_bytes,
@@ -780,6 +812,12 @@ fn native_owned_scene_with_artifact_fraction(
             bytes: &instance_bytes,
         },
     ];
+    if physics {
+        documents.push(NativeSourceDocument {
+            kind: NativeSourceKind::PhysicsDefinition,
+            bytes: &physics_bytes,
+        });
+    }
     let project_id = handles.configured_project.as_ref().unwrap().clone();
     let before = store.project(&project_id).unwrap();
     let old_revision: Sha256Digest = serde_json::from_value(before["revision"].clone()).unwrap();
@@ -790,16 +828,17 @@ fn native_owned_scene_with_artifact_fraction(
     let original_context = old_workspace.context["contextId"].clone();
     let artifact_id = ResourceId::new("resource-factory-owned-prefab").unwrap();
     let map_id = ResourceId::new("resource-factory-owned-map").unwrap();
+    let selected_node = if physics { "removable" } else { "door" };
     let door = prefab["nodes"]
         .as_array()
         .unwrap()
         .iter()
-        .position(|node| node["nodeId"] == "door")
+        .position(|node| node["nodeId"] == selected_node)
         .unwrap();
     let mut map = json!({"contractVersion":"0.2.0","generatorVersion":"factory-integration",
     "inputRevision":old_revision,"entries":[{
-        "sourceObjectId":instance["instanceId"],"sourceNodeId":"door",
-        "outputResourceId":artifact_id,"locator":format!("/nodes/{door}/transform"),
+        "sourceObjectId":instance["instanceId"],"sourceNodeId":selected_node,
+        "outputResourceId":artifact_id,"locator":if physics { format!("/nodes/{door}") } else { format!("/nodes/{door}/transform") },
     }]});
     let artifact = raw_resource(artifact_id.clone(), &artifact_bytes);
     let artifact_metadata = encode_json(&json!(artifact)).unwrap();
@@ -886,13 +925,13 @@ fn native_owned_scene_with_artifact_fraction(
     )
     .unwrap();
     assert_eq!(prepared.proposed_revision().unwrap(), next_revision);
-    assert_eq!(prepared.document_count(), 2);
+    assert_eq!(prepared.document_count(), if physics { 3 } else { 2 });
     assert_eq!(prepared.resource_count(), if decimal { 3 } else { 2 });
     let receipt = prepared.commit(store).unwrap();
     assert_eq!(receipt.project_id, project_id);
     assert_eq!(receipt.base_revision, old_revision);
     assert_eq!(receipt.project_revision, next_revision);
-    assert_eq!(receipt.documents.len(), 2);
+    assert_eq!(receipt.documents.len(), if physics { 3 } else { 2 });
     assert_eq!(receipt.resources.len(), if decimal { 3 } else { 2 });
     if decimal {
         let (_, blob) = receipt
@@ -916,6 +955,7 @@ fn native_owned_scene_with_artifact_fraction(
         assert_eq!(blob.digest, resource.sha256);
         assert_eq!(store.read_blob(blob).unwrap(), *bytes);
     }
+    let mut actual_prefab_bytes = None;
     for (id, bytes) in [
         (&prefab["prefabId"], &prefab_bytes),
         (&instance["instanceId"], &instance_bytes),
@@ -925,7 +965,20 @@ fn native_owned_scene_with_artifact_fraction(
             .iter()
             .find(|(pin, _)| pin.object_id.as_str() == id.as_str().unwrap())
             .unwrap();
-        assert_eq!(store.read_blob(blob).unwrap(), *bytes);
+        let actual = store.read_blob(blob).unwrap();
+        assert_eq!(actual, *bytes);
+        if id == &prefab["prefabId"] {
+            actual_prefab_bytes = Some(actual);
+        }
+    }
+    if physics {
+        let (_, blob) = receipt
+            .documents
+            .iter()
+            .find(|(pin, _)| pin.object_id.as_str() == "physics-door")
+            .unwrap();
+        assert_eq!(blob.digest, raw_digest(&physics_bytes));
+        assert_eq!(store.read_blob(blob).unwrap(), physics_bytes);
     }
     let project = store.project(&project_id).unwrap();
     assert_eq!(
@@ -971,14 +1024,15 @@ fn native_owned_scene_with_artifact_fraction(
     assert!(workspace.excluded_sources.is_empty());
     let objects: BTreeSet<String> =
         serde_json::from_value(workspace.context["scope"]["objectIds"].clone()).unwrap();
-    assert_eq!(
-        objects,
-        [
-            prefab["prefabId"].as_str().unwrap().to_owned(),
-            instance["instanceId"].as_str().unwrap().to_owned()
-        ]
-        .into()
-    );
+    let mut expected_objects: BTreeSet<String> = [
+        prefab["prefabId"].as_str().unwrap().to_owned(),
+        instance["instanceId"].as_str().unwrap().to_owned(),
+    ]
+    .into();
+    if physics {
+        expected_objects.insert("physics-door".to_owned());
+    }
+    assert_eq!(objects, expected_objects);
     let resources: BTreeSet<ResourceId> =
         serde_json::from_value(workspace.context["scope"]["resourceIds"].clone()).unwrap();
     let mut expected_resources: BTreeSet<ResourceId> =
@@ -993,12 +1047,13 @@ fn native_owned_scene_with_artifact_fraction(
     let patch = json!({"contractVersion":"0.2.0","patchId":"patch-factory-owned",
         "projectId":project_id,"baseRevision":catalog.revision(),
         "sourceArtifact":artifact,"sourceMap":map_pin,"entries":[{
-            "kind":"update_transform","instanceId":instance["instanceId"],"nodeId":"door",
+            "kind":"update_transform","instanceId":instance["instanceId"],"nodeId":selected_node,
             "transform":prefab["nodes"][door]["transform"],
         }],"losses":[],"absenceMeansDeletion":false});
     NativeOwnedScene {
         catalog,
         prefab,
+        prefab_bytes: actual_prefab_bytes.unwrap(),
         instance,
         patch,
         map,
@@ -1522,7 +1577,7 @@ fn offline_factory_data_reads_decimal_prefab_from_native_source_commit() {
 
 // This controlled environment stops as soon as actual source preparation has
 // finished. It does not issue a target, a game observation or a completed plan.
-struct StopAfterScenePreparation;
+struct StopAfterScenePreparation(Option<Rc<Cell<usize>>>);
 
 fn unexpected_scene_test_environment<T>() -> AppResult<T> {
     Err(AppError::new(
@@ -1622,9 +1677,44 @@ impl mmmm_planner::PlanningEnvironmentPort for StopAfterScenePreparation {
         &mut self,
         _: &PrincipalId,
         _: &ProjectCatalog,
-        _: &mmmm_planner::InstanceProjection,
+        projection: &mmmm_planner::InstanceProjection,
         _: &Value,
     ) -> AppResult<Vec<Value>> {
+        if let Some(observed) = &self.0 {
+            assert_eq!(projection.physics_definitions.len(), 1);
+            let physics = &projection.physics_definitions[0];
+            let original =
+                parse_json(include_bytes!("../../../examples/physics-definition.json")).unwrap();
+            assert_ne!(physics["physicsId"], original["physicsId"]);
+            assert_eq!(physics["bodies"], original["bodies"]);
+            assert_eq!(physics["colliders"], original["colliders"]);
+            let door = projection
+                .definition
+                .nodes
+                .iter()
+                .find(|node| node.node_id.as_str() == "door")
+                .unwrap();
+            let binding = door.physics_binding.as_ref().unwrap();
+            assert_eq!(
+                physics["physicsId"].as_str(),
+                Some(binding.physics_id.as_str())
+            );
+            assert_eq!(binding.body_id.as_str(), "body-door");
+            assert!(
+                !projection
+                    .definition
+                    .nodes
+                    .iter()
+                    .any(|node| node.node_id.as_str() == "removable")
+            );
+            assert!(
+                projection
+                    .resource_pins
+                    .iter()
+                    .any(|pin| pin.resource_id.as_str() == "resource-factory-decimal")
+            );
+            observed.set(observed.get() + 1);
+        }
         Ok(vec![])
     }
     fn compiler_target(
@@ -1709,7 +1799,7 @@ fn decimal_prefab_reaches_actual_scene_preparation_but_fractional_artifact_does_
             let source = BorrowedProjectSource::new(frame, access, data.clone());
             let mut planner = NativePlanner::new(
                 Box::new(source),
-                Box::new(StopAfterScenePreparation),
+                Box::new(StopAfterScenePreparation(None)),
                 Box::new(SystemClock),
                 PlannerOptions::default(),
             )?;
@@ -1745,6 +1835,227 @@ fn decimal_prefab_reaches_actual_scene_preparation_but_fractional_artifact_does_
             fixture.call().unwrap(),
             json!({"fractionalArtifact":fractional_artifact,"completePlanIssued":false})
         );
+        assert!(handles.request.occupied_witness().is_err());
+    }
+}
+
+// Only structural proposal admission, selection ID and selected nodes are supplied by this
+// test. The original static source, Store, request authority, owned documents,
+// and source resources remain the production adapters' responsibility.
+struct StructuralPhysicsFixture {
+    delegate: crate::planning_source::SharedPlanningData,
+    static_patch: Value,
+    structural_patch: Value,
+    prefab_bytes: Vec<u8>,
+    selection_id: &'static str,
+}
+
+impl PlanningDataPort for StructuralPhysicsFixture {
+    fn scene_source_with_store(
+        &mut self,
+        store: &PlanningStore<'_>,
+        principal: &PrincipalId,
+        project: &ProjectCatalog,
+        patch: &Value,
+        context: &Value,
+        budget: &RequestBudget,
+    ) -> AppResult<SceneSource> {
+        use mmmm_exchange::{
+            patch::{DeltaKind, DeltaPolicy},
+            selection::{ObjectNode, Selection},
+        };
+        assert_eq!(patch, &self.structural_patch);
+        let mut source = self.delegate.borrow_mut().scene_source_with_store(
+            store,
+            principal,
+            project,
+            &self.static_patch,
+            context,
+            budget,
+        )?;
+        let mut selection = source.selection.value().clone();
+        selection["selectionId"] = json!(self.selection_id);
+        selection["selectedNodeIds"] = json!(["door", "removable"]);
+        source.selection = Selection::from_value_with_integral_prefab_resource_comparison(
+            &selection,
+            &[self.prefab_bytes.as_slice()],
+            || budget.check(),
+        )
+        .expect("test selection must preserve the actual owned Prefab bytes");
+        let mut policy = DeltaPolicy::default();
+        policy
+            .allow(
+                ObjectNode {
+                    instance_id: patch["entries"][0]["instanceId"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                    node_id: "removable".to_owned(),
+                },
+                DeltaKind::DeleteNode,
+            )
+            .unwrap();
+        source.delta_policy = policy;
+        Ok(source)
+    }
+
+    fn validate_scene_provenance_with_store(
+        &mut self,
+        store: &PlanningStore<'_>,
+        principal: &PrincipalId,
+        project: &ProjectCatalog,
+        patch: &Value,
+        source: &SceneSource,
+        context: &Value,
+        budget: &RequestBudget,
+    ) -> AppResult<()> {
+        assert_eq!(patch, &self.structural_patch);
+        assert_eq!(source.selection.value()["selectionId"], self.selection_id);
+        let mut delegate = self.delegate.borrow_mut();
+        let original = delegate.scene_source_with_store(
+            store,
+            principal,
+            project,
+            &self.static_patch,
+            context,
+            budget,
+        )?;
+        assert_eq!(source.artifact, original.artifact);
+        assert_eq!(source.source_map, original.source_map);
+        delegate.validate_scene_provenance_with_store(
+            store,
+            principal,
+            project,
+            &self.static_patch,
+            &original,
+            context,
+            budget,
+        )
+    }
+
+    fn state_snapshot(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &Value,
+        _: &Value,
+        _: &Value,
+        _: &RequestBudget,
+    ) -> AppResult<ObservedStateSnapshot> {
+        unexpected_scene_test_environment()
+    }
+    fn scene_source(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &Value,
+        _: &Value,
+        _: &RequestBudget,
+    ) -> AppResult<SceneSource> {
+        unexpected_scene_test_environment()
+    }
+    fn validate_scene_provenance(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &Value,
+        _: &SceneSource,
+        _: &Value,
+        _: &RequestBudget,
+    ) -> AppResult<()> {
+        unexpected_scene_test_environment()
+    }
+}
+
+#[test]
+fn authorized_decimal_prefab_reaches_structural_physics_preparation() {
+    use crate::planning_source::{BorrowedProjectSource, LocalPlanningAccess, SharedPlanningData};
+    use mmmm_application::PlanningPort;
+    use mmmm_planner::{NativePlanner, PlannerOptions};
+
+    for mismatch in [false, true] {
+        let root = TestRoot::new();
+        let mut store = root.open();
+        let mut handles = handles(&mut store);
+        let budget =
+            RequestBudget::new(Duration::from_secs(30), Arc::new(AtomicBool::new(false))).unwrap();
+        let inputs =
+            native_owned_scene_with_physics(&mut store, &mut handles, &budget, true, false, true);
+        let context = handles.workspace.as_ref().unwrap().context.clone();
+        let authority = handles.authority.clone();
+        let hosts = handles.hosts.clone();
+        let mut factory = ProductionFactory::offline_owned(binary_digest());
+        let parts = factory.compose(&handles, &store).unwrap();
+        let contexts = parts.contexts.clone();
+        let owned_data = parts.data.clone();
+        let mut structural_patch = inputs.patch.clone();
+        structural_patch["entries"] = json!([{"kind":"delete_node", "instanceId":inputs.instance["instanceId"], "nodeId":"removable"}]);
+        let data: SharedPlanningData = Rc::new(std::cell::RefCell::new(Box::new(
+            StructuralPhysicsFixture {
+                delegate: parts.data.clone(),
+                static_patch: inputs.patch.clone(),
+                structural_patch: structural_patch.clone(),
+                prefab_bytes: inputs.prefab_bytes.clone(),
+                selection_id: if mismatch {
+                    "selection-mismatch"
+                } else {
+                    "selection-shop"
+                },
+            },
+        )));
+        let mut fixture = source_fixture(store, &handles, parts, budget, move |store, request| {
+            let principal = request.authenticated().principal().clone();
+            let access = LocalPlanningAccess::new(
+                request.authenticated().clone(),
+                authority.clone(),
+                hosts.clone(),
+                request.budget().clone(),
+                contexts.clone(),
+            )?;
+            let frame = PlanningStore::write(store);
+            let denied = match owned_data.borrow_mut().scene_source_with_store(
+                &frame,
+                &principal,
+                &inputs.catalog,
+                &structural_patch,
+                &context,
+                request.budget(),
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("static production source must deny structural edits"),
+            };
+            assert_eq!(denied.code, "CAPABILITY_UNAVAILABLE");
+            let source = BorrowedProjectSource::new(frame, access, data.clone());
+            let observed = Rc::new(Cell::new(0));
+            let mut planner = NativePlanner::new(
+                Box::new(source),
+                Box::new(StopAfterScenePreparation(Some(observed.clone()))),
+                Box::new(SystemClock),
+                PlannerOptions::default(),
+            )?;
+            let plan_request = json!({"projectId":inputs.catalog.project_id(), "expectedRevision":inputs.catalog.revision(),
+            "contextId":context["contextId"], "intent":{"kind":"scene.import_patch", "patch":structural_patch}});
+            let error = planner
+                .prepare(
+                    &principal,
+                    &plan_request,
+                    inputs.catalog.project(),
+                    &context,
+                )
+                .expect_err("fixture stops before a plan is issued");
+            assert_eq!(
+                error.code,
+                if mismatch {
+                    "SELECTION_MISMATCH"
+                } else {
+                    "TEST_SCENE_PREPARED"
+                },
+                "{error:?}"
+            );
+            assert_eq!(observed.get(), if mismatch { 0 } else { 1 });
+            Ok(json!({"completePlanIssued":false}))
+        });
+        assert_eq!(fixture.call().unwrap(), json!({"completePlanIssued":false}));
         assert!(handles.request.occupied_witness().is_err());
     }
 }
