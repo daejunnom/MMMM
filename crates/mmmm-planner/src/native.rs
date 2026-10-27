@@ -151,6 +151,9 @@ impl PreparedNativeChange {
                     "Prepared CAS payload violates its closed schema",
                 )
             })?;
+        // Inspect the original Value before the typed comparison copy rewrites
+        // resource lengths. A rounded float is not an original-byte witness.
+        reject_unwitnessed_physics_lengths(&value["change"])?;
         let mut typed = value["change"].clone();
         crate::normalize_resource_lengths(&mut typed);
         let change: Self = serde_json::from_value(typed)
@@ -217,6 +220,9 @@ impl PreparedNativeChange {
                     "REVISION_CONFLICT",
                     "Prepared document ID, digest or promoted project pin differs",
                 ));
+            }
+            if change.kind == OwnedKind::PhysicsDefinition {
+                crate::preparation::physics_mesh_resources(&change.after)?;
             }
         }
         self.validate_effect_shape()?;
@@ -485,6 +491,40 @@ impl PreparedNativeChange {
     }
 }
 
+fn reject_unwitnessed_physics_lengths(change: &Value) -> AppResult<()> {
+    fn check(physics: &Value) -> AppResult<()> {
+        let has_decimal_mesh_length = physics["colliders"].as_array().is_some_and(|colliders| {
+            colliders.iter().any(|collider| {
+                let shape = &collider["shape"]["shape"];
+                let size = &shape["geometry"]["sizeBytes"];
+                shape["kind"] == "mesh" && size.is_number() && size.as_u64().is_none()
+            })
+        });
+        if has_decimal_mesh_length {
+            // Keep invalid physics a contract error before the decimal-only
+            // limitation. Other shapes follow the existing receiver path.
+            validate("PhysicsDefinition", physics)?;
+            return Err(AppError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "Physics mesh decimal length requires an original-byte witness",
+            ));
+        }
+        Ok(())
+    }
+
+    for document in crate::array(change, "documentChanges")? {
+        if document["kind"] == "physics_definition" {
+            check(&document["after"])?;
+        }
+    }
+    for projection in crate::array(change, "worldProjection")? {
+        for physics in crate::array(projection, "physicsDefinitions")? {
+            check(physics)?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_projection_closure(projection: &InstanceProjection) -> AppResult<()> {
     let modules: BTreeSet<_> = projection
         .command_modules
@@ -584,6 +624,141 @@ struct BoundedJsonWriter {
 #[cfg(test)]
 mod allocation_tests {
     use super::*;
+
+    fn payload_with_physics_mesh() -> Value {
+        use crate::preparation::{document, empty_change, update_project};
+        use mmmm_contracts::{parse_json, projected_digest};
+        use serde_json::json;
+
+        let mesh = ResourceRef {
+            resource_id: ResourceId::new("resource-physics-mesh").unwrap(),
+            sha256: mmmm_contracts::raw_digest(b"mesh"),
+            media_type: "application/octet-stream".into(),
+            size_bytes: 4,
+        };
+        let mut physics =
+            parse_json(include_bytes!("../../../examples/physics-definition.json")).unwrap();
+        physics["colliders"][0]["shape"]["shape"] =
+            json!({"kind":"mesh","geometry":mesh,"topologyDigest":"0".repeat(64)});
+        physics["revision"] = json!(projected_digest("PhysicsDefinition", &physics).unwrap());
+
+        let mut prefab = parse_json(include_bytes!("../../../examples/prefab.json")).unwrap();
+        let door = prefab["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|node| node["nodeId"] == "door")
+            .unwrap();
+        door["physicsBinding"] = json!({"physicsId":"physics-door","bodyId":"body-door"});
+        prefab["revision"] = json!(projected_digest("Prefab", &prefab).unwrap());
+        let mut instance = parse_json(include_bytes!("../../../examples/instance.json")).unwrap();
+        instance["prefabRevision"] = prefab["revision"].clone();
+        instance["revision"] = json!(projected_digest("Instance", &instance).unwrap());
+        let mut project = parse_json(include_bytes!("../../../examples/project.json")).unwrap();
+        for pin in project["ownedResources"].as_array_mut().unwrap() {
+            if pin["kind"] == "prefab" && pin["objectId"] == prefab["prefabId"] {
+                pin["revision"] = prefab["revision"].clone();
+            } else if pin["kind"] == "instance" && pin["objectId"] == instance["instanceId"] {
+                pin["revision"] = instance["revision"].clone();
+            }
+        }
+        project["resourceIds"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(mesh.resource_id));
+        project["revision"] = json!(projected_digest("Project", &project).unwrap());
+        let catalog = crate::ProjectCatalog::from_project(&project).unwrap();
+        let definition: Prefab = crate::decode("Prefab", &prefab).unwrap();
+        let instance_typed: Instance = crate::decode("Instance", &instance).unwrap();
+        let module = parse_json(include_bytes!("../../../examples/command-module.json")).unwrap();
+        let clip = parse_json(include_bytes!("../../../examples/animation-clip.json")).unwrap();
+        let mut resources = definition.resources.clone();
+        resources.push(mesh.clone());
+        let projection = InstanceProjection {
+            before: Some(instance_typed.clone()),
+            before_definition: Some(definition.clone()),
+            after: instance_typed,
+            definition,
+            command_modules: vec![crate::decode("CommandModule", &module).unwrap()],
+            clips: vec![crate::decode("AnimationClip", &clip).unwrap()],
+            physics_definitions: vec![physics.clone()],
+            resource_pins: resources,
+        };
+        let mut change = empty_change(&catalog, NativeKind::ScenePatch);
+        change
+            .document_changes
+            .push(document(OwnedKind::PhysicsDefinition, None, physics).unwrap());
+        change.document_changes.push(
+            document(
+                OwnedKind::Instance,
+                Some(serde_json::from_value(instance["revision"].clone()).unwrap()),
+                instance.clone(),
+            )
+            .unwrap(),
+        );
+        change.world_projection.push(projection);
+        change.source_resource_pins.push(mesh.clone());
+        change.scene_patch = Some(
+            json!({"contractVersion":"0.2.0","patchId":"patch-mesh-test",
+            "projectId":project["projectId"],"baseRevision":project["revision"],
+            "sourceArtifact":mesh,"sourceMap":mesh,"entries":[{"kind":"update_transform",
+            "instanceId":instance["instanceId"],"nodeId":"door","transform":prefab["nodes"][3]["transform"]}],
+            "losses":[],"absenceMeansDeletion":false}),
+        );
+        update_project(&mut change).unwrap();
+        change.to_arguments().unwrap()
+    }
+
+    #[test]
+    fn from_payload_rejects_unwitnessed_decimal_physics_in_projection_and_documents() {
+        let payload = payload_with_physics_mesh();
+        PreparedNativeChange::from_payload(&payload).unwrap();
+        let rounded = mmmm_contracts::parse_json(br#"{"sizeBytes":4.0000000000000001}"#).unwrap();
+        assert_eq!(rounded["sizeBytes"], serde_json::json!(4.0));
+        for document in [false, true] {
+            for value in [serde_json::json!(4.0), rounded["sizeBytes"].clone()] {
+                let mut altered = payload.clone();
+                let physics = if document {
+                    &mut altered["change"]["documentChanges"][0]["after"]
+                } else {
+                    &mut altered["change"]["worldProjection"][0]["physicsDefinitions"][0]
+                };
+                physics["colliders"][0]["shape"]["shape"]["geometry"]["sizeBytes"] = value;
+                assert_eq!(
+                    PreparedNativeChange::from_payload(&altered)
+                        .unwrap_err()
+                        .code,
+                    "CAPABILITY_UNAVAILABLE"
+                );
+            }
+            let mut malformed = payload.clone();
+            let physics = if document {
+                &mut malformed["change"]["documentChanges"][0]["after"]
+            } else {
+                &mut malformed["change"]["worldProjection"][0]["physicsDefinitions"][0]
+            };
+            physics["colliders"][0]["shape"]["shape"]["kind"] = serde_json::json!("unknown");
+            assert!(PreparedNativeChange::from_payload(&malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn to_arguments_rejects_decimal_only_in_direct_physics_document() {
+        let payload = payload_with_physics_mesh();
+        let mut change = PreparedNativeChange::from_payload(&payload).unwrap();
+        change.to_arguments().unwrap();
+        let physics = change
+            .document_changes
+            .iter_mut()
+            .find(|document| document.kind == OwnedKind::PhysicsDefinition)
+            .unwrap();
+        physics.after["colliders"][0]["shape"]["shape"]["geometry"]["sizeBytes"] =
+            serde_json::json!(4.0);
+        assert_eq!(
+            change.to_arguments().unwrap_err().code,
+            "CAPABILITY_UNAVAILABLE"
+        );
+    }
 
     #[test]
     fn escaped_serialization_is_bounded_before_allocating_the_full_json_value() {
