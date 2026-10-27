@@ -231,6 +231,33 @@ impl HeldDirectory {
             parents: self.parents.clone(),
         }
     }
+    /// Check the complete root-relative spelling and ancestry bound before
+    /// opening any component. Only already-held path metadata is consulted.
+    pub(crate) fn descendant_fits(&self, components: &[&std::ffi::OsStr]) -> bool {
+        if components.is_empty()
+            || self
+                .parents
+                .len()
+                .checked_add(components.len())
+                .is_none_or(|count| count > 66)
+        {
+            return false;
+        }
+        let Some(parent) = self.parents.last() else {
+            return false;
+        };
+        let mut path = parent.path.clone();
+        for child in components {
+            if !ordinary_child(child) {
+                return false;
+            }
+            path.push(child);
+            if !is_ordinary_absolute_path(&path) {
+                return false;
+            }
+        }
+        true
+    }
     pub(crate) fn existing_child_directory<C: Control>(
         &self,
         child: &std::ffi::OsStr,
@@ -273,6 +300,37 @@ impl HeldDirectory {
         let directory = Self { parents };
         directory.revalidate(checks)?;
         Ok(Some(directory))
+    }
+    /// Open one existing regular leaf under this held ancestry. The caller
+    /// validates the complete relative component list before any I/O.
+    ///
+    /// Windows still opens the child's absolute spelling, but every ancestor
+    /// is held without delete sharing and checked before and after the open.
+    /// This is not a claim of an atomic namespace snapshot or that a writer
+    /// which preceded selection cannot mutate the object.
+    pub(crate) fn existing_child_file<C: Control>(
+        &self,
+        child: &std::ffi::OsStr,
+        checks: &C,
+    ) -> Result<Selected, C::Error> {
+        let path = self.child_path(child, checks)?;
+        self.revalidate(checks)?;
+        let (file, actual) = match open(&path, false, checks) {
+            Ok(opened) => opened,
+            Err(error) => return followup(Err(error), self.revalidate(checks), checks),
+        };
+        let selected = Selected {
+            path,
+            file,
+            identity: actual,
+            parents: self.parents.clone(),
+            created: false,
+        };
+        let result = followup(selected.revalidate(checks), self.revalidate(checks), checks);
+        match result {
+            Ok(()) => Ok(selected),
+            Err(error) => followup(Err(error), selected.close(checks), checks),
+        }
     }
     pub fn open_root<C: Control>(path: &Path, checks: &C) -> Result<Self, C::Error> {
         if !is_ordinary_absolute_path(path) {

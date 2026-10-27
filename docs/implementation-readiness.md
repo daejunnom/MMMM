@@ -4109,6 +4109,20 @@ facts equality·Deref·Box 크기와 pending 없는 Debug 형식을 유지한다
 제한이며 OS 스케줄이나 native I/O를 강제 중단하는 hard timeout이 아니다. 원 Rust132
 로그에는 후속 zombie 전이가 없어 이 변경으로 원 실패가 해결됐다고 단정할 수 없다.
 소스에 전이·실패·진단 보존 검사를 작성했으며 실제 검사와 macOS 관측은 별도로 확인한다.
+릴리스 후보의 실제 파일 관측 선행으로 `HeldDirectory::open_existing_descendant`를
+추가했다. 전체 상대 component·깊이·길이를 I/O 전에 검사하고 보유 root의 ancestry에
+결속된 기존 일반 단일 링크 파일을 선택한다. 중간 경로 부재는 기존 `None` 관측으로 만든
+합성 NotFound이며 native errno를 주장하지 않는다. 최종 파일의 원 오류와 후행 revalidate·
+close 오류는 구분해 보존한다. `Control::io` 후행 실패에서 Drop되는 handle의 native close
+성공은 관측하지 못한다.
+
+Unix는 mount 경계를 넘을 수 있고 같은 UID의 namespace ABA·동시 writer를 원자적으로
+차단하지 않는다. 사전 stat 후 leaf가 device로 교체되면 사후 거절 전에 device open
+부작용이 발생할 수 있다. Windows의 held ancestry 및 no-write/no-delete sharing도 선행
+writer·mapping이나 전체 후보 집합의 원자 snapshot을 증명하지 않는다. 이 API는 파일 선택
+관측이며 해시 inventory·인증된 release proof·권한을 발급하지 않는다. 기존 소유 marker
+하네스로 경로·링크·이동·취소·오류·ancestry 수명을 검사하도록 작성했으며, 실제 OS별
+컴파일·실행은 후속 CI에서 확인한다.
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

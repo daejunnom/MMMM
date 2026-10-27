@@ -133,6 +133,62 @@ pub struct CreatedFile {
 }
 
 impl HeldDirectory {
+    /// Select an existing ordinary file below this held root using only
+    /// validated relative components. The returned file retains the actual
+    /// held ancestry; this is a physical selection, not a content, release,
+    /// or authorization claim. All component and combined path limits are
+    /// checked before any control callback or filesystem access.
+    /// A missing intermediate directory is reported as a synthetic NotFound
+    /// from the existing absence observation; it has no retained native errno.
+    ///
+    /// POSIX named checks remain cooperative and do not atomically prevent a
+    /// same-UID namespace ABA or a concurrent writer. Descendant directories
+    /// may cross mount points onto another device. A leaf replaced by a device
+    /// after the named check may be opened before the handle check rejects it,
+    /// so selection does not guarantee an open without device side effects.
+    /// Windows holds ordinary
+    /// ancestors and the file without write/delete sharing, but does not prove
+    /// that an already-open writer or mapped view cannot modify the file.
+    pub fn open_existing_descendant<C: Control>(
+        &self,
+        components: &[&std::ffi::OsStr],
+        control: &C,
+    ) -> Result<HeldFile, C::Error> {
+        if !ordinary_relative_components(components) || !self.descendant_fits(components) {
+            return Err(control.unsafe_selection());
+        }
+        let mut held = self.shared();
+        let result = (|| {
+            self.revalidate(control)?;
+            let (leaf, directories) = components
+                .split_last()
+                .ok_or_else(|| control.unsafe_selection())?;
+            for component in directories {
+                held = held
+                    .existing_child_directory(component, control)?
+                    .ok_or_else(|| {
+                        control.io_error(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "Required held descendant directory is missing",
+                        ))
+                    })?;
+            }
+            held.existing_child_file(leaf, control)
+        })();
+        // If a post-check fails after a selection was acquired, explicitly
+        // attempt its close and retain a close failure beside that post-error.
+        // Existing Control::io can still drop an opened handle after its own
+        // post-check fails; that is not a native close-success observation.
+        let held_after_failure = if result.is_err() {
+            held.revalidate(control)
+        } else {
+            Ok(())
+        };
+        let result = followup_selection(result, held_after_failure, control);
+        let result = followup_selection(result, self.revalidate(control), control);
+        followup_selection(result, held.close(control), control)
+    }
+
     /// Compare the actual held leaf with a newly opened ordinary selection.
     /// Both ancestry chains are checked around the native identity reads. A
     /// successful match carries only identity_evidence()'s platform strength.
@@ -196,6 +252,22 @@ impl HeldDirectory {
         // Preserve original native failure and every following check/close cause.
         let result = followup(result, self.revalidate(control), control);
         followup(result, held.close(control), control)
+    }
+}
+
+fn followup_selection<C: Control>(
+    primary: Result<HeldFile, C::Error>,
+    after: Result<(), C::Error>,
+    control: &C,
+) -> Result<HeldFile, C::Error> {
+    match (primary, after) {
+        (Ok(selected), Ok(())) => Ok(selected),
+        (Ok(selected), Err(after)) => match selected.close(control) {
+            Ok(()) => Err(after),
+            Err(close) => Err(control.with_post_failure(after, close)),
+        },
+        (Err(primary), Err(after)) => Err(control.with_post_failure(primary, after)),
+        (Err(error), Ok(())) => Err(error),
     }
 }
 
@@ -315,6 +387,32 @@ impl CreatedFile {
     pub fn close<C: Control>(self, control: &C) -> Result<(), C::Error> {
         self.selected.close(control)
     }
+}
+
+fn ordinary_relative_components(components: &[&std::ffi::OsStr]) -> bool {
+    if components.is_empty() || components.len() > 64 {
+        return false;
+    }
+    let mut length = 0usize;
+    for (index, component) in components.iter().enumerate() {
+        if !ordinary_child(component) {
+            return false;
+        }
+        let Some(text) = component.to_str() else {
+            return false;
+        };
+        let Some(next) = length
+            .checked_add(text.len())
+            .and_then(|n| n.checked_add(if index == 0 { 0 } else { 1 }))
+        else {
+            return false;
+        };
+        if next > 4096 {
+            return false;
+        }
+        length = next;
+    }
+    true
 }
 
 fn ordinary_child(value: &std::ffi::OsStr) -> bool {

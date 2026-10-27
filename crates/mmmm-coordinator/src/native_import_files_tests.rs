@@ -445,6 +445,345 @@ fn shared_nested_absence_is_metadata_only_and_rejects_existing_or_non_directory_
     );
 }
 
+// The existing selected-file fixtures start from an absolute pathname. They
+// cannot establish that this new operation resolves a relative child through
+// the caller's already-held root and retains that root's ancestry.
+#[test]
+fn shared_relative_existing_file_is_bound_to_the_held_root() {
+    use mmmm_owned_files::{Control, HeldDirectory};
+    use std::{ffi::OsStr, io::Read};
+
+    let fixture = Fixture::new();
+    let directory = fixture.root.path.join("selected/relative-child");
+    fs::create_dir(&directory).unwrap();
+    let path = directory.join("entry.dat");
+    fs::write(&path, b"actual selected bytes").unwrap();
+    let checks = Checks {
+        owner: &fixture.owner,
+        budget: &fixture.budget,
+    };
+    let root = HeldDirectory::open_root(&fixture.root.path.join("selected"), &checks).unwrap();
+    let mut file = root
+        .open_existing_descendant(
+            &[OsStr::new("relative-child"), OsStr::new("entry.dat")],
+            &checks,
+        )
+        .unwrap();
+    assert_eq!(file.length(), b"actual selected bytes".len() as u64);
+    let mut bytes = [0u8; 21];
+    checks.io(|| file.file().read_exact(&mut bytes)).unwrap();
+    assert_eq!(&bytes, b"actual selected bytes");
+    file.revalidate(&checks).unwrap();
+    file.close(&checks).unwrap();
+    root.revalidate(&checks).unwrap();
+
+    // No component is opened until every component passes the shared lexical
+    // preflight. These names are selectors only; no protected file is created.
+    fixture.cancelled.store(true, Ordering::Release);
+    assert_eq!(
+        root.open_existing_descendant(&[OsStr::new("unopened"), OsStr::new(".env")], &checks)
+            .err()
+            .unwrap()
+            .kind,
+        ErrorKind::UnsafeSelection
+    );
+    fixture.cancelled.store(false, Ordering::Release);
+    let missing_directory = root
+        .open_existing_descendant(&[OsStr::new("missing"), OsStr::new("entry.dat")], &checks)
+        .err()
+        .unwrap();
+    assert_eq!(missing_directory.kind, ErrorKind::Io);
+    let synthetic = missing_directory
+        .source()
+        .unwrap()
+        .downcast_ref::<io::Error>()
+        .unwrap();
+    assert_eq!(synthetic.kind(), io::ErrorKind::NotFound);
+    assert_eq!(synthetic.raw_os_error(), None);
+    assert!(missing_directory.checkpoint_failure().is_none());
+
+    let missing_leaf = root
+        .open_existing_descendant(
+            &[OsStr::new("relative-child"), OsStr::new("missing.dat")],
+            &checks,
+        )
+        .err()
+        .unwrap();
+    assert_eq!(missing_leaf.kind, ErrorKind::Io);
+    let native = missing_leaf
+        .source()
+        .unwrap()
+        .downcast_ref::<io::Error>()
+        .unwrap();
+    assert_eq!(native.kind(), io::ErrorKind::NotFound);
+    #[cfg(unix)]
+    assert_eq!(native.raw_os_error(), Some(libc::ENOENT));
+    #[cfg(windows)]
+    assert_eq!(native.raw_os_error(), Some(2)); // ERROR_FILE_NOT_FOUND
+    assert!(missing_leaf.checkpoint_failure().is_none());
+    root.close(&checks).unwrap();
+    assert_eq!(fs::read(path).unwrap(), b"actual selected bytes");
+}
+
+#[test]
+fn shared_relative_existing_file_rejects_hardlinks_before_read() {
+    use mmmm_owned_files::HeldDirectory;
+    use std::ffi::OsStr;
+
+    let fixture = Fixture::new();
+    let path = fixture.file("relative-linked.dat", b"unchanged link target");
+    let second = fixture.root.path.join("selected/relative-other.dat");
+    fs::hard_link(&path, &second).unwrap();
+    let checks = Checks {
+        owner: &fixture.owner,
+        budget: &fixture.budget,
+    };
+    let root = HeldDirectory::open_root(&fixture.root.path.join("selected"), &checks).unwrap();
+    assert!(
+        root.open_existing_descendant(&[OsStr::new("relative-linked.dat")], &checks)
+            .is_err()
+    );
+    root.close(&checks).unwrap();
+    fixture.remove_owned_leaf(&second);
+    assert_eq!(fs::read(path).unwrap(), b"unchanged link target");
+}
+
+#[test]
+fn shared_relative_file_retains_ancestry_after_root_owner_is_released() {
+    use mmmm_owned_files::{Control, HeldDirectory};
+    use std::{ffi::OsStr, io::Read};
+
+    let fixture = Fixture::new();
+    let directory = fixture.root.path.join("selected/retained-parent");
+    fs::create_dir(&directory).unwrap();
+    let path = directory.join("entry.dat");
+    fs::write(&path, b"retained ancestry").unwrap();
+    let checks = Checks {
+        owner: &fixture.owner,
+        budget: &fixture.budget,
+    };
+    let root = HeldDirectory::open_root(&fixture.root.path.join("selected"), &checks).unwrap();
+    let mut file = root
+        .open_existing_descendant(
+            &[OsStr::new("retained-parent"), OsStr::new("entry.dat")],
+            &checks,
+        )
+        .unwrap();
+    // Closing this owner releases its references; shared ancestry pins remain
+    // held by the selected file and are not claimed as individually closed.
+    root.close(&checks).unwrap();
+    file.revalidate(&checks).unwrap();
+    let mut bytes = [0u8; 17];
+    checks.io(|| file.file().read_exact(&mut bytes)).unwrap();
+    assert_eq!(&bytes, b"retained ancestry");
+    file.revalidate(&checks).unwrap();
+    file.close(&checks).unwrap();
+    assert_eq!(fs::read(path).unwrap(), b"retained ancestry");
+}
+
+#[test]
+fn shared_relative_selection_preserves_original_cancellation_at_checkpoints() {
+    use mmmm_owned_files::{Control, HeldDirectory};
+    use std::{cell::Cell, ffi::OsStr};
+
+    struct Counted<'a, C> {
+        inner: &'a C,
+        cancelled: &'a AtomicBool,
+        calls: Cell<usize>,
+        cancel_at: Option<usize>,
+        missing_at: Cell<Option<usize>>,
+    }
+    impl<C: Control> Control for Counted<'_, C> {
+        type Error = C::Error;
+        fn check(&self) -> Result<(), Self::Error> {
+            let next = self.calls.get() + 1;
+            self.calls.set(next);
+            if self.cancel_at == Some(next) {
+                self.cancelled.store(true, Ordering::Release);
+            }
+            self.inner.check()
+        }
+        fn io_error(&self, error: io::Error) -> Self::Error {
+            if error.kind() == io::ErrorKind::NotFound && self.missing_at.get().is_none() {
+                self.missing_at.set(Some(self.calls.get()));
+            }
+            self.inner.io_error(error)
+        }
+        fn unsafe_selection(&self) -> Self::Error {
+            self.inner.unsafe_selection()
+        }
+        fn changed(&self) -> Self::Error {
+            self.inner.changed()
+        }
+        fn with_post_failure(&self, a: Self::Error, b: Self::Error) -> Self::Error {
+            self.inner.with_post_failure(a, b)
+        }
+    }
+
+    let fixture = Fixture::new();
+    let first = fixture.root.path.join("selected/relative-first");
+    let second = first.join("relative-second");
+    let third = second.join("relative-third");
+    fs::create_dir(&first).unwrap();
+    fs::create_dir(&second).unwrap();
+    fs::create_dir(&third).unwrap();
+    fs::write(third.join("entry.dat"), b"bounded test bytes").unwrap();
+    let checks = Checks {
+        owner: &fixture.owner,
+        budget: &fixture.budget,
+    };
+    let root = HeldDirectory::open_root(&fixture.root.path.join("selected"), &checks).unwrap();
+    let probe = Counted {
+        inner: &checks,
+        cancelled: &fixture.cancelled,
+        calls: Cell::new(0),
+        cancel_at: None,
+        missing_at: Cell::new(None),
+    };
+    // The first two existing directories are traversed before the third
+    // directory is found missing. Its synthetic NotFound records a checkpoint
+    // boundary without touching any protected entry or file contents.
+    assert!(
+        root.open_existing_descendant(
+            &[
+                OsStr::new("relative-first"),
+                OsStr::new("relative-second"),
+                OsStr::new("missing-third"),
+                OsStr::new("entry.dat")
+            ],
+            &probe,
+        )
+        .is_err()
+    );
+    let middle = probe
+        .missing_at
+        .get()
+        .expect("missing intermediate directory reached");
+    let baseline = Counted {
+        inner: &checks,
+        cancelled: &fixture.cancelled,
+        calls: Cell::new(0),
+        cancel_at: None,
+        missing_at: Cell::new(None),
+    };
+    let path = [
+        OsStr::new("relative-first"),
+        OsStr::new("relative-second"),
+        OsStr::new("relative-third"),
+        OsStr::new("entry.dat"),
+    ];
+    let file = root.open_existing_descendant(&path, &baseline).unwrap();
+    let total = baseline.calls.get();
+    assert!(
+        middle > 1 && middle < total,
+        "intermediate traversal must precede the final checkpoint"
+    );
+    file.close(&checks).unwrap();
+    for cancel_at in [1, middle, total] {
+        fixture.cancelled.store(false, Ordering::Release);
+        let controlled = Counted {
+            inner: &checks,
+            cancelled: &fixture.cancelled,
+            calls: Cell::new(0),
+            cancel_at: Some(cancel_at),
+            missing_at: Cell::new(None),
+        };
+        let error = root
+            .open_existing_descendant(&path, &controlled)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind, ErrorKind::Request);
+        assert!(fixture.cancelled.load(Ordering::Acquire));
+    }
+    fixture.cancelled.store(false, Ordering::Release);
+    root.revalidate(&checks).unwrap();
+    root.close(&checks).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_relative_selection_rejects_links_and_detects_root_or_leaf_replacement() {
+    use mmmm_owned_files::HeldDirectory;
+    use std::{ffi::OsStr, os::unix::fs::symlink};
+
+    let fixture = Fixture::new();
+    let target = fixture.file("relative-target.dat", b"stable owned bytes");
+    let leaf_link = fixture.root.path.join("selected/relative-link.dat");
+    symlink(&target, &leaf_link).unwrap();
+    let directory_link = fixture.root.path.join("selected/relative-alias");
+    symlink(fixture.root.path.join("selected"), &directory_link).unwrap();
+    let checks = Checks {
+        owner: &fixture.owner,
+        budget: &fixture.budget,
+    };
+    let selected_path = fixture.root.path.join("selected");
+    let root = HeldDirectory::open_root(&selected_path, &checks).unwrap();
+    assert!(
+        root.open_existing_descendant(&[OsStr::new("relative-link.dat")], &checks)
+            .is_err()
+    );
+    assert!(
+        root.open_existing_descendant(
+            &[
+                OsStr::new("relative-alias"),
+                OsStr::new("relative-target.dat")
+            ],
+            &checks
+        )
+        .is_err()
+    );
+    fixture.remove_owned_leaf(&leaf_link);
+    fixture.remove_owned_leaf(&directory_link);
+
+    let file = root
+        .open_existing_descendant(&[OsStr::new("relative-target.dat")], &checks)
+        .unwrap();
+    let moved_leaf = fixture.root.path.join("selected/relative-moved.dat");
+    fs::rename(&target, &moved_leaf).unwrap();
+    fs::write(&target, b"stable owned bytes").unwrap();
+    assert_eq!(
+        file.revalidate(&checks).err().unwrap().kind,
+        ErrorKind::Changed
+    );
+    fixture.remove_owned_leaf(&target);
+    fs::rename(&moved_leaf, &target).unwrap();
+    file.close(&checks).unwrap();
+
+    let moved_root = fixture.root.path.join("relative-moved-root");
+    fs::rename(&selected_path, &moved_root).unwrap();
+    // A missing original name may preserve a native I/O error; either way the
+    // held root cannot be silently treated as the current named root.
+    assert!(root.revalidate(&checks).is_err());
+    fs::rename(&moved_root, &selected_path).unwrap();
+    root.close(&checks).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_relative_selection_holds_file_and_root_against_new_writer_or_rename() {
+    use mmmm_owned_files::HeldDirectory;
+    use std::ffi::OsStr;
+
+    let fixture = Fixture::new();
+    let path = fixture.file("relative-held.dat", b"stable owned bytes");
+    let selected_path = fixture.root.path.join("selected");
+    let moved = fixture.root.path.join("relative-moved-root");
+    let checks = Checks {
+        owner: &fixture.owner,
+        budget: &fixture.budget,
+    };
+    let root = HeldDirectory::open_root(&selected_path, &checks).unwrap();
+    let file = root
+        .open_existing_descendant(&[OsStr::new("relative-held.dat")], &checks)
+        .unwrap();
+    assert!(OpenOptions::new().write(true).open(&path).is_err());
+    assert!(fs::rename(&selected_path, &moved).is_err());
+    file.revalidate(&checks).unwrap();
+    file.close(&checks).unwrap();
+    root.close(&checks).unwrap();
+    assert_eq!(fs::read(path).unwrap(), b"stable owned bytes");
+}
+
 #[cfg(unix)]
 #[test]
 fn shared_create_new_refuses_existing_symlink_without_opening_its_target() {

@@ -207,3 +207,65 @@ fn secret_and_parent_spellings_are_rejected_before_control_or_filesystem_access(
         ));
     }
 }
+
+#[test]
+fn relative_file_preflight_bounds_depth_and_total_encoded_length() {
+    use std::ffi::OsStr;
+
+    assert!(!ordinary_relative_components(&[]));
+    let max_depth = vec![OsStr::new("leaf"); 64];
+    assert!(ordinary_relative_components(&max_depth));
+    let too_deep = vec![OsStr::new("leaf"); 65];
+    assert!(!ordinary_relative_components(&too_deep));
+
+    // Seventeen 240-byte components plus sixteen separators are exactly 4096
+    // UTF-8 bytes; one additional component byte exceeds the relative budget.
+    let mut names = vec!["a".repeat(240); 17];
+    let components: Vec<&OsStr> = names.iter().map(|name| OsStr::new(name)).collect();
+    assert!(ordinary_relative_components(&components));
+    names[0].push('a');
+    let components: Vec<&OsStr> = names.iter().map(|name| OsStr::new(name)).collect();
+    assert!(!ordinary_relative_components(&components));
+}
+
+#[test]
+fn relative_file_preflight_rejects_forbidden_components_at_any_depth() {
+    use std::ffi::OsStr;
+
+    for forbidden in [
+        "",
+        ".",
+        "..",
+        "a/b",
+        "a\\b",
+        "a:b",
+        ".env",
+        "credentials",
+        "id_ed25519",
+    ] {
+        assert!(
+            !ordinary_relative_components(&[
+                OsStr::new("allowed"),
+                OsStr::new(forbidden),
+                OsStr::new("leaf")
+            ]),
+            "relative component should be rejected"
+        );
+    }
+    assert!(ordinary_relative_components(&[
+        OsStr::new("release"),
+        OsStr::new("windows-x64"),
+        OsStr::new("mmmm.zip"),
+    ]));
+
+    #[cfg(windows)]
+    for reserved in ["CON", "lpt1.txt", "trailing.", "trailing ", "name~1"] {
+        assert!(!ordinary_relative_components(&[OsStr::new(reserved)]));
+    }
+    #[cfg(unix)]
+    {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        let non_utf8 = OsString::from_vec(vec![0xff]);
+        assert!(!ordinary_relative_components(&[non_utf8.as_os_str()]));
+    }
+}

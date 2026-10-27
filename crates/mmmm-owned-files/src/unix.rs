@@ -251,6 +251,96 @@ impl HeldDirectory {
             parents: self.parents.clone(),
         }
     }
+    /// Check the complete held ancestry and relative selection without I/O.
+    /// The limit includes the root pin and the final file pin.
+    pub(crate) fn descendant_fits(&self, components: &[&OsStr]) -> bool {
+        if components.is_empty()
+            || self.parents.first().is_none_or(|root| root.name.is_some())
+            || self
+                .parents
+                .len()
+                .checked_add(components.len())
+                .is_none_or(|pins| pins > 66)
+        {
+            return false;
+        }
+        let mut length = 1usize; // The held Unix root is `/`.
+        for parent in self.parents.iter().skip(1) {
+            let Some(name) = parent.name.as_deref() else {
+                return false;
+            };
+            let Some(next) = length
+                .checked_add(if length > 1 { 1 } else { 0 })
+                .and_then(|length| length.checked_add(name.as_bytes().len()))
+            else {
+                return false;
+            };
+            length = next;
+        }
+        for component in components {
+            let Some(next) = length
+                .checked_add(if length > 1 { 1 } else { 0 })
+                .and_then(|length| length.checked_add(component.as_bytes().len()))
+            else {
+                return false;
+            };
+            length = next;
+        }
+        length <= 4096
+    }
+    /// Open one existing regular child relative to the held directory. The
+    /// returned selection retains this exact ancestry, not a reopened path.
+    pub(crate) fn existing_child_file<C: Control>(
+        &self,
+        child: &OsStr,
+        checks: &C,
+    ) -> Result<Selected, C::Error> {
+        if !ordinary_child(child) || self.parents.len() >= 66 {
+            return Err(checks.unsafe_selection());
+        }
+        let result = (|| {
+            self.revalidate(checks)?;
+            let parent = &self.parents.last().ok_or_else(|| checks.changed())?.file;
+            let before = stat_at(parent, child, checks)?;
+            if before.st_mode & libc::S_IFMT != libc::S_IFREG || before.st_nlink != 1 {
+                return Err(checks.unsafe_selection());
+            }
+            // If Control::io's post-check fails inside open_at, its temporary
+            // File is dropped before it reaches us; native close is unobserved.
+            let file = open_at(parent, child, false, checks)?;
+            let identity = match (|| {
+                let metadata = checks.io(|| file.metadata())?;
+                let identity = Identity::from(&metadata);
+                if !metadata.is_file()
+                    || identity.links != 1
+                    || !named_object(&before, identity, false)
+                {
+                    return Err(checks.unsafe_selection());
+                }
+                Ok(identity)
+            })() {
+                Ok(identity) => identity,
+                Err(primary) => return followup(Err(primary), close_file(file, checks), checks),
+            };
+            Ok(Selected {
+                file,
+                identity,
+                parents: self.parents.clone(),
+                name: child.to_owned(),
+            })
+        })();
+        match result {
+            Err(primary) => followup(Err(primary), self.revalidate(checks), checks),
+            Ok(selected) => {
+                let verified =
+                    followup(selected.revalidate(checks), self.revalidate(checks), checks);
+                match verified {
+                    Ok(()) => Ok(selected),
+                    Err(primary) => followup(Err(primary), selected.close(checks), checks),
+                }
+            }
+        }
+    }
     pub(crate) fn existing_child_directory<C: Control>(
         &self,
         child: &OsStr,
