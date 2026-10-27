@@ -4397,3 +4397,12 @@ Rust154 Linux에서는 test 명령이 성공하고 새 Node·native 자원 및 E
 `items_after_test_module` 한 건으로 실패했다. 원 ZIP을 보존하고 테스트 모듈 168행을
 내용 변경 없이 같은 native 모듈의 끝으로 이동했으며 후속 Clippy는 아직 미실행이다.
 설정 변경이 과거 메모리 실패를 해결했다는 인과관계는 확정하지 않는다.
+Rust154 Windows test 실행은 소유 트리 관측의 `vanished entry surviving ancestry left
+owned root` 오류로 중단됐고 원 기록만으로 실제 link 이탈이나 경로 표기 차이를 확정할
+수 없다. 원 ZIP과 이전 성공 범위를 보존한다. 후속 진단은 기존 `link_escape` 차단과
+cleanup·retry 정책을 바꾸지 않으며, 이미 거절된 비교의 ASCII lexical 분류, 1부터 센
+component 깊이와 NotFound 숫자 errno만 기록한다. 경로·구성요소 이름은 출력하지 않고
+불명확한 Windows prefix나 비UTF 표현은 `unknown`이다. 이 분류는 파일 동일성·권한의
+증거가 아니며 다른 오류가 우선하면 최종 출력에 없을 수 있다. 순수 주입 회귀를 작성했으나
+실행은 후속 CI 대상이다. 실제 canonicalize/junction 경합, case-sensitive NTFS 및 오류
+export 전체 경로와 Rust154 원인이나 복구는 미검증이다.

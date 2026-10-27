@@ -2804,6 +2804,76 @@ enum VanishedEntryObservation {
     Present(fs::Metadata),
 }
 
+// Diagnostic only: this does not authorize containment or a retry.  Windows
+// directories may themselves be case-sensitive, so even an ASCII-folded
+// match is not evidence that the paths identify the same filesystem object.
+#[cfg(windows)]
+fn comparable_windows_prefixes(root: &Path, candidate: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    match (root.components().next(), candidate.components().next()) {
+        (Some(Component::Prefix(root)), Some(Component::Prefix(candidate))) => matches!(
+            (root.kind(), candidate.kind()),
+            (Prefix::Disk(_), Prefix::Disk(_))
+                | (Prefix::VerbatimDisk(_), Prefix::VerbatimDisk(_))
+                | (Prefix::UNC(_, _), Prefix::UNC(_, _))
+                | (Prefix::VerbatimUNC(_, _), Prefix::VerbatimUNC(_, _))
+        ),
+        _ => false,
+    }
+}
+
+fn physical_prefix_diagnostic(root: &Path, candidate: &Path) -> &'static str {
+    if !root.is_absolute()
+        || !candidate.is_absolute()
+        || root.to_str().is_none()
+        || candidate.to_str().is_none()
+    {
+        return "unknown";
+    }
+    #[cfg(windows)]
+    if !comparable_windows_prefixes(root, candidate) {
+        return "unknown";
+    }
+    if candidate.starts_with(root) {
+        return "exact";
+    }
+    let mut candidate_components = candidate.components();
+    for root_component in root.components() {
+        let Some(candidate_component) = candidate_components.next() else {
+            return "ascii_fold_mismatch";
+        };
+        let (Some(root_text), Some(candidate_text)) = (
+            root_component.as_os_str().to_str(),
+            candidate_component.as_os_str().to_str(),
+        ) else {
+            return "unknown";
+        };
+        if !root_text.eq_ignore_ascii_case(candidate_text) {
+            return "ascii_fold_mismatch";
+        }
+    }
+    "ascii_fold_match"
+}
+
+// All fields are bounded classifications or numbers; never include either
+// path, any path component, or arbitrary native error text in this message.
+fn vanished_ancestry_escape(
+    root: &Path,
+    candidate: &Path,
+    component_depth_1based: usize,
+    total_components: usize,
+    first: &std::io::Error,
+) -> StorageError {
+    StorageError::new(
+        "link_escape",
+        format!(
+            "vanished entry surviving ancestry left owned root; prefix_class={}; component_depth_1based={component_depth_1based}; total_components={total_components}; first_not_found_errno={:?}",
+            physical_prefix_diagnostic(root, candidate),
+            first.raw_os_error(),
+        ),
+    )
+}
+
 /// This remains a cooperative path observation, not an atomic filesystem
 /// snapshot. The Running callback alone may use the shared bounded native-5
 /// recovery; nested missing proofs use the one-attempt callback above.
@@ -2892,9 +2962,12 @@ fn vanished_ephemeral_observation_with_progress(
         };
         observation_checkpoint(progress)?;
         if !physical.starts_with(&physical_root) {
-            return Err(StorageError::new(
-                "link_escape",
-                "vanished entry surviving ancestry left owned root",
+            return Err(vanished_ancestry_escape(
+                &physical_root,
+                &physical,
+                index + 1,
+                components.len(),
+                error,
             ));
         }
         if index + 1 == components.len() {

@@ -2042,6 +2042,159 @@ fn churn_allowance_does_not_apply_to_completed_slot_or_other_error_kinds() {
 }
 
 #[test]
+fn vanished_ancestry_prefix_diagnostic_never_authorizes_a_mismatch() {
+    #[cfg(windows)]
+    let (root, exact, case_only, sibling, prefix_trick) = (
+        PathBuf::from(concat!("C:", r"\fixture\Owned")),
+        PathBuf::from(concat!("C:", r"\fixture\Owned\child")),
+        PathBuf::from(concat!("C:", r"\fixture\owned\child")),
+        PathBuf::from(concat!("C:", r"\fixture\Other\child")),
+        PathBuf::from(concat!("C:", r"\fixture\OwnedSibling\child")),
+    );
+    #[cfg(not(windows))]
+    let (root, exact, case_only, sibling, prefix_trick) = (
+        PathBuf::from("/fixture/Owned"),
+        PathBuf::from("/fixture/Owned/child"),
+        PathBuf::from("/fixture/owned/child"),
+        PathBuf::from("/fixture/Other/child"),
+        PathBuf::from("/fixture/OwnedSibling/child"),
+    );
+    assert_eq!(physical_prefix_diagnostic(&root, &exact), "exact");
+    for (candidate, expected) in [
+        (&case_only, "ascii_fold_match"),
+        (&sibling, "ascii_fold_mismatch"),
+        (&prefix_trick, "ascii_fold_mismatch"),
+    ] {
+        assert!(!candidate.starts_with(&root));
+        assert_eq!(physical_prefix_diagnostic(&root, candidate), expected);
+        let error = vanished_ancestry_escape(
+            &root,
+            candidate,
+            1,
+            2,
+            &std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
+        assert_eq!(error.kind, "link_escape");
+        assert!(error.message.contains(&format!("prefix_class={expected}")));
+        assert!(
+            error
+                .message
+                .contains("component_depth_1based=1; total_components=2")
+        );
+        assert!(error.message.contains("first_not_found_errno=None"));
+        for private_component in ["fixture", "Owned", "Other", "child"] {
+            assert!(!error.message.contains(private_component));
+        }
+        assert!(!error.message.contains(root.to_str().unwrap()));
+        assert!(!error.message.contains(candidate.to_str().unwrap()));
+    }
+    assert_eq!(
+        physical_prefix_diagnostic(Path::new("relative"), Path::new("relative/child")),
+        "unknown"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn vanished_ancestry_prefix_diagnostic_handles_unc_as_diagnostic_only() {
+    let root = Path::new(r"\\server\share\Owned");
+    let case_only = Path::new(r"\\server\share\owned\child");
+    let other_share = Path::new(r"\\server\other\Owned\child");
+    assert_eq!(
+        physical_prefix_diagnostic(root, case_only),
+        "ascii_fold_match"
+    );
+    assert_eq!(
+        physical_prefix_diagnostic(root, other_share),
+        "ascii_fold_mismatch"
+    );
+    assert_eq!(
+        physical_prefix_diagnostic(
+            Path::new(concat!("C:", r"\fixture\Owned")),
+            Path::new(concat!(r"\\?\C:", r"\fixture\Owned\child")),
+        ),
+        "unknown"
+    );
+    assert_eq!(
+        physical_prefix_diagnostic(
+            Path::new(r"\\.\device\Owned"),
+            Path::new(r"\\.\device\Owned\child"),
+        ),
+        "unknown"
+    );
+    let error = vanished_ancestry_escape(
+        root,
+        case_only,
+        1,
+        1,
+        &std::io::Error::from(std::io::ErrorKind::NotFound),
+    );
+    assert_eq!(error.kind, "link_escape");
+    assert!(!error.message.contains("server"));
+    assert!(!error.message.contains("share"));
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn vanished_ancestry_diagnostic_records_only_native_not_found_number() {
+    #[cfg(windows)]
+    let (root, candidate, errno) = (
+        Path::new(concat!("C:", r"\fixture\Owned")),
+        Path::new(concat!("C:", r"\fixture\Other\child")),
+        3,
+    );
+    #[cfg(unix)]
+    let (root, candidate, errno) = (
+        Path::new("/fixture/Owned"),
+        Path::new("/fixture/Other/child"),
+        2,
+    );
+    let first = std::io::Error::from_raw_os_error(errno);
+    assert_eq!(first.kind(), std::io::ErrorKind::NotFound);
+    let error = vanished_ancestry_escape(root, candidate, 1, 2, &first);
+    assert_eq!(error.kind, "link_escape");
+    assert!(
+        error
+            .message
+            .contains(&format!("first_not_found_errno=Some({errno})"))
+    );
+    assert!(!error.message.contains("fixture"));
+    assert!(!error.message.contains("Other"));
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn vanished_ancestry_prefix_diagnostic_does_not_render_non_utf8() {
+    #[cfg(unix)]
+    let invalid = {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![0xff])
+    };
+    #[cfg(windows)]
+    let invalid = {
+        use std::os::windows::ffi::OsStringExt;
+        std::ffi::OsString::from_wide(&[0xd800])
+    };
+    #[cfg(unix)]
+    let root = PathBuf::from("/fixture").join(invalid);
+    #[cfg(windows)]
+    let root = PathBuf::from(concat!("C:", r"\fixture")).join(invalid);
+    let candidate = root.join("child");
+    assert_eq!(physical_prefix_diagnostic(&root, &candidate), "unknown");
+    let error = vanished_ancestry_escape(
+        &root,
+        &candidate,
+        1,
+        1,
+        &std::io::Error::from(std::io::ErrorKind::NotFound),
+    );
+    assert_eq!(error.kind, "link_escape");
+    assert!(error.message.contains("prefix_class=unknown"));
+    assert!(!error.message.contains("fixture"));
+    assert!(!error.message.contains("child"));
+}
+
+#[test]
 fn vanished_entry_allowance_rejects_nested_parent_replaced_by_external_link() {
     let fixture = Fixture::new("churn-link-boundary");
     let build = fixture.acquire();
