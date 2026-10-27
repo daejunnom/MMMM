@@ -45,6 +45,11 @@ debug = 1
 [profile.test]
 debug = "line-tables-only"
 
+# The coordinator's test target exceeded a bounded CI compiler allocation;
+# keep the resource limits and test semantics while omitting its debug info.
+[profile.test.package.mmmm-coordinator]
+debug = "none"
+
 # Full input/image SHA remains inside each original finite request budget.
 # Keep the existing algorithm and pin checks while optimizing its compression
 # implementation in development and test builds as well as release builds.

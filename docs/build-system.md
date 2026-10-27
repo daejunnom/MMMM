@@ -385,6 +385,14 @@ OOM 회피·메모리 절감량을 보장하지 않으며 host 메모리와 AS �
 후속 3개 OS CI의 실제 컴파일·test 결과를 별도로 확인한다. 재실패 시 상한이나 worker를
 자동 변경하지 않는다.
 
+후속 Rust153 Linux에서는 같은 상한과 `line-tables-only`로 Coordinator lib test를
+컴파일하던 rustc가 메모리 할당 실패 후 종료됐다. 이 기록을 보존하고 원인을 단정하지
+않는다. 후속 명시적 진단으로 test profile의 Coordinator package에만 `debug = "none"`을
+적용한다. 해당 package의 test-profile 대상은 파일·행 backtrace 정보를 잃는다. 다른
+package, assertions·overflow·최적화, worker 수, timeout과 자원 상한은 유지한다. 이
+설정이 메모리 절감이나 성공을 보장하지 않으며 정확한 SHA의 각 OS 검사와 실제 rustc
+인자를 확인한다.
+
 최초 Cargo 실행은 Windows의 `tools/bootstrap/bootstrap.ps1` 또는 Unix의
 `tools/bootstrap/bootstrap-unix.py`가 맡는다. Unix launcher의 Python 코드는
 첫 Rust 도구를 만들기 위한 build infrastructure에만 사용한다. 제품 계약 처리,

@@ -4373,3 +4373,11 @@ anchor 아래 최대 한 번 전체 재관측한다. 실제 errno·원 오류와
 기존 ENOENT 의미는 유지한다. 실패 처리 주입 회귀를 작성했으나 실행은 후속 CI 대상이며
 실제 procfs 경합 재현, 원 실패 해결, 짧게 존재한 프로세스의 과거 관측이나 kernel hard
 quota의 증거는 아니다.
+Rust153 Linux는 Coordinator lib test의 `line-tables-only` rustc가 25,427,984바이트
+할당 실패 후 SIGABRT로 종료돼 테스트와 Clippy가 실행되지 않았다. 프로세스별 2 GiB
+AS 제한은 관측됐으나 구체적인 OS 원인은 확정하지 않았고 원 ZIP을 보존한다. 후속
+진단은 workspace test profile에서 Coordinator package의 디버그 정보만 `none`으로
+명시한다. 2 GiB 한도·worker·timeout·전체 검사와 assertion/overflow 설정은 유지하며,
+Coordinator의 test-profile 대상에서 파일·행 backtrace를 잃는다. 메모리 절감이나
+원 실패 해결은 보장하지 않으며 다른 OS 및 후속 정확한 SHA의 검사에서 실제 결과를
+별도 확인한다. Rust152의 PID 관측 오류와 원인을 합치지 않는다.
