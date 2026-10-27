@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 MMMM contributors
+
+description = 'MMMM JNI definition observer startup boundary'
+
+// Java 25, compiler lint, existing JUnit dependencies, reproducible archives,
+// and the owned external build directory are configured by ../build.gradle.
+// premain appends its own bounded JAR to bootstrap search; the controlled
+// launcher separately owns native loading, source pins, and startup coverage.
+tasks.named('jar') {
+    manifest {
+        attributes(
+            'Premain-Class': 'io.github.daejunnom.mmmm.observer.DefinitionObserverAgent',
+            'Can-Redefine-Classes': 'false',
+            'Can-Retransform-Classes': 'false',
+            'Can-Set-Native-Method-Prefix': 'false'
+        )
+    }
+}

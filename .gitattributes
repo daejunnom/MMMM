@@ -4,13 +4,17 @@
 *.rs text eol=lf
 *.toml text eol=lf
 *.java text eol=lf
+*.c text eol=lf
+*.cs text eol=lf
 *.gradle text eol=lf
+*.properties text eol=lf
 *.kts text eol=lf
 *.json text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
 *.ps1 text eol=lf
 *.sh text eol=lf
+*.py text eol=lf
 Cargo.lock text eol=lf
 LICENSE text eol=lf
 .gitignore text eol=lf
@@ -23,6 +27,7 @@ policies/default-policy.json -text
 policies/vendor-registry.json -text
 tests/*-index.json -text
 tests/digest-fixtures.json -text
+jvm/provider-sdk/src/test/resources/action-descriptor-canonical.json -text
 docs/reference/** -text
 tests/**/fixtures/** -text
 crates/**/tests/fixtures/** -text

@@ -1,0 +1,34 @@
+pluginManagement {
+    repositories {
+        maven { url = 'https://maven.fabricmc.net/' }
+        gradlePluginPortal()
+        mavenCentral()
+    }
+    plugins { id 'net.fabricmc.fabric-loom' version '1.17.21' }
+}
+
+if (gradle.gradleVersion != '9.6.0') {
+    throw new GradleException('MMMM JVM build requires exactly Gradle 9.6.0')
+}
+def checkout = settingsDir.parentFile.canonicalFile.toPath()
+def projectCache = gradle.startParameter.projectCacheDir
+if (projectCache == null || !projectCache.isAbsolute() || projectCache.canonicalFile.toPath().startsWith(checkout)) {
+    throw new GradleException('Pass --project-cache-dir inside the managed slot cache, outside the checkout')
+}
+def managedHome = System.getenv('GRADLE_USER_HOME')
+if (managedHome == null || !new File(managedHome).isAbsolute() || new File(managedHome).canonicalFile.toPath().startsWith(checkout)) {
+    throw new GradleException('GRADLE_USER_HOME must be supplied by the managed runner outside the checkout')
+}
+def managedHomeFile = new File(managedHome).canonicalFile
+def managedSlotCache = managedHomeFile.parentFile
+if (managedHomeFile.name != 'gradle-user-home' || projectCache.canonicalFile.name != 'gradle-project-cache'
+        || projectCache.canonicalFile.parentFile != managedSlotCache) {
+    throw new GradleException('Gradle home and project cache must use the managed slot sibling directories')
+}
+if (gradle.startParameter.isBuildCacheEnabled()) {
+    throw new GradleException('The initial JVM profile does not enable a shared build cache')
+}
+
+rootProject.name = 'mmmm-jvm'
+include 'provider-sdk', 'host-core', 'public-java-adapter', 'fabric-host', 'definition-observer'
+include 'fixture-legacy', 'fixture-provider'
