@@ -4390,3 +4390,10 @@ resourceIds 검사는 유지한다. opaque 객체의 오인으로 인한 오류�
 통제 backend에 도달하거나 권한 거절하는 검사와 origin stage·재읽기 검사를 작성했으나
 실행은 후속 CI 대상이다. 해당 fixture는 실제 compiler target·전체 lowering·완성 pack
 또는 게임 성공을 증명하지 않는다.
+Rust154 Linux에서는 test 명령이 성공하고 새 Node·native 자원 및 ESRCH/ENOENT
+주입 회귀가 통과했다. Coordinator test rustc 명령에서 debuginfo 인자는 나타나지
+않았으며 2 GiB per-process 상한과 출력·정리·lease 해제를 확인했다. 이어 Clippy는
+`candidate_directory_failure_tests` 뒤에 production 항목이 있다는
+`items_after_test_module` 한 건으로 실패했다. 원 ZIP을 보존하고 테스트 모듈 168행을
+내용 변경 없이 같은 native 모듈의 끝으로 이동했으며 후속 Clippy는 아직 미실행이다.
+설정 변경이 과거 메모리 실패를 해결했다는 인과관계는 확정하지 않는다.

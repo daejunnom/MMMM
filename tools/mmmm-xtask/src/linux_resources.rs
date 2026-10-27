@@ -2345,174 +2345,6 @@ mod native {
         control.finish(result, "candidate_directory_open")
     }
 
-    #[cfg(test)]
-    mod candidate_directory_failure_tests {
-        use super::*;
-
-        #[test]
-        fn actual_failure_assembly_retains_errno_and_post_control() {
-            let mut phases = Vec::new();
-            let mut checkpoint = |phase| {
-                phases.push(phase);
-                Ok(())
-            };
-            let result = {
-                let mut control = ObservationControl::new(&mut checkpoint, true);
-                candidate_directory_open_failure(
-                    ProcessRole::EnumeratedCandidate,
-                    true,
-                    std::io::Error::from_raw_os_error(libc::ESRCH),
-                    &mut control,
-                )
-            };
-            let incomplete = match result {
-                Ok(CandidateOpen::Incomplete(incomplete)) => incomplete,
-                _ => panic!("unbound candidate ESRCH must remain an incomplete pass"),
-            };
-            assert_eq!(phases, ["candidate_directory_open"]);
-            assert!(incomplete.recoverable());
-            assert_eq!(incomplete.gap.native_errno(), libc::ESRCH);
-            assert!(!incomplete.gap.candidate_directory_opened());
-            assert!(
-                incomplete
-                    .original
-                    .message
-                    .contains("file_role=pid_directory; operation=open;")
-            );
-            assert!(incomplete.original.message.contains("os_error=Some(3)"));
-
-            let mut checkpoint = |_| {
-                let mut error = ProcessError::new("cancelled", "post-open checkpoint cancelled");
-                error.drained = false;
-                Err(error)
-            };
-            let mut control = ObservationControl::new(&mut checkpoint, true);
-            let result = candidate_directory_open_failure(
-                ProcessRole::EnumeratedCandidate,
-                true,
-                std::io::Error::from_raw_os_error(libc::ESRCH),
-                &mut control,
-            );
-            let incomplete = match result {
-                Ok(CandidateOpen::Incomplete(incomplete)) => incomplete,
-                _ => panic!("post-control error must retain the original incomplete pass"),
-            };
-            assert!(!incomplete.recoverable());
-            assert_eq!(incomplete.post_control.as_ref().unwrap().kind, "cancelled");
-            let error = incomplete.into_failure();
-            assert!(!error.drained);
-            assert!(error.message.contains("os_error=Some(3)"));
-            assert!(error.message.contains("post-open checkpoint cancelled"));
-        }
-
-        #[test]
-        fn retained_or_other_directory_failures_do_not_gain_a_retry() {
-            for (role, unbound, code) in [
-                (ProcessRole::EnumeratedCandidate, false, libc::ESRCH),
-                (ProcessRole::ReservedLeader, true, libc::ESRCH),
-                (ProcessRole::OwnedMember, true, libc::ESRCH),
-                (ProcessRole::EnumeratedCandidate, true, libc::EACCES),
-            ] {
-                let mut checkpoint = |_| Ok(());
-                let mut control = ObservationControl::new(&mut checkpoint, true);
-                let result = candidate_directory_open_failure(
-                    role,
-                    unbound,
-                    std::io::Error::from_raw_os_error(code),
-                    &mut control,
-                );
-                let error = match result {
-                    Err(error) => error,
-                    _ => panic!("bound or different errors must remain failures"),
-                };
-                assert_eq!(error.kind, "resource_observation");
-                assert!(error.message.contains(&format!("os_error=Some({code})")));
-            }
-        }
-
-        #[test]
-        fn candidate_directory_enoent_preserves_existing_unavailable_and_post_control() {
-            // The numeric enumeration role is the same for an unbound candidate
-            // and a namespace probe of a retained PID. Neither result asserts
-            // a retained identity's terminal state.
-            for unbound in [false, true] {
-                let mut phases = Vec::new();
-                let mut checkpoint = |phase| {
-                    phases.push(phase);
-                    Ok(())
-                };
-                let result = {
-                    let mut control = ObservationControl::new(&mut checkpoint, true);
-                    candidate_directory_open_failure(
-                        ProcessRole::EnumeratedCandidate,
-                        unbound,
-                        std::io::Error::from_raw_os_error(libc::ENOENT),
-                        &mut control,
-                    )
-                };
-                assert!(matches!(result, Ok(CandidateOpen::Unavailable)));
-                assert_eq!(phases, ["candidate_directory_open"]);
-
-                let mut checkpoint = |_| {
-                    let mut error =
-                        ProcessError::new("cancelled", "post-open checkpoint cancelled");
-                    error.drained = false;
-                    Err(error)
-                };
-                let mut control = ObservationControl::new(&mut checkpoint, true);
-                let result = candidate_directory_open_failure(
-                    ProcessRole::EnumeratedCandidate,
-                    unbound,
-                    std::io::Error::from_raw_os_error(libc::ENOENT),
-                    &mut control,
-                );
-                let error = match result {
-                    Err(error) => error,
-                    _ => panic!("post-control failure cannot become unavailable"),
-                };
-                assert_eq!(error.kind, "cancelled");
-                assert_eq!(error.message, "post-open checkpoint cancelled");
-                assert!(!error.drained);
-            }
-        }
-
-        #[test]
-        fn actual_failure_assembly_connects_to_bounded_second_pass() {
-            let mut pending = PendingObservations::default();
-            let mut calls = 0;
-            let (result, evidence) = enumeration_sample::<()>(&mut pending, |work, _| {
-                calls += 1;
-                work.entry()?;
-                if calls == 1 {
-                    let mut checkpoint = |_| Ok(());
-                    let mut control = ObservationControl::new(&mut checkpoint, true);
-                    match candidate_directory_open_failure(
-                        ProcessRole::EnumeratedCandidate,
-                        true,
-                        std::io::Error::from_raw_os_error(libc::ESRCH),
-                        &mut control,
-                    )? {
-                        CandidateOpen::Incomplete(incomplete) => {
-                            Ok(EnumerationPass::Incomplete(incomplete))
-                        }
-                        _ => panic!("failure assembly must not create an identity or FD"),
-                    }
-                } else {
-                    Err(ProcessError::new("timeout", "second pass deadline"))
-                }
-            });
-            let error = result.unwrap_err();
-            assert_eq!(calls, 2);
-            assert_eq!(error.kind, "timeout");
-            assert!(error.message.contains("first_incomplete_enumeration="));
-            assert!(error.message.contains("os_error=Some(3)"));
-            assert_eq!(evidence.count, 1);
-            assert_eq!(evidence.recovered_samples, 0);
-            assert_eq!(evidence.first.unwrap().native_errno, libc::ESRCH);
-            assert_eq!(evidence.following_failure.unwrap().kind, "timeout");
-        }
-    }
-
     fn open_process_checked(
         root: &File,
         pid: i32,
@@ -3077,6 +2909,173 @@ mod native {
                 error.raw_os_error(),
             ),
         )
+    }
+    #[cfg(test)]
+    mod candidate_directory_failure_tests {
+        use super::*;
+
+        #[test]
+        fn actual_failure_assembly_retains_errno_and_post_control() {
+            let mut phases = Vec::new();
+            let mut checkpoint = |phase| {
+                phases.push(phase);
+                Ok(())
+            };
+            let result = {
+                let mut control = ObservationControl::new(&mut checkpoint, true);
+                candidate_directory_open_failure(
+                    ProcessRole::EnumeratedCandidate,
+                    true,
+                    std::io::Error::from_raw_os_error(libc::ESRCH),
+                    &mut control,
+                )
+            };
+            let incomplete = match result {
+                Ok(CandidateOpen::Incomplete(incomplete)) => incomplete,
+                _ => panic!("unbound candidate ESRCH must remain an incomplete pass"),
+            };
+            assert_eq!(phases, ["candidate_directory_open"]);
+            assert!(incomplete.recoverable());
+            assert_eq!(incomplete.gap.native_errno(), libc::ESRCH);
+            assert!(!incomplete.gap.candidate_directory_opened());
+            assert!(
+                incomplete
+                    .original
+                    .message
+                    .contains("file_role=pid_directory; operation=open;")
+            );
+            assert!(incomplete.original.message.contains("os_error=Some(3)"));
+
+            let mut checkpoint = |_| {
+                let mut error = ProcessError::new("cancelled", "post-open checkpoint cancelled");
+                error.drained = false;
+                Err(error)
+            };
+            let mut control = ObservationControl::new(&mut checkpoint, true);
+            let result = candidate_directory_open_failure(
+                ProcessRole::EnumeratedCandidate,
+                true,
+                std::io::Error::from_raw_os_error(libc::ESRCH),
+                &mut control,
+            );
+            let incomplete = match result {
+                Ok(CandidateOpen::Incomplete(incomplete)) => incomplete,
+                _ => panic!("post-control error must retain the original incomplete pass"),
+            };
+            assert!(!incomplete.recoverable());
+            assert_eq!(incomplete.post_control.as_ref().unwrap().kind, "cancelled");
+            let error = incomplete.into_failure();
+            assert!(!error.drained);
+            assert!(error.message.contains("os_error=Some(3)"));
+            assert!(error.message.contains("post-open checkpoint cancelled"));
+        }
+
+        #[test]
+        fn retained_or_other_directory_failures_do_not_gain_a_retry() {
+            for (role, unbound, code) in [
+                (ProcessRole::EnumeratedCandidate, false, libc::ESRCH),
+                (ProcessRole::ReservedLeader, true, libc::ESRCH),
+                (ProcessRole::OwnedMember, true, libc::ESRCH),
+                (ProcessRole::EnumeratedCandidate, true, libc::EACCES),
+            ] {
+                let mut checkpoint = |_| Ok(());
+                let mut control = ObservationControl::new(&mut checkpoint, true);
+                let result = candidate_directory_open_failure(
+                    role,
+                    unbound,
+                    std::io::Error::from_raw_os_error(code),
+                    &mut control,
+                );
+                let error = match result {
+                    Err(error) => error,
+                    _ => panic!("bound or different errors must remain failures"),
+                };
+                assert_eq!(error.kind, "resource_observation");
+                assert!(error.message.contains(&format!("os_error=Some({code})")));
+            }
+        }
+
+        #[test]
+        fn candidate_directory_enoent_preserves_existing_unavailable_and_post_control() {
+            // The numeric enumeration role is the same for an unbound candidate
+            // and a namespace probe of a retained PID. Neither result asserts
+            // a retained identity's terminal state.
+            for unbound in [false, true] {
+                let mut phases = Vec::new();
+                let mut checkpoint = |phase| {
+                    phases.push(phase);
+                    Ok(())
+                };
+                let result = {
+                    let mut control = ObservationControl::new(&mut checkpoint, true);
+                    candidate_directory_open_failure(
+                        ProcessRole::EnumeratedCandidate,
+                        unbound,
+                        std::io::Error::from_raw_os_error(libc::ENOENT),
+                        &mut control,
+                    )
+                };
+                assert!(matches!(result, Ok(CandidateOpen::Unavailable)));
+                assert_eq!(phases, ["candidate_directory_open"]);
+
+                let mut checkpoint = |_| {
+                    let mut error =
+                        ProcessError::new("cancelled", "post-open checkpoint cancelled");
+                    error.drained = false;
+                    Err(error)
+                };
+                let mut control = ObservationControl::new(&mut checkpoint, true);
+                let result = candidate_directory_open_failure(
+                    ProcessRole::EnumeratedCandidate,
+                    unbound,
+                    std::io::Error::from_raw_os_error(libc::ENOENT),
+                    &mut control,
+                );
+                let error = match result {
+                    Err(error) => error,
+                    _ => panic!("post-control failure cannot become unavailable"),
+                };
+                assert_eq!(error.kind, "cancelled");
+                assert_eq!(error.message, "post-open checkpoint cancelled");
+                assert!(!error.drained);
+            }
+        }
+
+        #[test]
+        fn actual_failure_assembly_connects_to_bounded_second_pass() {
+            let mut pending = PendingObservations::default();
+            let mut calls = 0;
+            let (result, evidence) = enumeration_sample::<()>(&mut pending, |work, _| {
+                calls += 1;
+                work.entry()?;
+                if calls == 1 {
+                    let mut checkpoint = |_| Ok(());
+                    let mut control = ObservationControl::new(&mut checkpoint, true);
+                    match candidate_directory_open_failure(
+                        ProcessRole::EnumeratedCandidate,
+                        true,
+                        std::io::Error::from_raw_os_error(libc::ESRCH),
+                        &mut control,
+                    )? {
+                        CandidateOpen::Incomplete(incomplete) => {
+                            Ok(EnumerationPass::Incomplete(incomplete))
+                        }
+                        _ => panic!("failure assembly must not create an identity or FD"),
+                    }
+                } else {
+                    Err(ProcessError::new("timeout", "second pass deadline"))
+                }
+            });
+            let error = result.unwrap_err();
+            assert_eq!(calls, 2);
+            assert_eq!(error.kind, "timeout");
+            assert!(error.message.contains("first_incomplete_enumeration="));
+            assert!(error.message.contains("os_error=Some(3)"));
+            assert_eq!(evidence.count, 1);
+            assert_eq!(evidence.recovered_samples, 0);
+            assert_eq!(evidence.first.unwrap().native_errno, libc::ESRCH);
+            assert_eq!(evidence.following_failure.unwrap().kind, "timeout");
+        }
     }
 }
 
