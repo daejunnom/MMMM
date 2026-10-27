@@ -4236,3 +4236,10 @@ Prefab port의 decimal 표기는 이제 `CAPABILITY_UNAVAILABLE`로 거절한다
 모듈 범위에 없어 E0425로 컴파일 전 실패했다. 테스트와 strict는 미실행이며 각 OS 원
 로그와 drain/export·scratch 제거·lease 해제 결과를 보존한다. 수정은 같은 모듈의 명시적
 배열 검사를 사용하며 실제 재컴파일은 후속 CI에서 확인한다.
+
+실제 Native source commit·CAS·workspace와 production owned source adapter에서
+NativePlanner의 scene 변경 준비를 거쳐 test inventory sentinel까지 도달하는 검사를 작성했다.
+독립 Prefab artifact의 원 숫자가 같은 Value로 반올림되는 분수일 때는 그 준비 전에 실제
+exact 오류 원인을 확인한다. `scene.diff` 인증 fixture에서 planner를 직접 호출하고 projection
+참조를 제어하므로 scene.plan Service·완성 plan·physics·실제 게임 성공은 아니다. 실제 실행은
+후속 CI에서 확인한다.

@@ -702,6 +702,16 @@ fn native_owned_scene_with_decimal(
     budget: &RequestBudget,
     decimal: bool,
 ) -> NativeOwnedScene {
+    native_owned_scene_with_artifact_fraction(store, handles, budget, decimal, false)
+}
+
+fn native_owned_scene_with_artifact_fraction(
+    store: &mut DurableStore,
+    handles: &mut DaemonHandles,
+    budget: &RequestBudget,
+    decimal: bool,
+    artifact_fraction: bool,
+) -> NativeOwnedScene {
     // Keep only the original static root/door Nodes: the complete example also
     // requires real blockset, CommandModule and Clip sources. This regression
     // exercises Store forwarding, not those separate admission producers.
@@ -743,6 +753,22 @@ fn native_owned_scene_with_decimal(
         instance["revision"] = json!(projected_digest("Instance", &instance).unwrap());
     }
     let prefab_bytes = encode_json(&prefab).unwrap();
+    // Only the independent artifact's wire bytes change. Its parsed Value is
+    // deliberately identical: binary64 has rounded this fractional lexeme.
+    let artifact_bytes = if artifact_fraction {
+        assert!(decimal);
+        let text = std::str::from_utf8(&prefab_bytes).unwrap();
+        let needle = "\"sizeBytes\":1.0";
+        assert_eq!(text.matches(needle).count(), 2);
+        let bytes = text
+            .replacen(needle, "\"sizeBytes\":1.0000000000000001", 1)
+            .into_bytes();
+        assert_ne!(bytes, prefab_bytes);
+        assert_eq!(parse_json(&bytes).unwrap(), prefab);
+        bytes
+    } else {
+        prefab_bytes.clone()
+    };
     let instance_bytes = encode_json(&instance).unwrap();
     let documents = [
         NativeSourceDocument {
@@ -775,7 +801,7 @@ fn native_owned_scene_with_decimal(
         "sourceObjectId":instance["instanceId"],"sourceNodeId":"door",
         "outputResourceId":artifact_id,"locator":format!("/nodes/{door}/transform"),
     }]});
-    let artifact = raw_resource(artifact_id.clone(), &prefab_bytes);
+    let artifact = raw_resource(artifact_id.clone(), &artifact_bytes);
     let artifact_metadata = encode_json(&json!(artifact)).unwrap();
     // An unpublished preview derives membership only. The independent map's
     // bytes/hash do not enter either owned document or the Project revision.
@@ -786,7 +812,7 @@ fn native_owned_scene_with_decimal(
     let mut preview_raw = vec![
         NativeRawSourceResource {
             metadata: &artifact_metadata,
-            bytes: &prefab_bytes,
+            bytes: &artifact_bytes,
         },
         NativeRawSourceResource {
             metadata: &preview_map_metadata,
@@ -832,7 +858,7 @@ fn native_owned_scene_with_decimal(
     let mut raw_resources = vec![
         NativeRawSourceResource {
             metadata: &artifact_metadata,
-            bytes: &prefab_bytes,
+            bytes: &artifact_bytes,
         },
         NativeRawSourceResource {
             metadata: &map_metadata,
@@ -879,7 +905,7 @@ fn native_owned_scene_with_decimal(
         assert_eq!(store.read_blob(blob).unwrap().as_slice(), b"x");
     }
     for (id, resource, bytes) in [
-        (artifact_id.clone(), &artifact, &prefab_bytes),
+        (artifact_id.clone(), &artifact, &artifact_bytes),
         (map_id.clone(), &map_pin, &map_bytes),
     ] {
         let (_, blob) = receipt
@@ -1492,6 +1518,236 @@ fn offline_factory_data_reads_decimal_prefab_from_native_source_commit() {
         json!({"nativeDecimalSourceRead":true,"gameOrPlanIssued":false})
     );
     assert!(handles.request.occupied_witness().is_err());
+}
+
+// This controlled environment stops as soon as actual source preparation has
+// finished. It does not issue a target, a game observation or a completed plan.
+struct StopAfterScenePreparation;
+
+fn unexpected_scene_test_environment<T>() -> AppResult<T> {
+    Err(AppError::new(
+        "TEST_UNEXPECTED_ENVIRONMENT",
+        "Unexpected fixture environment call",
+    ))
+}
+
+impl mmmm_planner::PlanningEnvironmentPort for StopAfterScenePreparation {
+    fn execution_budget_ms(&mut self, _: &PrincipalId, _: &Value) -> AppResult<u64> {
+        unexpected_scene_test_environment()
+    }
+    fn inventory(
+        &mut self,
+        _: &PrincipalId,
+        _: &Value,
+    ) -> AppResult<mmmm_adapters::InventorySnapshot> {
+        Err(AppError::new(
+            "TEST_SCENE_PREPARED",
+            "Scene source preparation reached the inventory boundary",
+        ))
+    }
+    fn binding_dependency(
+        &mut self,
+        _: &PrincipalId,
+        _: &mmmm_contracts::BindingId,
+        _: &Sha256Digest,
+        _: &Value,
+    ) -> AppResult<Value> {
+        unexpected_scene_test_environment()
+    }
+    fn native_route(
+        &mut self,
+        _: &PrincipalId,
+        _: mmmm_planner::NativeKind,
+        _: &Value,
+    ) -> AppResult<mmmm_planner::NativeActionRoute> {
+        unexpected_scene_test_environment()
+    }
+    fn verified_native_target(
+        &mut self,
+        _: &PrincipalId,
+        _: &TargetProfileId,
+        _: mmmm_planner::NativeKind,
+        _: &Value,
+    ) -> AppResult<mmmm_planner::VerifiedNativeTarget> {
+        unexpected_scene_test_environment()
+    }
+    fn snapshot_native_targets(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &mmmm_planner::PreparedNativeChange,
+        _: &Value,
+    ) -> AppResult<mmmm_planner::NativeTargetSnapshot> {
+        unexpected_scene_test_environment()
+    }
+    fn registered_action_footprint(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &Value,
+        _: &mmmm_adapters::ActionDescriptor,
+        _: &Value,
+    ) -> AppResult<mmmm_planner::RegisteredActionFootprint> {
+        unexpected_scene_test_environment()
+    }
+    fn relocatable_modules(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &[Value],
+        _: &Value,
+    ) -> AppResult<BTreeSet<mmmm_contracts::ModuleId>> {
+        unexpected_scene_test_environment()
+    }
+    fn command_layout_support(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &Value,
+        _: &Value,
+    ) -> AppResult<mmmm_domain::commands::CommandLayoutSupport> {
+        unexpected_scene_test_environment()
+    }
+    fn command_layout_request(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &Value,
+        _: &Value,
+        _: &Value,
+    ) -> AppResult<Value> {
+        unexpected_scene_test_environment()
+    }
+    fn verify_projection_references(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &mmmm_planner::InstanceProjection,
+        _: &Value,
+    ) -> AppResult<Vec<Value>> {
+        Ok(vec![])
+    }
+    fn compiler_target(
+        &mut self,
+        _: &PrincipalId,
+        _: &TargetProfileId,
+        _: &Value,
+    ) -> AppResult<mmmm_compiler::VerifiedTarget> {
+        unexpected_scene_test_environment()
+    }
+    fn pack_inputs(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &[Value],
+        _: &Value,
+    ) -> AppResult<mmmm_compiler::PackBuildInputs> {
+        unexpected_scene_test_environment()
+    }
+    fn recovery_route(
+        &mut self,
+        _: &PrincipalId,
+        _: &mmmm_application::RecoveryPreparation,
+        _: &Value,
+    ) -> AppResult<mmmm_planner::NativeActionRoute> {
+        unexpected_scene_test_environment()
+    }
+    fn recovery_scope(
+        &mut self,
+        _: &PrincipalId,
+        _: &mmmm_application::RecoveryPreparation,
+        _: &ProjectCatalog,
+        _: &Value,
+    ) -> AppResult<mmmm_runtime::storage::WriteScope> {
+        unexpected_scene_test_environment()
+    }
+    fn project_bindings_available(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+    ) -> AppResult<bool> {
+        unexpected_scene_test_environment()
+    }
+}
+
+#[test]
+fn decimal_prefab_reaches_actual_scene_preparation_but_fractional_artifact_does_not() {
+    use crate::planning_source::{BorrowedProjectSource, LocalPlanningAccess};
+    use mmmm_application::PlanningPort;
+    use mmmm_planner::{NativePlanner, PlannerOptions};
+
+    for fractional_artifact in [false, true] {
+        let root = TestRoot::new();
+        let mut store = root.open();
+        let mut handles = handles(&mut store);
+        let budget =
+            RequestBudget::new(Duration::from_secs(30), Arc::new(AtomicBool::new(false))).unwrap();
+        let inputs = native_owned_scene_with_artifact_fraction(
+            &mut store,
+            &mut handles,
+            &budget,
+            true,
+            fractional_artifact,
+        );
+        let context = handles.workspace.as_ref().unwrap().context.clone();
+        let authority = handles.authority.clone();
+        let hosts = handles.hosts.clone();
+        let mut factory = ProductionFactory::offline_owned(binary_digest());
+        let parts = factory.compose(&handles, &store).unwrap();
+        let contexts = parts.contexts.clone();
+        let data = parts.data.clone();
+        let mut fixture = source_fixture(store, &handles, parts, budget, move |store, request| {
+            let principal = request.authenticated().principal().clone();
+            let access = LocalPlanningAccess::new(
+                request.authenticated().clone(),
+                authority.clone(),
+                hosts.clone(),
+                request.budget().clone(),
+                contexts.clone(),
+            )?;
+            let frame = PlanningStore::write(store);
+            let source = BorrowedProjectSource::new(frame, access, data.clone());
+            let mut planner = NativePlanner::new(
+                Box::new(source),
+                Box::new(StopAfterScenePreparation),
+                Box::new(SystemClock),
+                PlannerOptions::default(),
+            )?;
+            let plan_request = json!({"projectId":inputs.catalog.project_id(), "expectedRevision":inputs.catalog.revision(),
+                "contextId":context["contextId"], "intent":{"kind":"scene.import_patch", "patch":inputs.patch}});
+            let error = planner
+                .prepare(
+                    &principal,
+                    &plan_request,
+                    inputs.catalog.project(),
+                    &context,
+                )
+                .err()
+                .expect("fixture stops before a plan is issued");
+            if fractional_artifact {
+                assert_eq!(error.code, "INVALID_INPUT", "{error:?}");
+                assert_eq!(error.message, "Prefab artifact failed exact validation");
+                assert!(matches!(
+                    std::error::Error::source(&error).and_then(|cause| {
+                        cause.downcast_ref::<
+                        mmmm_contracts::validation::ControlledPrefabContractError<AppError>
+                    >()
+                    }),
+                    Some(
+                        mmmm_contracts::validation::ControlledPrefabContractError::ExactInteger { .. }
+                    )
+                ));
+            } else {
+                assert_eq!(error.code, "TEST_SCENE_PREPARED", "{error:?}");
+            }
+            Ok(json!({"fractionalArtifact":fractional_artifact,"completePlanIssued":false}))
+        });
+        assert_eq!(
+            fixture.call().unwrap(),
+            json!({"fractionalArtifact":fractional_artifact,"completePlanIssued":false})
+        );
+        assert!(handles.request.occupied_witness().is_err());
+    }
 }
 
 struct SuppliedPlanningData {
