@@ -2,7 +2,236 @@
 //! Coordinator native_import_files_tests and consume this same production kernel;
 //! a second directory fixture here would duplicate their ownership/cleanup logic.
 use super::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+
+// This in-memory stream controls each pass independently, including failures
+// that occur while a Control::io operation is in progress.
+struct ScriptedObservedStream<'a> {
+    passes: [&'a [u8]; 2],
+    current: Option<usize>,
+    offset: usize,
+    seeks: usize,
+    eof_reads: [usize; 2],
+    data_reads: [usize; 2],
+    max_buffer_length: usize,
+    revalidations: Cell<usize>,
+    events: RefCell<Vec<&'static str>>,
+    reported_seek: u64,
+    fail_read_pass: Option<usize>,
+    cancel_on_failed_read: Option<&'a Cell<bool>>,
+}
+
+impl<'a> ScriptedObservedStream<'a> {
+    fn new(first: &'a [u8], second: &'a [u8]) -> Self {
+        Self {
+            passes: [first, second],
+            current: None,
+            offset: 0,
+            seeks: 0,
+            eof_reads: [0, 0],
+            data_reads: [0, 0],
+            max_buffer_length: 0,
+            revalidations: Cell::new(0),
+            events: RefCell::new(Vec::new()),
+            reported_seek: 0,
+            fail_read_pass: None,
+            cancel_on_failed_read: None,
+        }
+    }
+}
+
+impl ObservedStream<Checks> for ScriptedObservedStream<'_> {
+    fn seek_start(&mut self) -> io::Result<u64> {
+        self.events.borrow_mut().push("seek");
+        if self.seeks >= self.passes.len() {
+            return Err(io::Error::other("unexpected extra pass"));
+        }
+        self.current = Some(self.seeks);
+        self.seeks += 1;
+        self.offset = 0;
+        Ok(self.reported_seek)
+    }
+
+    fn read_chunk(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let pass = self
+            .current
+            .ok_or_else(|| io::Error::other("read before seek"))?;
+        self.max_buffer_length = self.max_buffer_length.max(buffer.len());
+        if self.fail_read_pass == Some(pass) {
+            if let Some(cancelled) = self.cancel_on_failed_read {
+                cancelled.set(true);
+            }
+            return Err(io::Error::from_raw_os_error(5));
+        }
+        let input = self.passes[pass];
+        if self.offset == input.len() {
+            self.events.borrow_mut().push("eof");
+            self.eof_reads[pass] += 1;
+            return Ok(0);
+        }
+        let count = buffer.len().min(input.len() - self.offset);
+        self.data_reads[pass] += usize::from(count > 0);
+        buffer[..count].copy_from_slice(&input[self.offset..self.offset + count]);
+        self.offset += count;
+        Ok(count)
+    }
+
+    fn revalidate(&self, control: &Checks) -> Result<(), Failure> {
+        self.events.borrow_mut().push("revalidate");
+        self.revalidations.set(self.revalidations.get() + 1);
+        control.check()
+    }
+}
+
+fn failure_contains_cancelled(error: &Failure) -> bool {
+    match error {
+        Failure::Cancelled => true,
+        Failure::Both(primary, post) => {
+            failure_contains_cancelled(primary) || failure_contains_cancelled(post)
+        }
+        _ => false,
+    }
+}
+
+fn failure_contains_os_error(error: &Failure, code: i32) -> bool {
+    match error {
+        Failure::Io(error) => error.raw_os_error() == Some(code),
+        Failure::Both(primary, post) => {
+            failure_contains_os_error(primary, code) || failure_contains_os_error(post, code)
+        }
+        _ => false,
+    }
+}
+
+fn failure_has_io_with_cancelled_post(error: &Failure) -> bool {
+    match error {
+        Failure::Both(primary, post) => {
+            (failure_contains_os_error(primary, 5) && failure_contains_cancelled(post))
+                || failure_has_io_with_cancelled_post(primary)
+                || failure_has_io_with_cancelled_post(post)
+        }
+        _ => false,
+    }
+}
+
+#[test]
+fn observed_stream_hash_reads_both_passes_and_exact_eof() {
+    let bytes = vec![0x5a; 64 * 1024 + 3];
+    let mut stream = ScriptedObservedStream::new(&bytes, &bytes);
+    let checks = Checks {
+        cancelled: Cell::new(false),
+    };
+    let observed = observe_stream_sha256(&mut stream, bytes.len() as u64, &checks).unwrap();
+    let expected: [u8; 32] = Sha256::digest(&bytes).into();
+    assert_eq!(observed, expected);
+    assert_eq!(stream.seeks, 2);
+    assert_eq!(stream.eof_reads, [1, 1]);
+    assert!(stream.data_reads.iter().all(|count| *count >= 2));
+    assert_eq!(stream.max_buffer_length, 64 * 1024);
+    assert!(stream.revalidations.get() >= 4);
+    assert_eq!(stream.offset, bytes.len());
+    let events = stream.events.borrow();
+    let seek_positions: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| (*e == "seek").then_some(i))
+        .collect();
+    let eof_positions: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| (*e == "eof").then_some(i))
+        .collect();
+    assert!(events[..seek_positions[0]].contains(&"revalidate"));
+    assert!(
+        events[eof_positions[0] + 1..seek_positions[1]]
+            .iter()
+            .filter(|e| **e == "revalidate")
+            .count()
+            >= 2
+    );
+    assert!(events[eof_positions[1] + 1..].contains(&"revalidate"));
+    drop(events);
+
+    let mut empty = ScriptedObservedStream::new(b"", b"");
+    let observed = observe_stream_sha256(&mut empty, 0, &checks).unwrap();
+    let expected = [
+        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9,
+        0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52,
+        0xb8, 0x55,
+    ];
+    assert_eq!(observed, expected);
+    assert_eq!(empty.seeks, 2);
+    assert_eq!(empty.eof_reads, [1, 1]);
+}
+
+#[test]
+fn observed_stream_hash_rejects_changed_pass_and_inexact_lengths() {
+    let checks = Checks {
+        cancelled: Cell::new(false),
+    };
+    let mut changed = ScriptedObservedStream::new(b"abc", b"abd");
+    assert!(matches!(
+        observe_stream_sha256(&mut changed, 3, &checks),
+        Err(Failure::Changed)
+    ));
+    assert_eq!(changed.seeks, 2);
+    for (first, second, expected) in [
+        (&b"ab"[..], &b"ab"[..], 3),
+        (&b"abcd"[..], &b"abcd"[..], 3),
+        (&b"abc"[..], &b"ab"[..], 3),
+        (&b"abc"[..], &b"abcd"[..], 3),
+        (&b"x"[..], &b"x"[..], u64::MAX),
+    ] {
+        let mut stream = ScriptedObservedStream::new(first, second);
+        assert!(matches!(
+            observe_stream_sha256(&mut stream, expected, &checks),
+            Err(Failure::Changed)
+        ));
+    }
+
+    let mut bad_seek = ScriptedObservedStream::new(b"abc", b"abc");
+    bad_seek.reported_seek = 1;
+    assert!(observe_stream_sha256(&mut bad_seek, 3, &checks).is_err());
+}
+
+#[test]
+fn observed_stream_hash_preserves_io_and_cancellation_failures() {
+    let checks = Checks {
+        cancelled: Cell::new(false),
+    };
+    let mut first_failure = ScriptedObservedStream::new(b"abc", b"abc");
+    first_failure.fail_read_pass = Some(0);
+    let error = observe_stream_sha256(&mut first_failure, 3, &checks).unwrap_err();
+    assert!(failure_contains_os_error(&error, 5));
+    assert_eq!(first_failure.seeks, 1);
+
+    let mut stream = ScriptedObservedStream::new(b"abc", b"abc");
+    stream.fail_read_pass = Some(1);
+    let error = observe_stream_sha256(&mut stream, 3, &checks).unwrap_err();
+    assert!(failure_contains_os_error(&error, 5));
+    assert_eq!(stream.seeks, 2);
+
+    let checks = Checks {
+        cancelled: Cell::new(false),
+    };
+    let mut stream = ScriptedObservedStream::new(b"abc", b"abc");
+    stream.fail_read_pass = Some(1);
+    stream.cancel_on_failed_read = Some(&checks.cancelled);
+    let error = observe_stream_sha256(&mut stream, 3, &checks).unwrap_err();
+    assert!(matches!(&error, Failure::Both(_, _)));
+    assert!(failure_contains_os_error(&error, 5));
+    assert!(failure_contains_cancelled(&error));
+    assert!(failure_has_io_with_cancelled_post(&error));
+    assert_eq!(stream.seeks, 2);
+
+    let checks = Checks {
+        cancelled: Cell::new(true),
+    };
+    let mut stream = ScriptedObservedStream::new(b"abc", b"abc");
+    let error = observe_stream_sha256(&mut stream, 3, &checks).unwrap_err();
+    assert!(failure_contains_cancelled(&error));
+    assert_eq!(stream.seeks, 0);
+}
 
 #[derive(Debug)]
 enum Failure {
@@ -221,10 +450,10 @@ fn relative_file_preflight_bounds_depth_and_total_encoded_length() {
     // Seventeen 240-byte components plus sixteen separators are exactly 4096
     // UTF-8 bytes; one additional component byte exceeds the relative budget.
     let mut names = vec!["a".repeat(240); 17];
-    let components: Vec<&OsStr> = names.iter().map(|name| OsStr::new(name)).collect();
+    let components: Vec<&OsStr> = names.iter().map(OsStr::new).collect();
     assert!(ordinary_relative_components(&components));
     names[0].push('a');
-    let components: Vec<&OsStr> = names.iter().map(|name| OsStr::new(name)).collect();
+    let components: Vec<&OsStr> = names.iter().map(OsStr::new).collect();
     assert!(!ordinary_relative_components(&components));
 }
 

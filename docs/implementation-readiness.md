@@ -4123,6 +4123,15 @@ writer·mapping이나 전체 후보 집합의 원자 snapshot을 증명하지 �
 관측이며 해시 inventory·인증된 release proof·권한을 발급하지 않는다. 기존 소유 marker
 하네스로 경로·링크·이동·취소·오류·ancestry 수명을 검사하도록 작성했으며, 실제 OS별
 컴파일·실행은 후속 CI에서 확인한다.
+보유 파일의 같은 handle을 64KiB buffer로 두 번 읽고 길이·EOF·SHA와 전후 identity를
+대조하는 bounded 관측을 추가했다. 일반 파일 커널은 빈 파일을 허용하며 release inventory의
+1바이트 이상·8GiB 이하 정책은 소비자에서 따로 적용한다. 성공 시 offset은 두 번째 EOF,
+실패 시 중간 위치일 수 있고 복제된 OS handle의 공유 offset은 간섭할 수 있다. 일치하는
+두 해시도 불변 snapshot, 최초 원문, source provenance, release proof나 권한이 아니다.
+기존 POSIX writer/ABA·Windows 선행 writer/mapping·native close 미관측 한계는 유지한다.
+작은 실제 파일과 mock의 크기·EOF·변경·오류·취소 검사를 작성했으며 실행 결과는 별도다.
+Rust135 Linux의 상대 경로 preflight 검사는 통과했으나 Clippy에서 중복 closure 두 곳이
+실패해 원 기록을 보존했고 후속 소스에서 그 두 표현만 수정했다.
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

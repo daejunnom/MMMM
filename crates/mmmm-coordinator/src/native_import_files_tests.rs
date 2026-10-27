@@ -700,6 +700,253 @@ fn shared_relative_selection_preserves_original_cancellation_at_checkpoints() {
     root.close(&checks).unwrap();
 }
 
+// Existing source-read fixtures compare supplied original bytes. These cases
+// exercise the separate streaming digest observation over the held file itself;
+// the returned digest is not a release proof or an immutable snapshot.
+#[test]
+fn shared_held_file_digest_observes_multichunk_and_empty_files_with_bounds() {
+    use mmmm_owned_files::{CHUNK_BYTES, Control, HeldDirectory};
+    use std::{
+        ffi::OsStr,
+        io::{Seek, SeekFrom},
+    };
+
+    let fixture = Fixture::new();
+    let original: Vec<u8> = (0..(CHUNK_BYTES * 2 + 19))
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let path = fixture.file("streamed-digest.dat", &original);
+    let empty = fixture.file("streamed-empty.dat", b"");
+    let checks = Checks {
+        owner: &fixture.owner,
+        budget: &fixture.budget,
+    };
+    let root = HeldDirectory::open_root(&fixture.root.path.join("selected"), &checks).unwrap();
+    let mut selected = root
+        .open_existing_descendant(&[OsStr::new("streamed-digest.dat")], &checks)
+        .unwrap();
+    checks
+        .io(|| selected.file().seek(SeekFrom::Start(7)))
+        .unwrap();
+    let observed = selected
+        .observe_sha256(original.len() as u64, &checks)
+        .unwrap();
+    assert_eq!(observed.length, original.len() as u64);
+    let expected: [u8; 32] = Sha256::digest(&original).into();
+    assert_eq!(observed.sha256, expected);
+    assert_eq!(
+        selected
+            .observe_sha256(original.len() as u64 - 1, &checks)
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnsafeSelection
+    );
+    selected.close(&checks).unwrap();
+
+    let mut selected_empty = root
+        .open_existing_descendant(&[OsStr::new("streamed-empty.dat")], &checks)
+        .unwrap();
+    let observed_empty = selected_empty.observe_sha256(0, &checks).unwrap();
+    assert_eq!(observed_empty.length, 0);
+    let expected_empty: [u8; 32] = Sha256::digest(b"").into();
+    assert_eq!(observed_empty.sha256, expected_empty);
+    selected_empty.close(&checks).unwrap();
+    root.close(&checks).unwrap();
+    assert_eq!(fs::read(path).unwrap(), original);
+    assert_eq!(fs::read(empty).unwrap(), b"");
+}
+
+#[test]
+fn shared_held_file_digest_preserves_request_cancellation_at_checkpoints() {
+    use mmmm_owned_files::{CHUNK_BYTES, Control, HeldDirectory};
+    use std::{cell::Cell, ffi::OsStr};
+
+    struct Counted<'a, C> {
+        inner: &'a C,
+        cancelled: &'a AtomicBool,
+        calls: Cell<usize>,
+        cancel_at: Option<usize>,
+    }
+    impl<C: Control> Control for Counted<'_, C> {
+        type Error = C::Error;
+        fn check(&self) -> Result<(), Self::Error> {
+            let next = self.calls.get() + 1;
+            self.calls.set(next);
+            if self.cancel_at == Some(next) {
+                self.cancelled.store(true, Ordering::Release);
+            }
+            self.inner.check()
+        }
+        fn io_error(&self, error: io::Error) -> Self::Error {
+            self.inner.io_error(error)
+        }
+        fn unsafe_selection(&self) -> Self::Error {
+            self.inner.unsafe_selection()
+        }
+        fn changed(&self) -> Self::Error {
+            self.inner.changed()
+        }
+        fn with_post_failure(&self, a: Self::Error, b: Self::Error) -> Self::Error {
+            self.inner.with_post_failure(a, b)
+        }
+    }
+
+    let fixture = Fixture::new();
+    let original = vec![b'd'; CHUNK_BYTES * 2 + 1];
+    fixture.file("streamed-cancel.dat", &original);
+    let checks = Checks {
+        owner: &fixture.owner,
+        budget: &fixture.budget,
+    };
+    let root = HeldDirectory::open_root(&fixture.root.path.join("selected"), &checks).unwrap();
+    let mut selected = root
+        .open_existing_descendant(&[OsStr::new("streamed-cancel.dat")], &checks)
+        .unwrap();
+    let baseline = Counted {
+        inner: &checks,
+        cancelled: &fixture.cancelled,
+        calls: Cell::new(0),
+        cancel_at: None,
+    };
+    selected
+        .observe_sha256(original.len() as u64, &baseline)
+        .unwrap();
+    let total = baseline.calls.get();
+    assert!(
+        total > 2,
+        "the observation must contain intermediate checkpoints"
+    );
+    selected.close(&checks).unwrap();
+
+    for cancel_at in [1, total / 2, total] {
+        fixture.cancelled.store(false, Ordering::Release);
+        let mut selected = root
+            .open_existing_descendant(&[OsStr::new("streamed-cancel.dat")], &checks)
+            .unwrap();
+        let controlled = Counted {
+            inner: &checks,
+            cancelled: &fixture.cancelled,
+            calls: Cell::new(0),
+            cancel_at: Some(cancel_at),
+        };
+        let error = selected
+            .observe_sha256(original.len() as u64, &controlled)
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Request);
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<ServiceError>()
+                .unwrap()
+                .code,
+            "CANCELLED"
+        );
+        fixture.cancelled.store(false, Ordering::Release);
+        selected.close(&checks).unwrap();
+    }
+    root.close(&checks).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_held_file_digest_detects_a_truncation_during_observation() {
+    use mmmm_owned_files::{CHUNK_BYTES, Control, HeldDirectory};
+    use std::{cell::Cell, ffi::OsStr};
+
+    struct TruncateAt<'a, C> {
+        inner: &'a C,
+        calls: Cell<usize>,
+        at: usize,
+        path: &'a Path,
+    }
+    impl<C: Control> Control for TruncateAt<'_, C> {
+        type Error = C::Error;
+        fn check(&self) -> Result<(), Self::Error> {
+            let next = self.calls.get() + 1;
+            self.calls.set(next);
+            if next == self.at {
+                OpenOptions::new()
+                    .write(true)
+                    .open(self.path)
+                    .unwrap()
+                    .set_len(1)
+                    .unwrap();
+            }
+            self.inner.check()
+        }
+        fn io_error(&self, error: io::Error) -> Self::Error {
+            self.inner.io_error(error)
+        }
+        fn unsafe_selection(&self) -> Self::Error {
+            self.inner.unsafe_selection()
+        }
+        fn changed(&self) -> Self::Error {
+            self.inner.changed()
+        }
+        fn with_post_failure(&self, a: Self::Error, b: Self::Error) -> Self::Error {
+            self.inner.with_post_failure(a, b)
+        }
+    }
+
+    let fixture = Fixture::new();
+    let original = vec![b'x'; CHUNK_BYTES * 2 + 1];
+    let path = fixture.file("streamed-mutation.dat", &original);
+    let checks = Checks {
+        owner: &fixture.owner,
+        budget: &fixture.budget,
+    };
+    let root = HeldDirectory::open_root(&fixture.root.path.join("selected"), &checks).unwrap();
+    let mut selected = root
+        .open_existing_descendant(&[OsStr::new("streamed-mutation.dat")], &checks)
+        .unwrap();
+    // Mutation occurs at an observation checkpoint after selection; the test
+    // does not claim which pass observed the race.
+    let controlled = TruncateAt {
+        inner: &checks,
+        calls: Cell::new(0),
+        at: 4,
+        path: &path,
+    };
+    let error = selected
+        .observe_sha256(original.len() as u64, &controlled)
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Changed);
+    assert!(controlled.calls.get() >= controlled.at);
+    if let Err(close_error) = selected.close(&checks) {
+        assert_eq!(close_error.kind, ErrorKind::Changed);
+    }
+    root.close(&checks).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_held_file_digest_rejects_a_new_external_writer() {
+    use mmmm_owned_files::HeldDirectory;
+    use std::ffi::OsStr;
+
+    let fixture = Fixture::new();
+    let original = b"stable held digest bytes";
+    let path = fixture.file("streamed-held.dat", original);
+    let checks = Checks {
+        owner: &fixture.owner,
+        budget: &fixture.budget,
+    };
+    let root = HeldDirectory::open_root(&fixture.root.path.join("selected"), &checks).unwrap();
+    let mut selected = root
+        .open_existing_descendant(&[OsStr::new("streamed-held.dat")], &checks)
+        .unwrap();
+    assert!(OpenOptions::new().write(true).open(&path).is_err());
+    let observed = selected
+        .observe_sha256(original.len() as u64, &checks)
+        .unwrap();
+    let expected: [u8; 32] = Sha256::digest(original).into();
+    assert_eq!(observed.sha256, expected);
+    selected.close(&checks).unwrap();
+    root.close(&checks).unwrap();
+    assert_eq!(fs::read(path).unwrap(), original);
+}
+
 #[cfg(unix)]
 #[test]
 fn unix_relative_selection_rejects_links_and_detects_root_or_leaf_replacement() {

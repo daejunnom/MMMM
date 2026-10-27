@@ -125,6 +125,132 @@ pub struct FileFacts {
     pub sha256: [u8; 32],
 }
 
+/// Length and SHA-256 observed twice on one held file handle. This is not an
+/// original-byte, immutable snapshot, authorization, or release-proof claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObservedFileDigest {
+    pub length: u64,
+    pub sha256: [u8; 32],
+}
+
+/// Internal adapter permits exercising the same two-pass state machine with
+/// bounded failing readers without treating a test fake as an owned file.
+trait ObservedStream<C: Control> {
+    fn seek_start(&mut self) -> io::Result<u64>;
+    fn read_chunk(&mut self, bytes: &mut [u8]) -> io::Result<usize>;
+    fn revalidate(&self, control: &C) -> Result<(), C::Error>;
+}
+
+impl<C: Control> ObservedStream<C> for HeldFile {
+    fn seek_start(&mut self) -> io::Result<u64> {
+        self.file().seek(SeekFrom::Start(0))
+    }
+
+    fn read_chunk(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.file().read(bytes)
+    }
+
+    fn revalidate(&self, control: &C) -> Result<(), C::Error> {
+        HeldFile::revalidate(self, control)
+    }
+}
+
+impl HeldFile {
+    /// Observe the same held file twice with a fixed 64 KiB buffer and require
+    /// its opened length, both exact EOF observations and both digests to agree.
+    /// Empty files are permitted when `max_bytes` is zero. The caller owns the
+    /// finite byte, time, and authority budgets; synchronous native I/O cannot be
+    /// preempted by the cooperative `Control` checkpoints.
+    ///
+    /// Revalidation and two matching hashes are observations, not an immutable
+    /// snapshot. POSIX same-UID writers and namespace ABA are not atomically
+    /// excluded; Windows does not prove that a previously opened writer or
+    /// mapping cannot modify the file. This does not attest a file set, original
+    /// bytes, source provenance, release proof, or authorization. Existing close
+    /// and `Control::io` drop behavior do not prove native close success.
+    ///
+    /// The shared handle offset changes: on success it is at the second pass's
+    /// EOF; on failure it may be left at an intermediate position. An OS handle
+    /// previously cloned by a caller may share that offset, so concurrent seeks
+    /// or reads through the clone can interfere with this observation.
+    pub fn observe_sha256<C: Control>(
+        &mut self,
+        max_bytes: u64,
+        control: &C,
+    ) -> Result<ObservedFileDigest, C::Error> {
+        control.check()?;
+        let length = self.length();
+        if length > max_bytes {
+            return followup(Err(control.unsafe_selection()), control.check(), control);
+        }
+        let sha256 = observe_stream_sha256(self, length, control)?;
+        Ok(ObservedFileDigest { length, sha256 })
+    }
+}
+
+fn observe_stream_sha256<S: ObservedStream<C>, C: Control>(
+    source: &mut S,
+    expected_length: u64,
+    control: &C,
+) -> Result<[u8; 32], C::Error> {
+    let result = (|| {
+        let mut first = None;
+        for _ in 0..2 {
+            source.revalidate(control)?;
+            let observed = observe_stream_pass(source, expected_length, control);
+            let digest = followup(observed, source.revalidate(control), control)?;
+            if let Some(previous) = first {
+                if previous != digest {
+                    return Err(control.changed());
+                }
+            } else {
+                first = Some(digest);
+            }
+        }
+        first.ok_or_else(|| control.changed())
+    })();
+    followup(result, control.check(), control)
+}
+
+fn observe_stream_pass<S: ObservedStream<C>, C: Control>(
+    source: &mut S,
+    expected_length: u64,
+    control: &C,
+) -> Result<[u8; 32], C::Error> {
+    if control.io(|| source.seek_start())? != 0 {
+        return Err(control.changed());
+    }
+    let mut digest = Sha256::new();
+    let mut length = 0u64;
+    let mut buffer = [0u8; CHUNK_BYTES];
+    loop {
+        // Once the selected length is read, perform a separate one-byte read
+        // for EOF. No expected_length + 1 arithmetic or usize truncation.
+        let remaining = expected_length - length;
+        let take = if remaining == 0 {
+            1
+        } else {
+            remaining.min(CHUNK_BYTES as u64) as usize
+        };
+        let count = control.io(|| source.read_chunk(&mut buffer[..take]))?;
+        if count > take {
+            return Err(control.changed());
+        }
+        if count == 0 {
+            if length != expected_length {
+                return Err(control.changed());
+            }
+            break;
+        }
+        length = length
+            .checked_add(count as u64)
+            .filter(|length| *length <= expected_length)
+            .ok_or_else(|| control.changed())?;
+        digest.update(&buffer[..count]);
+    }
+    Ok(digest.finalize().into())
+}
+
 pub struct CreatedFile {
     selected: HeldFile,
     expected_length: u64,
