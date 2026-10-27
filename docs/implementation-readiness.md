@@ -4357,3 +4357,11 @@ Value-only 경로의 checkpoint는 기존처럼 no-op이고, 자원별 추가 sc
 소수형 크기는 거절하며, extension과 display payload의 opaque 값은 보존한다. 회귀
 검사는 작성했으나 실행은 후속 CI 대상이다. 일반 Exchange 경로와 직접 Node decode는
 오류 코드·우선순위가 다를 수 있으며 실제 create_node 전체·CAS·게임 검증은 아니다.
+Native batch 자원 수집은 검증된 소유 kind에 따라 Prefab resources·node geometry,
+Asset resource, Physics mesh geometry만 수집해 opaque JSON의 우연한 ResourceRef 모양을
+자원으로 오인하지 않도록 했다. Project resourceIds 전체 조회와 현재 scope/CAS·metadata
+충돌 검사 및 before/after 공유 예산은 유지한다. 문서·자원 반복에 같은 요청 예산의
+협조적 checkpoint를 추가했으나 개별 schema나 동기 포트 호출은 강제 선점하지 못한다.
+참조 순서와 오류·취소 우선순위, opaque 깊이 오류는 이전과 달라질 수 있다. 통제 포트
+회귀는 작성했으나 실행은 후속 CI 대상이며 실제 ACL/CAS·승인 target·게임 증거는 아니다.
+Value-only decimal은 원 숫자 lexeme을 입증하지 못하는 기존 한계를 유지한다.

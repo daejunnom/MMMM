@@ -370,13 +370,13 @@ impl HostNativeBackend {
         let actual = source.inspect_owned(principal, project, MAX_BYTES)?;
         verify_projection_sources(change, &actual)?;
         let before_values: Vec<_> = actual.iter().map(|(_, value)| value.clone()).collect();
-        let after_values = apply_document_changes(project, change, &actual)?;
+        let after_owned = apply_document_changes(project, change, &actual)?;
         let mut bytes_left = MAX_BYTES;
         let before_resources = read_scene_resources(
             &mut source,
             principal,
             project,
-            &before_values,
+            actual.iter().map(|(pin, value)| (pin.kind, value)),
             context,
             &budget,
             &mut bytes_left,
@@ -385,11 +385,12 @@ impl HostNativeBackend {
             &mut source,
             principal,
             project,
-            &after_values,
+            after_owned.iter().map(|(kind, value)| (*kind, value)),
             context,
             &budget,
             &mut bytes_left,
         )?;
+        let after_values: Vec<_> = after_owned.into_iter().map(|(_, value)| value).collect();
         let before = self.lower_sources(
             project.project(),
             &before_values,
@@ -1450,7 +1451,7 @@ fn apply_document_changes(
     project: &ProjectCatalog,
     change: &PreparedNativeChange,
     actual: &[(mmmm_planner::ObjectPin, Value)],
-) -> AppResult<Vec<Value>> {
+) -> AppResult<Vec<(OwnedKind, Value)>> {
     let mut values: BTreeMap<_, _> = actual
         .iter()
         .map(|(pin, value)| ((pin.kind, pin.object_id.to_string()), value.clone()))
@@ -1486,25 +1487,30 @@ fn apply_document_changes(
     {
         return Err(stale());
     }
-    Ok(values.into_values().collect())
+    Ok(values
+        .into_iter()
+        .map(|((kind, _), value)| (kind, value))
+        .collect())
 }
-fn read_scene_resources(
+fn read_scene_resources<'a>(
     source: &mut dyn ProjectSourcePort,
     principal: &PrincipalId,
     project: &ProjectCatalog,
-    owned: &[Value],
+    owned: impl IntoIterator<Item = (OwnedKind, &'a Value)>,
     context: &Value,
     budget: &RequestBudget,
     left: &mut u64,
 ) -> AppResult<Vec<SceneResource>> {
+    check_budget(budget)?;
     let mut pins = BTreeMap::new();
-    for value in owned {
-        collect_resources(value, &mut pins, 0)?;
+    for (kind, value) in owned {
+        collect_owned_resources(kind, value, &mut pins, budget)?;
     }
     for id in project.project()["resourceIds"]
         .as_array()
         .ok_or_else(invalid)?
     {
+        check_budget(budget)?;
         let pin = source.resource_pin(
             principal,
             project,
@@ -1527,42 +1533,55 @@ fn read_scene_resources(
     }
     Ok(resources)
 }
-fn collect_resources(
+// Owned kinds come from the verified Project pins or checked document-change
+// keys. Inspect only ResourceRef positions in that kind's canonical schema;
+// extension and display payload objects are not resource authority.
+fn collect_owned_resources(
+    kind: OwnedKind,
     value: &Value,
     pins: &mut BTreeMap<ResourceId, ResourceRef>,
-    depth: usize,
+    budget: &RequestBudget,
 ) -> AppResult<()> {
-    if depth > 64 {
-        return Err(budget_error());
+    check_budget(budget)?;
+    match kind {
+        OwnedKind::Prefab => {
+            for node in value["nodes"].as_array().ok_or_else(invalid)? {
+                check_budget(budget)?;
+                if let Some(resource) = node.get("geometryResource") {
+                    collect_declared_resource(resource, pins)?;
+                }
+            }
+            for resource in value["resources"].as_array().ok_or_else(invalid)? {
+                check_budget(budget)?;
+                collect_declared_resource(resource, pins)?;
+            }
+        }
+        OwnedKind::Asset => collect_declared_resource(&value["resource"], pins)?,
+        OwnedKind::PhysicsDefinition => {
+            for collider in value["colliders"].as_array().ok_or_else(invalid)? {
+                check_budget(budget)?;
+                let shape = &collider["shape"]["shape"];
+                match shape["kind"].as_str() {
+                    Some("mesh") => collect_declared_resource(&shape["geometry"], pins)?,
+                    Some("box" | "sphere" | "capsule") => {}
+                    _ => return Err(invalid()),
+                }
+            }
+        }
+        OwnedKind::Instance | OwnedKind::CommandModule | OwnedKind::Clip => {}
     }
-    match value {
-        Value::Object(object)
-            if object.len() == 4
-                && ["resourceId", "sha256", "mediaType", "sizeBytes"]
-                    .iter()
-                    .all(|field| object.contains_key(*field)) =>
-        {
-            validate("ResourceRef", value)?;
-            let mut typed = value.clone();
-            if let Some(size) = value["sizeBytes"].as_f64() {
-                typed["sizeBytes"] = json!(size as u64);
-            }
-            insert_resource(pins, serde_json::from_value(typed).map_err(|_| invalid())?)
-        }
-        Value::Object(object) => {
-            for child in object.values() {
-                collect_resources(child, pins, depth + 1)?;
-            }
-            Ok(())
-        }
-        Value::Array(array) => {
-            for child in array {
-                collect_resources(child, pins, depth + 1)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
+    Ok(())
+}
+fn collect_declared_resource(
+    value: &Value,
+    pins: &mut BTreeMap<ResourceId, ResourceRef>,
+) -> AppResult<()> {
+    validate("ResourceRef", value)?;
+    let mut typed = value.clone();
+    if let Some(size) = value["sizeBytes"].as_f64() {
+        typed["sizeBytes"] = json!(size as u64);
     }
+    insert_resource(pins, serde_json::from_value(typed).map_err(|_| invalid())?)
 }
 fn insert_resource(
     pins: &mut BTreeMap<ResourceId, ResourceRef>,

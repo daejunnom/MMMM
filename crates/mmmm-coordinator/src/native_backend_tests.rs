@@ -911,23 +911,362 @@ fn selectors_never_guess_a_storage_resource_identity() {
 
 #[test]
 fn contradictory_resource_aliases_cannot_choose_a_desired_source() {
+    let budget = scene_test_budget();
     let digest = raw_digest(b"original");
     let resource = json!({"resourceId":"exact-source","sha256":digest,"mediaType":"application/json","sizeBytes":8.0});
     let mut pins = BTreeMap::new();
-    collect_resources(&resource, &mut pins, 0).unwrap();
+    let mut prefab = example(include_bytes!("../../../examples/prefab.json"));
+    prefab["resources"] = json!([resource.clone()]);
+    for node in prefab["nodes"].as_array_mut().unwrap() {
+        node.as_object_mut().unwrap().remove("geometryResource");
+    }
+    collect_owned_resources(OwnedKind::Prefab, &prefab, &mut pins, &budget).unwrap();
     assert_eq!(
         pins[&ResourceId::new("exact-source").unwrap()].size_bytes,
         8
     );
-    let mut conflicting = resource;
-    conflicting["sha256"] = json!(raw_digest(b"replacement"));
+    for (field, changed) in [
+        ("sha256", json!(raw_digest(b"replacement"))),
+        ("mediaType", json!("application/octet-stream")),
+        ("sizeBytes", json!(9)),
+    ] {
+        let mut conflicting = resource.clone();
+        conflicting[field] = changed;
+        prefab["resources"] = json!([conflicting]);
+        assert_eq!(
+            collect_owned_resources(OwnedKind::Prefab, &prefab, &mut pins, &budget)
+                .err()
+                .unwrap()
+                .code,
+            "STALE_CONTEXT"
+        );
+    }
+}
+
+// This source only checks the planner's requests and simulates failures. It is
+// not a current Project ACL, CAS reader, admitted target or game observation.
+struct SceneResourceTestSource {
+    registered: BTreeMap<String, ResourceRef>,
+    pin_reads: Vec<String>,
+    byte_reads: Vec<String>,
+    denied: Option<String>,
+}
+
+fn unexpected_scene_resource_port<T>() -> AppResult<T> {
+    Err(AppError::new(
+        "TEST_UNEXPECTED_PORT",
+        "Unexpected scene resource port call",
+    ))
+}
+
+impl ProjectSourcePort for SceneResourceTestSource {
+    fn inspect_owned(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: u64,
+    ) -> AppResult<Vec<(mmmm_planner::ObjectPin, Value)>> {
+        unexpected_scene_resource_port()
+    }
+    fn owned_object(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &mmmm_planner::ObjectPin,
+        _: Option<&Value>,
+        _: u64,
+    ) -> AppResult<Value> {
+        unexpected_scene_resource_port()
+    }
+    fn resource_pin(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        resource_id: &str,
+        _: Option<&Value>,
+    ) -> AppResult<ResourceRef> {
+        self.pin_reads.push(resource_id.to_owned());
+        if self.denied.as_deref() == Some(resource_id) {
+            return Err(AppError::new("RESOURCE_FORBIDDEN", "Test scope denied"));
+        }
+        self.registered
+            .get(resource_id)
+            .cloned()
+            .ok_or_else(|| AppError::new("REFERENCE_UNRESOLVED", "Test resource missing"))
+    }
+    fn resource_bytes(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        resource: &ResourceRef,
+        _: Option<&Value>,
+        max_bytes: u64,
+    ) -> AppResult<mmmm_planner::PinnedResourceBytes> {
+        let id = resource.resource_id.as_str();
+        self.byte_reads.push(id.to_owned());
+        if self.denied.as_deref() == Some(id) {
+            return Err(AppError::new("RESOURCE_FORBIDDEN", "Test scope denied"));
+        }
+        let actual = self
+            .registered
+            .get(id)
+            .ok_or_else(|| AppError::new("REFERENCE_UNRESOLVED", "Test resource missing"))?;
+        if actual.sha256 != resource.sha256
+            || actual.media_type != resource.media_type
+            || actual.size_bytes != resource.size_bytes
+        {
+            return Err(stale());
+        }
+        if max_bytes < 4 {
+            return Err(budget_error());
+        }
+        Ok(mmmm_planner::PinnedResourceBytes {
+            resource: actual.clone(),
+            bytes: b"data".to_vec(),
+        })
+    }
+    fn stage_private(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: Option<&ResourceId>,
+        _: &[u8],
+        _: &str,
+        _: &Value,
+    ) -> AppResult<ResourceRef> {
+        unexpected_scene_resource_port()
+    }
+    fn allocate_instance_id(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &BTreeSet<InstanceId>,
+    ) -> AppResult<InstanceId> {
+        unexpected_scene_resource_port()
+    }
+    fn state_snapshot(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &Value,
+        _: &Value,
+        _: &Value,
+    ) -> AppResult<mmmm_planner::PinnedStateSnapshot> {
+        unexpected_scene_resource_port()
+    }
+    fn scene_source(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &Value,
+        _: &Value,
+    ) -> AppResult<mmmm_planner::SceneSource> {
+        unexpected_scene_resource_port()
+    }
+    fn validate_scene_provenance(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &Value,
+        _: &mmmm_planner::SceneSource,
+        _: &Value,
+    ) -> AppResult<()> {
+        unexpected_scene_resource_port()
+    }
+}
+
+fn scene_test_resource(id: &str) -> Value {
+    json!({"resourceId":id,"sha256":raw_digest(b"data"),"mediaType":"application/octet-stream","sizeBytes":4})
+}
+
+fn scene_test_budget() -> RequestBudget {
+    RequestBudget::new(
+        std::time::Duration::from_secs(60),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .unwrap()
+}
+
+fn scene_test_sources() -> Vec<(OwnedKind, Value)> {
+    let fake = json!({"resourceId":"opaque-not-owned","sha256":raw_digest(b"fake"),"mediaType":"application/json","sizeBytes":4.0});
+    let mut prefab = example(include_bytes!("../../../examples/prefab.json"));
+    prefab["resources"] = json!([scene_test_resource("prefab-declared")]);
+    for node in prefab["nodes"].as_array_mut().unwrap() {
+        node.as_object_mut().unwrap().remove("geometryResource");
+    }
+    prefab["nodes"][0]["geometryResource"] = scene_test_resource("prefab-geometry");
+    prefab["nodes"][0]["extensions"]["test:opaque"] = fake.clone();
+    prefab["nodes"][0]["display"] =
+        json!({"kind":"text","payload":{"nested":fake.clone()},"resourceRefs":[]});
+    revise("Prefab", &mut prefab);
+    let mut instance = example(include_bytes!("../../../examples/instance.json"));
+    instance["overrides"] = json!([{"kind":"display","nodeId":"root","display":{"kind":"text","payload":{"nested":fake},"resourceRefs":[]}}]);
+    revise("Instance", &mut instance);
+    let module = example(include_bytes!("../../../examples/command-module.json"));
+    let clip = example(include_bytes!("../../../examples/animation-clip.json"));
+    let mut asset = example(include_bytes!("../../../examples/asset.json"));
+    asset["resource"] = scene_test_resource("asset-source");
+    revise("Asset", &mut asset);
+    let mut physics = example(include_bytes!("../../../examples/physics-definition.json"));
+    physics["colliders"][0]["shape"]["shape"] = json!({"kind":"mesh","geometry":scene_test_resource("physics-mesh"),"topologyDigest":"0".repeat(64)});
+    revise("PhysicsDefinition", &mut physics);
+    let values = vec![
+        (OwnedKind::Prefab, prefab),
+        (OwnedKind::Instance, instance),
+        (OwnedKind::CommandModule, module),
+        (OwnedKind::Clip, clip),
+        (OwnedKind::Asset, asset),
+        (OwnedKind::PhysicsDefinition, physics),
+    ];
+    for (kind, value) in &values {
+        validate(kind.definition(), value).unwrap();
+    }
+    values
+}
+
+#[test]
+fn scene_resources_use_owned_schema_locations_and_current_project_reads() {
+    use std::{
+        sync::{Arc, atomic::AtomicBool},
+        time::Duration,
+    };
+    let owned = scene_test_sources();
+    let ids = [
+        "prefab-declared",
+        "prefab-geometry",
+        "asset-source",
+        "physics-mesh",
+        "project-extra",
+    ];
+    let mut project = example(include_bytes!("../../../examples/project.json"));
+    project["resourceIds"] = json!(ids);
+    revise("Project", &mut project);
+    let catalog = ProjectCatalog::from_project(&project).unwrap();
+    let registered = ids
+        .iter()
+        .map(|id| {
+            (
+                (*id).to_owned(),
+                serde_json::from_value(scene_test_resource(id)).unwrap(),
+            )
+        })
+        .collect();
+    let mut source = SceneResourceTestSource {
+        registered,
+        pin_reads: vec![],
+        byte_reads: vec![],
+        denied: None,
+    };
+    let budget =
+        RequestBudget::new(Duration::from_secs(60), Arc::new(AtomicBool::new(false))).unwrap();
+    let principal = PrincipalId::new("principal-scene-test").unwrap();
+    let mut left = 40;
+    for _ in 0..2 {
+        let resources = read_scene_resources(
+            &mut source,
+            &principal,
+            &catalog,
+            owned.iter().map(|(kind, value)| (*kind, value)),
+            &json!({}),
+            &budget,
+            &mut left,
+        )
+        .unwrap();
+        assert_eq!(resources.len(), 5);
+    }
+    assert_eq!(left, 0);
+    assert_eq!(source.pin_reads.len(), 10);
+    assert_eq!(source.byte_reads.len(), 10);
+    for id in ids {
+        assert_eq!(
+            source
+                .pin_reads
+                .iter()
+                .filter(|found| found.as_str() == id)
+                .count(),
+            2
+        );
+        assert_eq!(
+            source
+                .byte_reads
+                .iter()
+                .filter(|found| found.as_str() == id)
+                .count(),
+            2
+        );
+    }
+    assert!(!source.byte_reads.iter().any(|id| id == "opaque-not-owned"));
+
+    let mut same_id_opaque = owned.clone();
+    same_id_opaque[0].1["nodes"][0]["extensions"]["test:opaque"]["resourceId"] =
+        json!("prefab-declared");
+    revise("Prefab", &mut same_id_opaque[0].1);
+    validate("Prefab", &same_id_opaque[0].1).unwrap();
+    mmmm_contracts::verify_projected_digest("Prefab", &same_id_opaque[0].1).unwrap();
+    let mut pins = BTreeMap::new();
+    for (kind, value) in &same_id_opaque {
+        collect_owned_resources(*kind, value, &mut pins, &budget).unwrap();
+    }
+    assert_eq!(pins.len(), 4);
+
+    source.denied = Some("physics-mesh".into());
+    let mut left = 20;
     assert_eq!(
-        collect_resources(&conflicting, &mut pins, 0)
-            .err()
-            .unwrap()
-            .code,
-        "STALE_CONTEXT"
+        read_scene_resources(
+            &mut source,
+            &principal,
+            &catalog,
+            owned.iter().map(|(kind, value)| (*kind, value)),
+            &json!({}),
+            &budget,
+            &mut left
+        )
+        .err()
+        .unwrap()
+        .code,
+        "RESOURCE_FORBIDDEN"
     );
+    source.denied = None;
+    let mut left = 3;
+    assert_eq!(
+        read_scene_resources(
+            &mut source,
+            &principal,
+            &catalog,
+            owned.iter().map(|(kind, value)| (*kind, value)),
+            &json!({}),
+            &budget,
+            &mut left
+        )
+        .err()
+        .unwrap()
+        .code,
+        "BUDGET_EXCEEDED"
+    );
+
+    let cancelled =
+        RequestBudget::new(Duration::from_secs(60), Arc::new(AtomicBool::new(true))).unwrap();
+    let previous_pin_reads = source.pin_reads.len();
+    let previous_byte_reads = source.byte_reads.len();
+    let mut left = 20;
+    assert_eq!(
+        read_scene_resources(
+            &mut source,
+            &principal,
+            &catalog,
+            owned.iter().map(|(kind, value)| (*kind, value)),
+            &json!({}),
+            &cancelled,
+            &mut left
+        )
+        .err()
+        .unwrap()
+        .code,
+        "CANCELLED"
+    );
+    assert_eq!(source.pin_reads.len(), previous_pin_reads);
+    assert_eq!(source.byte_reads.len(), previous_byte_reads);
+    assert_eq!(left, 20);
 }
 
 /// The existing canonical DTOs are enough for these closed decoder boundaries.
