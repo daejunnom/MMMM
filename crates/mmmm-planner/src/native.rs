@@ -155,7 +155,7 @@ impl PreparedNativeChange {
         // resource lengths. A rounded float is not an original-byte witness.
         reject_unwitnessed_physics_lengths(&value["change"])?;
         let mut typed = value["change"].clone();
-        crate::normalize_resource_lengths(&mut typed);
+        normalize_typed_resource_lengths(&mut typed);
         let change: Self = serde_json::from_value(typed)
             .map_err(|_| AppError::new("INVALID_INPUT", "Prepared CAS payload cannot be typed"))?;
         change.to_arguments()?;
@@ -491,6 +491,65 @@ impl PreparedNativeChange {
     }
 }
 
+// Only schema-owned ResourceRef fields deserialize into u64. Other Values,
+// including display payloads and authored documents, remain opaque.
+fn normalize_typed_resource_lengths(change: &mut Value) {
+    fn list(value: Option<&mut Value>) {
+        if let Some(values) = value.and_then(Value::as_array_mut) {
+            for resource in values {
+                crate::normalize_resource_lengths(resource);
+            }
+        }
+    }
+    fn prefab(value: Option<&mut Value>) {
+        if let Some(prefab) = value.and_then(Value::as_object_mut) {
+            list(prefab.get_mut("resources"));
+            if let Some(nodes) = prefab.get_mut("nodes").and_then(Value::as_array_mut) {
+                for node in nodes {
+                    if let Some(resource) = node.get_mut("geometryResource") {
+                        crate::normalize_resource_lengths(resource);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(projections) = change
+        .get_mut("worldProjection")
+        .and_then(Value::as_array_mut)
+    {
+        for projection in projections {
+            prefab(projection.get_mut("beforeDefinition"));
+            prefab(projection.get_mut("definition"));
+            list(projection.get_mut("resourcePins"));
+        }
+    }
+    if let Some(replacements) = change
+        .get_mut("resourceReplacements")
+        .and_then(Value::as_array_mut)
+    {
+        for replacement in replacements {
+            if let Some(before) = replacement.get_mut("before") {
+                crate::normalize_resource_lengths(before);
+            }
+            if let Some(source) = replacement.get_mut("replacementSource") {
+                crate::normalize_resource_lengths(source);
+            }
+        }
+    }
+    if let Some(replacements) = change
+        .get_mut("recoveryReplacements")
+        .and_then(Value::as_array_mut)
+    {
+        for replacement in replacements {
+            if let Some(before) = replacement.get_mut("beforeResource") {
+                crate::normalize_resource_lengths(before);
+            }
+        }
+    }
+    list(change.get_mut("sourceResourcePins"));
+    list(change.get_mut("stagedResources"));
+}
+
 fn reject_unwitnessed_physics_lengths(change: &Value) -> AppResult<()> {
     fn check(physics: &Value) -> AppResult<()> {
         let has_decimal_mesh_length = physics["colliders"].as_array().is_some_and(|colliders| {
@@ -626,6 +685,10 @@ mod allocation_tests {
     use super::*;
 
     fn payload_with_physics_mesh() -> Value {
+        payload_with_physics_mesh_and_opaque(false)
+    }
+
+    fn payload_with_physics_mesh_and_opaque(with_opaque: bool) -> Value {
         use crate::preparation::{document, empty_change, update_project};
         use mmmm_contracts::{parse_json, projected_digest};
         use serde_json::json;
@@ -643,6 +706,12 @@ mod allocation_tests {
         physics["revision"] = json!(projected_digest("PhysicsDefinition", &physics).unwrap());
 
         let mut prefab = parse_json(include_bytes!("../../../examples/prefab.json")).unwrap();
+        let opaque = json!({"resourceId":"opaque-shape","sha256":"0".repeat(64),"mediaType":"application/json","sizeBytes":1.0});
+        if with_opaque {
+            prefab["nodes"][0]["extensions"]["test:opaque"] = opaque.clone();
+            let geometry = prefab["resources"][0].clone();
+            prefab["nodes"][0]["geometryResource"] = geometry;
+        }
         let door = prefab["nodes"]
             .as_array_mut()
             .unwrap()
@@ -652,6 +721,9 @@ mod allocation_tests {
         door["physicsBinding"] = json!({"physicsId":"physics-door","bodyId":"body-door"});
         prefab["revision"] = json!(projected_digest("Prefab", &prefab).unwrap());
         let mut instance = parse_json(include_bytes!("../../../examples/instance.json")).unwrap();
+        if with_opaque {
+            instance["overrides"] = json!([{"kind":"display","nodeId":"door","display":{"kind":"item","payload":{"shape":opaque},"resourceRefs":[]}}]);
+        }
         instance["prefabRevision"] = prefab["revision"].clone();
         instance["revision"] = json!(projected_digest("Instance", &instance).unwrap());
         let mut project = parse_json(include_bytes!("../../../examples/project.json")).unwrap();
@@ -668,7 +740,7 @@ mod allocation_tests {
             .push(json!(mesh.resource_id));
         project["revision"] = json!(projected_digest("Project", &project).unwrap());
         let catalog = crate::ProjectCatalog::from_project(&project).unwrap();
-        let definition: Prefab = crate::decode("Prefab", &prefab).unwrap();
+        let definition: Prefab = crate::decode_prefab_scoped(&prefab, || Ok(())).unwrap();
         let instance_typed: Instance = crate::decode("Instance", &instance).unwrap();
         let module = parse_json(include_bytes!("../../../examples/command-module.json")).unwrap();
         let clip = parse_json(include_bytes!("../../../examples/animation-clip.json")).unwrap();
@@ -698,15 +770,143 @@ mod allocation_tests {
         );
         change.world_projection.push(projection);
         change.source_resource_pins.push(mesh.clone());
+        let entry = if with_opaque {
+            json!({"kind":"update_display","instanceId":instance["instanceId"],"nodeId":"door",
+                "display":{"kind":"item","payload":{"shape":opaque},"resourceRefs":[]}})
+        } else {
+            json!({"kind":"update_transform","instanceId":instance["instanceId"],"nodeId":"door","transform":prefab["nodes"][3]["transform"]})
+        };
         change.scene_patch = Some(
             json!({"contractVersion":"0.2.0","patchId":"patch-mesh-test",
             "projectId":project["projectId"],"baseRevision":project["revision"],
-            "sourceArtifact":mesh,"sourceMap":mesh,"entries":[{"kind":"update_transform",
-            "instanceId":instance["instanceId"],"nodeId":"door","transform":prefab["nodes"][3]["transform"]}],
+            "sourceArtifact":mesh,"sourceMap":mesh,"entries":[entry],
             "losses":[],"absenceMeansDeletion":false}),
         );
         update_project(&mut change).unwrap();
         change.to_arguments().unwrap()
+    }
+
+    #[test]
+    fn from_payload_preserves_opaque_values_and_converts_only_typed_resources() {
+        let mut payload = payload_with_physics_mesh_and_opaque(true);
+        for field in ["beforeDefinition", "definition"] {
+            let definition = &mut payload["change"]["worldProjection"][0][field];
+            let size = definition["resources"][0]["sizeBytes"].as_u64().unwrap();
+            definition["resources"][0]["sizeBytes"] = serde_json::json!(size as f64);
+            definition["nodes"][0]["geometryResource"]["sizeBytes"] =
+                serde_json::json!(size as f64);
+        }
+        let projection = &mut payload["change"]["worldProjection"][0];
+        for resource in projection["resourcePins"].as_array_mut().unwrap() {
+            let size = resource["sizeBytes"].as_u64().unwrap();
+            resource["sizeBytes"] = serde_json::json!(size as f64);
+        }
+        let source = &mut payload["change"]["sourceResourcePins"][0];
+        source["sizeBytes"] = serde_json::json!(4.0);
+        let staged = source.clone();
+        payload["change"]["stagedResources"] = serde_json::json!([staged]);
+        payload["change"]["scenePatch"]["sourceArtifact"]["sizeBytes"] = serde_json::json!(4.0);
+        let decoded = PreparedNativeChange::from_payload(&payload).unwrap();
+        let output = decoded.to_arguments().unwrap();
+        for field in ["beforeDefinition", "definition"] {
+            let definition = &output["change"]["worldProjection"][0][field];
+            assert!(definition["resources"][0]["sizeBytes"].as_u64().is_some());
+            assert!(
+                definition["nodes"][0]["geometryResource"]["sizeBytes"]
+                    .as_u64()
+                    .is_some()
+            );
+            assert_eq!(
+                definition["nodes"][0]["extensions"]["test:opaque"]["sizeBytes"],
+                serde_json::json!(1.0)
+            );
+        }
+        for field in ["before", "after"] {
+            let size = &output["change"]["worldProjection"][0][field]["overrides"][0]["display"]["payload"]
+                ["shape"]["sizeBytes"];
+            assert_eq!(*size, serde_json::json!(1.0));
+            assert!(size.as_u64().is_none());
+        }
+        assert_eq!(
+            output["change"]["documentChanges"][1]["after"]["overrides"][0]["display"]["payload"]["shape"]
+                ["sizeBytes"],
+            serde_json::json!(1.0)
+        );
+        assert_eq!(
+            output["change"]["scenePatch"]["entries"][0]["display"]["payload"]["shape"]["sizeBytes"],
+            serde_json::json!(1.0)
+        );
+        assert_eq!(
+            output["change"]["scenePatch"]["sourceArtifact"]["sizeBytes"],
+            serde_json::json!(4.0)
+        );
+        assert!(
+            output["change"]["worldProjection"][0]["resourcePins"][0]["sizeBytes"]
+                .as_u64()
+                .is_some()
+        );
+        assert_eq!(
+            output["change"]["sourceResourcePins"][0]["sizeBytes"].as_u64(),
+            Some(4)
+        );
+        assert_eq!(
+            output["change"]["stagedResources"][0]["sizeBytes"].as_u64(),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn from_payload_converts_replacement_resource_lengths() {
+        use crate::preparation::empty_change;
+        use serde_json::json;
+        let project =
+            mmmm_contracts::parse_json(include_bytes!("../../../examples/project.json")).unwrap();
+        let catalog = crate::ProjectCatalog::from_project(&project).unwrap();
+        let resource = ResourceRef {
+            resource_id: ResourceId::new("resource-replacement-test").unwrap(),
+            sha256: mmmm_contracts::raw_digest(b"mesh"),
+            media_type: "application/octet-stream".into(),
+            size_bytes: 4,
+        };
+        let mut replacement = empty_change(&catalog, NativeKind::ResourcePatch);
+        replacement.resource_replacements.push(ResourceReplacement {
+            target_resource_id: resource.resource_id.clone(),
+            before: resource.clone(),
+            replacement_source: resource.clone(),
+        });
+        let mut payload = replacement.to_arguments().unwrap();
+        payload["change"]["resourceReplacements"][0]["before"]["sizeBytes"] = json!(4.0);
+        payload["change"]["resourceReplacements"][0]["replacementSource"]["sizeBytes"] = json!(4.0);
+        let output = PreparedNativeChange::from_payload(&payload)
+            .unwrap()
+            .to_arguments()
+            .unwrap();
+        assert_eq!(
+            output["change"]["resourceReplacements"][0]["before"]["sizeBytes"].as_u64(),
+            Some(4)
+        );
+        assert_eq!(
+            output["change"]["resourceReplacements"][0]["replacementSource"]["sizeBytes"].as_u64(),
+            Some(4)
+        );
+
+        let mut recovery = empty_change(&catalog, NativeKind::Recovery);
+        recovery.recovery_replacements.push(RecoveryReplacement {
+            target: "owned-resource:resource-replacement-test".into(),
+            before_resource: resource.clone(),
+            expected_current_sha256: resource.sha256,
+            source_step_ids: vec!["step-recorded-direct".into()],
+        });
+        let mut payload = recovery.to_arguments().unwrap();
+        payload["change"]["recoveryReplacements"][0]["beforeResource"]["sizeBytes"] = json!(4.0);
+        let output = PreparedNativeChange::from_payload(&payload)
+            .unwrap()
+            .to_arguments()
+            .unwrap();
+        assert_eq!(
+            output["change"]["recoveryReplacements"][0]["beforeResource"]["sizeBytes"].as_u64(),
+            Some(4)
+        );
     }
 
     #[test]

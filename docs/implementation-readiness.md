@@ -4338,3 +4338,11 @@ Planner의 `Instance`, `InstanceDraft`, `Display` decode는 schema 소유 Resour
 기존 schema·인코딩 예산·serde 오류 검사를 유지하며 세 타입의 보존 회귀를 작성했다.
 실행 결과는 후속 CI에서 확인한다. 실제 ResourceRef를 소유하는 Node 및 준비된 변경
 전체 수신의 재귀 정규화 문제와 clone·prepared CAS 왕복은 별도 미완료다.
+준비된 변경의 수신은 전체 JSON 대신 역직렬화에 필요한 typed ResourceRef 위치만
+정규화하도록 했다. Instance override, Prefab extension, 문서 after와 scene patch 등
+opaque Value는 변환하지 않으며 원 Physics의 float 선거절은 유지한다. 메모리 내 수신·
+직렬화와 일반·복구 자원 교체 회귀를 작성했으나 실행은 후속 CI 대상이다. collider
+parameters, Prefab display payload, nullable beforeDefinition의 개별 회귀는 별도로 남는다.
+Physics 외 typed ResourceRef의 Value-only decimal 수용은 원 숫자 표기의 exact 증거가
+아니며 이 변경은 CAS 권한 또는 게임 성공을 증명하지 않는다. 기존 입력 상한은 동시
+복사본의 전체 heap이나 단일 schema·serde 호출의 강제 시간 상한을 보장하지 않는다.
