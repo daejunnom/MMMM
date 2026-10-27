@@ -259,12 +259,12 @@ final class ImmutableWireSnapshotsTest {
         assertEquals(flags, copied.get("x-false-flags"));
     }
 
+    // Jackson's generic deepCopy contract requires unchecked covariance in this test-only subtype.
+    @SuppressWarnings("unchecked")
     private static final class SelfCopyingObjectNode extends ObjectNode {
         private static final long serialVersionUID = 1L;
 
         private SelfCopyingObjectNode() { super(com.fasterxml.jackson.databind.node.JsonNodeFactory.instance); }
-        // Jackson's generic deepCopy contract makes this covariant test override unchecked.
-        @SuppressWarnings("unchecked")
         @Override public ObjectNode deepCopy() { return this; }
     }
 
