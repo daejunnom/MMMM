@@ -4352,3 +4352,8 @@ Prefab Value-only fallback은 기존 source 계약과 정수형 ResourceRef 길�
 두 schema 소유 ResourceRef 위치의 decimal 거절을 확인하며 실행은 후속 CI 대상이다.
 Value-only 경로의 checkpoint는 기존처럼 no-op이고, 자원별 추가 schema 검증은 비용을
 늘릴 수 있다. 실제 CAS·권한·완료 clone 또는 게임의 증거는 아니다.
+새 Node의 decode에서는 기존 schema·인코딩 예산·serde 검사를 유지하면서 객체 전체의
+모양 기반 정규화를 생략한다. 정수형 geometry ResourceRef는 처리하고 원문 증거가 없는
+소수형 크기는 거절하며, extension과 display payload의 opaque 값은 보존한다. 회귀
+검사는 작성했으나 실행은 후속 CI 대상이다. 일반 Exchange 경로와 직접 Node decode는
+오류 코드·우선순위가 다를 수 있으며 실제 create_node 전체·CAS·게임 검증은 아니다.

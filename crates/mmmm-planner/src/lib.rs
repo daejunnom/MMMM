@@ -41,9 +41,10 @@ pub(crate) fn decode<T: DeserializeOwned>(name: &str, value: &Value) -> AppResul
         )
     })?;
     let mut typed = value.clone();
-    // These contracts contain no ResourceRef objects. In particular, a
-    // display payload is opaque even if its keys resemble a ResourceRef.
-    if !matches!(name, "Instance" | "InstanceDraft" | "Display") {
+    // These contracts have no typed ResourceRef fields, except Node's
+    // geometryResource. A newly supplied Node has no original byte witness,
+    // so its size must already be an integer. Opaque payloads must stay intact.
+    if !matches!(name, "Instance" | "InstanceDraft" | "Display" | "Node") {
         normalize_resource_lengths(&mut typed);
     }
     serde_json::from_value(typed)

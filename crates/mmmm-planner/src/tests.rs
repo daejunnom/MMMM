@@ -220,6 +220,57 @@ fn resource_ref_shaped_display_payload_remains_opaque_in_instance_and_draft() {
 }
 
 #[test]
+fn new_node_preserves_opaque_values_and_rejects_unwitnessed_decimal_geometry() {
+    let prefab = parse_json(include_bytes!("../../../examples/prefab.json")).unwrap();
+    let mut node = prefab["nodes"][0].clone();
+    let opaque = json!({"resourceId":"opaque-payload","sha256":"0".repeat(64),"mediaType":"application/json","sizeBytes":1.0});
+    node["extensions"]["test:opaque"] = opaque.clone();
+    node["display"] = json!({"kind":"item","payload":{"nested":opaque},"resourceRefs":[]});
+    node["geometryResource"] = prefab["resources"][0].clone();
+
+    let typed: mmmm_domain::types::Node = decode("Node", &node).unwrap();
+    let result = wire("Node", &typed).unwrap();
+    assert_eq!(result["extensions"]["test:opaque"], opaque);
+    assert_eq!(result["display"]["payload"]["nested"], opaque);
+    assert!(
+        result["extensions"]["test:opaque"]["sizeBytes"]
+            .as_u64()
+            .is_none()
+    );
+    assert!(
+        result["display"]["payload"]["nested"]["sizeBytes"]
+            .as_u64()
+            .is_none()
+    );
+    assert_eq!(result["geometryResource"], node["geometryResource"]);
+
+    let mut decimal = node.clone();
+    decimal["geometryResource"]["sizeBytes"] = json!(1.0);
+    assert_eq!(
+        decode::<mmmm_domain::types::Node>("Node", &decimal)
+            .unwrap_err()
+            .code,
+        "INVALID_INPUT"
+    );
+    let rounded = parse_json(br#"{"sizeBytes":1.0000000000000001}"#).unwrap();
+    decimal["geometryResource"]["sizeBytes"] = rounded["sizeBytes"].clone();
+    assert_eq!(
+        decode::<mmmm_domain::types::Node>("Node", &decimal)
+            .unwrap_err()
+            .code,
+        "INVALID_INPUT"
+    );
+    let mut malformed = node;
+    malformed["colliders"] = json!("invalid");
+    assert_eq!(
+        decode::<mmmm_domain::types::Node>("Node", &malformed)
+            .unwrap_err()
+            .code,
+        "INVALID_INPUT"
+    );
+}
+
+#[test]
 fn prefab_comparison_preserves_original_and_value_only_requires_integer_lengths() {
     let original = parse_json(include_bytes!("../../../examples/prefab.json")).unwrap();
     require_value_only_prefab_integer_lengths(&original).unwrap();
