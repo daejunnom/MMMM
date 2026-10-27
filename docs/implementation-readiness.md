@@ -4324,3 +4324,12 @@ Planner는 이미 pin·내용을 검사해 보유한 원 Instance와 Prefab Valu
 확인하도록 작성했으며 실제 실행은 후속 CI 대상이다. 관측기의 실제 CAS exact 검증과
 Planner·Coordinator typed 변환에서 opaque JSON 보존은 별도 미완료이고, 완료 clone 또는
 게임 관측을 입증하지 않는다.
+상태 소스의 Coordinator는 인가된 Prefab CAS 실제 bytes에서 controlled exact 검증을
+수행하고 파싱 값과 전달된 원 Value를 대조한다. typed Prefab은 schema 소유 ResourceRef
+위치만 정규화하며 Instance는 재귀 정규화 없이 읽는다. 원 Value·BlobRef와 재조회 검사는
+유지하고 처리 후 Project·context 및 두 객체 scope를 재확인한다. 격리 CAS의 합법적인
+소수 표기와 opaque 값·원 blob 보존 회귀를 작성했으며 실행은 후속 CI 대상이다. 손상된
+fractional CAS, 검증 중 취소·권한 철회, 완료 clone 및 게임 관측은 미검증이다. Planner의
+다른 typed 변환과 prepared payload 경계의 opaque 보존도 별도 미완료다. 공개 scoped
+변환 helper는 원문 검증과 권한을 증명하지 않는다. 단일 schema 처리의 강제 선점이나
+전체 heap 상한과 권한의 원자적 snapshot을 보장하지 않는다.

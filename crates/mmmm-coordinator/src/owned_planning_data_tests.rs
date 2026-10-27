@@ -483,6 +483,95 @@ fn static_inputs(fixture: &mut OwnedFixture, case: &str) -> StaticInputs {
 }
 
 #[test]
+fn owned_state_source_preserves_exact_decimal_and_opaque_values() {
+    let mut fixture = OwnedFixture::new_with_decimal_and_opaque_prefab(&[]);
+    let data = fixture.data();
+    let principal = fixture.principal.principal().clone();
+    let catalog = fixture.catalog.clone();
+    let instance = fixture.instance.clone();
+    let prefab = fixture.prefab.clone();
+    let context = fixture.context.clone();
+    let display_node = prefab["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|node| node.get("display").is_some())
+        .unwrap();
+    let display_node_id = prefab["nodes"][display_node]["nodeId"].clone();
+    let prefab_bytes = encode_json(&prefab).unwrap();
+    let instance_bytes = encode_json(&instance).unwrap();
+    fixture
+        .call(move |store, witness| {
+            let borrowed = PlanningStore::read(store);
+            let source = data.read_state_source(
+                &borrowed,
+                &principal,
+                &catalog,
+                &instance,
+                &prefab,
+                &context,
+                witness.budget(),
+            )?;
+            assert_eq!(source.prefab().resources[0].size_bytes, 16236);
+            assert_eq!(
+                source.prefab().nodes[0]
+                    .geometry_resource
+                    .as_ref()
+                    .unwrap()
+                    .size_bytes,
+                16236
+            );
+            let typed_prefab = serde_json::to_value(source.prefab()).unwrap();
+            let typed_instance = serde_json::to_value(source.instance()).unwrap();
+            let prefab_opaque = &typed_prefab["nodes"][0]["extensions"]["test:opaque"];
+            let display_opaque =
+                &typed_prefab["nodes"][display_node]["display"]["payload"]["opaque"];
+            let override_display = typed_instance["overrides"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["kind"] == "display" && entry["nodeId"] == display_node_id)
+                .unwrap();
+            let instance_opaque = &override_display["display"]["payload"]["opaque"];
+            assert_eq!(
+                prefab_opaque,
+                &prefab["nodes"][0]["extensions"]["test:opaque"]
+            );
+            assert_eq!(
+                display_opaque,
+                &prefab["nodes"][display_node]["display"]["payload"]["opaque"]
+            );
+            let original_override = instance["overrides"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["kind"] == "display" && entry["nodeId"] == display_node_id)
+                .unwrap();
+            assert_eq!(
+                instance_opaque,
+                &original_override["display"]["payload"]["opaque"]
+            );
+            for value in [prefab_opaque, display_opaque, instance_opaque] {
+                assert!(value["sizeBytes"].is_f64());
+                assert_eq!(value["sizeBytes"], json!(1.0));
+            }
+            assert_eq!(source.prefab_blob().digest, raw_digest(&prefab_bytes));
+            assert_eq!(source.instance_blob().digest, raw_digest(&instance_bytes));
+            borrowed.with_read(|store| {
+                assert_eq!(store.read_blob(source.prefab_blob()).unwrap(), prefab_bytes);
+                assert_eq!(
+                    store.read_blob(source.instance_blob()).unwrap(),
+                    instance_bytes
+                );
+                Ok(())
+            })?;
+            source.check_current(&borrowed)?;
+            Ok(json!({"exactOwnedStateSource":true}))
+        })
+        .unwrap();
+}
+
+#[test]
 fn owned_state_source_reads_real_pinned_documents_in_actual_request_and_retires_without_live_defaults()
  {
     let mut fixture = OwnedFixture::new(&[]);
@@ -1130,6 +1219,14 @@ impl OwnedFixture {
     }
 
     fn new_with_decimal_prefab(resource_ids: &[&str], decimal: bool) -> Self {
+        Self::new_with_options(resource_ids, decimal, false)
+    }
+
+    fn new_with_decimal_and_opaque_prefab(resource_ids: &[&str]) -> Self {
+        Self::new_with_options(resource_ids, true, true)
+    }
+
+    fn new_with_options(resource_ids: &[&str], decimal: bool, opaque: bool) -> Self {
         let root = OwnedRoot::new();
         let mut store = root.open();
         let selection = owned_example("scene-selection.json");
@@ -1140,6 +1237,27 @@ impl OwnedFixture {
             // real stored Prefab, with the same metadata for graph consistency.
             prefab["resources"][0]["sizeBytes"] = json!(16236.0);
             prefab["nodes"][0]["geometryResource"] = prefab["resources"][0].clone();
+        }
+        if opaque {
+            // These are intentionally opaque payloads, even though their shape
+            // resembles a ResourceRef. Only schema-owned references may be normalized.
+            let mut value = prefab["resources"][0].clone();
+            value["sizeBytes"] = json!(1.0);
+            prefab["nodes"][0]["extensions"]["test:opaque"] = value.clone();
+            let node = prefab["nodes"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|node| node.get("display").is_some())
+                .unwrap();
+            node["display"]["payload"]["opaque"] = value;
+            let node_id = node["nodeId"].clone();
+            let display = node["display"].clone();
+            let overrides = instance["overrides"].as_array_mut().unwrap();
+            overrides.retain(|entry| entry["kind"] != "display" || entry["nodeId"] != node_id);
+            overrides.push(json!({"kind":"display","nodeId":node_id,"display":display}));
+        }
+        if decimal || opaque {
             prefab["revision"] = json!(projected_digest("Prefab", &prefab).unwrap());
             instance["prefabRevision"] = prefab["revision"].clone();
             instance["revision"] = json!(projected_digest("Instance", &instance).unwrap());

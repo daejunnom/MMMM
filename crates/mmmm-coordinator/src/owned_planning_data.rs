@@ -172,13 +172,58 @@ impl OwnedPlanningData {
         if actual_instance.document != *instance || actual_prefab.document != *definition {
             return Err(revision_conflict());
         }
-        let typed_instance: Instance = decode(instance)?;
-        let typed_prefab: Prefab = decode(definition)?;
+        // The caller's Value and the actual CAS Value can compare equal even
+        // when a rounded number token in the CAS was not an exact integer.
+        // Validate the actual bytes before making the typed copy.
+        let validator = ContractValidator::shared().map_err(|error| {
+            AppError::caused_by(
+                "CAPABILITY_UNAVAILABLE",
+                "Prefab validation is unavailable",
+                error,
+            )
+        })?;
+        let verified_prefab = validator
+            .parse_validate_prefab_exact_with_control(
+                &actual_prefab.bytes,
+                mmmm_contracts::JsonLimits {
+                    max_bytes: MAX_DOCUMENT as usize,
+                    max_depth: 64,
+                    max_nodes: 100_000,
+                },
+                || session.check_local(),
+            )
+            .map_err(|error| match error {
+                ControlledPrefabContractError::Control(error) => error,
+                error @ ControlledPrefabContractError::CaptureUnavailable => AppError::caused_by(
+                    "CAPABILITY_UNAVAILABLE",
+                    "Prefab source capture is unavailable",
+                    error,
+                ),
+                error => AppError::caused_by(
+                    "INVALID_INPUT",
+                    "Owned Prefab source failed exact validation",
+                    error,
+                ),
+            })?;
+        if verified_prefab != actual_prefab.document || verified_prefab != *definition {
+            return Err(revision_conflict());
+        }
+        // Instance has no schema-owned ResourceRef; its display payload is
+        // opaque and must not pass through shape-based normalization.
+        let typed_instance: Instance =
+            serde_json::from_value(instance.clone()).map_err(|_| invalid())?;
+        let typed_prefab: Prefab =
+            mmmm_planner::decode_prefab_scoped(&verified_prefab, || session.check_local())?;
         // This validates authored override types without presenting their values
         // as any live state observation.
         effective_defaults(&typed_prefab, &typed_instance.overrides).map_err(domain_error)?;
         session.check_context()?;
         session.check_project(store)?;
+        for pin in [&instance_pin, &prefab_pin] {
+            session
+                .source_scope("objectIds", pin.object_id.as_str())
+                .map_err(|error| session.release(error))?;
+        }
         let store_root = store.with_read(|store| Ok(store.data_root().to_path_buf()))?;
         Ok(OwnedStateSource {
             session,

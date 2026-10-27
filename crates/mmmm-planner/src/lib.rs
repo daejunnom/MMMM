@@ -46,10 +46,14 @@ pub(crate) fn decode<T: DeserializeOwned>(name: &str, value: &Value) -> AppResul
         .map_err(|_| AppError::new("INVALID_INPUT", "Typed planning input is invalid"))
 }
 
-/// Decode an already validated Prefab by normalizing only its schema-owned
-/// ResourceRef positions. The caller must first establish the numeric lexemes
-/// from the same original bytes, or reject non-integer Value-only lengths.
-pub(crate) fn decode_prefab_scoped(
+/// Decode a Prefab by normalizing only its schema-owned ResourceRef positions.
+/// Before calling, establish exact numeric lexemes from the same original bytes
+/// and confirm the parsed Value directly equals `value`, or, for a Value-only
+/// source, reject non-integer ResourceRef lengths.
+///
+/// This helper does not establish authority or source provenance, or certify
+/// that the caller has completed those checks or the required exact validation.
+pub fn decode_prefab_scoped(
     value: &Value,
     mut check: impl FnMut() -> AppResult<()>,
 ) -> AppResult<mmmm_domain::Prefab> {
