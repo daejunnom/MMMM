@@ -215,6 +215,455 @@ fn command_owner() -> (Value, Value) {
     (owner, module)
 }
 
+fn physics_prefab() -> (Value, Value) {
+    // The original Prefab has no physics binding. Derive one from its root
+    // Node and the original authored PhysicsDefinition's actual first body.
+    // Recompute the Prefab revision because the authored content changed.
+    let mut owner = prefab();
+    let physics = parse_json(include_bytes!("../../../examples/physics-definition.json")).unwrap();
+    owner["nodes"][0]["physicsBinding"] = json!({
+        "physicsId": physics["physicsId"],
+        "bodyId": physics["bodies"][0]["bodyId"]
+    });
+    owner["revision"] = json!(projected_digest("Prefab", &owner).unwrap());
+    (owner, physics)
+}
+
+#[test]
+fn same_batch_physics_binding_uses_the_real_body_and_preserves_source_bytes() {
+    let (owner, physics) = physics_prefab();
+    // Instantiate only after the Prefab revision is recalculated, so the
+    // generated Instance's prefabRevision names the exact authored source.
+    let instance = instance(&owner);
+    let owner_bytes = encode_json(&owner).unwrap();
+    let instance_bytes = encode_json(&instance).unwrap();
+    let physics_bytes = include_bytes!("../../../examples/physics-definition.json");
+    for physics_first in [true, false] {
+        let mut fixture = Fixture::new();
+        let physics_source = || NativeSourceDocument {
+            kind: NativeSourceKind::PhysicsDefinition,
+            bytes: physics_bytes,
+        };
+        let prefab_source = || NativeSourceDocument {
+            kind: NativeSourceKind::Prefab,
+            bytes: &owner_bytes,
+        };
+        let instance_source = || NativeSourceDocument {
+            kind: NativeSourceKind::Instance,
+            bytes: &instance_bytes,
+        };
+        let documents = if physics_first {
+            [physics_source(), instance_source(), prefab_source()]
+        } else {
+            [prefab_source(), instance_source(), physics_source()]
+        };
+        let receipt = fixture
+            .prepare(&documents, &[])
+            .unwrap()
+            .commit(&mut fixture.store)
+            .unwrap();
+        let stored = receipt
+            .documents
+            .iter()
+            .find(|(pin, _)| pin.kind == OwnedDocumentKind::PhysicsDefinition)
+            .unwrap();
+        assert_eq!(
+            stored.0.object_id.as_str(),
+            physics["physicsId"].as_str().unwrap()
+        );
+        assert_eq!(
+            stored.0.revision.as_str(),
+            physics["revision"].as_str().unwrap()
+        );
+        assert_eq!(
+            fixture.store.read_blob(&stored.1).unwrap().as_slice(),
+            physics_bytes.as_slice()
+        );
+        assert_eq!(
+            mmmm_runtime::storage::owned_documents::read_owned_document(
+                &fixture.store,
+                &fixture.project,
+                &receipt.project_revision,
+                &stored.0,
+            )
+            .unwrap(),
+            physics
+        );
+        let project = fixture.store.project(&fixture.project).unwrap();
+        assert!(
+            project["ownedResources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|pin| pin["objectId"] == physics["physicsId"]
+                    && pin["revision"] == physics["revision"])
+        );
+        assert_eq!(project["prefabIds"], json!([owner["prefabId"]]));
+        assert_eq!(project["instanceIds"], json!([instance["instanceId"]]));
+    }
+}
+
+#[test]
+fn standalone_physics_can_be_used_from_retained_actual_store_source() {
+    let mut fixture = Fixture::new();
+    let (owner, physics) = physics_prefab();
+    let physics_bytes = include_bytes!("../../../examples/physics-definition.json");
+    let first = [NativeSourceDocument {
+        kind: NativeSourceKind::PhysicsDefinition,
+        bytes: physics_bytes,
+    }];
+    let first_receipt = fixture
+        .prepare(&first, &[])
+        .unwrap()
+        .commit(&mut fixture.store)
+        .unwrap();
+    let retained = first_receipt
+        .documents
+        .iter()
+        .find(|(pin, _)| pin.kind == OwnedDocumentKind::PhysicsDefinition)
+        .unwrap();
+    let authority = LocalAuthority::new(HostBridge::default());
+    let workspace = prepare_workspace(
+        &fixture.store,
+        &authority,
+        &fixture.project,
+        fixture.budget.deadline(),
+    )
+    .unwrap();
+    let owner_bytes = encode_json(&owner).unwrap();
+    let sources = [NativeSourceDocument {
+        kind: NativeSourceKind::Prefab,
+        bytes: &owner_bytes,
+    }];
+    let next = prepare_native_sources(
+        &fixture.store,
+        &workspace.witness,
+        &authority,
+        &fixture.budget,
+        &NativeSourceInput {
+            project: &fixture.project,
+            expected_revision: &first_receipt.project_revision,
+            documents: &sources,
+            retained_resources: &[],
+            raw_resources: &[],
+        },
+    )
+    .unwrap()
+    .commit(&mut fixture.store)
+    .unwrap();
+    let carried = mmmm_runtime::storage::owned_documents::read_owned_document(
+        &fixture.store,
+        &fixture.project,
+        &next.project_revision,
+        &retained.0,
+    )
+    .unwrap();
+    assert_eq!(carried, physics);
+    assert_eq!(
+        fixture.store.read_blob(&retained.1).unwrap().as_slice(),
+        physics_bytes.as_slice()
+    );
+}
+
+#[test]
+fn physics_binding_rejects_missing_definition_and_missing_body_before_publication() {
+    let fixture = Fixture::new();
+    let before = fixture.store.project(&fixture.project).unwrap();
+    let (owner, _) = physics_prefab();
+    let owner_bytes = encode_json(&owner).unwrap();
+    let missing = [NativeSourceDocument {
+        kind: NativeSourceKind::Prefab,
+        bytes: &owner_bytes,
+    }];
+    assert_eq!(
+        fixture.prepare(&missing, &[]).err().unwrap().code,
+        "SOURCE_UNAVAILABLE"
+    );
+    assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
+
+    let mut invalid = owner;
+    invalid["nodes"][0]["physicsBinding"]["bodyId"] = json!("body-unavailable");
+    invalid["revision"] = json!(projected_digest("Prefab", &invalid).unwrap());
+    let invalid_bytes = encode_json(&invalid).unwrap();
+    let documents = [
+        NativeSourceDocument {
+            kind: NativeSourceKind::Prefab,
+            bytes: &invalid_bytes,
+        },
+        NativeSourceDocument {
+            kind: NativeSourceKind::PhysicsDefinition,
+            bytes: include_bytes!("../../../examples/physics-definition.json"),
+        },
+    ];
+    assert_eq!(
+        fixture.prepare(&documents, &[]).err().unwrap().code,
+        "REFERENCE_UNRESOLVED"
+    );
+    assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
+}
+
+#[test]
+fn schema_valid_physics_with_invalid_graph_is_rejected_before_publication() {
+    let fixture = Fixture::new();
+    let before = fixture.store.project(&fixture.project).unwrap();
+    let (_, mut physics) = physics_prefab();
+    let mut wrong_revision = physics.clone();
+    wrong_revision["revision"] = json!("0".repeat(64));
+    let wrong_bytes = encode_json(&wrong_revision).unwrap();
+    let wrong_pin = [NativeSourceDocument {
+        kind: NativeSourceKind::PhysicsDefinition,
+        bytes: &wrong_bytes,
+    }];
+    assert_eq!(
+        fixture.prepare(&wrong_pin, &[]).err().unwrap().code,
+        "INPUT_DIGEST_MISMATCH"
+    );
+    assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
+
+    // Keep the original body and collider while breaking their graph relation.
+    // This remains a schema-valid PhysicsDefinition, but its dynamic body asks
+    // to derive inertia from an empty collider set.
+    physics["bodies"][0]["colliderIds"] = json!([]);
+    physics["revision"] = json!(projected_digest("PhysicsDefinition", &physics).unwrap());
+    let bytes = encode_json(&physics).unwrap();
+    let documents = [NativeSourceDocument {
+        kind: NativeSourceKind::PhysicsDefinition,
+        bytes: &bytes,
+    }];
+    assert_eq!(
+        fixture.prepare(&documents, &[]).err().unwrap().code,
+        "INVALID_PHYSICS"
+    );
+    assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
+}
+
+fn mesh_physics(bytes: &[u8]) -> (Value, Value) {
+    // The original PhysicsDefinition's collider is a box. Derive a mesh
+    // declaration so this test exercises the actual ResourceRef admission
+    // boundary; the arbitrary raw bytes and topology digest make no claim
+    // about a supported mesh codec, topology, solver, or game execution.
+    let (_, mut physics) = physics_prefab();
+    let resource = json!({
+        "resourceId":"resource-native-physics-mesh",
+        "sha256":raw_digest(bytes),
+        "mediaType":"application/octet-stream",
+        "sizeBytes":bytes.len()
+    });
+    physics["colliders"][0]["shape"]["shape"] = json!({
+        "kind":"mesh", "geometry":resource,
+        "topologyDigest":raw_digest(b"authored topology digest only")
+    });
+    physics["revision"] = json!(projected_digest("PhysicsDefinition", &physics).unwrap());
+    (physics, resource)
+}
+
+#[test]
+fn physics_mesh_raw_admission_and_retained_source_recheck_the_actual_resource() {
+    let mut fixture = Fixture::new();
+    let bytes = b"authored opaque mesh bytes\n";
+    let (physics, resource) = mesh_physics(bytes);
+    let physics_bytes = encode_json(&physics).unwrap();
+    let metadata = encode_json(&resource).unwrap();
+    let source = [NativeSourceDocument {
+        kind: NativeSourceKind::PhysicsDefinition,
+        bytes: &physics_bytes,
+    }];
+    let before = fixture.store.project(&fixture.project).unwrap();
+
+    // Neither a declared digest nor unrelated raw bytes authorizes a resource.
+    assert!(fixture.prepare(&source, &[]).is_err());
+    assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
+    assert_eq!(
+        fixture
+            .prepare_raw(
+                &source,
+                &[],
+                &[NativeRawSourceResource {
+                    metadata: &metadata,
+                    bytes: b"different mesh bytes",
+                }]
+            )
+            .err()
+            .unwrap()
+            .code,
+        "INPUT_DIGEST_MISMATCH"
+    );
+    assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
+
+    let first = fixture
+        .prepare_raw(
+            &source,
+            &[],
+            &[NativeRawSourceResource {
+                metadata: &metadata,
+                bytes,
+            }],
+        )
+        .unwrap()
+        .commit(&mut fixture.store)
+        .unwrap();
+    let physics_pin = first
+        .documents
+        .iter()
+        .find(|(pin, _)| pin.kind == OwnedDocumentKind::PhysicsDefinition)
+        .unwrap();
+    assert_eq!(first.resources.len(), 1);
+    let resource_blob = &first.resources[0].1;
+    assert_eq!(
+        fixture.store.read_blob(resource_blob).unwrap().as_slice(),
+        bytes.as_slice()
+    );
+    let authority = LocalAuthority::new(HostBridge::default());
+    let workspace = prepare_workspace(
+        &fixture.store,
+        &authority,
+        &fixture.project,
+        fixture.budget.deadline(),
+    )
+    .unwrap();
+    let before_next = fixture.store.project(&fixture.project).unwrap();
+    let (owner, _) = physics_prefab();
+    let owner_bytes = encode_json(&owner).unwrap();
+    let owner_source = [NativeSourceDocument {
+        kind: NativeSourceKind::Prefab,
+        bytes: &owner_bytes,
+    }];
+
+    // The retained physics body declares the real registered ResourceRef.
+    // Supplying conflicting metadata for that same ID cannot replace it.
+    let mut conflicting = resource.clone();
+    conflicting["sha256"] = json!(raw_digest(b"different metadata digest"));
+    let conflicting_bytes = encode_json(&conflicting).unwrap();
+    let mismatch = prepare_native_sources(
+        &fixture.store,
+        &workspace.witness,
+        &authority,
+        &fixture.budget,
+        &NativeSourceInput {
+            project: &fixture.project,
+            expected_revision: &first.project_revision,
+            documents: &owner_source,
+            retained_resources: &[&conflicting_bytes],
+            raw_resources: &[],
+        },
+    );
+    assert!(mismatch.is_err());
+    assert_eq!(
+        fixture.store.project(&fixture.project).unwrap(),
+        before_next
+    );
+
+    // The required resource is collected from the retained PhysicsDefinition,
+    // then resolved by the current Project reader without caller-authored scope.
+    let next = prepare_native_sources(
+        &fixture.store,
+        &workspace.witness,
+        &authority,
+        &fixture.budget,
+        &NativeSourceInput {
+            project: &fixture.project,
+            expected_revision: &first.project_revision,
+            documents: &owner_source,
+            retained_resources: &[],
+            raw_resources: &[],
+        },
+    )
+    .unwrap()
+    .commit(&mut fixture.store)
+    .unwrap();
+    let carried = mmmm_runtime::storage::owned_documents::read_owned_document(
+        &fixture.store,
+        &fixture.project,
+        &next.project_revision,
+        &physics_pin.0,
+    )
+    .unwrap();
+    assert_eq!(carried, physics);
+    assert_eq!(
+        fixture.store.read_blob(resource_blob).unwrap().as_slice(),
+        bytes.as_slice()
+    );
+    assert!(
+        fixture.store.project(&fixture.project).unwrap()["resourceIds"]
+            .as_array()
+            .unwrap()
+            .contains(&resource["resourceId"])
+    );
+}
+
+#[test]
+fn newly_authored_physics_resolves_a_previously_admitted_mesh_resource() {
+    let mut fixture = Fixture::new();
+    let bytes = b"already admitted opaque mesh bytes\n";
+    let (physics, resource) = mesh_physics(bytes);
+    let metadata = encode_json(&resource).unwrap();
+    let first = fixture
+        .prepare_raw(
+            &[],
+            &[],
+            &[NativeRawSourceResource {
+                metadata: &metadata,
+                bytes,
+            }],
+        )
+        .unwrap()
+        .commit(&mut fixture.store)
+        .unwrap();
+    assert_eq!(first.resources.len(), 1);
+    let authority = LocalAuthority::new(HostBridge::default());
+    let workspace = prepare_workspace(
+        &fixture.store,
+        &authority,
+        &fixture.project,
+        fixture.budget.deadline(),
+    )
+    .unwrap();
+    let physics_bytes = encode_json(&physics).unwrap();
+    let source = [NativeSourceDocument {
+        kind: NativeSourceKind::PhysicsDefinition,
+        bytes: &physics_bytes,
+    }];
+    let next = prepare_native_sources(
+        &fixture.store,
+        &workspace.witness,
+        &authority,
+        &fixture.budget,
+        &NativeSourceInput {
+            project: &fixture.project,
+            expected_revision: &first.project_revision,
+            documents: &source,
+            retained_resources: &[],
+            raw_resources: &[],
+        },
+    )
+    .unwrap()
+    .commit(&mut fixture.store)
+    .unwrap();
+    let stored = next
+        .documents
+        .iter()
+        .find(|(pin, _)| pin.kind == OwnedDocumentKind::PhysicsDefinition)
+        .unwrap();
+    assert_eq!(
+        stored.0.revision.as_str(),
+        physics["revision"].as_str().unwrap()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .read_blob(&first.resources[0].1)
+            .unwrap()
+            .as_slice(),
+        bytes.as_slice()
+    );
+    assert!(
+        fixture.store.project(&fixture.project).unwrap()["resourceIds"]
+            .as_array()
+            .unwrap()
+            .contains(&resource["resourceId"])
+    );
+}
+
 #[test]
 fn command_module_is_stored_with_its_actual_same_batch_owner_and_original_bytes() {
     let mut fixture = Fixture::new();

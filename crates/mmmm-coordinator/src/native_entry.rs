@@ -154,7 +154,7 @@ impl std::fmt::Display for EntryError {
             }
             Self::Arguments => f.write_str("Native command arguments are invalid"),
             Self::HostReadPolicyArguments => f.write_str("Host setup read policy requires unique --shape-mode survival|creative|adventure|spectator selections and optional --native-observation user_local_only; absent selections grant no corresponding source access"),
-            Self::SourceArguments => f.write_str("Native source import requires at least one document or raw resource pair and at most 256 combined document/resource inputs: --document <kind>:<JSON>, --document-file <kind>:<absolute JSON path>, and adjacent --resource-descriptor-file/--resource-bytes-file paths; kinds are prefab|instance|clip|command_module and OS argv limits may be smaller"),
+            Self::SourceArguments => f.write_str("Native source import requires at least one document or raw resource pair and at most 256 combined document/resource inputs: --document <kind>:<JSON>, --document-file <kind>:<absolute JSON path>, and adjacent --resource-descriptor-file/--resource-bytes-file paths; kinds are prefab|instance|clip|command_module|physics_definition and OS argv limits may be smaller"),
             Self::ManualArguments => f.write_str("Manual import requires an existing Coordinator, exact Project/head/context, an original exchange selection resource, selected absolute SourceMap/ScenePatch JSON files with unique resource IDs, and repeated --allow-delta kind,instanceId,nodeId static choices; no source rights or game-write grant is created"),
             Self::CatalogSourceArguments => f.write_str("Catalog source use requires --mode inspect or replace; replace needs --expected-state-digest and a complete set selected by --game-artifact <resourceId>/repeated --mod <canonicalId>,<nativeId>,<resourceId>, or explicit --withdraw true with no selections; <=256 selections, <=64 KiB selector metadata, user_local_only only"),
             Self::CatalogSourceRequest(error) => write!(f, "{}: Cold native catalog source use could not continue", error.code),
@@ -1579,6 +1579,7 @@ fn document_selector(value: &str) -> Result<(NativeSourceKind, &str), EntryError
         "instance" => NativeSourceKind::Instance,
         "clip" => NativeSourceKind::Clip,
         "command_module" => NativeSourceKind::CommandModule,
+        "physics_definition" => NativeSourceKind::PhysicsDefinition,
         _ => return Err(EntryError::SourceArguments),
     };
     Ok((kind, source))
@@ -2423,18 +2424,24 @@ mod tests {
             ("prefab", original),
             ("instance", "{}"),
             ("command_module", "{\"source\":\"a:b\"}"),
+            ("physics_definition", " {\"selectionId\":\"x:y\"} "),
         ] {
             input.extend(["--document".into(), format!("{kind}:{source}")]);
         }
         let Some(Command::SourceImport { documents, .. }) = parse(&input).unwrap() else {
             panic!("exact native source batch was not selected");
         };
-        assert_eq!(documents.len(), 4);
+        assert_eq!(documents.len(), 5);
         assert_eq!(documents[0].kind, NativeSourceKind::Clip);
         assert_eq!(documents[1].kind, NativeSourceKind::Prefab);
         assert_eq!(documents[2].kind, NativeSourceKind::Instance);
         assert_eq!(documents[3].kind, NativeSourceKind::CommandModule);
         assert_eq!(documents[3].source.as_bytes(), b"{\"source\":\"a:b\"}");
+        assert_eq!(documents[4].kind, NativeSourceKind::PhysicsDefinition);
+        assert_eq!(
+            documents[4].source.as_bytes(),
+            b" {\"selectionId\":\"x:y\"} "
+        );
         assert_eq!(documents[1].source.as_bytes(), original.as_bytes());
         // The CLI must not silently parse/normalize the duplicate key away;
         // the original strict ingress owns its actual semantic rejection.
@@ -2456,6 +2463,9 @@ mod tests {
             "command-module:{}",
             "CommandModule:{}",
             "command_module :{}",
+            "physics-definition:{}",
+            "PhysicsDefinition:{}",
+            "physics_definition :{}",
         ] {
             let mut input = import_args();
             input.extend(args(&["--document", document]));
@@ -3252,6 +3262,7 @@ mod tests {
     fn selected_file_parser_preserves_drive_colons_and_requires_adjacent_raw_pairs() {
         let document = PathBuf::from(root()).join("selected-prefab.json");
         let module = PathBuf::from(root()).join("selected-command-module.json");
+        let physics = PathBuf::from(root()).join("selected-physics-definition.json");
         let descriptor = PathBuf::from(root()).join("resource-reference.json");
         let bytes = PathBuf::from(root()).join("selected-content.bin");
         let mut input = import_args();
@@ -3262,6 +3273,10 @@ mod tests {
         input.extend([
             "--document-file".into(),
             format!("command_module:{}", module.display()),
+        ]);
+        input.extend([
+            "--document-file".into(),
+            format!("physics_definition:{}", physics.display()),
         ]);
         input.extend([
             "--resource-descriptor-file".into(),
@@ -3281,11 +3296,13 @@ mod tests {
             panic!("explicit file batch not selected");
         };
         assert!(documents.is_empty());
-        assert_eq!(document_files.len(), 2);
+        assert_eq!(document_files.len(), 3);
         assert_eq!(document_files[0].kind, NativeSourceKind::Prefab);
         assert_eq!(document_files[0].path, document);
         assert_eq!(document_files[1].kind, NativeSourceKind::CommandModule);
         assert_eq!(document_files[1].path, module);
+        assert_eq!(document_files[2].kind, NativeSourceKind::PhysicsDefinition);
+        assert_eq!(document_files[2].path, physics);
         assert_eq!(raw_resources.len(), 1);
         assert_eq!(raw_resources[0].descriptor, descriptor);
         assert_eq!(raw_resources[0].bytes, bytes);

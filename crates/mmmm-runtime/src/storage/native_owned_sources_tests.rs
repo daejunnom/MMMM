@@ -597,6 +597,395 @@ fn command_batch(base: &Value, mutate: impl FnOnce(&mut Value, &mut Value)) -> B
     Batch::from_sources(base, sources, initial.resources)
 }
 
+fn physics_batch(
+    base: &Value,
+    include_physics: bool,
+    physics_first: bool,
+    mutate: impl FnOnce(&mut Value, &mut Value),
+) -> Batch {
+    let initial = Batch::initial(base);
+    let mut sources: Vec<_> = initial
+        .pins
+        .iter()
+        .zip(&initial.documents)
+        .map(|(pin, bytes)| (pin.kind, parse_json(bytes).unwrap()))
+        .collect();
+    let mut physics = example("physics-definition.json");
+    // 원 Prefab 예제에는 physicsBinding이 없다. 기존 door node에 예제 물리
+    // 정의를 결속한 파생 입력을 만들고 모든 영향 revision을 다시 계산한다.
+    sources[0].1["nodes"][3]["physicsBinding"] = json!({
+        "physicsId": physics["physicsId"],
+        "bodyId": physics["bodies"][0]["bodyId"],
+    });
+    mutate(&mut sources[0].1, &mut physics);
+    revise("PhysicsDefinition", &mut physics);
+    revise("Prefab", &mut sources[0].1);
+    sources[1].1["prefabRevision"] = sources[0].1["revision"].clone();
+    revise("Instance", &mut sources[1].1);
+    if include_physics {
+        let source = (OwnedDocumentKind::PhysicsDefinition, physics);
+        if physics_first {
+            sources.insert(0, source);
+        } else {
+            sources.push(source);
+        }
+    }
+    Batch::from_sources(base, sources, initial.resources)
+}
+
+#[test]
+fn physics_source_and_prefab_binding_commit_in_either_batch_order() {
+    for physics_first in [true, false] {
+        let root = TestRoot::new();
+        let mut store = root.store();
+        let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+        let batch = physics_batch(&base, true, physics_first, |_, _| ());
+        let permit = TestPermit::new(&root, &initial);
+        let receipt = batch.commit(&mut store, &permit, &base).unwrap();
+        assert!(permit.0.final_rows_observed.get());
+        assert_eq!(store.project(&initial.project_id).unwrap(), batch.next);
+        let position = batch
+            .pins
+            .iter()
+            .position(|pin| pin.kind == OwnedDocumentKind::PhysicsDefinition)
+            .unwrap();
+        let (_, blob) = receipt
+            .documents
+            .iter()
+            .find(|(pin, _)| pin == &batch.pins[position])
+            .unwrap();
+        assert_eq!(store.read_blob(blob).unwrap(), batch.documents[position]);
+        let mut reader = permit
+            .owned_document_reader(MAX_OWNED_DOCUMENT_BYTES)
+            .unwrap();
+        let loaded = reader
+            .read_known_history_bytes(
+                &store,
+                &permit,
+                &initial.project_id,
+                &receipt.project_revision,
+                &batch.pins[position],
+            )
+            .unwrap();
+        assert_eq!(loaded.bytes, batch.documents[position]);
+        assert_eq!(&loaded.blob, blob);
+
+        let baseline = metadata_snapshot(&store);
+        assert!(matches!(
+            batch.commit(&mut store, &permit, &base),
+            Err(StorageError::Conflict(_))
+        ));
+        assert_unchanged(&store, &baseline, &batch.next);
+    }
+}
+
+#[test]
+fn physics_binding_rejects_missing_physics_body_and_invalid_graph_without_metadata() {
+    for case in 0..3 {
+        let root = TestRoot::new();
+        let mut store = root.store();
+        let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+        let batch = physics_batch(&base, true, true, |prefab, physics| match case {
+            0 => prefab["nodes"][3]["physicsBinding"]["physicsId"] = json!("physics-missing"),
+            1 => prefab["nodes"][3]["physicsBinding"]["bodyId"] = json!("body-missing"),
+            _ => physics["bodies"][0]["colliderIds"] = json!(["collider-missing"]),
+        });
+        if case == 2 {
+            let index = batch
+                .pins
+                .iter()
+                .position(|pin| pin.kind == OwnedDocumentKind::PhysicsDefinition)
+                .unwrap();
+            let schema_valid = parse_json(&batch.documents[index]).unwrap();
+            store
+                .validator
+                .validate("PhysicsDefinition", &schema_valid)
+                .unwrap();
+        }
+        let baseline = metadata_snapshot(&store);
+        let result = batch.commit(&mut store, &TestPermit::new(&root, &initial), &base);
+        let expected = match case {
+            0 => matches!(result, Err(StorageError::InvalidInput(message))
+                if message == "Owned physics binding has no actual Project membership"),
+            1 => matches!(result, Err(StorageError::InvalidInput(message))
+                if message == "Native physics binding definition or body differs"),
+            _ => matches!(result, Err(StorageError::Contract(_))),
+        };
+        assert!(expected, "case {case}");
+        assert_unchanged(&store, &baseline, &base);
+    }
+}
+
+#[test]
+fn retained_physics_document_is_loaded_for_later_prefab_body_binding() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let mut physics = example("physics-definition.json");
+    revise("PhysicsDefinition", &mut physics);
+    let first = Batch::from_sources(
+        &base,
+        vec![(OwnedDocumentKind::PhysicsDefinition, physics)],
+        vec![],
+    );
+    first
+        .commit(&mut store, &TestPermit::new(&root, &initial), &base)
+        .unwrap();
+
+    let baseline = metadata_snapshot(&store);
+    let invalid = physics_batch(&first.next, false, false, |prefab, _| {
+        prefab["nodes"][3]["physicsBinding"]["bodyId"] = json!("body-missing");
+    });
+    assert!(matches!(
+        invalid.commit(&mut store, &TestPermit::new(&root, &initial), &first.next),
+        Err(StorageError::InvalidInput(message))
+            if message == "Native physics binding definition or body differs"
+    ));
+    assert_unchanged(&store, &baseline, &first.next);
+
+    let valid = physics_batch(&first.next, false, false, |_, _| ());
+    let permit = TestPermit::new(&root, &initial);
+    let receipt = valid.commit(&mut store, &permit, &first.next).unwrap();
+    assert!(permit.0.final_rows_observed.get());
+    assert_eq!(store.project(&initial.project_id).unwrap(), valid.next);
+    let mut reader = permit
+        .owned_document_reader(MAX_OWNED_DOCUMENT_BYTES)
+        .unwrap();
+    let loaded = reader
+        .read_known_history_bytes(
+            &store,
+            &permit,
+            &initial.project_id,
+            &receipt.project_revision,
+            &first.pins[0],
+        )
+        .unwrap();
+    assert_eq!(loaded.bytes, first.documents[0]);
+}
+
+#[test]
+fn physics_transaction_cancellation_rolls_back_metadata() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let batch = physics_batch(&base, true, true, |_, _| ());
+    let baseline = metadata_snapshot(&store);
+    let permit = TestPermit::with_failure(&root, &initial, FinalFailure::Cancel);
+    assert!(batch.commit(&mut store, &permit, &base).is_err());
+    assert!(permit.0.final_rows_observed.get());
+    assert_unchanged(&store, &baseline, &base);
+}
+
+fn physics_mesh_fixture() -> (Value, Value, Vec<u8>) {
+    // 원 예제 collider는 box이므로 ResourceRef 연관을 확인할 때에만 mesh로
+    // 파생한다. 이 불투명 bytes는 mesh codec이나 topology 증명이 아니다.
+    let bytes = b"opaque authored mesh resource\0\n".to_vec();
+    let resource = json!({
+        "resourceId": "resource-physics-mesh",
+        "sha256": raw_digest(&bytes),
+        "mediaType": "application/octet-stream",
+        "sizeBytes": bytes.len(),
+    });
+    let mut physics = example("physics-definition.json");
+    physics["colliders"][0]["shape"]["shape"] = json!({
+        "kind": "mesh",
+        "geometry": resource,
+        "topologyDigest": raw_digest(b"opaque topology marker"),
+    });
+    revise("PhysicsDefinition", &mut physics);
+    (physics, resource, bytes)
+}
+
+#[test]
+fn physics_mesh_geometry_uses_actual_project_resource_and_cas() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let (physics, resource, bytes) = physics_mesh_fixture();
+    let batch = Batch::from_sources(
+        &base,
+        vec![(OwnedDocumentKind::PhysicsDefinition, physics)],
+        vec![(resource.clone(), bytes.clone())],
+    );
+    let permit = TestPermit::new(&root, &initial);
+    let receipt = batch.commit(&mut store, &permit, &base).unwrap();
+    assert!(permit.0.final_rows_observed.get());
+    assert_eq!(store.project(&initial.project_id).unwrap(), batch.next);
+    let query = ProjectResourceQuery::Current {
+        resource_id: ResourceId::new("resource-physics-mesh").unwrap(),
+    };
+    let mut reader = permit.resource_reader(MAX_SOURCE_TOTAL).unwrap();
+    let loaded = reader
+        .read(
+            &store,
+            &permit,
+            &ProjectResourceRequest {
+                project: &initial.project_id,
+                current_project_revision: &receipt.project_revision,
+                query: &query,
+                expected: Some(&resource),
+            },
+            MAX_SOURCE_TOTAL,
+        )
+        .unwrap();
+    assert_eq!(loaded.bytes, bytes);
+    assert_eq!(loaded.registered.blob.digest, raw_digest(&bytes));
+    assert_eq!(
+        loaded.registered.provenance,
+        ProjectResourceProvenance::CurrentProject {
+            project_revision: receipt.project_revision,
+        }
+    );
+}
+
+#[test]
+fn physics_mesh_geometry_rejects_missing_or_inexact_actual_resource() {
+    for case in 0..4 {
+        let root = TestRoot::new();
+        let mut store = root.store();
+        let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+        let (mut physics, resource, bytes) = physics_mesh_fixture();
+        match case {
+            0 => (),
+            1 => {
+                physics["colliders"][0]["shape"]["shape"]["geometry"]["sha256"] =
+                    json!(raw_digest(b"other digest"))
+            }
+            2 => {
+                physics["colliders"][0]["shape"]["shape"]["geometry"]["sizeBytes"] =
+                    json!(bytes.len() + 1)
+            }
+            _ => {
+                physics["colliders"][0]["shape"]["shape"]["geometry"]["mediaType"] =
+                    json!("application/x-test-alternate")
+            }
+        }
+        revise("PhysicsDefinition", &mut physics);
+        store
+            .validator
+            .validate("PhysicsDefinition", &physics)
+            .unwrap();
+        let resources = if case == 0 {
+            vec![]
+        } else {
+            vec![(resource, bytes)]
+        };
+        let batch = Batch::from_sources(
+            &base,
+            vec![(OwnedDocumentKind::PhysicsDefinition, physics)],
+            resources,
+        );
+        let baseline = metadata_snapshot(&store);
+        assert!(
+            matches!(
+                batch.commit(&mut store, &TestPermit::new(&root, &initial), &base),
+                Err(StorageError::InvalidInput(message))
+                    if message == "Owned source ResourceRef has no exact actual CAS association"
+            ),
+            "case {case}"
+        );
+        assert_unchanged(&store, &baseline, &base);
+    }
+}
+
+#[test]
+fn retained_physics_mesh_is_checked_when_new_prefab_binds_its_body() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let (physics, resource, bytes) = physics_mesh_fixture();
+    let first = Batch::from_sources(
+        &base,
+        vec![(OwnedDocumentKind::PhysicsDefinition, physics)],
+        vec![(resource.clone(), bytes.clone())],
+    );
+    let first_receipt = first
+        .commit(&mut store, &TestPermit::new(&root, &initial), &base)
+        .unwrap();
+
+    // 새 Prefab의 physicsId/bodyId가 같은 실제 retained mesh Physics를
+    // 참조한다. geometry bytes는 불투명하며 topology 검사는 여기서 하지 않는다.
+    let second = physics_batch(&first.next, false, false, |_, _| ());
+    let permit = TestPermit::new(&root, &initial);
+    let second_receipt = second.commit(&mut store, &permit, &first.next).unwrap();
+    assert_eq!(second_receipt.base_revision, first_receipt.project_revision);
+    assert!(permit.0.final_rows_observed.get());
+    assert_eq!(store.project(&initial.project_id).unwrap(), second.next);
+
+    let mut owned = permit
+        .owned_document_reader(MAX_OWNED_DOCUMENT_BYTES)
+        .unwrap();
+    let loaded_physics = owned
+        .read_known_history_bytes(
+            &store,
+            &permit,
+            &initial.project_id,
+            &second_receipt.project_revision,
+            &first.pins[0],
+        )
+        .unwrap();
+    assert_eq!(loaded_physics.bytes, first.documents[0]);
+
+    let query = ProjectResourceQuery::Current {
+        resource_id: ResourceId::new("resource-physics-mesh").unwrap(),
+    };
+    let mut resources = permit.resource_reader(MAX_SOURCE_TOTAL).unwrap();
+    let loaded_geometry = resources
+        .read(
+            &store,
+            &permit,
+            &ProjectResourceRequest {
+                project: &initial.project_id,
+                current_project_revision: &second_receipt.project_revision,
+                query: &query,
+                expected: Some(&resource),
+            },
+            MAX_SOURCE_TOTAL,
+        )
+        .unwrap();
+    assert_eq!(loaded_geometry.bytes, bytes);
+    assert_eq!(loaded_geometry.registered.blob.digest, raw_digest(&bytes));
+    assert_eq!(
+        loaded_geometry.registered.provenance,
+        ProjectResourceProvenance::CurrentProject {
+            project_revision: second_receipt.project_revision,
+        }
+    );
+}
+
+#[test]
+fn retained_physics_mesh_missing_current_resource_provenance_fails_closed() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let (physics, resource, bytes) = physics_mesh_fixture();
+    let first = Batch::from_sources(
+        &base,
+        vec![(OwnedDocumentKind::PhysicsDefinition, physics)],
+        vec![(resource.clone(), bytes)],
+    );
+    let first_receipt = first
+        .commit(&mut store, &TestPermit::new(&root, &initial), &base)
+        .unwrap();
+    // 이 test Store의 현재 revision에서 geometry provenance만 제거한다.
+    // 전체 carried-resource 재검사가 먼저 거절할 수 있으므로 이 사례는
+    // retained physics 전용 검사 분기의 도달을 따로 증명하지 않는다.
+    let removed = store.connection.execute(
+        "DELETE FROM project_resource_provenance WHERE project_id=?1 AND project_revision=?2 AND resource_id=?3 AND digest=?4",
+        params![initial.project_id.as_str(), first_receipt.project_revision.as_str(),
+            resource["resourceId"].as_str().unwrap(), resource["sha256"].as_str().unwrap()],
+    ).unwrap();
+    assert_eq!(removed, 1);
+    let baseline = metadata_snapshot(&store);
+    let batch = physics_batch(&first.next, false, false, |_, _| ());
+    assert!(
+        batch
+            .commit(&mut store, &TestPermit::new(&root, &initial), &first.next)
+            .is_err()
+    );
+    assert_unchanged(&store, &baseline, &first.next);
+}
+
 #[test]
 fn command_module_source_is_committed_with_its_actual_prefab_and_provenance() {
     let root = TestRoot::new();

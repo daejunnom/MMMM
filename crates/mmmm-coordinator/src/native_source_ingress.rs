@@ -16,6 +16,7 @@ use mmmm_domain::{
     Instance, Prefab,
     commands::CommandModule,
     instance::require_source,
+    physics::PhysicsDefinition,
     prefab::semantic_diagnostics,
     time::{AnimationClip, validate_clip},
 };
@@ -69,6 +70,7 @@ pub enum NativeSourceKind {
     Instance,
     Clip,
     CommandModule,
+    PhysicsDefinition,
 }
 impl NativeSourceKind {
     fn stored(self) -> OwnedDocumentKind {
@@ -77,6 +79,7 @@ impl NativeSourceKind {
             Self::Instance => OwnedDocumentKind::Instance,
             Self::Clip => OwnedDocumentKind::AnimationClip,
             Self::CommandModule => OwnedDocumentKind::CommandModule,
+            Self::PhysicsDefinition => OwnedDocumentKind::PhysicsDefinition,
         }
     }
 }
@@ -670,6 +673,7 @@ pub fn prepare_native_sources(
             NativeSourceKind::Instance => OwnedKind::Instance,
             NativeSourceKind::Clip => OwnedKind::Clip,
             NativeSourceKind::CommandModule => OwnedKind::CommandModule,
+            NativeSourceKind::PhysicsDefinition => OwnedKind::PhysicsDefinition,
         };
         if !identities.insert((identity_kind, pin.object_id.clone())) {
             return Err(AppError::new(
@@ -704,6 +708,13 @@ pub fn prepare_native_sources(
         } else if raw.kind == NativeSourceKind::Clip {
             let clip: AnimationClip = decode_domain(&value)?;
             validate_clip(&clip).map_err(domain_error)?;
+        } else if raw.kind == NativeSourceKind::PhysicsDefinition {
+            // Preserve the same authored Value and numeric interpretation as
+            // the shared PhysicsDefinition validator. Source pin and raw bytes
+            // were checked separately above and are never rewritten here.
+            PhysicsDefinition::from_value(&value).map_err(domain_error)?;
+            access.check_store(store)?;
+            collect_physics_resources(store, &access, &value, &mut resources)?;
         }
         access.check_local()?;
         let original_digest = raw_digest(raw.bytes);
@@ -760,6 +771,59 @@ pub fn prepare_native_sources(
         } else {
             let module: CommandModule = decode_domain(&document.value)?;
             validate_command_module_owner(&module, &owner_prefabs[&owner_id])?;
+        }
+    }
+    // Resolve Prefab bindings before authorizing declared resources, so mesh
+    // ResourceRefs in retained physics follow the same current source reader
+    // and finite budget as those in newly authored physics documents.
+    let mut physics_bodies = BTreeMap::<String, BTreeSet<String>>::new();
+    for document in &documents {
+        if document.pin.kind != OwnedDocumentKind::Prefab {
+            continue;
+        }
+        for node in array(&document.value, "nodes")? {
+            let Some(binding) = node.get("physicsBinding") else {
+                continue;
+            };
+            access.check_store(store)?;
+            let physics_id = text(binding, "physicsId")?;
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                physics_bodies.entry(physics_id.to_owned())
+            {
+                let value = authoring_source(
+                    store,
+                    &access,
+                    &catalog,
+                    &documents,
+                    OwnedKind::PhysicsDefinition,
+                    physics_id,
+                    &mut retained_total,
+                )?;
+                let physics = PhysicsDefinition::from_value(&value).map_err(domain_error)?;
+                access.check_store(store)?;
+                if physics.physics_id().as_str() != physics_id {
+                    return Err(AppError::new(
+                        "REFERENCE_UNRESOLVED",
+                        "Native Prefab physics identity differs from its actual source",
+                    ));
+                }
+                collect_physics_resources(store, &access, &value, &mut resources)?;
+                let mut bodies = BTreeSet::new();
+                for (index, body) in physics.bodies().iter().enumerate() {
+                    if index % 128 == 0 {
+                        access.check_store(store)?;
+                    }
+                    bodies.insert(body.body_id.as_str().to_owned());
+                }
+                access.check_store(store)?;
+                entry.insert(bodies);
+            }
+            if !physics_bodies[physics_id].contains(text(binding, "bodyId")?) {
+                return Err(AppError::new(
+                    "REFERENCE_UNRESOLVED",
+                    "Native Prefab physics binding has no body in its actual source",
+                ));
+            }
         }
     }
     for resource in raw_resources.values() {
@@ -941,6 +1005,7 @@ fn authoring_source(
         OwnedKind::Prefab => OwnedDocumentKind::Prefab,
         OwnedKind::Clip => OwnedDocumentKind::AnimationClip,
         OwnedKind::CommandModule => OwnedDocumentKind::CommandModule,
+        OwnedKind::PhysicsDefinition => OwnedDocumentKind::PhysicsDefinition,
         _ => {
             return Err(AppError::new(
                 "UNOWNED_REQUIRED_CAPABILITY",
@@ -1135,6 +1200,30 @@ fn read_owned(
 fn resource_reader(access: &NativeSourceAccess, maximum: u64) -> AppResult<ProjectResourceReader> {
     ProjectResourceReader::new(Box::new(access.clone()), maximum).map_err(storage_error)
 }
+/// Admit declared mesh metadata through the same resource path as Prefab
+/// ResourceRefs. This does not decode mesh bytes or establish topology, solver,
+/// selection or game authority.
+fn collect_physics_resources(
+    store: &DurableStore,
+    access: &NativeSourceAccess,
+    physics: &Value,
+    resources: &mut BTreeMap<ResourceId, Value>,
+) -> AppResult<()> {
+    for (index, collider) in array(physics, "colliders")?.iter().enumerate() {
+        if index % 128 == 0 {
+            access.check_store(store)?;
+        }
+        let shape = collider
+            .get("shape")
+            .and_then(|shape| shape.get("shape"))
+            .ok_or_else(invalid)?;
+        if text(shape, "kind")? == "mesh" {
+            let geometry = shape.get("geometry").ok_or_else(invalid)?;
+            insert_resource(resources, geometry.clone())?;
+        }
+    }
+    access.check_store(store)
+}
 fn insert_resource(resources: &mut BTreeMap<ResourceId, Value>, value: Value) -> AppResult<()> {
     validate("ResourceRef", &value)?;
     if encode_json(&value).map_err(|_| budget_error())?.len() > MAX_RESOURCE_METADATA {
@@ -1164,7 +1253,9 @@ fn derive_project(
         let index = match document.pin.kind {
             OwnedDocumentKind::Prefab => Some("prefabIds"),
             OwnedDocumentKind::Instance => Some("instanceIds"),
-            OwnedDocumentKind::AnimationClip | OwnedDocumentKind::CommandModule => None,
+            OwnedDocumentKind::AnimationClip
+            | OwnedDocumentKind::CommandModule
+            | OwnedDocumentKind::PhysicsDefinition => None,
             _ => return Err(invalid()),
         };
         if let Some(index) = index {

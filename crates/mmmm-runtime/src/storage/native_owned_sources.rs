@@ -23,6 +23,7 @@ use mmmm_contracts::{
     strict_json::{ControlledJsonError, parse_json_with_control},
     verify_projected_digest,
 };
+use mmmm_domain::physics::PhysicsDefinition;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -115,6 +116,10 @@ struct StagedResource {
     resource: Value,
     blob: BlobRef,
     previous: Option<RegisteredProjectResource>,
+}
+struct CheckedPhysics {
+    physics_id: String,
+    body_ids: BTreeSet<String>,
 }
 struct PreparedSources {
     base_project: Value,
@@ -318,6 +323,7 @@ fn request_scope(request: &NativeOwnedSourceCommitRequest<'_>) -> StorageResult<
                 | OwnedDocumentKind::Instance
                 | OwnedDocumentKind::AnimationClip
                 | OwnedDocumentKind::CommandModule
+                | OwnedDocumentKind::PhysicsDefinition
         ) || document.bytes.is_empty()
             || document.bytes.len() as u64 > MAX_OWNED_DOCUMENT_BYTES
             || !identities.insert((document.pin.kind, document.pin.object_id.clone()))
@@ -409,6 +415,7 @@ fn prepare(
     let base_pins = owned_pins(&base_project)?;
     let base_resources = resource_ids(&base_project)?;
     let mut documents = Vec::new();
+    let mut physics_documents = BTreeMap::new();
     let mut after_pins = base_pins.clone();
     let mut expected = base_project.clone();
     let mut remaining = MAX_SOURCE_TOTAL;
@@ -427,6 +434,10 @@ fn prepare(
             MAX_OWNED_DOCUMENT_BYTES as usize,
         )?;
         validate_document(store, document.pin, &value, false)?;
+        if document.pin.kind == OwnedDocumentKind::PhysicsDefinition {
+            let definition = checked_physics(store, permit, request.project, &scope, &value)?;
+            physics_documents.insert(document.pin.object_id.clone(), definition);
+        }
         if document.pin.kind == OwnedDocumentKind::Instance && value["lifecycle"] != "planned" {
             return Err(invalid(
                 "Native source Instance must remain an authored planned definition",
@@ -445,7 +456,9 @@ fn prepare(
             OwnedDocumentKind::Instance => {
                 append(&mut expected, "instanceIds", json!(document.pin.object_id))?
             }
-            OwnedDocumentKind::AnimationClip | OwnedDocumentKind::CommandModule => (),
+            OwnedDocumentKind::AnimationClip
+            | OwnedDocumentKind::CommandModule
+            | OwnedDocumentKind::PhysicsDefinition => (),
             _ => return Err(invalid("Native source authoring kind")),
         }
         append(
@@ -573,7 +586,8 @@ fn prepare(
             "Native source Project is not the exact membership-only derivation",
         ));
     }
-    // Only retain existing bodies needed for the new Prefab/CommandModule pairs.
+    // Only retain existing bodies needed for the new Prefab/CommandModule and
+    // Prefab/PhysicsDefinition relationships.
     // They are read by the same authorized history reader as all carried sources.
     let mut related = BTreeSet::new();
     for document in &documents {
@@ -588,6 +602,14 @@ fn prepare(
             OwnedDocumentKind::Prefab => {
                 for id in array(&document.value, "commandModuleIds")? {
                     related.insert((OwnedDocumentKind::CommandModule, decode(id)?));
+                }
+                for node in array(&document.value, "nodes")? {
+                    if let Some(binding) = node.get("physicsBinding") {
+                        related.insert((
+                            OwnedDocumentKind::PhysicsDefinition,
+                            decode(&binding["physicsId"])?,
+                        ));
+                    }
                 }
             }
             _ => (),
@@ -607,6 +629,19 @@ fn prepare(
         )?;
         account(&mut remaining, loaded.blob.byte_length)?;
         if related.contains(&(pin.kind, pin.object_id.clone())) {
+            if pin.kind == OwnedDocumentKind::PhysicsDefinition {
+                let definition =
+                    checked_physics(store, permit, request.project, &scope, &loaded.document)?;
+                require_physics_mesh_resources(
+                    store,
+                    permit,
+                    request.project,
+                    &scope,
+                    &loaded.document,
+                    &resources,
+                )?;
+                physics_documents.insert(pin.object_id.clone(), definition);
+            }
             retained.insert((pin.kind, pin.object_id.clone()), loaded.document);
         }
         carried_documents.push((pin.clone(), loaded.blob));
@@ -615,6 +650,16 @@ fn prepare(
         require_references(&document.value, &after_pins, &resources)?;
         checkpoint(store, permit, request.project, &scope)?;
         match document.pin.kind {
+            OwnedDocumentKind::PhysicsDefinition => {
+                require_physics_mesh_resources(
+                    store,
+                    permit,
+                    request.project,
+                    &scope,
+                    &document.value,
+                    &resources,
+                )?;
+            }
             OwnedDocumentKind::CommandModule => {
                 let owner = decode(&document.value["ownerPrefabId"])?;
                 let prefab =
@@ -632,6 +677,16 @@ fn prepare(
                         &retained,
                     )?;
                     require_command_module_binding(&document.value, module)?;
+                }
+                for node in array(&document.value, "nodes")? {
+                    checkpoint(store, permit, request.project, &scope)?;
+                    if let Some(binding) = node.get("physicsBinding") {
+                        let id: ObjectId = decode(&binding["physicsId"])?;
+                        let physics = physics_documents.get(&id).ok_or_else(|| {
+                            invalid("Native physics binding has no checked actual definition")
+                        })?;
+                        require_physics_binding(binding, physics)?;
+                    }
                 }
             }
             _ => (),
@@ -771,6 +826,84 @@ fn require_command_module_binding(prefab: &Value, module: &Value) -> StorageResu
     Ok(())
 }
 
+fn checked_physics(
+    store: &DurableStore,
+    permit: &dyn NativeOwnedSourceCommitPermit,
+    project: &ProjectId,
+    scope: &WriteScope,
+    value: &Value,
+) -> StorageResult<CheckedPhysics> {
+    checkpoint(store, permit, project, scope)?;
+    let physics = PhysicsDefinition::from_value(value).map_err(contract)?;
+    checkpoint(store, permit, project, scope)?;
+    let mut body_ids = BTreeSet::new();
+    for (index, body) in physics.bodies().iter().enumerate() {
+        if index.is_multiple_of(128) {
+            checkpoint(store, permit, project, scope)?;
+        }
+        body_ids.insert(body.body_id.as_str().to_owned());
+    }
+    checkpoint(store, permit, project, scope)?;
+    Ok(CheckedPhysics {
+        physics_id: physics.physics_id().as_str().to_owned(),
+        body_ids,
+    })
+}
+
+fn require_physics_binding(binding: &Value, physics: &CheckedPhysics) -> StorageResult<()> {
+    let physics_id = binding
+        .get("physicsId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("Native physics binding identity missing"))?;
+    let body_id = binding
+        .get("bodyId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("Native physics binding body identity missing"))?;
+    if physics.physics_id != physics_id || !physics.body_ids.contains(body_id) {
+        return Err(invalid("Native physics binding definition or body differs"));
+    }
+    Ok(())
+}
+
+fn require_exact_resource(
+    value: &Value,
+    resources: &BTreeMap<ResourceId, StagedResource>,
+) -> StorageResult<()> {
+    let id: ResourceId = decode(&value["resourceId"])?;
+    if resources
+        .get(&id)
+        .is_none_or(|resource| resource.resource != *value)
+    {
+        return Err(invalid(
+            "Owned source ResourceRef has no exact actual CAS association",
+        ));
+    }
+    Ok(())
+}
+
+fn require_physics_mesh_resources(
+    store: &DurableStore,
+    permit: &dyn NativeOwnedSourceCommitPermit,
+    project: &ProjectId,
+    scope: &WriteScope,
+    physics: &Value,
+    resources: &BTreeMap<ResourceId, StagedResource>,
+) -> StorageResult<()> {
+    // Apply the same storage admission rule as Prefab ResourceRefs to the
+    // original authored values. This does not attest mesh topology or a solver.
+    for collider in array(physics, "colliders")? {
+        checkpoint(store, permit, project, scope)?;
+        let shape = &collider["shape"]["shape"];
+        if shape.get("kind").and_then(Value::as_str) == Some("mesh") {
+            let geometry = shape
+                .get("geometry")
+                .ok_or_else(|| invalid("Native mesh geometry reference missing"))?;
+            require_exact_resource(geometry, resources)?;
+        }
+    }
+    Ok(())
+}
+
 fn require_references(
     document: &Value,
     pins: &BTreeMap<(OwnedDocumentKind, ObjectId), OwnedDocumentPin>,
@@ -813,27 +946,15 @@ fn require_references(
             }
         }
     }
-    let require_resource = |value: &Value| -> StorageResult<()> {
-        let id: ResourceId = decode(&value["resourceId"])?;
-        if resources
-            .get(&id)
-            .is_none_or(|resource| resource.resource != *value)
-        {
-            return Err(invalid(
-                "Owned source ResourceRef has no exact actual CAS association",
-            ));
-        }
-        Ok(())
-    };
     if let Some(values) = document.get("resources").and_then(Value::as_array) {
         for value in values {
-            require_resource(value)?;
+            require_exact_resource(value, resources)?;
         }
     }
     if let Some(nodes) = document.get("nodes").and_then(Value::as_array) {
         for node in nodes {
             if let Some(resource) = node.get("geometryResource") {
-                require_resource(resource)?;
+                require_exact_resource(resource, resources)?;
             }
             if let Some(block) = node.get("blockGeometry")
                 && !resources.contains_key(&decode::<ResourceId>(&block["resourceId"])?)
@@ -846,7 +967,7 @@ fn require_references(
                 .and_then(Value::as_array)
             {
                 for value in values {
-                    require_resource(value)?;
+                    require_exact_resource(value, resources)?;
                 }
             }
             if let Some(binding) = node.get("physicsBinding")

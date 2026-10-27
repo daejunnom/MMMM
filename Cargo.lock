@@ -837,6 +837,7 @@ dependencies = [
  "base64",
  "libc",
  "mmmm-contracts",
+ "mmmm-domain",
  "rusqlite",
  "serde",
  "serde_json",

@@ -4047,6 +4047,22 @@ Exchange는 기존 공개 메서드·직렬화·오류 및 selection 검증을 �
 일반 Rust 사용 경로를 유지하지만 `std::any::type_name`의 정의 경로는 달라진다.
 이 변경만으로 PhysicsDefinition의 native source import, 실제 selection·mesh 바이트,
 solver 또는 게임 권한이 구현된 것은 아니다. 컴파일과 기존 회귀 검사 결과는 별도다.
+### PhysicsDefinition 소유 소스 가져오기
+
+`source-import`는 `--document physics_definition:<JSON>`과
+`--document-file physics_definition:<절대 경로>`를 통해 독립 물리 정의를 받을 수 있다.
+Coordinator와 Store는 각각 원 schema·projected pin 및 공통 물리 그래프를 확인하고,
+Prefab의 `physicsId`와 `bodyId`를 같은 배치 또는 현재 권한으로 읽은 실제 보유 정의와
+대조한다. 물리 정의에 없는 Prefab 역방향 소유 관계를 새로 요구하지 않는다.
+
+mesh의 geometry ResourceRef는 기존 Prefab 자원과 같은 Project/CAS exact association,
+현재 권한·예산 및 publication 전 provenance 재검사를 요구한다. 이는 저장 경계의
+선택이며 원 계약에 명시된 별도 import 의무라고 단정하지 않는다. 연결 확인은 실제 mesh
+내용의 topology, selection, solver 또는 게임 사용 가능성을 증명하지 않는다. 원 box
+예제에서 파생한 mesh 입력으로 신규·보유 자원과 잘못된 연결을 검사하도록 작성했다.
+보유 mesh 손상 검사는 기존 공통 자원 gate가 먼저 거절할 수 있으며 보유 mesh 정의를
+새 Prefab에서 정상 참조하는 별도 검사도 작성했다. 실제 컴파일·테스트는 별도로 확인한다.
+Schema가 허용하는 `sizeBytes: 1.0`의 기존 serde 처리 결과는 아직 실행으로 확인하지 않았다.
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.
