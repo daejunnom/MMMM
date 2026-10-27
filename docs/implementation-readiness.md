@@ -4169,3 +4169,11 @@ Rust135 Linux의 상대 경로 preflight 검사는 통과했으나 Clippy에서 
 저장행끼리의 비교 및 다른 문서 내부 참조에 원 lexeme 증거를 부여하지 않는다. 기존 DB의
 재인코딩된 JSON을 최초 원문으로 주장하지 않는다. `1.0`·`1e0`, 반올림 분수, 권한과
 CAS/SQL 경계를 다루는 검사를 작성했으며 실제 실행은 후속 CI에서 확인한다.
+
+Runtime source의 Prefab display `resourceRefs`는 정본에 따라 문자열 ResourceId로 읽는다.
+각 ID가 현재 Project에서 확인한 자원 맵과 동일 Prefab의 `resources` 선언에 모두 있어야
+하며 선언된 ResourceRef 객체의 전체 metadata 비교를 유지한다. Runtime은 Prefab 도메인
+검사를 자동 수행하지 않으므로 이 선언 검사를 저장 진입점에서 별도로 수행한다. 실제
+commit 진입점의 정상·미등록·미선언·reader 권한 거절 검사를 작성했으며 실행 결과는
+후속 CI에서 확인한다. 원인 실패 전에 일반 문서 CAS가 prestage될 수 있고 게임 렌더링이나
+SourceAdmission을 검증하는 변경은 아니다.

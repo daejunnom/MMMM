@@ -1140,9 +1140,11 @@ fn require_references(
             }
         }
     }
+    let mut declared_resources = BTreeSet::new();
     if let Some(values) = document.get("resources").and_then(Value::as_array) {
         for value in values {
             require_exact_resource(value, resources)?;
+            declared_resources.insert(decode::<ResourceId>(&value["resourceId"])?);
         }
     }
     if let Some(nodes) = document.get("nodes").and_then(Value::as_array) {
@@ -1161,7 +1163,10 @@ fn require_references(
                 .and_then(Value::as_array)
             {
                 for value in values {
-                    require_exact_resource(value, resources)?;
+                    let id: ResourceId = decode(value)?;
+                    if !resources.contains_key(&id) || !declared_resources.contains(&id) {
+                        return Err(invalid("Owned display resource is unavailable"));
+                    }
                 }
             }
             if let Some(binding) = node.get("physicsBinding")

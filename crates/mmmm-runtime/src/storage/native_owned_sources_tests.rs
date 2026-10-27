@@ -589,6 +589,137 @@ impl Batch {
     }
 }
 
+fn display_batch(base: &Value, resource_id: &str, declared: Option<&Value>) -> Batch {
+    let initial = Batch::initial(base);
+    let mut sources: Vec<_> = initial
+        .pins
+        .iter()
+        .zip(&initial.documents)
+        .map(|(pin, bytes)| (pin.kind, parse_json(bytes).unwrap()))
+        .collect();
+    let prefab = &mut sources[0].1;
+    prefab["nodes"][0]["display"] = json!({
+        "kind": "block",
+        "payload": {},
+        "resourceRefs": [resource_id],
+    });
+    if let Some(resource) = declared {
+        prefab["resources"]
+            .as_array_mut()
+            .unwrap()
+            .push(resource.clone());
+    }
+    revise("Prefab", prefab);
+    let prefab_revision = prefab["revision"].clone();
+    sources[1].1["prefabRevision"] = prefab_revision;
+    revise("Instance", &mut sources[1].1);
+    Batch::from_sources(base, sources, initial.resources)
+}
+
+#[test]
+fn display_resource_ids_resolve_through_actual_owned_resources() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let batch = display_batch(&base, "resource-wall-blocks", None);
+    let permit = TestPermit::new(&root, &initial);
+    let receipt = batch.commit(&mut store, &permit, &base).unwrap();
+    assert!(permit.0.final_rows_observed.get());
+    assert_eq!(store.project(&initial.project_id).unwrap(), batch.next);
+    let query = ProjectResourceQuery::Current {
+        resource_id: ResourceId::new("resource-wall-blocks").unwrap(),
+    };
+    let mut reader = permit.resource_reader(MAX_SOURCE_TOTAL).unwrap();
+    let loaded = reader
+        .read(
+            &store,
+            &permit,
+            &ProjectResourceRequest {
+                project: &initial.project_id,
+                current_project_revision: &receipt.project_revision,
+                query: &query,
+                expected: Some(&batch.resources[0].0),
+            },
+            MAX_SOURCE_TOTAL,
+        )
+        .unwrap();
+    assert_eq!(loaded.bytes, batch.resources[0].1);
+}
+
+#[test]
+fn display_resource_id_without_actual_resource_cannot_commit() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let batch = display_batch(&base, "resource-missing", None);
+    let baseline = metadata_snapshot(&store);
+    assert!(matches!(
+        batch.commit(&mut store, &TestPermit::new(&root, &initial), &base),
+        Err(StorageError::InvalidInput(message))
+            if message == "Owned display resource is unavailable"
+    ));
+    assert_unchanged(&store, &baseline, &base);
+}
+
+#[test]
+fn display_current_project_resource_must_be_declared_by_prefab() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let permit = TestPermit::new(&root, &initial);
+    let query = ProjectResourceQuery::Current {
+        resource_id: ResourceId::new("policy-local").unwrap(),
+    };
+    let mut reader = permit.resource_reader(MAX_SOURCE_TOTAL).unwrap();
+    let actual = reader
+        .metadata(
+            &store,
+            &permit,
+            &ProjectResourceRequest {
+                project: &initial.project_id,
+                current_project_revision: &revision(&base),
+                query: &query,
+                expected: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(actual.resource["resourceId"], json!("policy-local"));
+    let batch = display_batch(&base, "policy-local", None);
+    let baseline = metadata_snapshot(&store);
+    assert!(matches!(
+        batch.commit(&mut store, &permit, &base),
+        Err(StorageError::InvalidInput(message))
+            if message == "Owned display resource is unavailable"
+    ));
+    assert_unchanged(&store, &baseline, &base);
+}
+
+#[test]
+fn display_retained_resource_still_requires_actual_reader_authorization() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let (physics, mesh, bytes) = physics_mesh_fixture();
+    let first = Batch::from_sources(
+        &base,
+        vec![(OwnedDocumentKind::PhysicsDefinition, physics)],
+        vec![(mesh.clone(), bytes)],
+    );
+    first
+        .commit(&mut store, &TestPermit::new(&root, &initial), &base)
+        .unwrap();
+    let batch = display_batch(&first.next, "resource-physics-mesh", Some(&mesh));
+    let permit = TestPermit::new(&root, &initial);
+    permit.0.deny_mesh_after_actual_checks.set(true);
+    let baseline = metadata_snapshot(&store);
+    assert!(matches!(
+        batch.commit(&mut store, &permit, &first.next),
+        Err(StorageError::Conflict("Authored scoped resource denied"))
+    ));
+    assert!(permit.0.mesh_denial_observed.get());
+    assert_unchanged(&store, &baseline, &first.next);
+}
+
 fn command_batch(base: &Value, mutate: impl FnOnce(&mut Value, &mut Value)) -> Batch {
     let initial = Batch::initial(base);
     let mut sources: Vec<_> = initial
