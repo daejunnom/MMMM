@@ -302,6 +302,139 @@ fn original_cancel_prevents_even_starting_the_operation() {
 // Synthetic closers exercise mandatory release and causal accounting without
 // duplicating the consumers' owned filesystem fixtures or issuing native I/O.
 #[test]
+fn held_file_close_attempts_leaf_and_all_last_owned_pins_after_cancellation() {
+    let checks = Checks {
+        cancelled: Cell::new(true),
+    };
+    let shared = Arc::new(1);
+    let pins = vec![Arc::new(0), Arc::clone(&shared), Arc::new(2)];
+    let attempted = RefCell::new(Vec::new());
+    let report = close_held_file_with(
+        9,
+        pins,
+        &checks,
+        |leaf| {
+            attempted.borrow_mut().push(leaf);
+            Err(io::Error::from_raw_os_error(5))
+        },
+        |pin| {
+            attempted.borrow_mut().push(pin);
+            if pin == 2 {
+                Err(io::Error::from_raw_os_error(6))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert_eq!(*attempted.borrow(), [9, 2, 0]);
+    assert!(matches!(report.leaf.status, NativeCloseStatus::Uncertain));
+    assert_eq!(report.leaf.failures.len(), 3);
+    assert_eq!(
+        report.leaf.failures[0].stage,
+        RetainedCloseStage::BeforeClose
+    );
+    assert!(matches!(report.leaf.failures[0].error, Failure::Cancelled));
+    assert_eq!(
+        report.leaf.failures[1].stage,
+        RetainedCloseStage::NativeClose
+    );
+    assert!(failure_contains_os_error(&report.leaf.failures[1].error, 5));
+    assert_eq!(
+        report.leaf.failures[2].stage,
+        RetainedCloseStage::AfterClose
+    );
+    assert!(matches!(report.leaf.failures[2].error, Failure::Cancelled));
+    assert_eq!(report.ancestry.pins, 3);
+    assert_eq!(report.ancestry.closed, 1);
+    assert_eq!(report.ancestry.shared, 1);
+    assert_eq!(report.ancestry.native_close_uncertain, 1);
+    let pin_failure = report
+        .ancestry
+        .failures
+        .iter()
+        .find(|failure| failure.pin == Some(2) && failure.stage == RetainedCloseStage::NativeClose)
+        .unwrap();
+    assert!(failure_contains_os_error(&pin_failure.error, 6));
+    assert!(!report.ancestry.all_pins_closed());
+    assert_eq!(*shared, 1);
+}
+
+#[test]
+fn held_file_close_reports_success_only_for_observed_closes() {
+    let checks = Checks {
+        cancelled: Cell::new(false),
+    };
+    let attempted = RefCell::new(Vec::new());
+    let report = close_held_file_with(
+        9,
+        vec![Arc::new(0), Arc::new(1)],
+        &checks,
+        |leaf| {
+            attempted.borrow_mut().push(leaf);
+            Ok(())
+        },
+        |pin| {
+            attempted.borrow_mut().push(pin);
+            Ok(())
+        },
+    );
+    assert_eq!(*attempted.borrow(), [9, 1, 0]);
+    assert!(matches!(report.leaf.status, NativeCloseStatus::Closed));
+    assert!(report.leaf.failures.is_empty());
+    assert!(report.ancestry.all_pins_closed());
+    assert!(report.ancestry.failures.is_empty());
+}
+
+#[test]
+fn held_file_close_records_post_cancel_after_leaf_success_or_native_failure() {
+    for native_failure in [false, true] {
+        let checks = Checks {
+            cancelled: Cell::new(false),
+        };
+        let attempted = RefCell::new(Vec::new());
+        let report = close_held_file_with(
+            9,
+            vec![Arc::new(0), Arc::new(1)],
+            &checks,
+            |leaf| {
+                attempted.borrow_mut().push(leaf);
+                checks.cancelled.set(true);
+                if native_failure {
+                    Err(io::Error::from_raw_os_error(6))
+                } else {
+                    Ok(())
+                }
+            },
+            |pin| {
+                attempted.borrow_mut().push(pin);
+                Ok(())
+            },
+        );
+        assert_eq!(*attempted.borrow(), [9, 1, 0]);
+        if native_failure {
+            assert!(matches!(report.leaf.status, NativeCloseStatus::Uncertain));
+            assert_eq!(report.leaf.failures.len(), 2);
+            assert_eq!(
+                report.leaf.failures[0].stage,
+                RetainedCloseStage::NativeClose
+            );
+            assert!(failure_contains_os_error(&report.leaf.failures[0].error, 6));
+        } else {
+            assert!(matches!(report.leaf.status, NativeCloseStatus::Closed));
+            assert_eq!(report.leaf.failures.len(), 1);
+        }
+        let last = report.leaf.failures.last().unwrap();
+        assert_eq!(last.stage, RetainedCloseStage::AfterClose);
+        assert!(matches!(last.error, Failure::Cancelled));
+        assert_eq!(report.ancestry.closed, 2);
+        assert_eq!(report.ancestry.shared, 0);
+        assert_eq!(report.ancestry.native_close_uncertain, 0);
+        assert!(report.ancestry.all_pins_closed());
+        assert!(!report.ancestry.failures.is_empty());
+    }
+}
+
+#[test]
 fn retained_release_attempts_every_last_pin_after_cancel_and_native_failure() {
     let checks = Checks {
         cancelled: Cell::new(true),

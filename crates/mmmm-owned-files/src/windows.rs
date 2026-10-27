@@ -490,6 +490,15 @@ impl Selected {
         close_file(self.file, checks)?;
         release_pins(self.parents, checks, |directory| directory.file)
     }
+
+    /// Consumes an already acquired selection and observes one native close
+    /// attempt for its leaf and each last-owned ancestry pin, even after a
+    /// failed checkpoint. Shared pins and other handles remain unobserved.
+    /// This cannot recover or observe a handle dropped during acquisition,
+    /// including a failed `Control::io` post-check; no namespace is removed.
+    pub fn close_retained<C: Control>(self, checks: &C) -> HeldFileCloseReport<C::Error> {
+        close_held_file(self.file, self.parents, checks, |directory| directory.file)
+    }
 }
 
 // Independently expressed user-mode ABI from Microsoft:

@@ -95,6 +95,39 @@ impl<E> RetainedCloseReport<E> {
     }
 }
 
+/// Result of one native close call on an exclusively owned handle. A failed
+/// call is uncertain and must not be retried, including on POSIX EINTR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeCloseStatus {
+    Closed,
+    Uncertain,
+}
+
+/// A leaf checkpoint or native close failure, retained in occurrence order.
+#[derive(Debug)]
+pub struct LeafCloseFailure<E> {
+    pub stage: RetainedCloseStage,
+    pub error: E,
+}
+
+/// Native close status is independent of the surrounding checkpoint failures.
+#[derive(Debug)]
+pub struct LeafCloseReport<E> {
+    pub status: NativeCloseStatus,
+    pub failures: Vec<LeafCloseFailure<E>>,
+}
+
+/// Observations for the leaf and its retained ancestry, kept separately so
+/// ancestry indices and shared-reference semantics are unchanged. A shared pin
+/// had another reference at `Arc::try_unwrap`; its native close is unobserved,
+/// including if dropping our reference races with the other owner. Other
+/// handles and operating-system state are outside this report.
+#[derive(Debug)]
+pub struct HeldFileCloseReport<E> {
+    pub leaf: LeafCloseReport<E>,
+    pub ancestry: RetainedCloseReport<E>,
+}
+
 /// Borrowed per-operation checks. No callback, request or authority is retained.
 /// The consumer owns its closed error taxonomy and both original causal errors.
 pub trait Control {
@@ -586,6 +619,56 @@ fn release_retained_pins<T, C: Control>(
     file: impl Fn(T) -> File,
 ) -> RetainedCloseReport<C::Error> {
     release_retained_pins_with(pins, control, |owned| close_file_native(file(owned)))
+}
+
+fn close_held_file<T, C: Control>(
+    leaf: File,
+    pins: Vec<Arc<T>>,
+    control: &C,
+    file: impl Fn(T) -> File,
+) -> HeldFileCloseReport<C::Error> {
+    close_held_file_with(leaf, pins, control, close_file_native, |pin| {
+        close_file_native(file(pin))
+    })
+}
+
+fn close_held_file_with<L, P, C: Control>(
+    leaf: L,
+    pins: Vec<Arc<P>>,
+    control: &C,
+    close_leaf: impl FnOnce(L) -> io::Result<()>,
+    close_pin: impl FnMut(P) -> io::Result<()>,
+) -> HeldFileCloseReport<C::Error> {
+    let mut failures = Vec::with_capacity(3);
+    if let Err(error) = control.check() {
+        failures.push(LeafCloseFailure {
+            stage: RetainedCloseStage::BeforeClose,
+            error,
+        });
+    }
+    // Once cleanup owns the leaf, cancellation cannot skip its physical close.
+    // The owned native handle is consumed exactly once, even if close fails.
+    let status = match close_leaf(leaf) {
+        Ok(()) => NativeCloseStatus::Closed,
+        Err(error) => {
+            failures.push(LeafCloseFailure {
+                stage: RetainedCloseStage::NativeClose,
+                error: control.io_error(error),
+            });
+            NativeCloseStatus::Uncertain
+        }
+    };
+    if let Err(error) = control.check() {
+        failures.push(LeafCloseFailure {
+            stage: RetainedCloseStage::AfterClose,
+            error,
+        });
+    }
+    let ancestry = release_retained_pins_with(pins, control, close_pin);
+    HeldFileCloseReport {
+        leaf: LeafCloseReport { status, failures },
+        ancestry,
+    }
 }
 
 fn release_retained_pins_with<T, C: Control>(
