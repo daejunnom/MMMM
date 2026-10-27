@@ -4277,3 +4277,10 @@ Selection artifact의 기존 Value-only 정수 성공 경로는 유지한다. Pr
 `.err().expect()`를 `err_expect`로 거절했다. 원 test·lint 출력과 drain/export·scratch·lease
 결과는 보존한다. 수정은 `.expect_err()` 표현만 사용하며 예상치 못한 Ok의 Debug 표시가
 추가된다. 실제 재검사는 후속 CI에서 확인한다.
+
+Selection의 effective node 확장에서 각 instance의 override를 node ID별로 한 번 묶고 각
+node의 override 입력 순서를 유지한다. 선택 여부와 존재 확인도 node ID 집합을 재사용해
+반복 선형 탐색을 줄인다. 원 Selection·effective node·revision, 기존 중복·누락 오류 및
+선택의 비삭제 의미는 유지하며 인덱스 크기에 비례한 추가 메모리가 든다. 동기 schema와
+SelectionIndex 검사에는 새 checkpoint가 없고 hard 실행 시간 상한을 주장하지 않는다.
+256개 노드·2개 instance 및 override/선택 회귀를 작성했으며 실행은 후속 CI에서 확인한다.

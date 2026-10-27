@@ -30,6 +30,7 @@ pub struct Selection {
     value: Value,
     nodes: BTreeMap<ObjectNode, Value>,
     instance_prefabs: BTreeMap<String, String>,
+    selected_node_ids: BTreeSet<String>,
     physics_index: Arc<crate::physics::SelectionIndex>,
     // Only the raw-byte constructor can populate this private semantic view.
     // Original Selection Values and expanded nodes remain unchanged.
@@ -465,6 +466,18 @@ impl Selection {
                     "Instance prefab revision differs from the selection snapshot",
                 ));
             }
+            // Preserve each matching override's input order while avoiding a
+            // full scan for every expanded node. SelectionIndex has already
+            // checked the instance's override targets and duplicate kinds.
+            let mut node_overrides: BTreeMap<&str, Vec<&Value>> = BTreeMap::new();
+            for override_value in array(instance, "overrides")? {
+                if let Some(node_id) = override_value.get("nodeId").and_then(Value::as_str) {
+                    node_overrides
+                        .entry(node_id)
+                        .or_default()
+                        .push(override_value);
+                }
+            }
             for node in array(prefab, "nodes")? {
                 if nodes.len() >= 65536 {
                     return Err(ExchangeError::new(
@@ -474,8 +487,8 @@ impl Selection {
                 }
                 let node_id = text(node, "nodeId")?;
                 let mut effective = node.clone();
-                for override_value in array(instance, "overrides")? {
-                    if override_value["nodeId"].as_str() == Some(node_id) {
+                if let Some(overrides) = node_overrides.get(node_id) {
+                    for override_value in overrides {
                         match override_value["kind"].as_str() {
                             Some("transform") => {
                                 effective["transform"] = override_value["transform"].clone()
@@ -510,12 +523,15 @@ impl Selection {
                 );
             }
         }
-        let selected: BTreeSet<_> = array(value, "selectedNodeIds")?
+        let selected: BTreeSet<String> = array(value, "selectedNodeIds")?
             .iter()
             .filter_map(Value::as_str)
+            .map(str::to_owned)
             .collect();
-        for node_id in selected {
-            if !nodes.keys().any(|n| n.node_id == node_id) {
+        let qualified_node_ids: BTreeSet<&str> =
+            nodes.keys().map(|node| node.node_id.as_str()).collect();
+        for node_id in &selected {
+            if !qualified_node_ids.contains(node_id.as_str()) {
                 return Err(ExchangeError::new(
                     "REFERENCE_UNRESOLVED",
                     "Selected stable node ID is not present in any qualified instance",
@@ -526,6 +542,7 @@ impl Selection {
             value: value.clone(),
             nodes,
             instance_prefabs,
+            selected_node_ids: selected,
             physics_index: Arc::new(physics_index),
             semantic_prefabs: keep_semantic.then(|| Arc::new(semantic_prefabs)),
         })
@@ -552,11 +569,7 @@ impl Selection {
         self.instance_prefabs.get(instance).map(String::as_str)
     }
     pub fn selected(&self, node: &ObjectNode) -> bool {
-        self.node(node).is_some()
-            && self.value["selectedNodeIds"].as_array().is_some_and(|ids| {
-                ids.iter()
-                    .any(|id| id.as_str() == Some(node.node_id.as_str()))
-            })
+        self.node(node).is_some() && self.selected_node_ids.contains(&node.node_id)
     }
     pub fn check_revision(&self, project: &str, revision: &str) -> ExchangeResult<()> {
         if self.value["projectId"].as_str() != Some(project)
@@ -671,6 +684,122 @@ mod integral_prefab_tests {
         let instance_revision = projected_digest("Instance", &selection["instances"][0]).unwrap();
         selection["instances"][0]["revision"] = json!(instance_revision);
         selection
+    }
+
+    #[test]
+    fn many_overrides_keep_effective_nodes_and_selected_ids() {
+        let mut value = selection_with_decimal_prefab();
+        value["prefabs"][0]["resources"][0]["sizeBytes"] = json!(1);
+        let node_template = value["prefabs"][0]["nodes"][0].clone();
+        let mut display = value["prefabs"][0]["nodes"][2]["display"].clone();
+        display["payload"]["text"] = json!("overridden");
+        let mut overrides = Vec::new();
+        let mut selected = Vec::new();
+        for index in 0..256 {
+            let node_id = format!("scan-node-{index:03}");
+            let mut node = node_template.clone();
+            node["nodeId"] = json!(node_id);
+            node["parentId"] = json!("root");
+            value["prefabs"][0]["nodes"]
+                .as_array_mut()
+                .unwrap()
+                .push(node);
+            overrides.push(json!({
+                "kind": "transform", "nodeId": node_id,
+                "transform": {"kind": "trs", "translation": [index, 2, 1],
+                    "rotationXyzw": [0, 0, 0, 1], "scale": [1, 1, 1]}
+            }));
+            selected.push(json!(node_id));
+        }
+        overrides.reverse();
+        overrides.insert(
+            0,
+            json!({"kind":"display", "nodeId":"sign", "display":display}),
+        );
+        overrides.insert(
+            1,
+            json!({"kind":"transform", "nodeId":"sign", "transform": {
+                "kind":"trs", "translation":[7,8,9], "rotationXyzw":[0,0,0,1], "scale":[1,1,1]
+            }}),
+        );
+        selected.reverse();
+        value["instances"][0]["overrides"] = json!(overrides);
+        value["selectedNodeIds"] = json!(selected);
+        let prefab_revision = projected_digest("Prefab", &value["prefabs"][0]).unwrap();
+        value["prefabs"][0]["revision"] = json!(prefab_revision);
+        value["instances"][0]["prefabRevision"] = json!(prefab_revision);
+        value["instances"][0]["revision"] =
+            json!(projected_digest("Instance", &value["instances"][0]).unwrap());
+        let mut second_instance = value["instances"][0].clone();
+        second_instance["instanceId"] = json!("instance-shop-b");
+        second_instance["overrides"][257]["transform"]["translation"] = json!([999, 2, 1]);
+        second_instance["revision"] =
+            json!(projected_digest("Instance", &second_instance).unwrap());
+        value["instances"]
+            .as_array_mut()
+            .unwrap()
+            .push(second_instance);
+
+        let selection = Selection::from_value(&value).unwrap();
+        assert_eq!(selection.value(), &value);
+        for index in 0..256 {
+            let node = ObjectNode {
+                instance_id: "instance-shop-a".into(),
+                node_id: format!("scan-node-{index:03}"),
+            };
+            assert_eq!(
+                selection.node(&node).unwrap()["transform"]["translation"],
+                json!([index, 2, 1])
+            );
+            assert!(selection.selected(&node));
+        }
+        let sign = ObjectNode {
+            instance_id: "instance-shop-a".into(),
+            node_id: "sign".into(),
+        };
+        assert_eq!(
+            selection.node(&sign).unwrap()["display"]["payload"]["text"],
+            json!("overridden")
+        );
+        assert_eq!(
+            selection.node(&sign).unwrap()["transform"]["translation"],
+            json!([7, 8, 9])
+        );
+        assert!(!selection.selected(&sign));
+        let second = ObjectNode {
+            instance_id: "instance-shop-b".into(),
+            node_id: "scan-node-000".into(),
+        };
+        assert_eq!(
+            selection.node(&second).unwrap()["transform"]["translation"],
+            json!([999, 2, 1])
+        );
+        assert!(selection.selected(&second));
+        let absent = ObjectNode {
+            instance_id: "unknown".into(),
+            node_id: "scan-node-000".into(),
+        };
+        assert!(!selection.selected(&absent));
+
+        let mut missing = value.clone();
+        missing["selectedNodeIds"] = json!(["unknown-node"]);
+        assert_eq!(
+            Selection::from_value(&missing).unwrap_err().code,
+            "REFERENCE_UNRESOLVED"
+        );
+
+        let mut duplicate = value;
+        let repeated = duplicate["instances"][0]["overrides"][2].clone();
+        duplicate["instances"][0]["overrides"]
+            .as_array_mut()
+            .unwrap()
+            .push(repeated);
+        duplicate["instances"][0]["revision"] =
+            json!(projected_digest("Instance", &duplicate["instances"][0]).unwrap());
+        assert_eq!(
+            Selection::from_value(&duplicate).unwrap_err().code,
+            "DUPLICATE_ID"
+        );
     }
 
     #[test]
