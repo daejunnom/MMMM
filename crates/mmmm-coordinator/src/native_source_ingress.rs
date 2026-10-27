@@ -10,7 +10,7 @@ use mmmm_contracts::{
     ContextId, ContractValidator, JsonLimits, PrincipalId, ProjectId, ResourceId, Sha256Digest,
     encode_json, projected_digest, raw_digest,
     strict_json::{ControlledJsonError, parse_json_with_control},
-    validation::{ControlledContractError, ExactSelector},
+    validation::{ControlledContractError, ControlledPrefabContractError, ExactSelector},
     verify_projected_digest,
 };
 use mmmm_domain::{
@@ -709,7 +709,11 @@ pub fn prepare_native_sources(
             ));
         }
         if raw.kind == NativeSourceKind::Prefab {
-            let prefab: Prefab = decode_domain(&value)?;
+            // Only these schema-owned ResourceRefs are normalized on a private
+            // comparison copy. The original Value, bytes and revision remain
+            // the source identity and must pass their own exact-token gate.
+            let comparison = prefab_comparison_copy(&access, &value)?;
+            let prefab: Prefab = decode(&comparison)?;
             if semantic_diagnostics(&prefab)
                 .iter()
                 .any(|diagnostic| diagnostic.severity == "error")
@@ -719,12 +723,18 @@ pub fn prepare_native_sources(
                     "Native source Prefab has invalid authoring semantics",
                 ));
             }
-            for reference in array(&value, "resources")? {
-                insert_resource(&mut resources, reference.clone())?;
+            for (index, reference) in array(&value, "resources")?.iter().enumerate() {
+                if index % 128 == 0 {
+                    access.check_local()?;
+                }
+                insert_resource(&mut resources, comparable_raw_resource(reference)?)?;
             }
-            for node in array(&value, "nodes")? {
+            for (index, node) in array(&value, "nodes")?.iter().enumerate() {
+                if index % 128 == 0 {
+                    access.check_local()?;
+                }
                 if let Some(reference) = node.get("geometryResource") {
-                    insert_resource(&mut resources, reference.clone())?;
+                    insert_resource(&mut resources, comparable_raw_resource(reference)?)?;
                 }
             }
         } else if raw.kind == NativeSourceKind::Instance && value["lifecycle"] != "planned" {
@@ -755,6 +765,9 @@ pub fn prepare_native_sources(
     }
     let mut retained_total = policy_bytes.len() as u64;
     let mut owner_prefabs = BTreeMap::new();
+    // These are actual bytes obtained through the original authorized owned
+    // reader. Their encoding is not necessarily the author's first input.
+    let mut retained_prefabs = Vec::<(Vec<u8>, Value)>::new();
     for document in &documents {
         let owner_id = match document.pin.kind {
             OwnedDocumentKind::AnimationClip => {
@@ -769,7 +782,7 @@ pub fn prepare_native_sources(
         if let std::collections::btree_map::Entry::Vacant(entry) =
             owner_prefabs.entry(owner_id.clone())
         {
-            let value = authoring_source(
+            let source = authoring_source(
                 store,
                 &access,
                 &catalog,
@@ -777,19 +790,28 @@ pub fn prepare_native_sources(
                 OwnedKind::Prefab,
                 owner_id.as_str(),
                 &mut retained_total,
-            )?
-            .value;
-            let prefab: Prefab = decode_domain(&value)?;
+            )?;
+            let comparison = prefab_comparison_copy(&access, &source.value)?;
+            let prefab: Prefab = decode(&comparison)?;
             // Recheck the actual owner's declared resources through the same
             // current ACL/CAS reader used for other admitted source documents.
             mmmm_domain::prefab::require_valid(&prefab).map_err(domain_error)?;
-            for reference in array(&value, "resources")? {
-                insert_resource(&mut resources, reference.clone())?;
-            }
-            for node in array(&value, "nodes")? {
-                if let Some(reference) = node.get("geometryResource") {
-                    insert_resource(&mut resources, reference.clone())?;
+            for (index, reference) in array(&source.value, "resources")?.iter().enumerate() {
+                if index % 128 == 0 {
+                    access.check_local()?;
                 }
+                insert_resource(&mut resources, comparable_raw_resource(reference)?)?;
+            }
+            for (index, node) in array(&source.value, "nodes")?.iter().enumerate() {
+                if index % 128 == 0 {
+                    access.check_local()?;
+                }
+                if let Some(reference) = node.get("geometryResource") {
+                    insert_resource(&mut resources, comparable_raw_resource(reference)?)?;
+                }
+            }
+            if let Some(bytes) = source.retained_bytes {
+                retained_prefabs.push((bytes, source.value));
             }
             entry.insert(prefab);
         }
@@ -925,11 +947,13 @@ pub fn prepare_native_sources(
                     .value;
                     if kind == OwnedKind::Clip {
                         let clip: AnimationClip = decode_domain(&value)?;
-                        let prefab: Prefab = decode_domain(&document.value)?;
+                        let prefab: Prefab =
+                            decode(&prefab_comparison_copy(&access, &document.value)?)?;
                         validate_clip_owner(&clip, &prefab)?;
                     } else if kind == OwnedKind::CommandModule {
                         let module: CommandModule = decode_domain(&value)?;
-                        let prefab: Prefab = decode_domain(&document.value)?;
+                        let prefab: Prefab =
+                            decode(&prefab_comparison_copy(&access, &document.value)?)?;
                         validate_command_module_owner(&module, &prefab)?;
                     }
                 }
@@ -944,12 +968,12 @@ pub fn prepare_native_sources(
             }
         } else if document.pin.kind == OwnedDocumentKind::Instance {
             let instance: Instance = decode_domain(&document.value)?;
-            let prefab_value = match documents.iter().find(|candidate| {
+            let prefab: Prefab = match documents.iter().find(|candidate| {
                 candidate.pin.kind == OwnedDocumentKind::Prefab
                     && candidate.pin.object_id.as_str() == instance.prefab_id.as_str()
                     && candidate.pin.revision == instance.prefab_revision
             }) {
-                Some(candidate) => candidate.value.clone(),
+                Some(candidate) => decode(&prefab_comparison_copy(&access, &candidate.value)?)?,
                 None => {
                     let current = catalog.authorize_pin(
                         OwnedKind::Prefab,
@@ -963,10 +987,11 @@ pub fn prepare_native_sources(
                     };
                     let loaded = read_owned(store, &access, &pin)?;
                     retained_total = add_retained(retained_total, loaded.bytes.len() as u64)?;
-                    loaded.document
+                    let prefab = decode(&prefab_comparison_copy(&access, &loaded.document)?)?;
+                    retained_prefabs.push((loaded.bytes, loaded.document));
+                    prefab
                 }
             };
-            let prefab: Prefab = decode_domain(&prefab_value)?;
             require_source(&instance, &prefab).map_err(domain_error)?;
             mmmm_domain::instance::ensure_placement(
                 &prefab,
@@ -1057,6 +1082,10 @@ pub fn prepare_native_sources(
         )?;
     }
     for document in &prepared.documents {
+        if document.pin.kind == OwnedDocumentKind::Prefab {
+            prepared.access.check_store(store)?;
+            require_exact_prefab(&prepared.access, &document.original_bytes, &document.value)?;
+        }
         if document.pin.kind == OwnedDocumentKind::PhysicsDefinition {
             prepared.access.check_store(store)?;
             require_exact_source(
@@ -1067,6 +1096,10 @@ pub fn prepare_native_sources(
                 &document.value,
             )?;
         }
+    }
+    for (bytes, value) in &retained_prefabs {
+        prepared.access.check_store(store)?;
+        require_exact_prefab(&prepared.access, bytes, value)?;
     }
     for bytes in &retained_physics_bytes {
         prepared.access.check_store(store)?;
@@ -1079,7 +1112,18 @@ pub fn prepare_native_sources(
             &expected,
         )?;
     }
-    prepared.access.check_store(store)?;
+    // The Prefab exact pass can be long. Recheck the same Project head,
+    // policy and retained resource authority before returning its candidate.
+    if !retained_prefabs.is_empty()
+        || prepared
+            .documents
+            .iter()
+            .any(|document| document.pin.kind == OwnedDocumentKind::Prefab)
+    {
+        prepared.check_current(store)?;
+    } else {
+        prepared.access.check_store(store)?;
+    }
     Ok(prepared)
 }
 
@@ -1264,6 +1308,40 @@ fn comparable_raw_resource(value: &Value) -> AppResult<Value> {
     normalize_mesh_resource_ref(value).map_err(domain_error)
 }
 
+/// The Prefab contract has ResourceRefs in exactly these two locations. This
+/// provisional clone is only for typed/association comparisons: even a
+/// fractional source token can round to an integer during strict parsing. The
+/// original bytes and Value must pass `require_exact_prefab` before return.
+fn prefab_comparison_copy(access: &NativeSourceAccess, value: &Value) -> AppResult<Value> {
+    access.check_local()?;
+    let mut comparison = value.clone();
+    access.check_local()?;
+    let resources = comparison
+        .get_mut("resources")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(invalid)?;
+    for (index, resource) in resources.iter_mut().enumerate() {
+        if index % 128 == 0 {
+            access.check_local()?;
+        }
+        *resource = normalize_mesh_resource_ref(resource).map_err(domain_error)?;
+    }
+    let nodes = comparison
+        .get_mut("nodes")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(invalid)?;
+    for (index, node) in nodes.iter_mut().enumerate() {
+        if index % 128 == 0 {
+            access.check_local()?;
+        }
+        if let Some(geometry) = node.get_mut("geometryResource") {
+            *geometry = normalize_mesh_resource_ref(geometry).map_err(domain_error)?;
+        }
+    }
+    access.check_local()?;
+    Ok(comparison)
+}
+
 fn check_raw_resource(value: &Value, bytes: &[u8]) -> AppResult<(ResourceId, Sha256Digest)> {
     validate("ResourceRef", value)?;
     let id = decode(&value["resourceId"])?;
@@ -1313,6 +1391,66 @@ impl std::fmt::Display for ExactSourceMismatch {
     }
 }
 impl std::error::Error for ExactSourceMismatch {}
+
+/// Verify this exact authorized Prefab input, retaining its original parsed
+/// Value and its numeric token's own error rather than upgrading a Value-only
+/// copy or an independently serialized stored row to a witness.
+fn require_exact_prefab(
+    access: &NativeSourceAccess,
+    bytes: &[u8],
+    expected: &Value,
+) -> AppResult<()> {
+    let validator = ContractValidator::shared().map_err(|error| {
+        AppError::caused_by(
+            "CAPABILITY_UNAVAILABLE",
+            "Native exact source validation is unavailable",
+            error,
+        )
+    })?;
+    let actual = validator
+        .parse_validate_prefab_exact_with_control(
+            bytes,
+            JsonLimits {
+                max_bytes: MAX_DOCUMENT,
+                max_depth: 64,
+                max_nodes: 100_000,
+            },
+            || access.check_local(),
+        )
+        .map_err(|error| match error {
+            ControlledPrefabContractError::Control(error) => error,
+            ControlledPrefabContractError::Contract(mmmm_contracts::ContractError::Json(error)) => {
+                AppError::caused_by(
+                    "INVALID_INPUT",
+                    "Native source is not bounded strict JSON",
+                    error,
+                )
+            }
+            ControlledPrefabContractError::Contract(error) => AppError::caused_by(
+                "INVALID_INPUT",
+                "Native source violates the canonical contract",
+                error,
+            ),
+            error @ ControlledPrefabContractError::ExactInteger { .. } => AppError::caused_by(
+                "INVALID_INPUT",
+                "Native source has an invalid exact decimal integer",
+                error,
+            ),
+            error @ ControlledPrefabContractError::CaptureUnavailable => AppError::caused_by(
+                "CAPABILITY_UNAVAILABLE",
+                "Native exact source capture is unavailable",
+                error,
+            ),
+        })?;
+    if actual != *expected {
+        return Err(AppError::caused_by(
+            "CAPABILITY_UNAVAILABLE",
+            "Native exact source validation could not confirm the parsed value",
+            ExactSourceMismatch,
+        ));
+    }
+    Ok(())
+}
 
 /// Check the same immutable bytes only after their existing strict JSON,
 /// schema, identity, digest and authoring checks have completed. This result

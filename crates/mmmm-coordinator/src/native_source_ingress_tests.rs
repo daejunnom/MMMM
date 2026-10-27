@@ -857,6 +857,263 @@ fn physics_mesh_integral_float_size_matches_current_retained_integer_resource() 
     );
 }
 
+// The Prefab source and ResourceRef metadata have independent bytes. The
+// single-byte resource makes a nearby decimal fraction round to the same Value
+// and projected pin as 1.0; it does not model geometry or game execution.
+fn prefab_with_decimal_resource(geometry: bool, token: &str) -> (Value, Value, Vec<u8>) {
+    let resource = json!({
+        "resourceId":"resource-prefab-decimal",
+        "sha256":raw_digest(b"x"),
+        "mediaType":"application/octet-stream",
+        "sizeBytes":1
+    });
+    let mut owner = prefab();
+    if geometry {
+        owner["resources"] = json!([resource]);
+        owner["nodes"][0]["geometryResource"] = resource.clone();
+        owner["nodes"][0]["geometryResource"]["sizeBytes"] = json!(1.0);
+    } else {
+        owner["resources"] = json!([resource]);
+        owner["resources"][0]["sizeBytes"] = json!(1.0);
+    }
+    owner["revision"] = json!(projected_digest("Prefab", &owner).unwrap());
+    let text = String::from_utf8(serde_json::to_vec(&owner).unwrap()).unwrap();
+    let selected = "\"sizeBytes\":1.0";
+    assert_eq!(text.matches(selected).count(), 1);
+    let bytes = text
+        .replacen(selected, &format!("\"sizeBytes\":{token}"), 1)
+        .into_bytes();
+    assert_eq!(parse_json(&bytes).unwrap(), owner);
+    (owner, resource, bytes)
+}
+
+#[test]
+fn prefab_decimal_resource_prepare_preserves_raw_source_and_projected_pin() {
+    for geometry in [false, true] {
+        for token in ["1.0", "1e0"] {
+            let fixture = Fixture::new();
+            let before = fixture.store.project(&fixture.project).unwrap();
+            let (owner, resource, bytes) = prefab_with_decimal_resource(geometry, token);
+            let metadata = encode_json(&resource).unwrap();
+            let documents = [NativeSourceDocument {
+                kind: NativeSourceKind::Prefab,
+                bytes: &bytes,
+            }];
+            let raw = [NativeRawSourceResource {
+                metadata: &metadata,
+                bytes: b"x",
+            }];
+            let prepared = fixture.prepare_raw(&documents, &[], &raw).unwrap();
+            assert_eq!(prepared.documents.len(), 1);
+            assert_eq!(prepared.documents[0].original_bytes, bytes);
+            assert_eq!(prepared.documents[0].original_digest, raw_digest(&bytes));
+            assert_eq!(prepared.documents[0].value, owner);
+            assert_eq!(
+                prepared.documents[0].pin.revision,
+                projected_digest("Prefab", &owner).unwrap()
+            );
+            prepared.check_current(&fixture.store).unwrap();
+            assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn prefab_decimal_resource_rejects_rounded_fraction_and_preserves_request_errors() {
+    for geometry in [false, true] {
+        let fixture = Fixture::new();
+        let before = fixture.store.project(&fixture.project).unwrap();
+        let (owner, resource, bytes) = prefab_with_decimal_resource(geometry, "1.0000000000000001");
+        let metadata = encode_json(&resource).unwrap();
+        let documents = [NativeSourceDocument {
+            kind: NativeSourceKind::Prefab,
+            bytes: &bytes,
+        }];
+        let raw = [NativeRawSourceResource {
+            metadata: &metadata,
+            bytes: b"x",
+        }];
+        let error = fixture.prepare_raw(&documents, &[], &raw).err().unwrap();
+        assert_eq!(error.code, "INVALID_INPUT");
+        let location = if geometry {
+            mmmm_contracts::validation::PrefabExactLocation::Geometry(0)
+        } else {
+            mmmm_contracts::validation::PrefabExactLocation::Resource(0)
+        };
+        assert!(matches!(
+            std::error::Error::source(&error).and_then(|cause| {
+                cause.downcast_ref::<
+                    mmmm_contracts::validation::ControlledPrefabContractError<
+                        mmmm_application::AppError,
+                    >,
+                >()
+            }),
+            Some(mmmm_contracts::validation::ControlledPrefabContractError::ExactInteger {
+                location: actual
+            }) if *actual == location
+        ));
+        assert_eq!(parse_json(&bytes).unwrap(), owner);
+        assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
+
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        let revision = owner["revision"].as_str().unwrap();
+        assert_eq!(text.matches(revision).count(), 1);
+        let bad_pin = text.replacen(revision, &"0".repeat(64), 1).into_bytes();
+        let wrong = [NativeSourceDocument {
+            kind: NativeSourceKind::Prefab,
+            bytes: &bad_pin,
+        }];
+        assert_eq!(
+            fixture.prepare_raw(&wrong, &[], &raw).err().unwrap().code,
+            "INPUT_DIGEST_MISMATCH"
+        );
+        fixture.cancelled.store(true, Ordering::Release);
+        assert_eq!(
+            fixture
+                .prepare_raw(&documents, &[], &raw)
+                .err()
+                .unwrap()
+                .code,
+            "CANCELLED"
+        );
+        assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
+
+        let revoked = Fixture::new();
+        let revoked_before = revoked.store.project(&revoked.project).unwrap();
+        revoked
+            .authority
+            .revoke_project(revoked.owner.principal(), &revoked.project)
+            .unwrap();
+        assert_eq!(
+            revoked
+                .prepare_raw(&documents, &[], &raw)
+                .err()
+                .unwrap()
+                .code,
+            "PERMISSION_REQUIRED"
+        );
+        assert_eq!(
+            revoked.store.project(&revoked.project).unwrap(),
+            revoked_before
+        );
+    }
+}
+
+#[test]
+fn retained_integer_prefab_is_read_from_actual_cas_and_keeps_current_authority() {
+    let mut fixture = Fixture::new();
+    let (mut owner, resource, _) = prefab_with_decimal_resource(false, "1.0");
+    // This retained fixture uses the already-supported integer representation.
+    // It does not claim Runtime can yet commit a Prefab whose original JSON
+    // contains N.0 or preserve such a representation in a prior source.
+    owner["resources"][0]["sizeBytes"] = json!(1);
+    owner["revision"] = json!(projected_digest("Prefab", &owner).unwrap());
+    let owner_bytes = encode_json(&owner).unwrap();
+    let metadata = encode_json(&resource).unwrap();
+    let sources = [NativeSourceDocument {
+        kind: NativeSourceKind::Prefab,
+        bytes: &owner_bytes,
+    }];
+    let first = fixture
+        .prepare_raw(
+            &sources,
+            &[],
+            &[NativeRawSourceResource {
+                metadata: &metadata,
+                bytes: b"x",
+            }],
+        )
+        .unwrap()
+        .commit(&mut fixture.store)
+        .unwrap();
+    let retained = first
+        .documents
+        .iter()
+        .find(|(pin, _)| pin.kind == OwnedDocumentKind::Prefab)
+        .unwrap();
+    assert_eq!(fixture.store.read_blob(&retained.1).unwrap(), owner_bytes);
+    assert_eq!(
+        retained.0.revision,
+        projected_digest("Prefab", &owner).unwrap()
+    );
+
+    let authority = LocalAuthority::new(HostBridge::default());
+    let workspace = prepare_workspace(
+        &fixture.store,
+        &authority,
+        &fixture.project,
+        fixture.budget.deadline(),
+    )
+    .unwrap();
+    let instance_bytes = encode_json(&instance(&owner)).unwrap();
+    let instance_source = [NativeSourceDocument {
+        kind: NativeSourceKind::Instance,
+        bytes: &instance_bytes,
+    }];
+    let prepared = prepare_native_sources(
+        &fixture.store,
+        &workspace.witness,
+        &authority,
+        &fixture.budget,
+        &NativeSourceInput {
+            project: &fixture.project,
+            expected_revision: &first.project_revision,
+            documents: &instance_source,
+            retained_resources: &[],
+            raw_resources: &[],
+        },
+    )
+    .unwrap();
+    prepared.check_current(&fixture.store).unwrap();
+    let before = fixture.store.project(&fixture.project).unwrap();
+    authority
+        .revoke_project(workspace.witness.principal(), &fixture.project)
+        .unwrap();
+    assert_eq!(
+        prepared.check_current(&fixture.store).unwrap_err().code,
+        "PERMISSION_REQUIRED"
+    );
+    assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
+    assert_eq!(fixture.store.read_blob(&retained.1).unwrap(), owner_bytes);
+}
+
+#[test]
+fn prepared_decimal_prefab_rechecks_the_actual_project_head() {
+    let mut fixture = Fixture::new();
+    let (_, resource, bytes) = prefab_with_decimal_resource(false, "1.0");
+    let metadata = encode_json(&resource).unwrap();
+    let sources = [NativeSourceDocument {
+        kind: NativeSourceKind::Prefab,
+        bytes: &bytes,
+    }];
+    let prepared = fixture
+        .prepare_raw(
+            &sources,
+            &[],
+            &[NativeRawSourceResource {
+                metadata: &metadata,
+                bytes: b"x",
+            }],
+        )
+        .unwrap();
+    let other_bytes = encode_json(&prefab()).unwrap();
+    let other = [NativeSourceDocument {
+        kind: NativeSourceKind::Prefab,
+        bytes: &other_bytes,
+    }];
+    fixture
+        .prepare(&other, &[])
+        .unwrap()
+        .commit(&mut fixture.store)
+        .unwrap();
+    let current = fixture.store.project(&fixture.project).unwrap();
+    assert_eq!(
+        prepared.check_current(&fixture.store).unwrap_err().code,
+        "REVISION_CONFLICT"
+    );
+    assert_eq!(fixture.store.project(&fixture.project).unwrap(), current);
+}
+
 // The authored mesh needs one actual byte so that an exact fraction can round
 // to the same parsed Value, projected pin, and valid ResourceRef as 1.0.
 // This derives from the original box fixture and asserts nothing about mesh

@@ -4184,3 +4184,11 @@ Prefab의 `resources[*].sizeBytes`와 `nodes[*].geometryResource.sizeBytes` 원 
 기존 selector와 오류 enum은 유지하고 display ID와 불투명 확장은 선택하지 않는다.
 검사는 작성했으나 실제 실행은 후속 CI에서 확인한다. 이 단계는 Coordinator/Runtime
 진입점, 현재 자원 권한이나 제품 인수에 아직 연결되지 않았다.
+
+Coordinator는 신규 Prefab과 권한 있는 보유 Prefab의 실제 bytes·최초 parse Value를 각자의
+exact 검사에 결속하고 두 ResourceRef 경로의 비교 복사본만 정규화한다. 원 bytes·Value·
+revision을 보존하며 배열 처리 중 원 요청을 확인한다. 반환 직전 head·policy·scope와 수집된
+resource를 다시 조회하므로 기존보다 후행 I/O·권한 오류가 추가 관측될 수 있다. Instance만
+제출할 때 보유 Prefab의 모든 resource를 새로 수집하거나 그 전체 ACL을 검사하지는 않는다.
+실제 보유 CAS의 소수 표기와 Runtime 저장 연결은 미검증·미완료이며 검사 실행 결과는 CI에서
+확인한다. 현재 CAS bytes를 최초 작성 원문이나 검사 후 불변 snapshot으로 주장하지 않는다.
