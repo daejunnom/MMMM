@@ -1767,6 +1767,232 @@ fn raw_resource_digest_length_and_exact_owned_reference_mismatch_are_rejected() 
     }
 }
 
+// Exercise the public Runtime source entry with the exact descriptor bytes,
+// instead of serializing a Value and losing the author's numeric lexeme.
+fn commit_with_resource_metadata(
+    batch: &Batch,
+    store: &mut DurableStore,
+    permit: &TestPermit,
+    base: &Value,
+    metadata: &[u8],
+) -> StorageResult<NativeOwnedSourceCommitReceipt> {
+    assert_eq!(batch.resources.len(), 1);
+    let project: ProjectId = serde_json::from_value(base["projectId"].clone()).unwrap();
+    let expected_revision = revision(base);
+    let project_bytes = raw_json(&batch.next);
+    let documents: Vec<_> = batch
+        .pins
+        .iter()
+        .zip(&batch.documents)
+        .map(|(pin, bytes)| NativeOwnedDocumentSource { pin, bytes })
+        .collect();
+    let resources = [NativeOwnedResourceSource::Raw {
+        metadata,
+        bytes: &batch.resources[0].1,
+    }];
+    commit_native_owned_sources(
+        store,
+        permit,
+        &NativeOwnedSourceCommitRequest {
+            project: &project,
+            expected_revision: &expected_revision,
+            project_bytes: &project_bytes,
+            documents: &documents,
+            resources: &resources,
+        },
+    )
+}
+
+fn resource_metadata_with_size_lexeme(resource: &Value, lexeme: &str) -> Vec<u8> {
+    let original = String::from_utf8(raw_json(resource)).unwrap();
+    let needle = format!("\"sizeBytes\": {}", resource["sizeBytes"].as_u64().unwrap());
+    assert_eq!(original.matches(&needle).count(), 1);
+    original
+        .replacen(&needle, &format!("\"sizeBytes\": {lexeme}"), 1)
+        .into_bytes()
+}
+
+#[test]
+fn raw_resource_metadata_exact_decimal_is_normalized_only_for_registration() {
+    for lexeme in ["1.0", "1e0"] {
+        let root = TestRoot::new();
+        let mut store = root.store();
+        let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+        let bytes = vec![b'a'];
+        let resource = json!({
+            "resourceId": "resource-decimal-metadata",
+            "sha256": raw_digest(&bytes),
+            "mediaType": "application/octet-stream",
+            "sizeBytes": 1,
+        });
+        let metadata = resource_metadata_with_size_lexeme(&resource, lexeme);
+        let original = parse_json(&metadata).unwrap();
+        assert_ne!(original["sizeBytes"], resource["sizeBytes"]);
+        let batch = Batch::from_sources(&base, vec![], vec![(resource.clone(), bytes.clone())]);
+        let permit = TestPermit::new(&root, &initial);
+        let receipt =
+            commit_with_resource_metadata(&batch, &mut store, &permit, &base, &metadata).unwrap();
+        assert_eq!(receipt.project_revision, revision(&batch.next));
+        let id = ResourceId::new("resource-decimal-metadata").unwrap();
+        let query = ProjectResourceQuery::Current { resource_id: id };
+        let registered = permit
+            .resource_reader(MAX_SOURCE_TOTAL)
+            .unwrap()
+            .read(
+                &store,
+                &permit,
+                &ProjectResourceRequest {
+                    project: &initial.project_id,
+                    current_project_revision: &receipt.project_revision,
+                    query: &query,
+                    expected: Some(&resource),
+                },
+                MAX_SOURCE_TOTAL,
+            )
+            .unwrap();
+        assert_eq!(registered.registered.resource, resource);
+        assert_eq!(registered.bytes, bytes);
+        assert_eq!(parse_json(&metadata).unwrap(), original);
+    }
+}
+
+#[test]
+fn rounded_raw_resource_fraction_rejects_before_resource_and_physics_stage() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let (physics, resource, bytes) = physics_mesh_fixture();
+    let lexeme = format!("{}.0000000000000000000001", bytes.len());
+    let metadata = resource_metadata_with_size_lexeme(&resource, &lexeme);
+    let parsed = parse_json(&metadata).unwrap();
+    assert_eq!(parsed["sizeBytes"].as_f64(), Some(bytes.len() as f64));
+    let batch = Batch::from_sources(
+        &base,
+        vec![(OwnedDocumentKind::PhysicsDefinition, physics)],
+        vec![(resource, bytes.clone())],
+    );
+    let resource_blob = BlobRef {
+        digest: raw_digest(&bytes),
+        byte_length: bytes.len() as u64,
+    };
+    let physics_blob = BlobRef {
+        digest: raw_digest(&batch.documents[0]),
+        byte_length: batch.documents[0].len() as u64,
+    };
+    for blob in [&resource_blob, &physics_blob] {
+        assert!(
+            matches!(store.read_blob(blob), Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound)
+        );
+    }
+    let baseline = metadata_snapshot(&store);
+    let permit = TestPermit::new(&root, &initial);
+    let error =
+        commit_with_resource_metadata(&batch, &mut store, &permit, &base, &metadata).unwrap_err();
+    assert!(matches!(error, StorageError::Contract(message)
+        if message.contains("ResourceRef sizeBytes is not an exact safe JSON integer")));
+    assert_unchanged(&store, &baseline, &base);
+    assert!(!permit.0.final_rows_observed.get());
+    for blob in [&resource_blob, &physics_blob] {
+        assert!(
+            matches!(store.read_blob(blob), Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound)
+        );
+    }
+}
+
+#[test]
+fn value_only_retained_decimal_metadata_does_not_gain_raw_witness() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let bytes = vec![b'a'];
+    let resource = json!({
+        "resourceId": "resource-value-only-decimal",
+        "sha256": raw_digest(&bytes),
+        "mediaType": "application/octet-stream",
+        "sizeBytes": 1,
+    });
+    store.put_blob(&bytes).unwrap();
+    register_resource(
+        &mut store,
+        &resource,
+        ResourceOwner::Project(initial.project_id.clone()),
+    )
+    .unwrap();
+    let batch = Batch::from_sources(&base, vec![], vec![(resource.clone(), bytes)]);
+    let mut unproven = resource.clone();
+    unproven["sizeBytes"] = json!(1.0);
+    let retained = [NativeOwnedResourceSource::Retained {
+        resource: &unproven,
+    }];
+    let project_bytes = raw_json(&batch.next);
+    let baseline = metadata_snapshot(&store);
+    let result = commit_native_owned_sources(
+        &mut store,
+        &TestPermit::new(&root, &initial),
+        &NativeOwnedSourceCommitRequest {
+            project: &initial.project_id,
+            expected_revision: &initial.project_revision,
+            project_bytes: &project_bytes,
+            documents: &[],
+            resources: &retained,
+        },
+    );
+    assert!(matches!(result, Err(StorageError::Contract(message))
+        if message == "Native artifact ResourceRef is invalid"));
+    assert_unchanged(&store, &baseline, &base);
+}
+
+#[test]
+fn raw_decimal_for_current_resource_preserves_registration_and_acl_priority() {
+    for denied in [false, true] {
+        let root = TestRoot::new();
+        let mut store = root.store();
+        let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+        let (physics, resource, bytes) = physics_mesh_fixture();
+        let first = Batch::from_sources(&base, vec![], vec![(resource.clone(), bytes.clone())]);
+        first
+            .commit(&mut store, &TestPermit::new(&root, &initial), &base)
+            .unwrap();
+
+        let mut second = Batch::from_sources(
+            &first.next,
+            vec![(OwnedDocumentKind::PhysicsDefinition, physics)],
+            vec![],
+        );
+        // This is an already-current resource; do not append its Project ID a
+        // second time. The raw descriptor is still independently checked.
+        second.resources.push((resource.clone(), bytes.clone()));
+        let lexeme = if denied {
+            format!("{}.0000000000000000000001", bytes.len())
+        } else {
+            format!("{}.0", bytes.len())
+        };
+        let metadata = resource_metadata_with_size_lexeme(&resource, &lexeme);
+        let permit = TestPermit::new(&root, &initial);
+        permit.0.deny_mesh_after_actual_checks.set(denied);
+        let baseline = metadata_snapshot(&store);
+        let result =
+            commit_with_resource_metadata(&second, &mut store, &permit, &first.next, &metadata);
+        if denied {
+            assert!(matches!(
+                result,
+                Err(StorageError::Conflict("Authored scoped resource denied"))
+            ));
+            assert!(permit.0.mesh_denial_observed.get());
+            assert_unchanged(&store, &baseline, &first.next);
+        } else {
+            let receipt = result.unwrap();
+            assert_eq!(receipt.project_revision, revision(&second.next));
+            let sql: String = store.connection.query_row(
+                "SELECT resource_json FROM project_resource_versions WHERE project_id=?1 AND resource_id=?2 AND digest=?3",
+                params![initial.project_id.as_str(), "resource-physics-mesh", resource["sha256"].as_str().unwrap()],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(parse_json(sql.as_bytes()).unwrap(), resource);
+        }
+    }
+}
+
 #[test]
 fn project_nonmembership_change_and_missing_membership_are_rejected() {
     for case in 0..2 {

@@ -1021,6 +1021,15 @@ fn raw_resource_metadata_rejects_rounded_fraction_after_digest_and_id_checks() {
     let fixture = Fixture::new();
     let before = fixture.store.project(&fixture.project).unwrap();
     let (_, valid, invalid) = rounded_resource_metadata();
+    let blob = mmmm_runtime::storage::BlobRef {
+        digest: raw_digest(b"x"),
+        byte_length: 1,
+    };
+    assert!(matches!(
+        fixture.store.read_blob(&blob),
+        Err(mmmm_runtime::storage::StorageError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound
+    ));
     let raw = [NativeRawSourceResource {
         metadata: &invalid,
         bytes: b"x",
@@ -1059,6 +1068,11 @@ fn raw_resource_metadata_rejects_rounded_fraction_after_digest_and_id_checks() {
         "REVISION_CONFLICT"
     );
     assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
+    assert!(matches!(
+        fixture.store.read_blob(&blob),
+        Err(mmmm_runtime::storage::StorageError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound
+    ));
 }
 
 #[test]
@@ -1101,11 +1115,18 @@ fn submitted_retained_resource_metadata_rejects_rounded_fraction() {
     )
     .err()
     .unwrap();
-    // Existing ProjectResourceReader's integer metadata gate rejects the
-    // submitted f64 Value before the new raw exact check can be reached.
-    // The newly submitted bytes do not prove the original lexeme of the
-    // previously registered Value-only resource.
-    assert_eq!(error.code, "SOURCE_UNAVAILABLE");
+    // The caller's original bytes reach the exact-integer gate after current
+    // Project/resource checks. They do not prove the lexeme of the previously
+    // registered Value-only resource.
+    assert_eq!(error.code, "INVALID_INPUT");
+    assert!(matches!(
+        std::error::Error::source(&error).and_then(|cause| {
+            cause.downcast_ref::<
+                mmmm_contracts::validation::ControlledContractError<mmmm_application::AppError>
+            >()
+        }),
+        Some(mmmm_contracts::validation::ControlledContractError::ExactInteger { collider: None })
+    ));
     assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
     assert_eq!(
         fixture
@@ -1115,6 +1136,109 @@ fn submitted_retained_resource_metadata_rejects_rounded_fraction() {
             .as_slice(),
         b"x"
     );
+}
+
+#[test]
+fn integral_decimal_resource_metadata_commits_and_rechecks_as_retained_input() {
+    let mut fixture = Fixture::new();
+    let (resource, integer, invalid) = rounded_resource_metadata();
+    let source = String::from_utf8(integer).unwrap();
+    assert_eq!(source.matches("\"sizeBytes\":1").count(), 1);
+    let decimal = source
+        .replacen("\"sizeBytes\":1", "\"sizeBytes\":1.0", 1)
+        .into_bytes();
+    let raw = [NativeRawSourceResource {
+        metadata: &decimal,
+        bytes: b"x",
+    }];
+    let prepared = fixture.prepare_raw(&[], &[], &raw).unwrap();
+    assert_eq!(prepared.raw_resources.len(), 1);
+    assert_eq!(prepared.raw_resources[0].metadata_bytes, decimal);
+    assert_eq!(
+        prepared.raw_resources[0].metadata_digest,
+        raw_digest(&decimal)
+    );
+    prepared.check_current(&fixture.store).unwrap();
+    let receipt = prepared.commit(&mut fixture.store).unwrap();
+    assert_eq!(receipt.resources.len(), 1);
+    assert_eq!(
+        fixture
+            .store
+            .read_blob(&receipt.resources[0].1)
+            .unwrap()
+            .as_slice(),
+        b"x"
+    );
+
+    let authority = LocalAuthority::new(HostBridge::default());
+    let workspace = prepare_workspace(
+        &fixture.store,
+        &authority,
+        &fixture.project,
+        fixture.budget.deadline(),
+    )
+    .unwrap();
+    let before = fixture.store.project(&fixture.project).unwrap();
+    // Build each input inline: the one-element slice must live through the call.
+    let retained = [decimal.as_slice()];
+    let candidate = prepare_native_sources(
+        &fixture.store,
+        &workspace.witness,
+        &authority,
+        &fixture.budget,
+        &NativeSourceInput {
+            project: &fixture.project,
+            expected_revision: &receipt.project_revision,
+            documents: &[],
+            retained_resources: &retained,
+            raw_resources: &[],
+        },
+    )
+    .unwrap();
+    assert_eq!(candidate.retained_resources.len(), 1);
+    assert_eq!(candidate.retained_resources[0].resource, resource);
+    assert_eq!(candidate.retained_resources[0].blob, receipt.resources[0].1);
+    candidate.check_current(&fixture.store).unwrap();
+
+    let bad = [invalid.as_slice()];
+    let error = prepare_native_sources(
+        &fixture.store,
+        &workspace.witness,
+        &authority,
+        &fixture.budget,
+        &NativeSourceInput {
+            project: &fixture.project,
+            expected_revision: &receipt.project_revision,
+            documents: &[],
+            retained_resources: &bad,
+            raw_resources: &[],
+        },
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error.code, "INVALID_INPUT");
+    assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
+
+    authority
+        .revoke_project(workspace.witness.principal(), &fixture.project)
+        .unwrap();
+    let error = prepare_native_sources(
+        &fixture.store,
+        &workspace.witness,
+        &authority,
+        &fixture.budget,
+        &NativeSourceInput {
+            project: &fixture.project,
+            expected_revision: &receipt.project_revision,
+            documents: &[],
+            retained_resources: &bad,
+            raw_resources: &[],
+        },
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error.code, "PERMISSION_REQUIRED");
+    assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
 }
 
 #[test]

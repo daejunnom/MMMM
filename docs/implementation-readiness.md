@@ -4161,3 +4161,11 @@ Rust135 Linux의 상대 경로 preflight 검사는 통과했으나 Clippy에서 
 않는다. 획득 중 post-check 실패 등으로 이미 drop된 핸들·임시 핸들의 close는 이 보고서
 범위 밖이며, 생성이 선행된 실패를 미생성이나 안전한 재시도로 간주하지 않는다. 작성한
 모의 검사의 실제 실행과 각 OS native close 경로 검증은 후속 CI에서 확인한다.
+
+별도 raw ResourceRef metadata는 원 bytes와 최초 strict Value를 보존하면서 내부 관계·등록
+비교에 한정한 정수 복사본을 사용할 수 있도록 보강했다. 같은 원 bytes와 최초 Value를
+결속한 exact 검사를 기존 권한·현재 상태 검사 뒤, raw/Physics CAS stage와 후보 반환 전에
+통과해야 한다. 비물리 문서의 선행 CAS prestage는 남는다. Value-only retained 입력,
+저장행끼리의 비교 및 다른 문서 내부 참조에 원 lexeme 증거를 부여하지 않는다. 기존 DB의
+재인코딩된 JSON을 최초 원문으로 주장하지 않는다. `1.0`·`1e0`, 반올림 분수, 권한과
+CAS/SQL 경계를 다루는 검사를 작성했으며 실제 실행은 후속 CI에서 확인한다.

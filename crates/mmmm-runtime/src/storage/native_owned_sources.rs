@@ -138,6 +138,7 @@ enum PendingResourceSource<'a> {
     Existing(RegisteredProjectResource),
     Raw {
         metadata: &'a [u8],
+        original_metadata: Value,
         bytes: &'a [u8],
         expected: BlobRef,
     },
@@ -536,6 +537,7 @@ fn prepare(
     let mut existing_raw_metadata = Vec::new();
     for input in request.resources {
         checkpoint(store, permit, request.project, &scope)?;
+        let mut original_metadata = None;
         let resource = match input {
             NativeOwnedResourceSource::Retained { resource } => {
                 // Validate/bound the original metadata before allocating a copy.
@@ -543,7 +545,10 @@ fn prepare(
                 (*resource).clone()
             }
             NativeOwnedResourceSource::Raw { metadata, .. } => {
-                parse(store, permit, metadata, MAX_METADATA)?
+                let original = parse(store, permit, metadata, MAX_METADATA)?;
+                let comparable = raw_resource_comparison_copy(store, &original)?;
+                original_metadata = Some(original);
+                comparable
             }
         };
         let (id, blob) = resource_pin(store, &resource)?;
@@ -566,7 +571,11 @@ fn prepare(
                 return Err(invalid("Native raw resource digest or size differs"));
             }
             if let NativeOwnedResourceSource::Raw { metadata, .. } = input {
-                existing_raw_metadata.push((id, *metadata));
+                existing_raw_metadata.push((
+                    id,
+                    *metadata,
+                    original_metadata.ok_or_else(|| invalid("Native raw metadata missing"))?,
+                ));
             }
             continue;
         }
@@ -603,6 +612,8 @@ fn prepare(
                 }
                 PendingResourceSource::Raw {
                     metadata,
+                    original_metadata: original_metadata
+                        .ok_or_else(|| invalid("Native raw metadata missing"))?,
                     bytes,
                     expected: blob,
                 }
@@ -788,7 +799,7 @@ fn prepare(
             )?;
         }
     }
-    for (id, metadata) in existing_raw_metadata {
+    for (id, metadata, original_metadata) in existing_raw_metadata {
         checkpoint(store, permit, request.project, &scope)?;
         let resource = resources
             .get(&id)
@@ -799,11 +810,21 @@ fn prepare(
             metadata,
             MAX_METADATA,
             ExactSelector::ResourceRef,
-            &resource.resource,
+            &original_metadata,
         )?;
+        // The original token is now checked; the provisional copy must still
+        // match the exact retained registration, including every other field.
+        if raw_resource_comparison_copy(store, &original_metadata)? != resource.resource {
+            return Err(conflict("Native source would replace a current resource"));
+        }
     }
     for resource in resources.values() {
-        if let PendingResourceSource::Raw { metadata, .. } = &resource.source {
+        if let PendingResourceSource::Raw {
+            metadata,
+            original_metadata,
+            ..
+        } = &resource.source
+        {
             checkpoint(store, permit, request.project, &scope)?;
             check_exact_input(
                 store,
@@ -811,8 +832,11 @@ fn prepare(
                 metadata,
                 MAX_METADATA,
                 ExactSelector::ResourceRef,
-                &resource.resource,
+                original_metadata,
             )?;
+            if raw_resource_comparison_copy(store, original_metadata)? != resource.resource {
+                return Err(StorageError::RawExactCaptureUnavailable);
+            }
         }
     }
     let mut staged_documents = Vec::with_capacity(documents.len());
@@ -1363,6 +1387,31 @@ fn resource_pin(store: &DurableStore, resource: &Value) -> StorageResult<(Resour
         return Err(invalid("Native ResourceRef metadata budget"));
     }
     super::artifact::validate_resource(&store.validator, resource).map_err(artifact_error)
+}
+
+/// Private comparison copy for a ResourceRef parsed from this request's raw
+/// metadata bytes. This is provisional: a parsed float may have rounded an
+/// inexact decimal, so the caller must check the original bytes and Value with
+/// `check_exact_input` before staging or publishing. Existing stored rows and
+/// Value-only retained inputs never pass through this conversion.
+fn raw_resource_comparison_copy(store: &DurableStore, original: &Value) -> StorageResult<Value> {
+    let original_error = match resource_pin(store, original) {
+        Ok(_) => return Ok(original.clone()),
+        Err(error) => error,
+    };
+    if original.get("sizeBytes").and_then(Value::as_u64).is_some()
+        || !matches!(encode_json(original), Ok(encoded) if encoded.len() <= MAX_METADATA)
+        || store.validator.validate("ResourceRef", original).is_err()
+    {
+        return Err(original_error);
+    }
+    let Ok(comparable) = normalize_mesh_resource_ref(original) else {
+        return Err(original_error);
+    };
+    if resource_pin(store, &comparable).is_err() {
+        return Err(original_error);
+    }
+    Ok(comparable)
 }
 fn require_project_resource(
     project: &ProjectId,

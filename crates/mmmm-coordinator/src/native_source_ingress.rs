@@ -114,6 +114,7 @@ struct PreparedDocument {
 }
 struct PreparedRawResource {
     resource: Value,
+    original_metadata: Value,
     metadata_bytes: Vec<u8>,
     metadata_digest: Sha256Digest,
     bytes: Vec<u8>,
@@ -188,7 +189,8 @@ impl PreparedNativeSources {
                     &self.access,
                     &resource.metadata_bytes,
                     MAX_RESOURCE_METADATA,
-                )? != resource.resource
+                )? != resource.original_metadata
+                || comparable_raw_resource(&resource.original_metadata)? != resource.resource
                 || raw_digest(&resource.bytes) != resource.digest
             {
                 return Err(conflict());
@@ -648,27 +650,33 @@ pub fn prepare_native_sources(
         .map(|pin| (pin.kind, pin.object_id.clone()))
         .collect::<BTreeSet<_>>();
     let mut resources = BTreeMap::new();
+    // Retain the exact strict parse used to form each provisional comparison
+    // copy until its own input bytes have passed the original-token gate.
+    let mut retained_metadata = Vec::with_capacity(input.retained_resources.len());
     for raw in input.retained_resources {
         let value = parse_checked(&access, raw, MAX_RESOURCE_METADATA)?;
-        insert_resource(&mut resources, value)?;
+        insert_resource(&mut resources, comparable_raw_resource(&value)?)?;
+        retained_metadata.push((*raw, value));
     }
     let mut raw_resources = BTreeMap::new();
     for raw in input.raw_resources {
         access.check_store(store)?;
         let value = parse_checked(&access, raw.metadata, MAX_RESOURCE_METADATA)?;
         let (id, digest) = check_raw_resource(&value, raw.bytes)?;
+        let comparable = comparable_raw_resource(&value)?;
         if catalog.resource_ids().contains(&id)
             || resources.contains_key(&id)
             || raw_resources.contains_key(&id)
         {
             return Err(conflict());
         }
-        insert_resource(&mut resources, value.clone())?;
+        insert_resource(&mut resources, comparable.clone())?;
         access.check_local()?;
         raw_resources.insert(
             id,
             PreparedRawResource {
-                resource: value,
+                resource: comparable,
+                original_metadata: value,
                 metadata_bytes: raw.metadata.to_vec(),
                 metadata_digest: raw_digest(raw.metadata),
                 bytes: raw.bytes.to_vec(),
@@ -1020,15 +1028,22 @@ pub fn prepare_native_sources(
     // Run new original-token checks only after the original prepare path,
     // including authorization, membership, and exact source rechecks, has
     // succeeded. This preserves those failures when both are present.
-    for raw in input.retained_resources {
+    for (raw, original) in retained_metadata {
         prepared.access.check_store(store)?;
         let expected = parse_checked(&prepared.access, raw, MAX_RESOURCE_METADATA)?;
+        if expected != original {
+            return Err(AppError::caused_by(
+                "CAPABILITY_UNAVAILABLE",
+                "Native exact source validation could not confirm the parsed value",
+                ExactSourceMismatch,
+            ));
+        }
         require_exact_source(
             &prepared.access,
             raw,
             MAX_RESOURCE_METADATA,
             ExactSelector::ResourceRef,
-            &expected,
+            &original,
         )?;
     }
     for resource in &prepared.raw_resources {
@@ -1038,7 +1053,7 @@ pub fn prepare_native_sources(
             &resource.metadata_bytes,
             MAX_RESOURCE_METADATA,
             ExactSelector::ResourceRef,
-            &resource.resource,
+            &resource.original_metadata,
         )?;
     }
     for document in &prepared.documents {
@@ -1236,6 +1251,19 @@ fn check_input_budget(input: &NativeSourceInput<'_>) -> AppResult<()> {
     }
     Ok(())
 }
+/// This is a tentative comparison copy of *separate raw metadata*, not an
+/// exact-decimal witness. A rounded fraction may appear integral here. The
+/// original bytes must pass `require_exact_source` before preparation returns.
+fn comparable_raw_resource(value: &Value) -> AppResult<Value> {
+    // Keep the original Value-only validation and metadata budget before
+    // deriving a private comparison representation.
+    validate("ResourceRef", value)?;
+    if encode_json(value).map_err(|_| budget_error())?.len() > MAX_RESOURCE_METADATA {
+        return Err(budget_error());
+    }
+    normalize_mesh_resource_ref(value).map_err(domain_error)
+}
+
 fn check_raw_resource(value: &Value, bytes: &[u8]) -> AppResult<(ResourceId, Sha256Digest)> {
     validate("ResourceRef", value)?;
     let id = decode(&value["resourceId"])?;
