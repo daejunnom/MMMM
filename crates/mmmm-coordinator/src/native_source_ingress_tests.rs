@@ -1003,9 +1003,8 @@ fn prefab_decimal_resource_rejects_rounded_fraction_and_preserves_request_errors
 fn retained_integer_prefab_is_read_from_actual_cas_and_keeps_current_authority() {
     let mut fixture = Fixture::new();
     let (mut owner, resource, _) = prefab_with_decimal_resource(false, "1.0");
-    // This retained fixture uses the already-supported integer representation.
-    // It does not claim Runtime can yet commit a Prefab whose original JSON
-    // contains N.0 or preserve such a representation in a prior source.
+    // This retained fixture exercises the integer representation. The separate
+    // decimal-prefab test covers its own raw bytes and retained source path.
     owner["resources"][0]["sizeBytes"] = json!(1);
     owner["revision"] = json!(projected_digest("Prefab", &owner).unwrap());
     let owner_bytes = encode_json(&owner).unwrap();
@@ -1075,6 +1074,100 @@ fn retained_integer_prefab_is_read_from_actual_cas_and_keeps_current_authority()
     );
     assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
     assert_eq!(fixture.store.read_blob(&retained.1).unwrap(), owner_bytes);
+}
+
+#[test]
+fn decimal_prefab_commit_preserves_raw_bytes_and_authorized_retained_source() {
+    for geometry in [false, true] {
+        for token in ["1.0", "1e0"] {
+            let mut fixture = Fixture::new();
+            let (owner, resource, bytes) = prefab_with_decimal_resource(geometry, token);
+            let metadata = encode_json(&resource).unwrap();
+            let source = [NativeSourceDocument {
+                kind: NativeSourceKind::Prefab,
+                bytes: &bytes,
+            }];
+            let raw = [NativeRawSourceResource {
+                metadata: &metadata,
+                bytes: b"x",
+            }];
+            let prepared = fixture.prepare_raw(&source, &[], &raw).unwrap();
+            assert_eq!(prepared.documents[0].original_bytes, bytes);
+            assert_eq!(prepared.documents[0].value, owner);
+            let expected_revision = projected_digest("Prefab", &owner).unwrap();
+            assert_eq!(prepared.documents[0].pin.revision, expected_revision);
+            let receipt = prepared.commit(&mut fixture.store).unwrap();
+            let (pin, blob) = receipt
+                .documents
+                .iter()
+                .find(|(pin, _)| pin.kind == OwnedDocumentKind::Prefab)
+                .unwrap();
+            assert_eq!(pin.revision, expected_revision);
+            assert_eq!(blob.digest, raw_digest(&bytes));
+            assert_eq!(blob.byte_length, bytes.len() as u64);
+            assert_eq!(fixture.store.read_blob(blob).unwrap(), bytes);
+
+            let authority = LocalAuthority::new(HostBridge::default());
+            let workspace = prepare_workspace(
+                &fixture.store,
+                &authority,
+                &fixture.project,
+                fixture.budget.deadline(),
+            )
+            .unwrap();
+            assert_eq!(workspace.project_revision, receipt.project_revision);
+            assert!(
+                workspace.context["scope"]["objectIds"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&owner["prefabId"])
+            );
+            assert!(
+                workspace.context["scope"]["resourceIds"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&resource["resourceId"])
+            );
+
+            // Make an authored draft from the integer fixture, then bind it to
+            // the actual original Prefab revision without rewriting the stored
+            // source or relying on a Value-only decimal witness.
+            let mut authored_instance = instance(&prefab());
+            authored_instance["prefabRevision"] = json!(pin.revision.as_str());
+            authored_instance["revision"] =
+                json!(projected_digest("Instance", &authored_instance).unwrap());
+            let instance_bytes = encode_json(&authored_instance).unwrap();
+            let instance_source = [NativeSourceDocument {
+                kind: NativeSourceKind::Instance,
+                bytes: &instance_bytes,
+            }];
+            let retained = prepare_native_sources(
+                &fixture.store,
+                &workspace.witness,
+                &authority,
+                &fixture.budget,
+                &NativeSourceInput {
+                    project: &fixture.project,
+                    expected_revision: &receipt.project_revision,
+                    documents: &instance_source,
+                    retained_resources: &[],
+                    raw_resources: &[],
+                },
+            )
+            .unwrap();
+            retained.check_current(&fixture.store).unwrap();
+            let before = fixture.store.project(&fixture.project).unwrap();
+            authority
+                .revoke_project(workspace.witness.principal(), &fixture.project)
+                .unwrap();
+            assert_eq!(
+                retained.check_current(&fixture.store).unwrap_err().code,
+                "PERMISSION_REQUIRED"
+            );
+            assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
+            assert_eq!(fixture.store.read_blob(blob).unwrap(), bytes);
+        }
+    }
 }
 
 #[test]

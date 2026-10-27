@@ -4200,3 +4200,8 @@ exact 검사를 마쳐야 Prefab·Physics·raw resource CAS를 stage한다. 기�
 수 있다. 검사 후 권한 철회 시 최종 transaction 재검사는 commit을 막지만 그 전에 미참조
 CAS가 남을 수 있다. 보유 문서 전체나 일반 owned-document API에 원문 검사를 새로 강제하지
 않는다. 작성한 실제 commit 경로 검사의 실행과 게임 검증은 별도다.
+
+Prefab 두 ResourceRef 위치의 `1.0`·`1e0`에 대해 Coordinator prepare→Runtime commit의
+receipt·원 digest/길이와 실제 CAS bytes, 새 workspace scope, 보유 Prefab의 Instance prepare,
+Project 권한 철회 뒤 거절을 연결하는 검사를 작성했다. Instance commit·resource별 ACL·게임은
+그 범위가 아니며, 실제 검사 실행 결과는 후속 CI에서 확인한다.
