@@ -206,16 +206,15 @@ impl Selection {
             if keep_semantic {
                 let mut geometry = BTreeMap::new();
                 for node in array(typed_prefab, "nodes")? {
-                    if let Some(resource) = node.get("geometryResource") {
-                        if geometry
+                    if let Some(resource) = node.get("geometryResource")
+                        && geometry
                             .insert(text(node, "nodeId")?.to_owned(), resource.clone())
                             .is_some()
-                        {
-                            return Err(ExchangeError::new(
-                                "OBJECT_MAPPING_AMBIGUOUS",
-                                "Duplicate geometry node ID",
-                            ));
-                        }
+                    {
+                        return Err(ExchangeError::new(
+                            "OBJECT_MAPPING_AMBIGUOUS",
+                            "Duplicate geometry node ID",
+                        ));
                     }
                 }
                 semantic_prefabs.insert(

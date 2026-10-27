@@ -4257,3 +4257,8 @@ exact 오류 원인을 확인한다. `scene.diff` 인증 fixture에서 planner�
 capture는 거절한다. sourceMap·display·opaque는 선택하지 않고 기존 공개 selector/오류를
 유지한다. 각 위치·span과 입력에는 유한 예산이 있으며 동기 parse/schema는 hard preemption을
 보장하지 않는다. 아직 제품 소비자·CAS·ACL에 연결하지 않았고 테스트 실행은 후속 CI 대상이다.
+
+`475bc63` Rust144 Linux의 실제 test는 성공했고 이전 decimal Prefab 실패 두 검사도 각각
+통과했다. 뒤이은 strict Clippy는 Selection의 중첩 `if` 한 곳을 `collapsible_if`로 거절했다.
+원 로그와 정상 drain/export·scratch 제거·lease 해제 결과를 보존한다. 수정은 기존 평가·중복
+오류 순서를 유지하는 let-chain이며 lint 완화는 없다. 수정 후 실제 검사는 후속 CI에서 확인한다.
