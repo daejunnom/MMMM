@@ -4100,6 +4100,15 @@ Clippy에서 실패했다. 후속 소스는 사용하지 않는 staged 필드만
 쓰는 pending 값은 유지한다. macOS는 Coordinator 검사 439개 통과 후 `native_stdio`의 내부
 종료 확인에서 EPERM과 `IdentityNotTerminal`로 실패했으며, 바깥 관리 실행의 정상 drain과
 구분한다. 두 원 실패는 보존하고 후속 검사나 과거 실패와 같은 원인으로 재분류하지 않는다.
+macOS 원 EPERM 뒤 같은 owner·identity의 `status=2`, exit pending, terminal ESRCH가 실제
+관측된 경우에만 원 deadline 아래 최대 두 번, 각 5ms의 제한된 재관측을 수행하도록 했다.
+Pending은 종료가 아니다. 새 확인은 기존 실제 동일 identity zombie 두 관측, WNOWAIT 종료,
+scope no-live·UID 재확인과 두 번의 안정 drain 및 reap을 모두 거쳐야 한다. 최초 EPERM,
+가장 최근 해당 시도의 최초 pending·재확인 횟수 및 최종 결과를 함께 보존한다. 기존 공개
+facts equality·Deref·Box 크기와 pending 없는 Debug 형식을 유지한다. 두 5ms 대기는 협조적
+제한이며 OS 스케줄이나 native I/O를 강제 중단하는 hard timeout이 아니다. 원 Rust132
+로그에는 후속 zombie 전이가 없어 이 변경으로 원 실패가 해결됐다고 단정할 수 없다.
+소스에 전이·실패·진단 보존 검사를 작성했으며 실제 검사와 macOS 관측은 별도로 확인한다.
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

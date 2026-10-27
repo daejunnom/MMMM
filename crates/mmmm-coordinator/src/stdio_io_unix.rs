@@ -757,9 +757,14 @@ impl Process {
                         native_errno,
                         postcheck: DarwinStdioSignalPostcheck::NotAttempted,
                     };
-                    let terminal_scope = mac_signal_failure_terminal_scope(
-                        &mut failure,
-                        owner_confirmed,
+                    let mut pending_history = None;
+                    let terminal_scope = mac_signal_failure_terminal_scope_with_retry(
+                        DarwinStdioPostcheckContext {
+                            failure: &mut failure,
+                            pending_history: &mut pending_history,
+                            owner_confirmed,
+                            maximum_rechecks: MAC_SIGNAL_PENDING_MAX_RECHECKS,
+                        },
                         || {
                             identity.is_some_and(|identity| {
                                 identity.uid == unsafe { libc::geteuid() }
@@ -787,11 +792,23 @@ impl Process {
                             Ok((exited, empty))
                         },
                         || super::deadline_check(deadline),
+                        || {
+                            // A poll holds the Bridge lock. Limit this path to
+                            // two short pauses and the original deadline.
+                            let interval = Duration::from_millis(5);
+                            if deadline.saturating_duration_since(Instant::now()) <= interval {
+                                return Err(StdioError::new("deadline"));
+                            }
+                            std::thread::sleep(interval);
+                            super::deadline_check(deadline)
+                        },
                     );
                     if failure.postcheck.requires_identity_uncertainty() {
                         self.identity_uncertain = true;
                     }
-                    self.resources.evidence.0.parent_last_signal_failure = Some(failure);
+                    self.resources
+                        .evidence
+                        .record_signal_attempt(failure, pending_history);
                     if terminal_scope {
                         // The signal still failed. No further signal is needed;
                         // the original stable drain and reap remain required.
@@ -1075,14 +1092,60 @@ fn check_worker_gap_at(encoded: u64, now: u64) -> Result<(), StdioError> {
 /// Parent polls and child admission samples have different coverage. The
 /// child's later samples are enforced locally but are not transmitted here.
 #[cfg(target_os = "macos")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DarwinStdioResources(Box<DarwinStdioResourceFacts>);
+#[derive(Clone)]
+pub struct DarwinStdioResources(Box<DarwinStdioResourceStorage>);
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Eq, PartialEq)]
+struct DarwinStdioResourceStorage {
+    facts: DarwinStdioResourceFacts,
+    pending_signal_history: Option<DarwinStdioPendingSignal>,
+}
+
+// Preserve the pre-existing public equality semantics: the auxiliary pending
+// history is independently observable and does not change resource facts.
+#[cfg(target_os = "macos")]
+impl PartialEq for DarwinStdioResources {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.facts == other.0.facts
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Eq for DarwinStdioResources {}
+
+#[cfg(target_os = "macos")]
+impl std::ops::Deref for DarwinStdioResourceStorage {
+    type Target = DarwinStdioResourceFacts;
+    fn deref(&self) -> &Self::Target {
+        &self.facts
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::ops::DerefMut for DarwinStdioResourceStorage {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.facts
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Debug for DarwinStdioResources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut tuple = f.debug_tuple("DarwinStdioResources");
+        tuple.field(&self.0.facts);
+        if let Some(history) = &self.0.pending_signal_history {
+            tuple.field(history);
+        }
+        tuple.finish()
+    }
+}
 
 #[cfg(target_os = "macos")]
 impl std::ops::Deref for DarwinStdioResources {
     type Target = DarwinStdioResourceFacts;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.0.facts
     }
 }
 
@@ -1131,48 +1194,83 @@ pub struct DarwinStdioResourceFacts {
 
 #[cfg(target_os = "macos")]
 impl DarwinStdioResources {
+    /// The first pending status, pending flag, terminal errno and subsequent
+    /// identity-check count in this owner's most recent post-EPERM attempt.
+    /// This is diagnostic evidence, not proof of exit, drain, or signal success.
+    pub fn pending_signal_history(&self) -> Option<(u32, bool, Option<i32>, u8)> {
+        self.0.pending_signal_history.map(|history| {
+            (
+                history.initial_status,
+                history.initial_exit_pending,
+                history.initial_terminal_query_errno,
+                history.identity_rechecks,
+            )
+        })
+    }
+    fn record_signal_attempt(
+        &mut self,
+        failure: DarwinStdioSignalFailure,
+        history: Option<DarwinStdioPendingSignal>,
+    ) {
+        self.0.facts.parent_last_signal_failure = Some(failure);
+        self.0.pending_signal_history = history;
+    }
     fn pending() -> Self {
-        Self(Box::new(DarwinStdioResourceFacts {
-            policy: "darwin-stdio-sampled-resources/1",
-            vm_limit_bytes: MAC_VM_LIMIT,
-            rss_threshold_bytes: MAC_PHYSICAL_THRESHOLD,
-            footprint_threshold_bytes: MAC_PHYSICAL_THRESHOLD,
-            worker_limit: 1,
-            target_sample_interval_millis: MAC_SAMPLE_TARGET_MILLIS,
-            maximum_sample_gap_millis: MAC_MAX_GAP_MILLIS,
-            sampling_may_overshoot: true,
-            activation_memory_coverage_unknown: true,
-            activation_interval_millis: None,
-            parent_samples: 0,
-            parent_peak_vm_bytes: 0,
-            parent_peak_rss_bytes: 0,
-            parent_peak_footprint_bytes: 0,
-            parent_maximum_sample_gap_millis: 0,
-            parent_elapsed_millis: 0,
-            parent_sampling_is_poll_driven: true,
-            parent_confirmed_zombie_observations: 0,
-            parent_exit_pending_observations: 0,
-            parent_last_exit_observation: None,
-            parent_last_resource_failure: None,
-            parent_last_resource_error: None,
-            parent_terminal_identity_query_errno: None,
-            parent_last_signal_failure: None,
-            child_admitted: false,
-            child_as_soft_bytes: None,
-            child_as_hard_bytes: None,
-            child_admission_samples: None,
-            child_admission_vm_bytes: None,
-            child_admission_rss_bytes: None,
-            child_admission_footprint_bytes: None,
-            child_admission_peak_vm_bytes: None,
-            child_admission_peak_rss_bytes: None,
-            child_admission_peak_footprint_bytes: None,
-            child_admission_maximum_sample_gap_millis: None,
-            child_admission_elapsed_millis: None,
-            child_samples_after_admission_unobserved: true,
-            child_watchdog_gap_detection_may_be_delayed: true,
+        Self(Box::new(DarwinStdioResourceStorage {
+            facts: DarwinStdioResourceFacts {
+                policy: "darwin-stdio-sampled-resources/1",
+                vm_limit_bytes: MAC_VM_LIMIT,
+                rss_threshold_bytes: MAC_PHYSICAL_THRESHOLD,
+                footprint_threshold_bytes: MAC_PHYSICAL_THRESHOLD,
+                worker_limit: 1,
+                target_sample_interval_millis: MAC_SAMPLE_TARGET_MILLIS,
+                maximum_sample_gap_millis: MAC_MAX_GAP_MILLIS,
+                sampling_may_overshoot: true,
+                activation_memory_coverage_unknown: true,
+                activation_interval_millis: None,
+                parent_samples: 0,
+                parent_peak_vm_bytes: 0,
+                parent_peak_rss_bytes: 0,
+                parent_peak_footprint_bytes: 0,
+                parent_maximum_sample_gap_millis: 0,
+                parent_elapsed_millis: 0,
+                parent_sampling_is_poll_driven: true,
+                parent_confirmed_zombie_observations: 0,
+                parent_exit_pending_observations: 0,
+                parent_last_exit_observation: None,
+                parent_last_resource_failure: None,
+                parent_last_resource_error: None,
+                parent_terminal_identity_query_errno: None,
+                parent_last_signal_failure: None,
+                child_admitted: false,
+                child_as_soft_bytes: None,
+                child_as_hard_bytes: None,
+                child_admission_samples: None,
+                child_admission_vm_bytes: None,
+                child_admission_rss_bytes: None,
+                child_admission_footprint_bytes: None,
+                child_admission_peak_vm_bytes: None,
+                child_admission_peak_rss_bytes: None,
+                child_admission_peak_footprint_bytes: None,
+                child_admission_maximum_sample_gap_millis: None,
+                child_admission_elapsed_millis: None,
+                child_samples_after_admission_unobserved: true,
+                child_watchdog_gap_detection_may_be_delayed: true,
+            },
+            pending_signal_history: None,
         }))
     }
+}
+
+/// A retained initial pending fact and the number of fresh identity checks.
+/// A pending observation alone never establishes terminal ownership or drain.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DarwinStdioPendingSignal {
+    initial_status: u32,
+    initial_exit_pending: bool,
+    initial_terminal_query_errno: Option<i32>,
+    identity_rechecks: u8,
 }
 
 /// Signal failure and its subsequent bounded observations are separate facts.
@@ -1326,14 +1424,61 @@ fn mac_terminal_scope_is_empty(
 }
 
 #[cfg(target_os = "macos")]
+const MAC_SIGNAL_PENDING_MAX_RECHECKS: u8 = 2;
+
+#[cfg(target_os = "macos")]
+struct DarwinStdioPostcheckContext<'a> {
+    failure: &'a mut DarwinStdioSignalFailure,
+    pending_history: &'a mut Option<DarwinStdioPendingSignal>,
+    owner_confirmed: bool,
+    maximum_rechecks: u8,
+}
+
+#[cfg(target_os = "macos")]
+#[cfg(test)]
 fn mac_signal_failure_terminal_scope(
     failure: &mut DarwinStdioSignalFailure,
     owner_confirmed: bool,
-    mut current_uid_matches: impl FnMut() -> bool,
+    current_uid_matches: impl FnMut() -> bool,
     verify_identity: impl FnOnce() -> Result<VerifiedMacIdentity, StdioError>,
     observe_scope: impl FnOnce() -> Result<(Option<i32>, bool), StdioError>,
-    mut checkpoint: impl FnMut() -> Result<(), StdioError>,
+    checkpoint: impl FnMut() -> Result<(), StdioError>,
 ) -> bool {
+    let mut once = Some(verify_identity);
+    mac_signal_failure_terminal_scope_with_retry(
+        DarwinStdioPostcheckContext {
+            failure,
+            pending_history: &mut None,
+            owner_confirmed,
+            maximum_rechecks: 0,
+        },
+        current_uid_matches,
+        || {
+            once.take()
+                .expect("zero-retry fixture observes identity once")()
+        },
+        observe_scope,
+        checkpoint,
+        || panic!("zero-retry fixture cannot pause"),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn mac_signal_failure_terminal_scope_with_retry(
+    context: DarwinStdioPostcheckContext<'_>,
+    mut current_uid_matches: impl FnMut() -> bool,
+    mut verify_identity: impl FnMut() -> Result<VerifiedMacIdentity, StdioError>,
+    observe_scope: impl FnOnce() -> Result<(Option<i32>, bool), StdioError>,
+    mut checkpoint: impl FnMut() -> Result<(), StdioError>,
+    mut retry_pause: impl FnMut() -> Result<(), StdioError>,
+) -> bool {
+    let DarwinStdioPostcheckContext {
+        failure,
+        pending_history,
+        owner_confirmed,
+        maximum_rechecks,
+    } = context;
+    let maximum_rechecks = maximum_rechecks.min(MAC_SIGNAL_PENDING_MAX_RECHECKS);
     if failure.signal_result != -1 || failure.native_errno != libc::EPERM {
         return false;
     }
@@ -1351,17 +1496,53 @@ fn mac_signal_failure_terminal_scope(
             failure.postcheck = DarwinStdioSignalPostcheck::UidBeforeMismatch;
             return Ok(false);
         }
-        phase = "identity";
-        checkpoint()?;
-        let verified = verify_identity()?;
-        if verified.status != 5 || verified.exit_pending {
+        let mut is_recheck = false;
+        let verified = loop {
+            phase = "identity";
+            checkpoint()?;
+            if is_recheck {
+                let history = pending_history
+                    .as_mut()
+                    .ok_or_else(|| StdioError::new("native_resource_identity"))?;
+                history.identity_rechecks += 1;
+            }
+            let verified = verify_identity()?;
+            if verified.status == 5 && !verified.exit_pending {
+                break verified;
+            }
             failure.postcheck = DarwinStdioSignalPostcheck::IdentityNotTerminal {
                 status: verified.status,
                 exit_pending: verified.exit_pending,
                 terminal_query_errno: verified.terminal_query_errno,
             };
-            return Ok(false);
-        }
+            // The actual same-identity lookup returned ESRCH while BSD still
+            // reported this exact nonterminal state. It is pending, not exit.
+            if verified.status != 2
+                || !verified.exit_pending
+                || verified.terminal_query_errno != Some(libc::ESRCH)
+            {
+                return Ok(false);
+            }
+            let history = pending_history.get_or_insert(DarwinStdioPendingSignal {
+                initial_status: verified.status,
+                initial_exit_pending: verified.exit_pending,
+                initial_terminal_query_errno: verified.terminal_query_errno,
+                identity_rechecks: 0,
+            });
+            if history.identity_rechecks >= maximum_rechecks {
+                return Ok(false);
+            }
+            phase = "retry_pause";
+            checkpoint()?;
+            retry_pause()?;
+            checkpoint()?;
+            phase = "uid_before_retry";
+            if !current_uid_matches() {
+                failure.postcheck = DarwinStdioSignalPostcheck::UidBeforeMismatch;
+                return Ok(false);
+            }
+            is_recheck = true;
+        };
         phase = "terminal_scope";
         checkpoint()?;
         let mut observed = None;
@@ -2316,6 +2497,486 @@ fn mac_members(group: i32, identity: (u64, u64), deadline: Instant) -> Result<us
 #[cfg(all(test, target_os = "macos"))]
 mod resource_policy_tests {
     use super::*;
+
+    fn pending_identity() -> VerifiedMacIdentity {
+        VerifiedMacIdentity {
+            status: 2,
+            terminal_query_errno: Some(libc::ESRCH),
+            exit_pending: true,
+        }
+    }
+
+    fn zombie_identity() -> VerifiedMacIdentity {
+        VerifiedMacIdentity {
+            status: 5,
+            terminal_query_errno: Some(libc::ESRCH),
+            exit_pending: false,
+        }
+    }
+
+    fn failed_signal() -> DarwinStdioSignalFailure {
+        DarwinStdioSignalFailure {
+            signal_result: -1,
+            native_errno: libc::EPERM,
+            postcheck: DarwinStdioSignalPostcheck::NotAttempted,
+        }
+    }
+
+    #[test]
+    fn darwin_pending_signal_rechecks_require_fresh_terminal_scope() {
+        let mut failure = failed_signal();
+        let mut history = None;
+        let mut identities = 0;
+        let mut pauses = 0;
+        let mut uid_checks = 0;
+        let mut scopes = 0;
+        let confirmed = mac_signal_failure_terminal_scope_with_retry(
+            DarwinStdioPostcheckContext {
+                failure: &mut failure,
+                pending_history: &mut history,
+                owner_confirmed: true,
+                maximum_rechecks: 2,
+            },
+            || {
+                uid_checks += 1;
+                true
+            },
+            || {
+                identities += 1;
+                Ok(if identities == 1 {
+                    pending_identity()
+                } else {
+                    zombie_identity()
+                })
+            },
+            || {
+                scopes += 1;
+                Ok((Some(0), true))
+            },
+            || Ok(()),
+            || {
+                pauses += 1;
+                Ok(())
+            },
+        );
+        assert!(confirmed);
+        assert_eq!((identities, pauses, uid_checks, scopes), (2, 1, 3, 1));
+        assert_eq!(
+            (failure.signal_result, failure.native_errno),
+            (-1, libc::EPERM)
+        );
+        assert_eq!(
+            failure.postcheck,
+            DarwinStdioSignalPostcheck::ConfirmedTerminalScope { exit_code: 0 }
+        );
+        assert_eq!(
+            history,
+            Some(DarwinStdioPendingSignal {
+                initial_status: 2,
+                initial_exit_pending: true,
+                initial_terminal_query_errno: Some(libc::ESRCH),
+                identity_rechecks: 1,
+            })
+        );
+        // Terminal scope is not drain: the caller still requires the existing
+        // stable observations and the real Child reap before issuing proof.
+    }
+
+    #[test]
+    fn darwin_pending_last_bounded_recheck_can_observe_terminal_scope() {
+        let mut failure = failed_signal();
+        let mut history = None;
+        let mut identities = 0;
+        let mut pauses = 0;
+        let mut scopes = 0;
+        assert!(mac_signal_failure_terminal_scope_with_retry(
+            DarwinStdioPostcheckContext {
+                failure: &mut failure,
+                pending_history: &mut history,
+                owner_confirmed: true,
+                maximum_rechecks: 2
+            },
+            || true,
+            || {
+                identities += 1;
+                Ok(if identities <= 2 {
+                    pending_identity()
+                } else {
+                    zombie_identity()
+                })
+            },
+            || {
+                scopes += 1;
+                Ok((Some(0), true))
+            },
+            || Ok(()),
+            || {
+                pauses += 1;
+                Ok(())
+            },
+        ));
+        assert_eq!((identities, pauses, scopes), (3, 2, 1));
+        assert_eq!(history.unwrap().identity_rechecks, 2);
+        assert_eq!(
+            (failure.signal_result, failure.native_errno),
+            (-1, libc::EPERM)
+        );
+        assert_eq!(
+            failure.postcheck,
+            DarwinStdioSignalPostcheck::ConfirmedTerminalScope { exit_code: 0 }
+        );
+    }
+
+    #[test]
+    fn darwin_pending_recheck_count_does_not_include_deadline_before_identity_call() {
+        let mut failure = failed_signal();
+        let mut history = None;
+        let mut checks = 0;
+        let mut identities = 0;
+        let mut pauses = 0;
+        assert!(!mac_signal_failure_terminal_scope_with_retry(
+            DarwinStdioPostcheckContext {
+                failure: &mut failure,
+                pending_history: &mut history,
+                owner_confirmed: true,
+                maximum_rechecks: 2
+            },
+            || true,
+            || {
+                identities += 1;
+                Ok(pending_identity())
+            },
+            || panic!("deadline cannot query terminal scope"),
+            || {
+                checks += 1;
+                // initial, UID, first identity, pre-pause, post-pause, then
+                // the checkpoint immediately before the next identity call.
+                if checks == 6 {
+                    Err(StdioError::new("deadline"))
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                pauses += 1;
+                Ok(())
+            },
+        ));
+        assert_eq!((identities, pauses), (1, 1));
+        assert_eq!(history.unwrap().identity_rechecks, 0);
+        assert_eq!(
+            (failure.signal_result, failure.native_errno),
+            (-1, libc::EPERM)
+        );
+        assert_eq!(
+            failure.postcheck,
+            DarwinStdioSignalPostcheck::ObservationFailed {
+                phase: "identity",
+                code: "deadline",
+                native_code: None,
+                native_code_unknown: false,
+            }
+        );
+    }
+
+    #[test]
+    fn darwin_pending_signal_is_bounded_and_other_identity_states_do_not_retry() {
+        let mut failure = failed_signal();
+        let mut history = None;
+        let mut identities = 0;
+        let mut pauses = 0;
+        assert!(!mac_signal_failure_terminal_scope_with_retry(
+            DarwinStdioPostcheckContext {
+                failure: &mut failure,
+                pending_history: &mut history,
+                owner_confirmed: true,
+                maximum_rechecks: 255
+            },
+            || true,
+            || {
+                identities += 1;
+                Ok(pending_identity())
+            },
+            || panic!("pending identity cannot query terminal scope"),
+            || Ok(()),
+            || {
+                pauses += 1;
+                Ok(())
+            },
+        ));
+        assert_eq!((identities, pauses), (3, 2));
+        assert_eq!(history.unwrap().identity_rechecks, 2);
+        assert_eq!(
+            (failure.signal_result, failure.native_errno),
+            (-1, libc::EPERM)
+        );
+        assert_eq!(
+            failure.postcheck,
+            DarwinStdioSignalPostcheck::IdentityNotTerminal {
+                status: 2,
+                exit_pending: true,
+                terminal_query_errno: Some(libc::ESRCH),
+            }
+        );
+        for (status, pending, errno) in [
+            (2, false, Some(libc::ESRCH)),
+            (2, true, None),
+            (2, true, Some(libc::EPERM)),
+            (5, true, Some(libc::ESRCH)),
+            (3, true, Some(libc::ESRCH)),
+        ] {
+            let mut failure = failed_signal();
+            let mut history = None;
+            assert!(!mac_signal_failure_terminal_scope_with_retry(
+                DarwinStdioPostcheckContext {
+                    failure: &mut failure,
+                    pending_history: &mut history,
+                    owner_confirmed: true,
+                    maximum_rechecks: 2
+                },
+                || true,
+                || Ok(VerifiedMacIdentity {
+                    status,
+                    exit_pending: pending,
+                    terminal_query_errno: errno
+                }),
+                || panic!("unconfirmed identity cannot query terminal scope"),
+                || Ok(()),
+                || panic!("only exact pending ESRCH may pause"),
+            ));
+            assert!(history.is_none());
+            assert_eq!(
+                failure.postcheck,
+                DarwinStdioSignalPostcheck::IdentityNotTerminal {
+                    status,
+                    exit_pending: pending,
+                    terminal_query_errno: errno,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn darwin_pending_signal_preserves_primary_failure_and_retry_outcomes() {
+        for case in 0..7 {
+            let mut failure = failed_signal();
+            let mut history = None;
+            let mut identities = 0;
+            let mut uids = 0;
+            let result = mac_signal_failure_terminal_scope_with_retry(
+                DarwinStdioPostcheckContext {
+                    failure: &mut failure,
+                    pending_history: &mut history,
+                    owner_confirmed: true,
+                    maximum_rechecks: 2,
+                },
+                || {
+                    uids += 1;
+                    match case {
+                        1 => uids == 1,
+                        6 => uids < 3,
+                        _ => true,
+                    }
+                },
+                || {
+                    identities += 1;
+                    if identities == 1 {
+                        return Ok(pending_identity());
+                    }
+                    if case == 2 {
+                        return Err(StdioError::new("native_resource_identity"));
+                    }
+                    if case == 3 {
+                        return Ok(VerifiedMacIdentity {
+                            status: 2,
+                            exit_pending: false,
+                            terminal_query_errno: None,
+                        });
+                    }
+                    Ok(zombie_identity())
+                },
+                || match case {
+                    4 => Ok((Some(0), false)),
+                    6 => Ok((Some(0), true)),
+                    _ => Ok((None, true)),
+                },
+                || Ok(()),
+                || {
+                    if case == 0 {
+                        Err(StdioError::new("deadline"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(!result, "case {case}");
+            assert_eq!(
+                (failure.signal_result, failure.native_errno),
+                (-1, libc::EPERM)
+            );
+            assert!(
+                history.is_some(),
+                "initial pending must survive case {case}"
+            );
+            match case {
+                0 => assert!(matches!(
+                    failure.postcheck,
+                    DarwinStdioSignalPostcheck::ObservationFailed {
+                        phase: "retry_pause",
+                        code: "deadline",
+                        ..
+                    }
+                )),
+                1 => assert_eq!(
+                    failure.postcheck,
+                    DarwinStdioSignalPostcheck::UidBeforeMismatch
+                ),
+                2 => assert!(matches!(
+                    failure.postcheck,
+                    DarwinStdioSignalPostcheck::ObservationFailed {
+                        phase: "identity",
+                        code: "native_resource_identity",
+                        ..
+                    }
+                )),
+                3 => assert_eq!(
+                    failure.postcheck,
+                    DarwinStdioSignalPostcheck::IdentityNotTerminal {
+                        status: 2,
+                        exit_pending: false,
+                        terminal_query_errno: None
+                    }
+                ),
+                4 => assert_eq!(failure.postcheck, DarwinStdioSignalPostcheck::ScopeNotEmpty),
+                5 => assert_eq!(
+                    failure.postcheck,
+                    DarwinStdioSignalPostcheck::ChildNotExited
+                ),
+                _ => assert_eq!(
+                    failure.postcheck,
+                    DarwinStdioSignalPostcheck::UidAfterMismatch
+                ),
+            }
+            assert_eq!(
+                failure.postcheck.requires_identity_uncertainty(),
+                matches!(case, 1 | 2 | 6)
+            );
+        }
+        let mut failure = failed_signal();
+        let mut history = None;
+        failure.native_errno = libc::EACCES;
+        assert!(!mac_signal_failure_terminal_scope_with_retry(
+            DarwinStdioPostcheckContext {
+                failure: &mut failure,
+                pending_history: &mut history,
+                owner_confirmed: true,
+                maximum_rechecks: 2
+            },
+            || panic!("non-EPERM cannot query UID"),
+            || panic!("non-EPERM cannot query identity"),
+            || panic!("non-EPERM cannot query scope"),
+            || panic!("non-EPERM cannot checkpoint"),
+            || panic!("non-EPERM cannot pause"),
+        ));
+        assert!(history.is_none());
+        assert_eq!(failure.postcheck, DarwinStdioSignalPostcheck::NotAttempted);
+    }
+
+    #[test]
+    fn darwin_pending_signal_diagnostics_keep_public_resource_shape() {
+        let mut resources = DarwinStdioResources::pending();
+        assert_eq!(
+            std::mem::size_of_val(&resources),
+            std::mem::size_of::<Box<()>>()
+        );
+        assert_eq!(
+            format!("{resources:?}"),
+            format!("DarwinStdioResources({:?})", &*resources)
+        );
+        assert_eq!(resources.pending_signal_history(), None);
+        let baseline = resources.clone();
+        resources.0.pending_signal_history = Some(DarwinStdioPendingSignal {
+            initial_status: 2,
+            initial_exit_pending: true,
+            initial_terminal_query_errno: Some(libc::ESRCH),
+            identity_rechecks: 1,
+        });
+        assert_eq!(
+            resources, baseline,
+            "pending history must not change the existing facts-only equality"
+        );
+        assert_ne!(
+            resources.pending_signal_history(),
+            baseline.pending_signal_history()
+        );
+        let mut different_facts = resources.clone();
+        different_facts.0.parent_samples = 1;
+        assert_ne!(
+            resources, different_facts,
+            "resource facts still control equality"
+        );
+        let history = resources.0.pending_signal_history;
+        resources.record_signal_attempt(
+            DarwinStdioSignalFailure {
+                signal_result: -1,
+                native_errno: libc::EPERM,
+                postcheck: DarwinStdioSignalPostcheck::ConfirmedTerminalScope { exit_code: 0 },
+            },
+            history,
+        );
+        assert_eq!(
+            resources.pending_signal_history(),
+            Some((2, true, Some(libc::ESRCH), 1))
+        );
+        let evidence = resources.clone();
+        let signal = evidence.parent_last_signal_failure.as_ref().unwrap();
+        assert_eq!(
+            (signal.signal_result, signal.native_errno),
+            (-1, libc::EPERM)
+        );
+        assert_eq!(
+            signal.postcheck,
+            DarwinStdioSignalPostcheck::ConfirmedTerminalScope { exit_code: 0 }
+        );
+        assert_eq!(
+            evidence.pending_signal_history(),
+            Some((2, true, Some(libc::ESRCH), 1))
+        );
+        assert!(format!("{resources:?}").contains("DarwinStdioPendingSignal"));
+        // A later signal attempt replaces both components together; the
+        // accessor describes that attempt rather than the owner's lifetime.
+        resources.record_signal_attempt(
+            DarwinStdioSignalFailure {
+                signal_result: -1,
+                native_errno: libc::EPERM,
+                postcheck: DarwinStdioSignalPostcheck::UidBeforeMismatch,
+            },
+            None,
+        );
+        assert_eq!(resources.pending_signal_history(), None);
+        assert_eq!(
+            resources
+                .parent_last_signal_failure
+                .as_ref()
+                .unwrap()
+                .postcheck,
+            DarwinStdioSignalPostcheck::UidBeforeMismatch
+        );
+        assert_eq!(
+            evidence.pending_signal_history(),
+            Some((2, true, Some(libc::ESRCH), 1)),
+            "an earlier returned evidence clone remains unchanged"
+        );
+        assert_eq!(
+            evidence
+                .parent_last_signal_failure
+                .as_ref()
+                .unwrap()
+                .postcheck,
+            DarwinStdioSignalPostcheck::ConfirmedTerminalScope { exit_code: 0 },
+            "an earlier returned signal result remains unchanged"
+        );
+    }
     use mmmm_native_process::darwin::MemoryObservation;
 
     fn sample() -> MemoryObservation {
