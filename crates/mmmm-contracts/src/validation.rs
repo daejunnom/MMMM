@@ -1,13 +1,13 @@
 //! Schema validation is a format boundary, not authorization or a claim that a
 //! referenced object, world, vendor, or release evidence exists.
 
-pub use crate::strict_json::{ExactSelector, PrefabExactLocation};
+pub use crate::strict_json::{ExactSelector, PrefabExactLocation, SelectionExactLocation};
 use crate::{
     CANONICAL_SCHEMA, CANONICAL_SCHEMA_ID, CONTRACT_VERSION, FUNCTION_INDEX, RationalTime,
     strict_json::{
         ControlledJsonError, JsonError, JsonLimits, RawExactError, RawPrefabExactError,
-        check_value, parse_json, parse_json_with_exact_capture,
-        parse_prefab_json_with_exact_capture,
+        RawSelectionExactError, check_value, parse_json, parse_json_with_exact_capture,
+        parse_prefab_json_with_exact_capture, parse_selection_json_with_exact_capture,
     },
 };
 use jsonschema::{
@@ -147,6 +147,73 @@ impl<E: Error + 'static> Error for ControlledPrefabContractError<E> {
             Self::Control(error) => Some(error),
             Self::ExactInteger { .. } | Self::CaptureUnavailable => None,
         }
+    }
+}
+
+/// Exact numeric validation of Prefabs embedded in a SceneSelectionSnapshot.
+/// Locations identify the actual input arrays without exposing source tokens.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ControlledSelectionContractError<E> {
+    Contract(ContractError),
+    ExactInteger { location: SelectionExactLocation },
+    CaptureUnavailable,
+    Control(E),
+}
+
+impl<E: fmt::Display> fmt::Display for ControlledSelectionContractError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Contract(error) => error.fmt(f),
+            Self::ExactInteger { location } => match location.location {
+                PrefabExactLocation::Resource(index) => write!(
+                    f,
+                    "Selection Prefab {} resource {index} sizeBytes is not an exact safe JSON integer",
+                    location.prefab
+                ),
+                PrefabExactLocation::Geometry(index) => write!(
+                    f,
+                    "Selection Prefab {} node {index} geometry sizeBytes is not an exact safe JSON integer",
+                    location.prefab
+                ),
+            },
+            Self::CaptureUnavailable => f.write_str("Bounded raw numeric capture is unavailable"),
+            Self::Control(error) => error.fmt(f),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for ControlledSelectionContractError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Contract(error) => Some(error),
+            Self::Control(error) => Some(error),
+            Self::ExactInteger { .. } | Self::CaptureUnavailable => None,
+        }
+    }
+}
+
+fn controlled_selection_json_error<E>(
+    error: ControlledJsonError<E>,
+) -> ControlledSelectionContractError<E> {
+    match error {
+        ControlledJsonError::Json(error) => {
+            ControlledSelectionContractError::Contract(error.into())
+        }
+        ControlledJsonError::Control(error) => ControlledSelectionContractError::Control(error),
+    }
+}
+
+fn controlled_selection_exact_error<E>(
+    error: RawSelectionExactError<E>,
+) -> ControlledSelectionContractError<E> {
+    match error {
+        RawSelectionExactError::ExactInteger { location } => {
+            ControlledSelectionContractError::ExactInteger { location }
+        }
+        RawSelectionExactError::CaptureUnavailable => {
+            ControlledSelectionContractError::CaptureUnavailable
+        }
+        RawSelectionExactError::Control(error) => ControlledSelectionContractError::Control(error),
     }
 }
 
@@ -429,6 +496,30 @@ impl ContractValidator {
         Ok(parsed.into_value())
     }
 
+    /// Strictly parse and validate a complete SceneSelectionSnapshot, then
+    /// check only its embedded Prefabs' resource and geometry size lexemes on
+    /// the same immutable input bytes. This does not attest another document,
+    /// sourceMap numbers, CAS provenance, resource availability or authority.
+    /// Parsing and private capture are bounded; schema validation and each
+    /// synchronous operation are cooperative and cannot be preempted.
+    pub fn parse_validate_selection_exact_with_control<E>(
+        &self,
+        bytes: &[u8],
+        limits: JsonLimits,
+        mut checkpoint: impl FnMut() -> Result<(), E>,
+    ) -> Result<Value, ControlledSelectionContractError<E>> {
+        let parsed = parse_selection_json_with_exact_capture(bytes, limits, &mut checkpoint)
+            .map_err(controlled_selection_json_error)?;
+        self.validate("SceneSelectionSnapshot", parsed.value())
+            .map_err(ControlledSelectionContractError::Contract)?;
+        checkpoint().map_err(ControlledSelectionContractError::Control)?;
+        parsed
+            .validate_exact(&mut checkpoint)
+            .map_err(controlled_selection_exact_error)?;
+        checkpoint().map_err(ControlledSelectionContractError::Control)?;
+        Ok(parsed.into_value())
+    }
+
     pub fn validate(&self, definition: &str, value: &Value) -> Result<(), ContractError> {
         let violations = self.violations(definition, value)?;
         if violations.is_empty() {
@@ -541,6 +632,7 @@ fn schema_violations(validator: &Validator, value: &Value) -> Vec<ContractViolat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::strict_json::parse_json_with_control;
     use serde_json::json;
     use std::cell::Cell;
     use std::sync::OnceLock;
@@ -711,6 +803,238 @@ mod tests {
         validator().parse_validate_prefab_exact_with_control(bytes, JsonLimits::default(), || {
             Ok::<(), std::convert::Infallible>(())
         })
+    }
+
+    // This uses the existing Selection and Prefab examples. The two embedded
+    // Prefabs have independent numeric tokens even when serde parses the
+    // resulting values identically. Non-selected sourceMap and extension
+    // tokens deliberately retain a fraction that rounds to a binary64 integer.
+    fn selection_exact_wire(tokens: [[&str; 4]; 2], prefabs_first: bool, escaped: bool) -> Vec<u8> {
+        let mut selection =
+            parse_json(include_bytes!("../../../examples/scene-selection.json")).unwrap();
+        selection["sourceMap"]["sizeBytes"] = json!(970001);
+        let first = prefab_exact_wire(
+            [
+                tokens[0][0],
+                tokens[0][1],
+                tokens[0][2],
+                tokens[0][3],
+                "1.0000000000000001",
+            ],
+            false,
+            escaped,
+        );
+        let second = prefab_exact_wire(
+            [
+                tokens[1][0],
+                tokens[1][1],
+                tokens[1][2],
+                tokens[1][3],
+                "1.0000000000000001",
+            ],
+            true,
+            escaped,
+        );
+        selection
+            .as_object_mut()
+            .unwrap()
+            .remove("prefabs")
+            .unwrap();
+        let mut rest = serde_json::to_string(&selection).unwrap();
+        assert_eq!(rest.matches("970001").count(), 1);
+        rest = rest.replacen("970001", "1.0000000000000001", 1);
+        let key = if escaped { "\\u0070refabs" } else { "prefabs" };
+        let prefabs = format!(
+            "\"{key}\":[{},{}]",
+            std::str::from_utf8(&first).unwrap(),
+            std::str::from_utf8(&second).unwrap()
+        );
+        if prefabs_first {
+            assert!(rest.starts_with('{'));
+            rest.insert_str(1, &format!("{prefabs},"));
+        } else {
+            assert_eq!(rest.pop(), Some('}'));
+            rest.push_str(&format!(",{prefabs}}}"));
+        }
+        rest.into_bytes()
+    }
+
+    fn exact_selection(
+        bytes: &[u8],
+    ) -> Result<Value, ControlledSelectionContractError<std::convert::Infallible>> {
+        validator().parse_validate_selection_exact_with_control(
+            bytes,
+            JsonLimits::default(),
+            || Ok::<(), std::convert::Infallible>(()),
+        )
+    }
+
+    #[test]
+    fn selection_exact_binds_all_nested_locations_to_its_own_bytes() {
+        let baseline_tokens = [
+            ["1.0", "1e0", "-0.0", "9007199254740991"],
+            ["1.0", "1e0", "0", "1"],
+        ];
+        for prefabs_first in [false, true] {
+            for escaped in [false, true] {
+                let valid = selection_exact_wire(baseline_tokens, prefabs_first, escaped);
+                let ordinary = validator()
+                    .parse_and_validate("SceneSelectionSnapshot", &valid)
+                    .unwrap();
+                assert_eq!(exact_selection(&valid).unwrap(), ordinary);
+                for prefab in 0..2 {
+                    for index in 0..4 {
+                        let mut tokens = baseline_tokens;
+                        // Compare equal parsed floating-point Values despite
+                        // different original decimal mathematical values.
+                        tokens[prefab][index] = "1.0000000000000001";
+                        let bad = selection_exact_wire(tokens, prefabs_first, escaped);
+                        if prefab == 0 && index == 0 {
+                            assert_eq!(parse_json(&bad).unwrap(), parse_json(&valid).unwrap());
+                        }
+                        assert!(
+                            validator()
+                                .parse_and_validate("SceneSelectionSnapshot", &bad)
+                                .is_ok()
+                        );
+                        let location = SelectionExactLocation {
+                            prefab,
+                            location: if index < 2 {
+                                PrefabExactLocation::Resource(index)
+                            } else {
+                                PrefabExactLocation::Geometry(index - 2)
+                            },
+                        };
+                        let error = exact_selection(&bad).unwrap_err();
+                        assert!(
+                            matches!(&error, ControlledSelectionContractError::ExactInteger { location: actual } if *actual == location)
+                        );
+                        assert!(!error.to_string().contains("1.0000000000000001"));
+                    }
+                }
+            }
+        }
+        let mut empty = parse_json(&selection_exact_wire(baseline_tokens, false, false)).unwrap();
+        empty["prefabs"] = json!([]);
+        let wire = serde_json::to_vec(&empty).unwrap();
+        assert_eq!(exact_selection(&wire).unwrap(), empty);
+
+        let mut no_geometry =
+            parse_json(&selection_exact_wire(baseline_tokens, false, false)).unwrap();
+        no_geometry["prefabs"][0]["resources"] = json!([]);
+        for node in no_geometry["prefabs"][0]["nodes"].as_array_mut().unwrap() {
+            node.as_object_mut().unwrap().remove("geometryResource");
+        }
+        let wire = serde_json::to_vec(&no_geometry).unwrap();
+        assert_eq!(exact_selection(&wire).unwrap(), no_geometry);
+    }
+
+    #[test]
+    fn selection_exact_keeps_strict_schema_budget_and_control_errors() {
+        let wire = selection_exact_wire(
+            [["1.0000000000000001", "1", "1", "1"], ["1"; 4]],
+            false,
+            false,
+        );
+        let text = std::str::from_utf8(&wire).unwrap();
+        let duplicate = text.replacen("\"prefabs\":", "\"prefabs\":[],\"\\u0070refabs\":", 1);
+        assert_ne!(duplicate, text);
+        let strict = parse_json(duplicate.as_bytes()).unwrap_err();
+        assert_eq!(
+            exact_selection(duplicate.as_bytes()),
+            Err(ControlledSelectionContractError::Contract(
+                ContractError::Json(strict)
+            ))
+        );
+        let malformed = text.replacen("1.0000000000000001", "1e+", 1);
+        let strict = parse_json(malformed.as_bytes()).unwrap_err();
+        assert_eq!(
+            exact_selection(malformed.as_bytes()),
+            Err(ControlledSelectionContractError::Contract(
+                ContractError::Json(strict)
+            ))
+        );
+        let mut trailing = wire.clone();
+        trailing.extend_from_slice(b" true");
+        let strict = parse_json(&trailing).unwrap_err();
+        assert_eq!(
+            exact_selection(&trailing),
+            Err(ControlledSelectionContractError::Contract(
+                ContractError::Json(strict)
+            ))
+        );
+        let invalid_schema = text.replacen(
+            "\"selectionId\":\"selection-shop\"",
+            "\"selectionId\":null",
+            1,
+        );
+        assert_ne!(invalid_schema, text);
+        let schema = validator()
+            .parse_and_validate("SceneSelectionSnapshot", invalid_schema.as_bytes())
+            .unwrap_err();
+        assert!(matches!(schema, ContractError::Violations(_)));
+        assert_eq!(
+            exact_selection(invalid_schema.as_bytes()),
+            Err(ControlledSelectionContractError::Contract(schema))
+        );
+        for limits in [
+            JsonLimits {
+                max_bytes: wire.len() - 1,
+                ..JsonLimits::default()
+            },
+            JsonLimits {
+                max_depth: 0,
+                ..JsonLimits::default()
+            },
+            JsonLimits {
+                max_nodes: 3,
+                ..JsonLimits::default()
+            },
+        ] {
+            let strict =
+                parse_json_with_control(&wire, limits, || Ok::<(), std::convert::Infallible>(()))
+                    .unwrap_err();
+            assert!(matches!(strict, ControlledJsonError::Json(_)));
+            assert_eq!(
+                validator().parse_validate_selection_exact_with_control(&wire, limits, || Ok::<
+                    (),
+                    std::convert::Infallible,
+                >(
+                    ()
+                )),
+                Err(controlled_selection_json_error(strict))
+            );
+        }
+        let valid = selection_exact_wire([["1.0"; 4]; 2], false, false);
+        let checkpoints = Cell::new(0_usize);
+        validator()
+            .parse_validate_selection_exact_with_control(&valid, JsonLimits::default(), || {
+                checkpoints.set(checkpoints.get() + 1);
+                Ok::<(), &'static str>(())
+            })
+            .unwrap();
+        let total = checkpoints.get();
+        assert!(total > 3);
+        for fail_at in [1, total / 2, total] {
+            let calls = Cell::new(0_usize);
+            let result = validator().parse_validate_selection_exact_with_control(
+                &valid,
+                JsonLimits::default(),
+                || {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == fail_at {
+                        Err("cancelled")
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert_eq!(
+                result,
+                Err(ControlledSelectionContractError::Control("cancelled"))
+            );
+            assert_eq!(calls.get(), fail_at);
+        }
     }
 
     #[test]

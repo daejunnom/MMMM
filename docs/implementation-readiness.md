@@ -4250,3 +4250,10 @@ exact 오류 원인을 확인한다. `scene.diff` 인증 fixture에서 planner�
 수정은 exact 원 bytes에 결속한 private typed resources·기존 node geometry만 해당 의미
 검사에 적용하고 원 Selection·node·revision과 새 create-node 입력은 변환하지 않는다.
 수정한 양성·새 node의 원문 증거 없는 decimal 거절 검사는 후속 CI에서 확인한다.
+
+별도 Selection artifact 전체 원 bytes에서 각 `prefabs[*]`의 `resources[*]`와
+`nodes[*].geometryResource` 숫자 위치를 Prefab·항목 인덱스에 결속하는 opt-in 계약 API를
+작성했다. strict JSON·schema 후 키 순서와 무관하게 exact 정수를 검사하며 누락·중복·예상 밖
+capture는 거절한다. sourceMap·display·opaque는 선택하지 않고 기존 공개 selector/오류를
+유지한다. 각 위치·span과 입력에는 유한 예산이 있으며 동기 parse/schema는 hard preemption을
+보장하지 않는다. 아직 제품 소비자·CAS·ACL에 연결하지 않았고 테스트 실행은 후속 CI 대상이다.
