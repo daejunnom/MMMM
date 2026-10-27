@@ -25,6 +25,22 @@ pub(crate) struct Sources {
 }
 
 impl Sources {
+    pub(crate) fn retained_object(
+        &self,
+        kind: OwnedKind,
+        id: &str,
+        revision: &Sha256Digest,
+    ) -> AppResult<&Value> {
+        self.objects
+            .get(&(kind, id.to_owned(), revision.clone()))
+            .ok_or_else(|| {
+                AppError::new(
+                    "SOURCE_PROVENANCE_INVALID",
+                    "Validated source is absent from the current planning call",
+                )
+            })
+    }
+
     fn account(&mut self, bytes: usize, max: u64) -> AppResult<()> {
         self.bytes = self.bytes.checked_add(bytes as u64).ok_or_else(budget)?;
         if self.bytes > max {
@@ -557,11 +573,24 @@ impl NativePlanner<'_> {
                     )?;
                     let mut request = json!({"source":before_value,"definition":definition_value,"allocatedInstanceId":id,"placement":intent["placement"],"statePolicy":intent["statePolicy"]});
                     let snapshot = if intent["statePolicy"] == "explicit_snapshot" {
+                        // These are the original validated Values retained for
+                        // this call, not independently renewed authority. The
+                        // snapshot port must recheck its own actual sources.
+                        let source_instance = sources.retained_object(
+                            OwnedKind::Instance,
+                            before.instance_id.as_str(),
+                            &before.revision,
+                        )?;
+                        let source_prefab = sources.retained_object(
+                            OwnedKind::Prefab,
+                            definition.prefab_id.as_str(),
+                            &definition.revision,
+                        )?;
                         let snapshot = self.source.state_snapshot(
                             principal,
                             project,
-                            &before_value,
-                            &definition_value,
+                            source_instance,
+                            source_prefab,
                             context,
                         )?;
                         self.load_resource(

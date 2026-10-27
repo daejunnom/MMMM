@@ -654,3 +654,222 @@ fn physics_mesh_resource_comparison_rejects_decimal_and_invalid_shape() {
         "REVISION_CONFLICT"
     );
 }
+
+// Controlled source observes the actual Planner call only; it does not claim
+// Coordinator authority, a real state codec, a completed clone or a game.
+struct SnapshotSource {
+    instance: serde_json::Value,
+    prefab: serde_json::Value,
+    prefab_bytes: Vec<u8>,
+    calls: std::rc::Rc<std::cell::Cell<usize>>,
+    deny: bool,
+}
+
+impl ProjectSourcePort for SnapshotSource {
+    fn inspect_owned(
+        &mut self,
+        _: &mmmm_contracts::PrincipalId,
+        _: &ProjectCatalog,
+        _: u64,
+    ) -> mmmm_application::AppResult<Vec<(ObjectPin, serde_json::Value)>> {
+        mesh_unexpected()
+    }
+    fn owned_object(
+        &mut self,
+        _: &mmmm_contracts::PrincipalId,
+        _: &ProjectCatalog,
+        pin: &ObjectPin,
+        _: Option<&serde_json::Value>,
+        _: u64,
+    ) -> mmmm_application::AppResult<serde_json::Value> {
+        assert_eq!(pin.kind, OwnedKind::Instance);
+        Ok(self.instance.clone())
+    }
+    fn owned_object_bytes(
+        &mut self,
+        _: &mmmm_contracts::PrincipalId,
+        _: &ProjectCatalog,
+        pin: &ObjectPin,
+        _: Option<&serde_json::Value>,
+        _: u64,
+    ) -> mmmm_application::AppResult<Option<PinnedOwnedObjectBytes>> {
+        assert_eq!(pin.kind, OwnedKind::Prefab);
+        Ok(Some(PinnedOwnedObjectBytes {
+            value: self.prefab.clone(),
+            bytes: self.prefab_bytes.clone(),
+            digest: mmmm_contracts::raw_digest(&self.prefab_bytes),
+        }))
+    }
+    fn check_owned_source(
+        &mut self,
+        _: &mmmm_contracts::PrincipalId,
+        _: &ProjectCatalog,
+        pin: &ObjectPin,
+        _: Option<&serde_json::Value>,
+    ) -> mmmm_application::AppResult<()> {
+        assert_eq!(pin.kind, OwnedKind::Prefab);
+        Ok(())
+    }
+    fn checkpoint_source(&mut self) -> mmmm_application::AppResult<()> {
+        Ok(())
+    }
+    fn resource_pin(
+        &mut self,
+        _: &mmmm_contracts::PrincipalId,
+        _: &ProjectCatalog,
+        _: &str,
+        _: Option<&serde_json::Value>,
+    ) -> mmmm_application::AppResult<mmmm_domain::types::ResourceRef> {
+        mesh_unexpected()
+    }
+    fn resource_bytes(
+        &mut self,
+        _: &mmmm_contracts::PrincipalId,
+        _: &ProjectCatalog,
+        _: &mmmm_domain::types::ResourceRef,
+        _: Option<&serde_json::Value>,
+        _: u64,
+    ) -> mmmm_application::AppResult<PinnedResourceBytes> {
+        mesh_unexpected()
+    }
+    fn stage_private(
+        &mut self,
+        _: &mmmm_contracts::PrincipalId,
+        _: &ProjectCatalog,
+        _: Option<&mmmm_contracts::ResourceId>,
+        _: &[u8],
+        _: &str,
+        _: &serde_json::Value,
+    ) -> mmmm_application::AppResult<mmmm_domain::types::ResourceRef> {
+        mesh_unexpected()
+    }
+    fn allocate_instance_id(
+        &mut self,
+        _: &mmmm_contracts::PrincipalId,
+        _: &ProjectCatalog,
+        _: &std::collections::BTreeSet<mmmm_contracts::InstanceId>,
+    ) -> mmmm_application::AppResult<mmmm_contracts::InstanceId> {
+        Ok(mmmm_contracts::InstanceId::new("instance-snapshot-clone").unwrap())
+    }
+    fn state_snapshot(
+        &mut self,
+        _: &mmmm_contracts::PrincipalId,
+        _: &ProjectCatalog,
+        instance: &serde_json::Value,
+        prefab: &serde_json::Value,
+        _: &serde_json::Value,
+    ) -> mmmm_application::AppResult<PinnedStateSnapshot> {
+        self.calls.set(self.calls.get() + 1);
+        assert_eq!(instance, &self.instance);
+        assert_eq!(prefab, &self.prefab);
+        Err(if self.deny {
+            AppError::new("FORBIDDEN", "snapshot source scope denied")
+        } else {
+            AppError::new(
+                "TEST_SNAPSHOT_SOURCE_REACHED",
+                "original source values reached the controlled port",
+            )
+        })
+    }
+    fn scene_source(
+        &mut self,
+        _: &mmmm_contracts::PrincipalId,
+        _: &ProjectCatalog,
+        _: &serde_json::Value,
+        _: &serde_json::Value,
+    ) -> mmmm_application::AppResult<SceneSource> {
+        mesh_unexpected()
+    }
+    fn validate_scene_provenance(
+        &mut self,
+        _: &mmmm_contracts::PrincipalId,
+        _: &ProjectCatalog,
+        _: &serde_json::Value,
+        _: &SceneSource,
+        _: &serde_json::Value,
+    ) -> mmmm_application::AppResult<()> {
+        mesh_unexpected()
+    }
+}
+
+#[test]
+fn clone_snapshot_receives_original_validated_values_and_preserves_port_error() {
+    use std::{cell::Cell, rc::Rc};
+    let mut prefab = parse_json(include_bytes!("../../../examples/prefab.json")).unwrap();
+    let size = prefab["resources"][0]["sizeBytes"].as_u64().unwrap();
+    prefab["resources"][0]["sizeBytes"] = json!(size as f64);
+    prefab["revision"] = json!(projected_digest("Prefab", &prefab).unwrap());
+    let prefab_bytes = serde_json::to_vec(&prefab).unwrap();
+    let mut instance = parse_json(include_bytes!("../../../examples/instance.json")).unwrap();
+    instance["placement"]["translation"][0] = json!(1);
+    instance["prefabRevision"] = prefab["revision"].clone();
+    instance["revision"] = json!(projected_digest("Instance", &instance).unwrap());
+    let mut project = parse_json(include_bytes!("../../../examples/project.json")).unwrap();
+    for pin in project["ownedResources"].as_array_mut().unwrap() {
+        if pin["kind"] == "prefab" && pin["objectId"] == prefab["prefabId"] {
+            pin["revision"] = prefab["revision"].clone();
+        }
+        if pin["kind"] == "instance" && pin["objectId"] == instance["instanceId"] {
+            pin["revision"] = instance["revision"].clone();
+        }
+    }
+    project["revision"] = json!(projected_digest("Project", &project).unwrap());
+    let catalog = ProjectCatalog::from_project(&project).unwrap();
+    let typed_prefab = decode_prefab_scoped(&prefab, || Ok(())).unwrap();
+    let typed_instance: mmmm_domain::Instance = decode("Instance", &instance).unwrap();
+    assert_ne!(wire("Prefab", &typed_prefab).unwrap(), prefab);
+    assert_ne!(wire("Instance", &typed_instance).unwrap(), instance);
+
+    for deny in [false, true] {
+        let calls = Rc::new(Cell::new(0));
+        let source = SnapshotSource {
+            instance: instance.clone(),
+            prefab: prefab.clone(),
+            prefab_bytes: prefab_bytes.clone(),
+            calls: calls.clone(),
+            deny,
+        };
+        let mut planner = NativePlanner::new(
+            Box::new(source),
+            Box::new(MeshEnvironment),
+            Box::new(mmmm_application::SystemClock),
+            PlannerOptions::default(),
+        )
+        .unwrap();
+        let intent = json!({"kind":"instance.clone","instanceId":instance["instanceId"],"expectedRevision":instance["revision"],
+            "placement":instance["placement"],"statePolicy":"explicit_snapshot","externalReferencePolicy":"preserve"});
+        let result = planner.prepare_change(
+            &mmmm_contracts::PrincipalId::new("principal-snapshot-test").unwrap(),
+            &intent,
+            &catalog,
+            &json!({}),
+        );
+        let error = match result {
+            Ok(_) => panic!("controlled snapshot port must stop preparation"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.code,
+            if deny {
+                "FORBIDDEN"
+            } else {
+                "TEST_SNAPSHOT_SOURCE_REACHED"
+            }
+        );
+        assert_eq!(calls.get(), 1);
+    }
+    let missing = crate::preparation::Sources::default();
+    let pin = catalog
+        .owned_pin(
+            OwnedKind::Instance,
+            instance["instanceId"].as_str().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        missing
+            .retained_object(OwnedKind::Instance, pin.object_id.as_str(), &pin.revision)
+            .unwrap_err()
+            .code,
+        "SOURCE_PROVENANCE_INVALID"
+    );
+}

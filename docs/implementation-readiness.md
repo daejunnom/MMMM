@@ -4316,3 +4316,11 @@ Clippy는 성공으로 처리하지 않는다. 후속 소스는 기존 scene 배
 Windows 원 검사에서도 같은 네 E0425 위치가 별도로 관측되어 테스트와 Clippy가 시작되지
 않았다. Windows 원 로그 역시 보존한다. Linux의 감독 관측 오류를 같은 컴파일 원인으로
 재분류하지 않는다.
+`instance.clone`의 `explicit_snapshot`에서 typed 객체를 다시 직렬화해 원 CAS Value와
+비교하면 유효한 Prefab 정수 소수 표기나 Instance 좌표 표현이 달라 충돌할 수 있다.
+Planner는 이미 pin·내용을 검사해 보유한 원 Instance와 Prefab Value를 snapshot 포트에
+전달하고 typed clone 요청은 유지한다. 원본 보유는 현재 ACL 증거가 아니며 Coordinator의
+독립 인가와 CAS 재조회는 그대로 필요하다. 통제 포트 회귀는 원 Value 전달과 거절 전파를
+확인하도록 작성했으며 실제 실행은 후속 CI 대상이다. 관측기의 실제 CAS exact 검증과
+Planner·Coordinator typed 변환에서 opaque JSON 보존은 별도 미완료이고, 완료 clone 또는
+게임 관측을 입증하지 않는다.
