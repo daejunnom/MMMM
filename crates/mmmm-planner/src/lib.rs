@@ -41,7 +41,11 @@ pub(crate) fn decode<T: DeserializeOwned>(name: &str, value: &Value) -> AppResul
         )
     })?;
     let mut typed = value.clone();
-    normalize_resource_lengths(&mut typed);
+    // These contracts contain no ResourceRef objects. In particular, a
+    // display payload is opaque even if its keys resemble a ResourceRef.
+    if !matches!(name, "Instance" | "InstanceDraft" | "Display") {
+        normalize_resource_lengths(&mut typed);
+    }
     serde_json::from_value(typed)
         .map_err(|_| AppError::new("INVALID_INPUT", "Typed planning input is invalid"))
 }

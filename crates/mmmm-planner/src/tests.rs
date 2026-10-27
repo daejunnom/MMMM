@@ -158,6 +158,68 @@ fn typed_and_cas_codecs_preserve_large_finite_float_wire_spelling() {
 }
 
 #[test]
+fn resource_ref_shaped_display_payload_remains_opaque_in_instance_and_draft() {
+    let opaque = json!({"resourceId":"opaque-payload","sha256":"0".repeat(64),"mediaType":"application/json","sizeBytes":1.0});
+    let display = json!({"kind":"item","payload":{"nested":{"shape":opaque}},"resourceRefs":[]});
+    let typed_display: mmmm_domain::types::Display = decode("Display", &display).unwrap();
+    let display_wire = wire("Display", &typed_display).unwrap();
+    assert_eq!(display_wire["payload"]["nested"]["shape"], opaque);
+    assert!(
+        display_wire["payload"]["nested"]["shape"]["sizeBytes"]
+            .as_u64()
+            .is_none()
+    );
+
+    let mut instance = parse_json(include_bytes!("../../../examples/instance.json")).unwrap();
+    instance["overrides"] = json!([{"kind":"display","nodeId":"door","display":display}]);
+    instance["revision"] = json!(projected_digest("Instance", &instance).unwrap());
+    let typed_instance: mmmm_domain::Instance = decode("Instance", &instance).unwrap();
+    let instance_wire = wire("Instance", &typed_instance).unwrap();
+    assert_eq!(
+        instance_wire["overrides"][0]["display"]["payload"]["nested"]["shape"],
+        opaque
+    );
+    assert!(
+        instance_wire["overrides"][0]["display"]["payload"]["nested"]["shape"]["sizeBytes"]
+            .as_u64()
+            .is_none()
+    );
+
+    let draft = json!({"instance":instance,"newSymbolBindings":[],"diagnostics":[],"losses":[]});
+    let typed_draft: mmmm_domain::types::InstanceDraft = decode("InstanceDraft", &draft).unwrap();
+    let draft_wire = wire("InstanceDraft", &typed_draft).unwrap();
+    assert_eq!(
+        draft_wire["instance"]["overrides"][0]["display"]["payload"]["nested"]["shape"],
+        opaque
+    );
+    assert!(draft_wire["instance"]["overrides"][0]["display"]["payload"]["nested"]["shape"]["sizeBytes"].as_u64().is_none());
+
+    let ordinary = parse_json(include_bytes!("../../../examples/instance.json")).unwrap();
+    let ordinary_typed: mmmm_domain::Instance = decode("Instance", &ordinary).unwrap();
+    assert_eq!(
+        wire("Instance", &ordinary_typed).unwrap()["instanceId"],
+        ordinary["instanceId"]
+    );
+    let ordinary_display = json!({"kind":"text","payload":{"text":"hello"},"resourceRefs":[]});
+    let ordinary_typed: mmmm_domain::types::Display = decode("Display", &ordinary_display).unwrap();
+    assert_eq!(wire("Display", &ordinary_typed).unwrap(), ordinary_display);
+    let ordinary_draft =
+        json!({"instance":ordinary,"newSymbolBindings":[],"diagnostics":[],"losses":[]});
+    let ordinary_typed: mmmm_domain::types::InstanceDraft =
+        decode("InstanceDraft", &ordinary_draft).unwrap();
+    assert!(wire("InstanceDraft", &ordinary_typed).is_ok());
+
+    let mut invalid = display;
+    invalid["payload"] = json!([]);
+    assert_eq!(
+        decode::<mmmm_domain::types::Display>("Display", &invalid)
+            .unwrap_err()
+            .code,
+        "INVALID_INPUT"
+    );
+}
+
+#[test]
 fn prefab_comparison_preserves_original_and_value_only_requires_integer_lengths() {
     let original = parse_json(include_bytes!("../../../examples/prefab.json")).unwrap();
     require_value_only_prefab_integer_lengths(&original).unwrap();

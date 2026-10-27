@@ -4333,3 +4333,8 @@ fractional CAS, 검증 중 취소·권한 철회, 완료 clone 및 게임 관측
 다른 typed 변환과 prepared payload 경계의 opaque 보존도 별도 미완료다. 공개 scoped
 변환 helper는 원문 검증과 권한을 증명하지 않는다. 단일 schema 처리의 강제 선점이나
 전체 heap 상한과 권한의 원자적 snapshot을 보장하지 않는다.
+Planner의 `Instance`, `InstanceDraft`, `Display` decode는 schema 소유 ResourceRef 객체가
+없으므로 payload 안의 우연한 ResourceRef 모양 opaque JSON을 재귀 정규화하지 않도록 했다.
+기존 schema·인코딩 예산·serde 오류 검사를 유지하며 세 타입의 보존 회귀를 작성했다.
+실행 결과는 후속 CI에서 확인한다. 실제 ResourceRef를 소유하는 Node 및 준비된 변경
+전체 수신의 재귀 정규화 문제와 clone·prepared CAS 왕복은 별도 미완료다.
