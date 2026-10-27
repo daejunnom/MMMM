@@ -4026,6 +4026,19 @@ stderr와 process/finish 기록, 실제 drain·export·scratch 제거·lease 해
 오류 0을 보존한다. 이 실패를 코드 테스트 실패나 성공으로 재분류하지 않으며 해당 source의
 실제 테스트와 후속 CI 결과는 따로 확인한다.
 
+### CommandModule의 소유 소스 가져오기
+
+CLI `source-import`는 기존 문서 입력과 같은 방식으로 `--document command_module:<JSON>` 또는
+`--document-file command_module:<절대 경로>`를 받을 수 있다. 최초 가져오기에서는
+Prefab과 해당 CommandModule을 같은 배치에 넣고 원 계약·digest, 실제 소유자,
+Prefab의 모듈 ID와 모듈의 origin node를 확인한다. 기존 소유 문서를 참조할 때도
+현재 Store의 문서와 provenance를 확인하고, Project head·권한 및 거래 경계를 유지한다.
+기존 Prefab에 새 모듈을 나중에 연결하려면 별도의 Prefab 수정 경로가 필요하다.
+
+이 경로는 작성된 소스를 저장하며 host parsing, 게임 실행 권한이나 실제 게임 결과를
+발급하지 않는다. 실패 시 metadata transaction은 보호하지만 사전 저장한 미참조 CAS가
+남을 수 있다. 같은 배치의 정상 반영, 잘못된 관계, 취소와 기존 문서 재검사를 위한
+검사를 작성했으며 실제 컴파일·테스트 결과는 별도로 기록한다.
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

@@ -154,7 +154,7 @@ impl std::fmt::Display for EntryError {
             }
             Self::Arguments => f.write_str("Native command arguments are invalid"),
             Self::HostReadPolicyArguments => f.write_str("Host setup read policy requires unique --shape-mode survival|creative|adventure|spectator selections and optional --native-observation user_local_only; absent selections grant no corresponding source access"),
-            Self::SourceArguments => f.write_str("Native source import requires at least one document or raw resource pair and at most 256 combined document/resource inputs: --document <kind>:<JSON>, --document-file <kind>:<absolute JSON path>, and adjacent --resource-descriptor-file/--resource-bytes-file paths; kinds are prefab|instance|clip and OS argv limits may be smaller"),
+            Self::SourceArguments => f.write_str("Native source import requires at least one document or raw resource pair and at most 256 combined document/resource inputs: --document <kind>:<JSON>, --document-file <kind>:<absolute JSON path>, and adjacent --resource-descriptor-file/--resource-bytes-file paths; kinds are prefab|instance|clip|command_module and OS argv limits may be smaller"),
             Self::ManualArguments => f.write_str("Manual import requires an existing Coordinator, exact Project/head/context, an original exchange selection resource, selected absolute SourceMap/ScenePatch JSON files with unique resource IDs, and repeated --allow-delta kind,instanceId,nodeId static choices; no source rights or game-write grant is created"),
             Self::CatalogSourceArguments => f.write_str("Catalog source use requires --mode inspect or replace; replace needs --expected-state-digest and a complete set selected by --game-artifact <resourceId>/repeated --mod <canonicalId>,<nativeId>,<resourceId>, or explicit --withdraw true with no selections; <=256 selections, <=64 KiB selector metadata, user_local_only only"),
             Self::CatalogSourceRequest(error) => write!(f, "{}: Cold native catalog source use could not continue", error.code),
@@ -1578,6 +1578,7 @@ fn document_selector(value: &str) -> Result<(NativeSourceKind, &str), EntryError
         "prefab" => NativeSourceKind::Prefab,
         "instance" => NativeSourceKind::Instance,
         "clip" => NativeSourceKind::Clip,
+        "command_module" => NativeSourceKind::CommandModule,
         _ => return Err(EntryError::SourceArguments),
     };
     Ok((kind, source))
@@ -2417,16 +2418,23 @@ mod tests {
     fn source_batch_parser_preserves_original_bytes_and_closed_kinds() {
         let original = " \n{\"name\":\"a:b\",\"duplicate\":1,\"duplicate\":2}\n ";
         let mut input = import_args();
-        for (kind, source) in [("clip", "{}"), ("prefab", original), ("instance", "{}")] {
+        for (kind, source) in [
+            ("clip", "{}"),
+            ("prefab", original),
+            ("instance", "{}"),
+            ("command_module", "{\"source\":\"a:b\"}"),
+        ] {
             input.extend(["--document".into(), format!("{kind}:{source}")]);
         }
         let Some(Command::SourceImport { documents, .. }) = parse(&input).unwrap() else {
             panic!("exact native source batch was not selected");
         };
-        assert_eq!(documents.len(), 3);
+        assert_eq!(documents.len(), 4);
         assert_eq!(documents[0].kind, NativeSourceKind::Clip);
         assert_eq!(documents[1].kind, NativeSourceKind::Prefab);
         assert_eq!(documents[2].kind, NativeSourceKind::Instance);
+        assert_eq!(documents[3].kind, NativeSourceKind::CommandModule);
+        assert_eq!(documents[3].source.as_bytes(), b"{\"source\":\"a:b\"}");
         assert_eq!(documents[1].source.as_bytes(), original.as_bytes());
         // The CLI must not silently parse/normalize the duplicate key away;
         // the original strict ingress owns its actual semantic rejection.
@@ -2439,7 +2447,16 @@ mod tests {
             parse(&import_args()),
             Err(EntryError::SourceArguments)
         ));
-        for document in ["prefab", "prefab:", "asset:{}", "Prefab:{}", "clip :{}"] {
+        for document in [
+            "prefab",
+            "prefab:",
+            "asset:{}",
+            "Prefab:{}",
+            "clip :{}",
+            "command-module:{}",
+            "CommandModule:{}",
+            "command_module :{}",
+        ] {
             let mut input = import_args();
             input.extend(args(&["--document", document]));
             assert!(matches!(parse(&input), Err(EntryError::SourceArguments)));
@@ -2893,7 +2910,7 @@ mod tests {
     }
 
     #[test]
-    fn cold_native_batch_commits_actual_clip_sources_and_retains_delivery_failure() {
+    fn cold_native_batch_commits_clip_and_command_module_sources_and_retains_delivery_failure() {
         let root = ImportRoot::new();
         let initialized = root.initialize();
         let (budget, cancelled) = import_budget();
@@ -2907,9 +2924,19 @@ mod tests {
         }
         clip["revision"] = json!(projected_digest("AnimationClip", &clip).unwrap());
         prefab["clipIds"] = json!([clip["clipId"]]);
+        // Keep the original command example as authoring data. Its parseStatus
+        // is not a host parser attestation or an execution permission.
+        let mut module =
+            parse_json(include_bytes!("../../../examples/command-module.json")).unwrap();
+        module["moduleId"] = json!("module-entry");
+        module["ownerPrefabId"] = prefab["prefabId"].clone();
+        module["localOriginNodeId"] = prefab["nodes"][0]["nodeId"].clone();
+        module["revision"] = json!(projected_digest("CommandModule", &module).unwrap());
+        prefab["commandModuleIds"] = json!([module["moduleId"]]);
         prefab["revision"] = json!(projected_digest("Prefab", &prefab).unwrap());
         let prefab_bytes = [b" \n".as_slice(), &encode_json(&prefab).unwrap(), b"\n "].concat();
         let clip_bytes = encode_json(&clip).unwrap();
+        let module_bytes = encode_json(&module).unwrap();
         let mut input = args(&[
             "source-import",
             "--data-root",
@@ -2924,6 +2951,13 @@ mod tests {
         input.extend([
             "--document".into(),
             format!("clip:{}", String::from_utf8(clip_bytes.clone()).unwrap()),
+        ]);
+        input.extend([
+            "--document".into(),
+            format!(
+                "command_module:{}",
+                String::from_utf8(module_bytes.clone()).unwrap()
+            ),
         ]);
         input.extend([
             "--document".into(),
@@ -2960,7 +2994,7 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.base_revision, initialized.project_revision);
         assert_ne!(receipt.project_revision, receipt.base_revision);
-        assert_eq!(receipt.documents.len(), 2);
+        assert_eq!(receipt.documents.len(), 3);
         let stored = root.open();
         assert_eq!(
             stored.project(&project).unwrap()["revision"],
@@ -2977,6 +3011,9 @@ mod tests {
                 mmmm_runtime::storage::owned_documents::OwnedDocumentKind::Prefab => &prefab_bytes,
                 mmmm_runtime::storage::owned_documents::OwnedDocumentKind::AnimationClip => {
                     &clip_bytes
+                }
+                mmmm_runtime::storage::owned_documents::OwnedDocumentKind::CommandModule => {
+                    &module_bytes
                 }
                 _ => panic!("unexpected admitted document kind"),
             };
@@ -3214,12 +3251,17 @@ mod tests {
     #[test]
     fn selected_file_parser_preserves_drive_colons_and_requires_adjacent_raw_pairs() {
         let document = PathBuf::from(root()).join("selected-prefab.json");
+        let module = PathBuf::from(root()).join("selected-command-module.json");
         let descriptor = PathBuf::from(root()).join("resource-reference.json");
         let bytes = PathBuf::from(root()).join("selected-content.bin");
         let mut input = import_args();
         input.extend([
             "--document-file".into(),
             format!("prefab:{}", document.display()),
+        ]);
+        input.extend([
+            "--document-file".into(),
+            format!("command_module:{}", module.display()),
         ]);
         input.extend([
             "--resource-descriptor-file".into(),
@@ -3239,9 +3281,11 @@ mod tests {
             panic!("explicit file batch not selected");
         };
         assert!(documents.is_empty());
-        assert_eq!(document_files.len(), 1);
+        assert_eq!(document_files.len(), 2);
         assert_eq!(document_files[0].kind, NativeSourceKind::Prefab);
         assert_eq!(document_files[0].path, document);
+        assert_eq!(document_files[1].kind, NativeSourceKind::CommandModule);
+        assert_eq!(document_files[1].path, module);
         assert_eq!(raw_resources.len(), 1);
         assert_eq!(raw_resources[0].descriptor, descriptor);
         assert_eq!(raw_resources[0].bytes, bytes);

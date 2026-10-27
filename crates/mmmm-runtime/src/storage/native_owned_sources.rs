@@ -123,7 +123,7 @@ struct PreparedSources {
     next_revision: Sha256Digest,
     project_blob: BlobRef,
     documents: Vec<StagedDocument>,
-    carried_documents: Vec<OwnedDocumentPin>,
+    carried_documents: Vec<(OwnedDocumentPin, BlobRef)>,
     resources: BTreeMap<ResourceId, StagedResource>,
     new_resource_ids: Vec<ResourceId>,
     scope: WriteScope,
@@ -190,7 +190,7 @@ pub fn commit_native_owned_sources(
             &mut check,
         )?;
     }
-    for pin in &staged.carried_documents {
+    for (pin, _) in &staged.carried_documents {
         check()?;
         carry_owned_provenance(
             &transaction,
@@ -317,6 +317,7 @@ fn request_scope(request: &NativeOwnedSourceCommitRequest<'_>) -> StorageResult<
             OwnedDocumentKind::Prefab
                 | OwnedDocumentKind::Instance
                 | OwnedDocumentKind::AnimationClip
+                | OwnedDocumentKind::CommandModule
         ) || document.bytes.is_empty()
             || document.bytes.len() as u64 > MAX_OWNED_DOCUMENT_BYTES
             || !identities.insert((document.pin.kind, document.pin.object_id.clone()))
@@ -444,7 +445,7 @@ fn prepare(
             OwnedDocumentKind::Instance => {
                 append(&mut expected, "instanceIds", json!(document.pin.object_id))?
             }
-            OwnedDocumentKind::AnimationClip => (),
+            OwnedDocumentKind::AnimationClip | OwnedDocumentKind::CommandModule => (),
             _ => return Err(invalid("Native source authoring kind")),
         }
         append(
@@ -572,6 +573,27 @@ fn prepare(
             "Native source Project is not the exact membership-only derivation",
         ));
     }
+    // Only retain existing bodies needed for the new Prefab/CommandModule pairs.
+    // They are read by the same authorized history reader as all carried sources.
+    let mut related = BTreeSet::new();
+    for document in &documents {
+        checkpoint(store, permit, request.project, &scope)?;
+        match document.pin.kind {
+            OwnedDocumentKind::CommandModule => {
+                related.insert((
+                    OwnedDocumentKind::Prefab,
+                    decode(&document.value["ownerPrefabId"])?,
+                ));
+            }
+            OwnedDocumentKind::Prefab => {
+                for id in array(&document.value, "commandModuleIds")? {
+                    related.insert((OwnedDocumentKind::CommandModule, decode(id)?));
+                }
+            }
+            _ => (),
+        }
+    }
+    let mut retained = BTreeMap::new();
     let mut owned_reader = permit.owned_document_reader(MAX_OWNED_DOCUMENT_BYTES)?;
     let mut carried_documents = Vec::new();
     for pin in base_pins.values() {
@@ -584,10 +606,36 @@ fn prepare(
             pin,
         )?;
         account(&mut remaining, loaded.blob.byte_length)?;
-        carried_documents.push(pin.clone());
+        if related.contains(&(pin.kind, pin.object_id.clone())) {
+            retained.insert((pin.kind, pin.object_id.clone()), loaded.document);
+        }
+        carried_documents.push((pin.clone(), loaded.blob));
     }
     for document in &documents {
         require_references(&document.value, &after_pins, &resources)?;
+        checkpoint(store, permit, request.project, &scope)?;
+        match document.pin.kind {
+            OwnedDocumentKind::CommandModule => {
+                let owner = decode(&document.value["ownerPrefabId"])?;
+                let prefab =
+                    related_document(OwnedDocumentKind::Prefab, &owner, &documents, &retained)?;
+                require_command_module_binding(prefab, &document.value)?;
+            }
+            OwnedDocumentKind::Prefab => {
+                for id in array(&document.value, "commandModuleIds")? {
+                    checkpoint(store, permit, request.project, &scope)?;
+                    let id = decode(id)?;
+                    let module = related_document(
+                        OwnedDocumentKind::CommandModule,
+                        &id,
+                        &documents,
+                        &retained,
+                    )?;
+                    require_command_module_binding(&document.value, module)?;
+                }
+            }
+            _ => (),
+        }
     }
     let project_blob = stage_bytes(store, permit, request.project_bytes)?;
     checkpoint(store, permit, request.project, &scope)?;
@@ -662,19 +710,65 @@ fn recheck_sources(
         }
     }
     let mut owned_reader = permit.owned_document_reader(MAX_OWNED_DOCUMENT_BYTES)?;
-    for pin in &staged.carried_documents {
-        owned_reader.read_known_history_bytes(
+    for (pin, previous_blob) in &staged.carried_documents {
+        checkpoint(store, permit, request.project, &staged.scope)?;
+        let loaded = owned_reader.read_known_history_bytes(
             store,
             &rpc,
             request.project,
             request.expected_revision,
             pin,
         )?;
+        if &loaded.blob != previous_blob {
+            return Err(conflict("Native carried document provenance changed"));
+        }
     }
     for document in &staged.documents {
         verify_blob(store, permit, &document.blob)?;
     }
     verify_blob(store, permit, &staged.project_blob)
+}
+
+fn related_document<'a>(
+    kind: OwnedDocumentKind,
+    id: &ObjectId,
+    documents: &'a [StagedDocument],
+    retained: &'a BTreeMap<(OwnedDocumentKind, ObjectId), Value>,
+) -> StorageResult<&'a Value> {
+    documents
+        .iter()
+        .find(|document| document.pin.kind == kind && &document.pin.object_id == id)
+        .map(|document| &document.value)
+        .or_else(|| retained.get(&(kind, id.clone())))
+        .ok_or_else(|| invalid("Native source has no actual related document"))
+}
+
+fn require_command_module_binding(prefab: &Value, module: &Value) -> StorageResult<()> {
+    let prefab_id = prefab
+        .get("prefabId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("Native CommandModule owner identity missing"))?;
+    let module_id = module
+        .get("moduleId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("Native CommandModule identity missing"))?;
+    let origin = module
+        .get("localOriginNodeId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("Native CommandModule origin missing"))?;
+    if module.get("ownerPrefabId").and_then(Value::as_str) != Some(prefab_id)
+        || !array(prefab, "commandModuleIds")?
+            .iter()
+            .any(|id| id.as_str() == Some(module_id))
+        || !array(prefab, "nodes")?
+            .iter()
+            .any(|node| node.get("nodeId").and_then(Value::as_str) == Some(origin))
+    {
+        return Err(invalid(
+            "Native CommandModule owner, membership or origin differs",
+        ));
+    }
+    Ok(())
 }
 
 fn require_references(
@@ -698,7 +792,7 @@ fn require_references(
     if let Some(id) = document.get("ownerPrefabId")
         && !pins.contains_key(&(OwnedDocumentKind::Prefab, decode(id)?))
     {
-        return Err(invalid("Native Clip has no owned Prefab membership"));
+        return Err(invalid("Native source has no owned Prefab membership"));
     }
     if let Some(id) = document.get("sourceMapResourceId")
         && !resources.contains_key(&decode::<ResourceId>(id)?)

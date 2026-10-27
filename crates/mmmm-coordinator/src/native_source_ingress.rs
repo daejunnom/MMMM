@@ -14,6 +14,7 @@ use mmmm_contracts::{
 };
 use mmmm_domain::{
     Instance, Prefab,
+    commands::CommandModule,
     instance::require_source,
     prefab::semantic_diagnostics,
     time::{AnimationClip, validate_clip},
@@ -67,6 +68,7 @@ pub enum NativeSourceKind {
     Prefab,
     Instance,
     Clip,
+    CommandModule,
 }
 impl NativeSourceKind {
     fn stored(self) -> OwnedDocumentKind {
@@ -74,6 +76,7 @@ impl NativeSourceKind {
             Self::Prefab => OwnedDocumentKind::Prefab,
             Self::Instance => OwnedDocumentKind::Instance,
             Self::Clip => OwnedDocumentKind::AnimationClip,
+            Self::CommandModule => OwnedDocumentKind::CommandModule,
         }
     }
 }
@@ -666,6 +669,7 @@ pub fn prepare_native_sources(
             NativeSourceKind::Prefab => OwnedKind::Prefab,
             NativeSourceKind::Instance => OwnedKind::Instance,
             NativeSourceKind::Clip => OwnedKind::Clip,
+            NativeSourceKind::CommandModule => OwnedKind::CommandModule,
         };
         if !identities.insert((identity_kind, pin.object_id.clone())) {
             return Err(AppError::new(
@@ -712,15 +716,20 @@ pub fn prepare_native_sources(
         });
     }
     let mut retained_total = policy_bytes.len() as u64;
-    let mut clip_prefabs = BTreeMap::new();
+    let mut owner_prefabs = BTreeMap::new();
     for document in &documents {
-        if document.pin.kind != OwnedDocumentKind::AnimationClip {
-            continue;
-        }
+        let owner_id = match document.pin.kind {
+            OwnedDocumentKind::AnimationClip => {
+                decode_domain::<AnimationClip>(&document.value)?.owner_prefab_id
+            }
+            OwnedDocumentKind::CommandModule => {
+                decode_domain::<CommandModule>(&document.value)?.owner_prefab_id
+            }
+            _ => continue,
+        };
         access.check_store(store)?;
-        let clip: AnimationClip = decode_domain(&document.value)?;
         if let std::collections::btree_map::Entry::Vacant(entry) =
-            clip_prefabs.entry(clip.owner_prefab_id.clone())
+            owner_prefabs.entry(owner_id.clone())
         {
             let value = authoring_source(
                 store,
@@ -728,13 +737,12 @@ pub fn prepare_native_sources(
                 &catalog,
                 &documents,
                 OwnedKind::Prefab,
-                clip.owner_prefab_id.as_str(),
+                owner_id.as_str(),
                 &mut retained_total,
             )?;
             let prefab: Prefab = decode_domain(&value)?;
-            // Clip has no separate Asset/ResourceRef fields. Its geometry and
-            // display sources belong to its actual owner Prefab; recheck those
-            // declared resources through the original current ACL/CAS reader.
+            // Recheck the actual owner's declared resources through the same
+            // current ACL/CAS reader used for other admitted source documents.
             mmmm_domain::prefab::require_valid(&prefab).map_err(domain_error)?;
             for reference in array(&value, "resources")? {
                 insert_resource(&mut resources, reference.clone())?;
@@ -746,7 +754,13 @@ pub fn prepare_native_sources(
             }
             entry.insert(prefab);
         }
-        validate_clip_owner(&clip, &clip_prefabs[&clip.owner_prefab_id])?;
+        if document.pin.kind == OwnedDocumentKind::AnimationClip {
+            let clip: AnimationClip = decode_domain(&document.value)?;
+            validate_clip_owner(&clip, &owner_prefabs[&owner_id])?;
+        } else {
+            let module: CommandModule = decode_domain(&document.value)?;
+            validate_command_module_owner(&module, &owner_prefabs[&owner_id])?;
+        }
     }
     for resource in raw_resources.values() {
         retained_total = add_retained(retained_total, resource.bytes.len() as u64)?;
@@ -809,6 +823,10 @@ pub fn prepare_native_sources(
                         let clip: AnimationClip = decode_domain(&value)?;
                         let prefab: Prefab = decode_domain(&document.value)?;
                         validate_clip_owner(&clip, &prefab)?;
+                    } else if kind == OwnedKind::CommandModule {
+                        let module: CommandModule = decode_domain(&value)?;
+                        let prefab: Prefab = decode_domain(&document.value)?;
+                        validate_command_module_owner(&module, &prefab)?;
                     }
                 }
             }
@@ -856,10 +874,21 @@ pub fn prepare_native_sources(
             let clip: AnimationClip = decode_domain(&document.value)?;
             validate_clip_owner(
                 &clip,
-                clip_prefabs.get(&clip.owner_prefab_id).ok_or_else(|| {
+                owner_prefabs.get(&clip.owner_prefab_id).ok_or_else(|| {
                     AppError::new(
                         "SOURCE_UNAVAILABLE",
                         "Native Clip has no checked owner Prefab source",
+                    )
+                })?,
+            )?;
+        } else if document.pin.kind == OwnedDocumentKind::CommandModule {
+            let module: CommandModule = decode_domain(&document.value)?;
+            validate_command_module_owner(
+                &module,
+                owner_prefabs.get(&module.owner_prefab_id).ok_or_else(|| {
+                    AppError::new(
+                        "SOURCE_UNAVAILABLE",
+                        "Native CommandModule has no checked owner Prefab source",
                     )
                 })?,
             )?;
@@ -989,6 +1018,29 @@ fn validate_clip_owner(clip: &AnimationClip, prefab: &Prefab) -> AppResult<()> {
     Ok(())
 }
 
+fn validate_command_module_owner(module: &CommandModule, prefab: &Prefab) -> AppResult<()> {
+    if module.owner_prefab_id != prefab.prefab_id
+        || !prefab.command_module_ids.contains(&module.module_id)
+    {
+        return Err(AppError::new(
+            "REFERENCE_UNRESOLVED",
+            "Native CommandModule and its actual owner Prefab lack an exact authored binding",
+        ));
+    }
+    if !prefab
+        .nodes
+        .iter()
+        .any(|node| node.node_id == module.local_origin_node_id)
+    {
+        return Err(AppError::new(
+            "REFERENCE_UNRESOLVED",
+            "Native CommandModule origin has no node in its actual owner Prefab",
+        ));
+    }
+    // Authored parse status does not prove host parsing or execution authority.
+    Ok(())
+}
+
 fn check_input_budget(input: &NativeSourceInput<'_>) -> AppResult<()> {
     if input
         .documents
@@ -1112,7 +1164,7 @@ fn derive_project(
         let index = match document.pin.kind {
             OwnedDocumentKind::Prefab => Some("prefabIds"),
             OwnedDocumentKind::Instance => Some("instanceIds"),
-            OwnedDocumentKind::AnimationClip => None,
+            OwnedDocumentKind::AnimationClip | OwnedDocumentKind::CommandModule => None,
             _ => return Err(invalid()),
         };
         if let Some(index) = index {

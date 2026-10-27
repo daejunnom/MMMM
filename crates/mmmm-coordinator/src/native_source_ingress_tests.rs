@@ -201,6 +201,210 @@ fn clip_owner() -> (Value, Value) {
     (owner, clip)
 }
 
+fn command_owner() -> (Value, Value) {
+    // Keep the original authored documents and remove only unrelated optional
+    // resource and clip dependencies from the Prefab.
+    let mut owner = parse_json(include_bytes!("../../../examples/prefab.json")).unwrap();
+    let module = parse_json(include_bytes!("../../../examples/command-module.json")).unwrap();
+    owner["clipIds"] = json!([]);
+    owner["resources"] = json!([]);
+    for node in owner["nodes"].as_array_mut().unwrap() {
+        node.as_object_mut().unwrap().remove("blockGeometry");
+    }
+    owner["revision"] = json!(projected_digest("Prefab", &owner).unwrap());
+    (owner, module)
+}
+
+#[test]
+fn command_module_is_stored_with_its_actual_same_batch_owner_and_original_bytes() {
+    let mut fixture = Fixture::new();
+    let (owner, module) = command_owner();
+    let owner_bytes = encode_json(&owner).unwrap();
+    let module_bytes = include_bytes!("../../../examples/command-module.json");
+    let sources = [
+        NativeSourceDocument {
+            kind: NativeSourceKind::CommandModule,
+            bytes: module_bytes,
+        },
+        NativeSourceDocument {
+            kind: NativeSourceKind::Prefab,
+            bytes: &owner_bytes,
+        },
+    ];
+    let receipt = fixture
+        .prepare(&sources, &[])
+        .unwrap()
+        .commit(&mut fixture.store)
+        .unwrap();
+    let stored = receipt
+        .documents
+        .iter()
+        .find(|(pin, _)| pin.kind == OwnedDocumentKind::CommandModule)
+        .unwrap();
+    assert_eq!(
+        stored.0.object_id.as_str(),
+        module["moduleId"].as_str().unwrap()
+    );
+    assert_eq!(
+        stored.0.revision.as_str(),
+        module["revision"].as_str().unwrap()
+    );
+    assert_eq!(
+        fixture.store.read_blob(&stored.1).unwrap().as_slice(),
+        module_bytes.as_slice()
+    );
+    let loaded = mmmm_runtime::storage::owned_documents::read_owned_document(
+        &fixture.store,
+        &fixture.project,
+        &receipt.project_revision,
+        &stored.0,
+    )
+    .unwrap();
+    assert_eq!(loaded, module);
+    assert_eq!(loaded["commands"][0]["parseStatus"], "parsed");
+    let project = fixture.store.project(&fixture.project).unwrap();
+    assert_eq!(project["prefabIds"], json!([owner["prefabId"]]));
+    assert!(project["instanceIds"].as_array().unwrap().is_empty());
+    assert!(
+        project["ownedResources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|pin| pin["objectId"] == module["moduleId"]
+                && pin["revision"] == module["revision"])
+    );
+}
+
+#[test]
+fn command_module_owner_reciprocal_and_origin_fail_without_publication() {
+    let fixture = Fixture::new();
+    let before = fixture.store.project(&fixture.project).unwrap();
+    let (valid_owner, valid_module) = command_owner();
+    for (case, expected) in [
+        ("missing_owner", "SOURCE_UNAVAILABLE"),
+        ("reciprocal", "REFERENCE_UNRESOLVED"),
+        ("origin", "REFERENCE_UNRESOLVED"),
+    ] {
+        let mut owner = valid_owner.clone();
+        let mut module = valid_module.clone();
+        match case {
+            "missing_owner" => module["ownerPrefabId"] = json!("prefab-unavailable"),
+            "reciprocal" => owner["commandModuleIds"] = json!([]),
+            "origin" => module["localOriginNodeId"] = json!("node-unavailable"),
+            _ => unreachable!(),
+        }
+        owner["revision"] = json!(projected_digest("Prefab", &owner).unwrap());
+        module["revision"] = json!(projected_digest("CommandModule", &module).unwrap());
+        let owner_bytes = encode_json(&owner).unwrap();
+        let module_bytes = encode_json(&module).unwrap();
+        let sources = [
+            NativeSourceDocument {
+                kind: NativeSourceKind::Prefab,
+                bytes: &owner_bytes,
+            },
+            NativeSourceDocument {
+                kind: NativeSourceKind::CommandModule,
+                bytes: &module_bytes,
+            },
+        ];
+        assert_eq!(
+            fixture.prepare(&sources, &[]).err().unwrap().code,
+            expected,
+            "{case}"
+        );
+        assert_eq!(
+            fixture.store.project(&fixture.project).unwrap(),
+            before,
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn prefab_cannot_list_a_module_owned_by_another_prefab() {
+    let fixture = Fixture::new();
+    let before = fixture.store.project(&fixture.project).unwrap();
+    let (owner, module) = command_owner();
+    let mut other = owner.clone();
+    other["prefabId"] = json!("prefab-other");
+    other["revision"] = json!(projected_digest("Prefab", &other).unwrap());
+    let owner_bytes = encode_json(&owner).unwrap();
+    let other_bytes = encode_json(&other).unwrap();
+    let module_bytes = encode_json(&module).unwrap();
+    let sources = [
+        NativeSourceDocument {
+            kind: NativeSourceKind::Prefab,
+            bytes: &owner_bytes,
+        },
+        NativeSourceDocument {
+            kind: NativeSourceKind::Prefab,
+            bytes: &other_bytes,
+        },
+        NativeSourceDocument {
+            kind: NativeSourceKind::CommandModule,
+            bytes: &module_bytes,
+        },
+    ];
+    assert_eq!(
+        fixture.prepare(&sources, &[]).err().unwrap().code,
+        "REFERENCE_UNRESOLVED"
+    );
+    assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
+}
+
+#[test]
+fn retained_actual_owner_rejects_an_unlisted_command_module() {
+    let mut fixture = Fixture::new();
+    let (owner, mut module) = command_owner();
+    let owner_bytes = encode_json(&owner).unwrap();
+    let first = [
+        NativeSourceDocument {
+            kind: NativeSourceKind::Prefab,
+            bytes: &owner_bytes,
+        },
+        NativeSourceDocument {
+            kind: NativeSourceKind::CommandModule,
+            bytes: include_bytes!("../../../examples/command-module.json"),
+        },
+    ];
+    let receipt = fixture
+        .prepare(&first, &[])
+        .unwrap()
+        .commit(&mut fixture.store)
+        .unwrap();
+    let before = fixture.store.project(&fixture.project).unwrap();
+    let authority = LocalAuthority::new(HostBridge::default());
+    let workspace = prepare_workspace(
+        &fixture.store,
+        &authority,
+        &fixture.project,
+        fixture.budget.deadline(),
+    )
+    .unwrap();
+    module["moduleId"] = json!("module-unlisted");
+    module["revision"] = json!(projected_digest("CommandModule", &module).unwrap());
+    let bytes = encode_json(&module).unwrap();
+    let sources = [NativeSourceDocument {
+        kind: NativeSourceKind::CommandModule,
+        bytes: &bytes,
+    }];
+    let result = prepare_native_sources(
+        &fixture.store,
+        &workspace.witness,
+        &authority,
+        &fixture.budget,
+        &NativeSourceInput {
+            project: &fixture.project,
+            expected_revision: &receipt.project_revision,
+            documents: &sources,
+            retained_resources: &[],
+            raw_resources: &[],
+        },
+    );
+    assert_eq!(result.err().unwrap().code, "REFERENCE_UNRESOLVED");
+    assert_eq!(fixture.store.project(&fixture.project).unwrap(), before);
+}
+
 #[test]
 fn owner_prepares_closed_prefab_and_instance_without_publishing_any_membership() {
     let fixture = Fixture::new();

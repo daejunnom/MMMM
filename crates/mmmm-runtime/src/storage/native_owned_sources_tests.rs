@@ -467,8 +467,8 @@ impl Batch {
             "sizeBytes":bytes.len(),
         });
         let mut prefab = example("prefab.json");
-        // CommandModule은 이 bounded writer의 소유 범위가 아니므로 원본의
-        // 미제공 command 참조를 제거한다. door/Clip과 실제 resource는 유지한다.
+        // 이 batch에는 CommandModule을 제공하지 않으므로 참조를 제거한다.
+        // door/Clip과 실제 resource는 유지한다.
         prefab["commandModuleIds"] = json!([]);
         prefab["references"] = json!([]);
         prefab["resources"] = json!([resource]);
@@ -575,6 +575,152 @@ impl Batch {
         self.next["ownedResources"][index] = json!(self.pins[index]);
         revise("Project", &mut self.next);
     }
+}
+
+fn command_batch(base: &Value, mutate: impl FnOnce(&mut Value, &mut Value)) -> Batch {
+    let initial = Batch::initial(base);
+    let mut sources: Vec<_> = initial
+        .pins
+        .iter()
+        .zip(&initial.documents)
+        .map(|(pin, bytes)| (pin.kind, parse_json(bytes).unwrap()))
+        .collect();
+    let mut module = example("command-module.json");
+    sources[0].1["commandModuleIds"] = json!([module["moduleId"]]);
+    mutate(&mut sources[0].1, &mut module);
+    revise("Prefab", &mut sources[0].1);
+    revise("CommandModule", &mut module);
+    sources[1].1["prefabRevision"] = sources[0].1["revision"].clone();
+    revise("Instance", &mut sources[1].1);
+    // Module first: validation must not depend on the order of a batch.
+    sources.insert(0, (OwnedDocumentKind::CommandModule, module));
+    Batch::from_sources(base, sources, initial.resources)
+}
+
+#[test]
+fn command_module_source_is_committed_with_its_actual_prefab_and_provenance() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let batch = command_batch(&base, |_, _| ());
+    let permit = TestPermit::new(&root, &initial);
+    let receipt = batch.commit(&mut store, &permit, &base).unwrap();
+    assert!(permit.0.final_rows_observed.get());
+    assert_eq!(store.project(&initial.project_id).unwrap(), batch.next);
+    assert_eq!(batch.next["prefabIds"].as_array().unwrap().len(), 1);
+    assert_eq!(batch.next["instanceIds"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        receipt.documents[0].0.kind,
+        OwnedDocumentKind::CommandModule
+    );
+    assert_eq!(
+        store.read_blob(&receipt.documents[0].1).unwrap(),
+        batch.documents[0]
+    );
+    let mut reader = permit
+        .owned_document_reader(MAX_OWNED_DOCUMENT_BYTES)
+        .unwrap();
+    let loaded = reader
+        .read_known_history_bytes(
+            &store,
+            &permit,
+            &initial.project_id,
+            &receipt.project_revision,
+            &batch.pins[0],
+        )
+        .unwrap();
+    assert_eq!(loaded.bytes, batch.documents[0]);
+    assert_eq!(loaded.blob, receipt.documents[0].1);
+
+    let baseline = metadata_snapshot(&store);
+    assert!(matches!(
+        batch.commit(&mut store, &permit, &base),
+        Err(StorageError::Conflict(_))
+    ));
+    assert_unchanged(&store, &baseline, &batch.next);
+}
+
+#[test]
+fn command_module_missing_owner_membership_or_origin_publishes_no_metadata() {
+    for case in 0..3 {
+        let root = TestRoot::new();
+        let mut store = root.store();
+        let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+        let batch = command_batch(&base, |prefab, module| match case {
+            0 => module["ownerPrefabId"] = json!("prefab-missing"),
+            1 => prefab["commandModuleIds"] = json!([]),
+            _ => module["localOriginNodeId"] = json!("missing-node"),
+        });
+        let baseline = metadata_snapshot(&store);
+        let expected = if case == 0 {
+            "Native source has no owned Prefab membership"
+        } else {
+            "Native CommandModule owner, membership or origin differs"
+        };
+        assert!(
+            matches!(
+                batch.commit(&mut store, &TestPermit::new(&root, &initial), &base),
+                Err(StorageError::InvalidInput(message)) if message == expected
+            ),
+            "case {case}"
+        );
+        assert_unchanged(&store, &baseline, &base);
+    }
+}
+
+#[test]
+fn command_module_transaction_cancellation_rolls_back_metadata() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let batch = command_batch(&base, |_, _| ());
+    let baseline = metadata_snapshot(&store);
+    let permit = TestPermit::with_failure(&root, &initial, FinalFailure::Cancel);
+    assert!(batch.commit(&mut store, &permit, &base).is_err());
+    assert!(permit.0.final_rows_observed.get());
+    assert_unchanged(&store, &baseline, &base);
+}
+
+#[test]
+fn retained_prefab_and_module_are_checked_by_actual_body_in_both_directions() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let first = command_batch(&base, |_, _| ());
+    first
+        .commit(&mut store, &TestPermit::new(&root, &initial), &base)
+        .unwrap();
+    let baseline = metadata_snapshot(&store);
+
+    // The retained Prefab does not reciprocally list this new module.
+    let mut module = example("command-module.json");
+    module["moduleId"] = json!("module-other");
+    revise("CommandModule", &mut module);
+    let new_module = Batch::from_sources(
+        &first.next,
+        vec![(OwnedDocumentKind::CommandModule, module)],
+        vec![],
+    );
+    assert!(matches!(
+        new_module.commit(&mut store, &TestPermit::new(&root, &initial), &first.next),
+        Err(StorageError::InvalidInput(message)) if message == "Native CommandModule owner, membership or origin differs"
+    ));
+    assert_unchanged(&store, &baseline, &first.next);
+
+    // The retained module belongs to the original Prefab, not this new one.
+    let mut prefab = parse_json(&first.documents[1]).unwrap();
+    prefab["prefabId"] = json!("prefab-other");
+    revise("Prefab", &mut prefab);
+    let new_prefab = Batch::from_sources(
+        &first.next,
+        vec![(OwnedDocumentKind::Prefab, prefab)],
+        vec![],
+    );
+    assert!(matches!(
+        new_prefab.commit(&mut store, &TestPermit::new(&root, &initial), &first.next),
+        Err(StorageError::InvalidInput(message)) if message == "Native CommandModule owner, membership or origin differs"
+    ));
+    assert_unchanged(&store, &baseline, &first.next);
 }
 
 // 고정된 test table의 전체 SQL 내용을 비교한다. count만으로 head/body
