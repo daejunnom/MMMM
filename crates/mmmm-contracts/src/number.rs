@@ -7,6 +7,130 @@ use serde::{
 };
 use std::fmt;
 
+/// Parse the exact decimal value of one bounded JSON number lexeme as a
+/// nonnegative safe integer. This helper validates the supplied lexeme, but
+/// does not prove which source bytes or schema path it came from.
+///
+/// The input is bounded to the strict JSON byte budget. Its coefficient and
+/// exponent are scanned without floating point or input-sized allocation.
+pub fn exact_safe_u64_json_lexeme(lexeme: &str) -> Option<u64> {
+    const MAX_BYTES: usize = 8 * 1024 * 1024;
+    const MAX_SAFE: u64 = 9_007_199_254_740_991;
+
+    let bytes = lexeme.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_BYTES {
+        return None;
+    }
+    let mut pos = 0;
+    let negative = bytes[pos] == b'-';
+    if negative {
+        pos += 1;
+    }
+    let integer_start = pos;
+    match bytes.get(pos) {
+        Some(b'0') => {
+            pos += 1;
+            if bytes.get(pos).is_some_and(u8::is_ascii_digit) {
+                return None;
+            }
+        }
+        Some(b'1'..=b'9') => {
+            pos += 1;
+            while bytes.get(pos).is_some_and(u8::is_ascii_digit) {
+                pos += 1;
+            }
+        }
+        _ => return None,
+    }
+    let integer_end = pos;
+    let mut fraction_start = pos;
+    let mut fraction_end = pos;
+    if bytes.get(pos) == Some(&b'.') {
+        pos += 1;
+        fraction_start = pos;
+        while bytes.get(pos).is_some_and(u8::is_ascii_digit) {
+            pos += 1;
+        }
+        fraction_end = pos;
+        if fraction_start == fraction_end {
+            return None;
+        }
+    }
+
+    let mut exponent = 0usize;
+    let mut exponent_negative = false;
+    if matches!(bytes.get(pos), Some(b'e' | b'E')) {
+        pos += 1;
+        if matches!(bytes.get(pos), Some(b'+' | b'-')) {
+            exponent_negative = bytes[pos] == b'-';
+            pos += 1;
+        }
+        let exponent_start = pos;
+        // A magnitude above the input length plus 32 cannot change whether
+        // a nonzero coefficient is fractional or exceeds the safe range.
+        let cap = bytes.len().saturating_add(32);
+        while let Some(digit @ b'0'..=b'9') = bytes.get(pos).copied() {
+            exponent = exponent
+                .saturating_mul(10)
+                .saturating_add(usize::from(digit - b'0'))
+                .min(cap);
+            pos += 1;
+        }
+        if exponent_start == pos {
+            return None;
+        }
+    }
+    if pos != bytes.len() {
+        return None;
+    }
+
+    let digits = bytes[integer_start..integer_end]
+        .iter()
+        .chain(bytes[fraction_start..fraction_end].iter());
+    let mut first = None;
+    let mut last = 0usize;
+    let mut count = 0usize;
+    for &digit in digits.clone() {
+        if digit != b'0' {
+            first.get_or_insert(count);
+            last = count;
+        }
+        count += 1;
+    }
+    let Some(first) = first else {
+        return Some(0);
+    };
+    if negative {
+        return None;
+    }
+    let trailing = count - last - 1;
+    let exponent = i128::try_from(exponent).ok()?;
+    let signed_exponent = if exponent_negative {
+        -exponent
+    } else {
+        exponent
+    };
+    let scale = signed_exponent - i128::try_from(fraction_end - fraction_start).ok()?
+        + i128::try_from(trailing).ok()?;
+    let significant = last - first + 1;
+    if scale < 0 || i128::try_from(significant).ok()? + scale > 16 {
+        return None;
+    }
+
+    let mut value = 0u64;
+    for (index, &digit) in digits.enumerate() {
+        if (first..=last).contains(&index) {
+            value = value
+                .checked_mul(10)?
+                .checked_add(u64::from(digit - b'0'))?;
+        }
+    }
+    for _ in 0..usize::try_from(scale).ok()? {
+        value = value.checked_mul(10)?;
+    }
+    (value <= MAX_SAFE).then_some(value)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct Int32(i32);
@@ -122,5 +246,61 @@ mod tests {
         ] {
             assert!(serde_json::from_slice::<Int32>(bytes).is_err());
         }
+    }
+
+    #[test]
+    fn exact_lexemes_accept_only_nonnegative_safe_mathematical_integers() {
+        for (lexeme, expected) in [
+            ("0", 0),
+            ("-0.0", 0),
+            ("1", 1),
+            ("1.0", 1),
+            ("1e0", 1),
+            ("100e-2", 1),
+            ("0.0001000e4", 1),
+            ("9007199254740991", 9_007_199_254_740_991),
+            ("90071992547409910e-1", 9_007_199_254_740_991),
+        ] {
+            assert_eq!(
+                exact_safe_u64_json_lexeme(lexeme),
+                Some(expected),
+                "{lexeme}"
+            );
+        }
+        for lexeme in [
+            "1.0000000000000001",
+            "9007199254740991.1",
+            "90071992547409911e-1",
+            "9007199254740992",
+            "-1",
+            "1e-10000",
+            "-1e-10000",
+            "0.5",
+        ] {
+            assert_eq!(exact_safe_u64_json_lexeme(lexeme), None, "{lexeme}");
+        }
+    }
+
+    #[test]
+    fn exact_lexemes_check_json_grammar_and_bound_huge_exponents() {
+        for lexeme in [
+            "", "-", "+1", "01", "-01", ".5", "1.", "1e", "1e+", "1e-", "1 0", " 1", "1 ", "NaN",
+            "∞", "0x1",
+        ] {
+            assert_eq!(exact_safe_u64_json_lexeme(lexeme), None, "{lexeme}");
+        }
+        let huge_exponent = "9".repeat(4_096);
+        assert_eq!(
+            exact_safe_u64_json_lexeme(&format!("1e{huge_exponent}")),
+            None
+        );
+        assert_eq!(
+            exact_safe_u64_json_lexeme(&format!("1e-{huge_exponent}")),
+            None
+        );
+        assert_eq!(
+            exact_safe_u64_json_lexeme(&format!("-0e{huge_exponent}")),
+            Some(0)
+        );
     }
 }

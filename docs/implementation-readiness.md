@@ -4062,7 +4062,7 @@ mesh의 geometry ResourceRef는 기존 Prefab 자원과 같은 Project/CAS exact
 예제에서 파생한 mesh 입력으로 신규·보유 자원과 잘못된 연결을 검사하도록 작성했다.
 보유 mesh 손상 검사는 기존 공통 자원 gate가 먼저 거절할 수 있으며 보유 mesh 정의를
 새 Prefab에서 정상 참조하는 별도 검사도 작성했다. 실제 컴파일·테스트는 별도로 확인한다.
-Physics mesh의 `sizeBytes: N.0`은 원 문서를 보존하며 DTO와 자원 비교용 복사본에서만 정수 N으로 정규화하도록 작성했다. 실제 검사 결과는 별도로 확인한다. 일반 ResourceRef 등록 metadata 자체의 소수 표기 지원은 별도의 미완료 경계다.
+Physics mesh의 `sizeBytes: N.0`은 원 문서를 보존하며 DTO와 자원 비교용 복사본에서만 정수 N으로 정규화하도록 작성했다. 실제 검사 결과는 별도로 확인한다. 이 정규화는 파싱된 `Value`의 유한 안전 정수 조건을 사용하므로 binary64로 반올림되기 전 원 숫자 lexeme이 수학적 정수였음을 별도로 보증하지 않는다. 일반 ResourceRef 등록 metadata 자체의 소수 표기 지원과 원 lexeme의 정확한 정수 판정은 미완료 경계다.
 Rust128의 Linux 실행에서는 Coordinator 검사 429개 통과 후 선등록 mesh 자원의 후속
 commit 검사 하나가 `REVISION_CONFLICT`로 실패했다. 원 로그에는 선택 revision이나 내부
 충돌 원인이 없어 원인을 확정할 수 없다. 후속 소스는 최초 `Exact`가 선택한 historical
@@ -4070,6 +4070,11 @@ revision을 재검사에서 고정해 사용하되 현재 membership·권한·�
 검사를 유지한다. 원 실패와 후속 실행 결과를 구분한다. JVM122 Windows의 Maven Central
 HTTP 429와 Linux의 프로세스 RSS 관측 `ESRCH`·감독 종료도 보존하며, 둘 다 전체 JVM
 검사 성공으로 취급하지 않는다.
+정확한 원 decimal lexeme의 안전 비음수 정수 판정 함수를 계약 계층에 별도로 작성했다.
+입력 길이 제한 안에서 부동소수점이나 입력 크기에 비례하는 추가 할당 없이 숫자 문법과
+수학적 정수 범위를 검사하도록 구현했다. 이 함수 하나만으로 원 bytes와 schema 경로의
+결속이나 실제 입력 경계 적용을 증명하지 않으며, controlled parser 연결 시 긴 토큰의
+취소·기한 및 오류 우선순위를 별도 검증해야 한다. 실제 테스트는 후속 CI에서 확인한다.
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.
