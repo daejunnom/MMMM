@@ -21,7 +21,7 @@ use mmmm_contracts::{
     ContextId, JsonLimits, ObjectId, PrincipalId, ProjectId, ResourceId, Sha256Digest, encode_json,
     projected_digest, raw_digest,
     strict_json::{ControlledJsonError, parse_json_with_control},
-    validation::{ControlledContractError, ExactSelector},
+    validation::{ControlledContractError, ControlledPrefabContractError, ExactSelector},
     verify_projected_digest,
 };
 use mmmm_domain::physics::{PhysicsDefinition, normalize_mesh_resource_ref};
@@ -111,9 +111,10 @@ struct StagedDocument {
     pin: OwnedDocumentPin,
     blob: BlobRef,
 }
-/// A document being prepared is not yet a publication record. Physics bytes
-/// remain pending until all current resource and reference checks complete;
-/// only an actual verified CAS write can produce its final StagedDocument.
+/// A document being prepared is not yet a publication record. Physics and
+/// Prefab bytes remain pending until their current resource, reference and raw
+/// exact checks complete; only an actual verified CAS write can produce its
+/// final StagedDocument.
 struct PendingDocument<'a> {
     pin: OwnedDocumentPin,
     value: Value,
@@ -470,10 +471,14 @@ fn prepare(
             ));
         }
         account(&mut remaining, document.bytes.len() as u64)?;
-        // Preserve ordinary document staging order. Physics remains pending
-        // until the current resources, retained sources and their authored
-        // relationships are checked; a predicted hash is not a CAS receipt.
-        let staged_blob = if document.pin.kind == OwnedDocumentKind::PhysicsDefinition {
+        // Preserve other ordinary document staging order. Prefab and Physics
+        // remain pending until relation, authority and exact checks finish.
+        // Delaying Prefab staging changes which error is observed if its CAS
+        // I/O and one of those later checks would both fail.
+        let staged_blob = if matches!(
+            document.pin.kind,
+            OwnedDocumentKind::PhysicsDefinition | OwnedDocumentKind::Prefab
+        ) {
             None
         } else {
             Some(stage_bytes(store, permit, document.bytes)?)
@@ -702,7 +707,14 @@ fn prepare(
         carried_documents.push((pin.clone(), loaded.blob));
     }
     for document in &documents {
-        require_references(&document.value, &after_pins, &resources)?;
+        let reference_context = ReferenceContext {
+            store,
+            permit,
+            project: request.project,
+            scope: &scope,
+            is_prefab: document.pin.kind == OwnedDocumentKind::Prefab,
+        };
+        require_references(&reference_context, &document.value, &after_pins, &resources)?;
         checkpoint(store, permit, request.project, &scope)?;
         match document.pin.kind {
             OwnedDocumentKind::PhysicsDefinition => {
@@ -750,11 +762,14 @@ fn prepare(
     // Existing resource ACL, current Project membership and document relation
     // failures must remain observable before a newly added exact-decimal error.
     // Earlier ordinary document CAS files may already exist; raw resources and
-    // Physics documents remain pending without a storage/provenance claim.
+    // Physics and Prefab documents remain pending without a storage claim.
     let needs_exact = !retained_physics_bytes.is_empty()
-        || documents
-            .iter()
-            .any(|document| document.pin.kind == OwnedDocumentKind::PhysicsDefinition)
+        || documents.iter().any(|document| {
+            matches!(
+                document.pin.kind,
+                OwnedDocumentKind::PhysicsDefinition | OwnedDocumentKind::Prefab
+            )
+        })
         || !existing_raw_metadata.is_empty()
         || resources
             .values()
@@ -797,6 +812,9 @@ fn prepare(
                 ExactSelector::PhysicsDefinition,
                 &document.value,
             )?;
+        } else if document.pin.kind == OwnedDocumentKind::Prefab {
+            checkpoint(store, permit, request.project, &scope)?;
+            check_exact_prefab(store, permit, document.bytes, &document.value)?;
         }
     }
     for (id, metadata, original_metadata) in existing_raw_metadata {
@@ -849,7 +867,7 @@ fn prepare(
                 if actual.byte_length != document.bytes.len() as u64
                     || actual.digest != raw_digest(document.bytes)
                 {
-                    return Err(conflict("Native Physics actual CAS pin differs"));
+                    return Err(conflict("Native pending document actual CAS pin differs"));
                 }
                 actual
             }
@@ -1098,7 +1116,16 @@ fn require_physics_mesh_resources(
     Ok(())
 }
 
+struct ReferenceContext<'a> {
+    store: &'a DurableStore,
+    permit: &'a dyn NativeOwnedSourceCommitPermit,
+    project: &'a ProjectId,
+    scope: &'a WriteScope,
+    is_prefab: bool,
+}
+
 fn require_references(
+    context: &ReferenceContext<'_>,
     document: &Value,
     pins: &BTreeMap<(OwnedDocumentKind, ObjectId), OwnedDocumentPin>,
     resources: &BTreeMap<ResourceId, PendingResource<'_>>,
@@ -1142,15 +1169,31 @@ fn require_references(
     }
     let mut declared_resources = BTreeSet::new();
     if let Some(values) = document.get("resources").and_then(Value::as_array) {
-        for value in values {
-            require_exact_resource(value, resources)?;
+        for (index, value) in values.iter().enumerate() {
+            if context.is_prefab && index % 128 == 0 {
+                checkpoint(
+                    context.store,
+                    context.permit,
+                    context.project,
+                    context.scope,
+                )?;
+            }
+            require_document_resource(value, context.is_prefab, resources)?;
             declared_resources.insert(decode::<ResourceId>(&value["resourceId"])?);
         }
     }
     if let Some(nodes) = document.get("nodes").and_then(Value::as_array) {
-        for node in nodes {
+        for (index, node) in nodes.iter().enumerate() {
+            if context.is_prefab && index % 128 == 0 {
+                checkpoint(
+                    context.store,
+                    context.permit,
+                    context.project,
+                    context.scope,
+                )?;
+            }
             if let Some(resource) = node.get("geometryResource") {
-                require_exact_resource(resource, resources)?;
+                require_document_resource(resource, context.is_prefab, resources)?;
             }
             if let Some(block) = node.get("blockGeometry")
                 && !resources.contains_key(&decode::<ResourceId>(&block["resourceId"])?)
@@ -1185,6 +1228,22 @@ fn require_references(
     // as ResourceRef or source/permission declarations. Their registered domain
     // codec and semantics remain the trusted preparation producer's obligation.
     Ok(())
+}
+
+/// Only a raw Prefab's schema-owned references receive this provisional copy.
+/// A decimal fraction can round to an integer in Value, so it is never a raw
+/// witness. The same source bytes must pass check_exact_prefab before staging.
+fn require_document_resource(
+    value: &Value,
+    is_prefab: bool,
+    resources: &BTreeMap<ResourceId, PendingResource<'_>>,
+) -> StorageResult<()> {
+    if is_prefab {
+        let comparison = normalize_mesh_resource_ref(value).map_err(contract)?;
+        require_exact_resource(&comparison, resources)
+    } else {
+        require_exact_resource(value, resources)
+    }
 }
 
 fn insert_project(
@@ -1357,6 +1416,42 @@ fn check_exact_input(
             ControlledContractError::Contract(cause) => contract(cause),
             cause @ ControlledContractError::ExactInteger { .. } => contract(cause),
             ControlledContractError::CaptureUnavailable => StorageError::RawExactCaptureUnavailable,
+        })?;
+    if &actual != expected {
+        return Err(StorageError::RawExactCaptureUnavailable);
+    }
+    Ok(())
+}
+
+/// Validate only this request's actual raw Prefab bytes, and bind the result
+/// to the Value used for identity and the provisional association checks.
+fn check_exact_prefab(
+    store: &DurableStore,
+    permit: &dyn NativeOwnedSourceCommitPermit,
+    bytes: &[u8],
+    expected: &Value,
+) -> StorageResult<()> {
+    let actual = store
+        .validator
+        .parse_validate_prefab_exact_with_control(
+            bytes,
+            JsonLimits {
+                max_bytes: MAX_OWNED_DOCUMENT_BYTES as usize,
+                max_depth: 64,
+                max_nodes: 100_000,
+            },
+            || {
+                permit.check_store(store)?;
+                permit.check()
+            },
+        )
+        .map_err(|cause| match cause {
+            ControlledPrefabContractError::Control(cause) => cause,
+            ControlledPrefabContractError::Contract(cause) => contract(cause),
+            cause @ ControlledPrefabContractError::ExactInteger { .. } => contract(cause),
+            ControlledPrefabContractError::CaptureUnavailable => {
+                StorageError::RawExactCaptureUnavailable
+            }
         })?;
     if &actual != expected {
         return Err(StorageError::RawExactCaptureUnavailable);

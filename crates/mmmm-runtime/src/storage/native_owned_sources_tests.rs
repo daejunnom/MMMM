@@ -2540,3 +2540,204 @@ mod compatibility_approval_tests;
 
 #[path = "calibration_approval_tests.rs"]
 mod calibration_approval_tests;
+
+// Reuse the canonical Prefab fixture and vary only the two schema-owned
+// ResourceRef number tokens. The opaque extension intentionally resembles a
+// ResourceRef but is not one of the selected paths.
+fn prefab_decimal_batch(base: &Value, geometry: &str, resource: &str, with_physics: bool) -> Batch {
+    let bytes = vec![b'p'];
+    let reference = json!({
+        "resourceId": "resource-wall-blocks",
+        "sha256": raw_digest(&bytes),
+        "mediaType": "application/vnd.mmmm.blockset+json",
+        "sizeBytes": 1,
+    });
+    let mut prefab = example("prefab.json");
+    prefab["commandModuleIds"] = json!([]);
+    prefab["clipIds"] = json!([]);
+    prefab["references"] = json!([]);
+    prefab["resources"] = json!([reference]);
+    prefab["nodes"][0]["geometryResource"] = reference.clone();
+    prefab["nodes"][0]["display"] =
+        json!({"kind":"block", "payload":{}, "resourceRefs":["resource-wall-blocks"]});
+    prefab["nodes"][0]["extensions"]["test:opaque"] = json!({
+        "resourceId": "resource-opaque",
+        "sha256": raw_digest(b"opaque-not-a-resource"),
+        "mediaType": "application/octet-stream",
+        "sizeBytes": 8,
+    });
+    revise("Prefab", &mut prefab);
+    let mut sources = vec![(OwnedDocumentKind::Prefab, prefab)];
+    if with_physics {
+        sources.push((
+            OwnedDocumentKind::PhysicsDefinition,
+            example("physics-definition.json"),
+        ));
+    }
+    let mut batch = Batch::from_sources(base, sources, vec![(reference, bytes)]);
+    // Assign distinct temporary sentinels to the exact selected paths. The
+    // stored pin was computed above from the intended integer values, and is
+    // checked again after replacing both sentinels in the serialized bytes.
+    let mut wire = parse_json(&batch.documents[0]).unwrap();
+    wire["nodes"][0]["geometryResource"]["sizeBytes"] = json!(11111);
+    wire["resources"][0]["sizeBytes"] = json!(22222);
+    let mut text = String::from_utf8(raw_json(&wire)).unwrap();
+    let geometry_sentinel = "\"sizeBytes\": 11111";
+    let resource_sentinel = "\"sizeBytes\": 22222";
+    assert_eq!(text.matches(geometry_sentinel).count(), 1);
+    assert_eq!(text.matches(resource_sentinel).count(), 1);
+    text = text.replacen(geometry_sentinel, &format!("\"sizeBytes\": {geometry}"), 1);
+    text = text.replacen(resource_sentinel, &format!("\"sizeBytes\": {resource}"), 1);
+    let opaque = "\"sizeBytes\": 8";
+    assert_eq!(text.matches(opaque).count(), 1);
+    text = text.replacen(opaque, "\"sizeBytes\": 8.0000000000000001", 1);
+    batch.documents[0] = text.into_bytes();
+    let original = parse_json(&batch.documents[0]).unwrap();
+    assert_eq!(
+        verify_projected_digest("Prefab", &original).unwrap(),
+        batch.pins[0].revision
+    );
+    batch
+}
+
+fn assert_native_blob_absent(store: &DurableStore, bytes: &[u8]) {
+    let blob = BlobRef {
+        digest: raw_digest(bytes),
+        byte_length: bytes.len() as u64,
+    };
+    assert!(
+        matches!(store.read_blob(&blob), Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound)
+    );
+}
+
+#[test]
+fn prefab_raw_integer_tokens_commit_with_original_bytes_and_scoped_paths() {
+    for (geometry, resource) in [("1.0", "1e0"), ("1e0", "1.0")] {
+        let root = TestRoot::new();
+        let mut store = root.store();
+        let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+        let batch = prefab_decimal_batch(&base, geometry, resource, false);
+        let original = batch.documents[0].clone();
+        let original_value = parse_json(&original).unwrap();
+        assert_eq!(
+            original_value["nodes"][0]["extensions"]["test:opaque"]["sizeBytes"].as_f64(),
+            Some(8.0)
+        );
+        let permit = TestPermit::new(&root, &initial);
+        let receipt = batch.commit(&mut store, &permit, &base).unwrap();
+        assert_eq!(receipt.documents[0].0, batch.pins[0]);
+        assert_eq!(receipt.documents[0].1.digest, raw_digest(&original));
+        assert_eq!(receipt.project_revision, revision(&batch.next));
+        let loaded = permit
+            .owned_document_reader(MAX_OWNED_DOCUMENT_BYTES)
+            .unwrap()
+            .read_known_history_bytes(
+                &store,
+                &permit,
+                &initial.project_id,
+                &receipt.project_revision,
+                &batch.pins[0],
+            )
+            .unwrap();
+        assert_eq!(loaded.bytes, original);
+        assert_eq!(loaded.document, original_value);
+        assert_eq!(
+            loaded.document["nodes"][0]["display"]["resourceRefs"],
+            json!(["resource-wall-blocks"])
+        );
+    }
+}
+
+#[test]
+fn prefab_rounded_fraction_rejects_before_prefab_resource_and_physics_stage() {
+    for (geometry, resource, location) in [
+        ("1.0", "1.0000000000000001", "Prefab resource 0 sizeBytes"),
+        (
+            "1.0000000000000001",
+            "1.0",
+            "Prefab node 0 geometry sizeBytes",
+        ),
+    ] {
+        let root = TestRoot::new();
+        let mut store = root.store();
+        let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+        let batch = prefab_decimal_batch(&base, geometry, resource, true);
+        let prefab = &batch.documents[0];
+        let physics = &batch.documents[1];
+        let raw = &batch.resources[0].1;
+        assert_ne!(raw_digest(prefab), raw_digest(physics));
+        assert_ne!(raw_digest(prefab), raw_digest(raw));
+        assert_ne!(raw_digest(physics), raw_digest(raw));
+        for bytes in [prefab.as_slice(), physics.as_slice(), raw.as_slice()] {
+            assert_native_blob_absent(&store, bytes);
+        }
+        let baseline = metadata_snapshot(&store);
+        let permit = TestPermit::new(&root, &initial);
+        let error = batch.commit(&mut store, &permit, &base).unwrap_err();
+        assert!(
+            matches!(error, StorageError::Contract(message) if message.contains(location) && message.contains("not an exact safe JSON integer"))
+        );
+        assert_unchanged(&store, &baseline, &base);
+        assert!(!permit.0.final_rows_observed.get());
+        for bytes in [prefab.as_slice(), physics.as_slice(), raw.as_slice()] {
+            assert_native_blob_absent(&store, bytes);
+        }
+    }
+}
+
+#[test]
+fn prefab_raw_fraction_preserves_original_cancel_and_head_errors() {
+    for stale in [false, true] {
+        let root = TestRoot::new();
+        let mut store = root.store();
+        let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+        let batch = prefab_decimal_batch(&base, "1.0", "1.0000000000000001", false);
+        let permit = TestPermit::new(&root, &initial);
+        let actual_base = if stale {
+            // Make a non-empty membership-only change using an unrelated real resource.
+            let bytes = b"advance-head".to_vec();
+            let resource = json!({"resourceId":"resource-head-advance", "sha256":raw_digest(&bytes), "mediaType":"application/octet-stream", "sizeBytes":bytes.len()});
+            let first = Batch::from_sources(&base, vec![], vec![(resource, bytes)]);
+            first.commit(&mut store, &permit, &base).unwrap();
+            first.next
+        } else {
+            permit.0.cancelled.set(true);
+            base.clone()
+        };
+        let baseline = metadata_snapshot(&store);
+        let error = batch.commit(&mut store, &permit, &base).unwrap_err();
+        if stale {
+            assert!(matches!(error, StorageError::Conflict(_)));
+        } else {
+            assert!(
+                matches!(error, StorageError::InvalidTransition(message) if message.contains("cancelled"))
+            );
+        }
+        assert_unchanged(&store, &baseline, &actual_base);
+        assert_native_blob_absent(&store, &batch.documents[0]);
+    }
+}
+
+#[test]
+fn prefab_raw_fraction_preserves_current_resource_acl_denial() {
+    let root = TestRoot::new();
+    let mut store = root.store();
+    let (base, initial) = bootstrap(&mut store, &root, "project-fixture", "policy-local");
+    let (_, mesh, mesh_bytes) = physics_mesh_fixture();
+    let first = Batch::from_sources(&base, vec![], vec![(mesh, mesh_bytes)]);
+    first
+        .commit(&mut store, &TestPermit::new(&root, &initial), &base)
+        .unwrap();
+    let batch = prefab_decimal_batch(&first.next, "1.0", "1.0000000000000001", false);
+    let permit = TestPermit::new(&root, &initial);
+    permit.0.deny_mesh_after_actual_checks.set(true);
+    let baseline = metadata_snapshot(&store);
+    assert!(matches!(
+        batch.commit(&mut store, &permit, &first.next),
+        Err(StorageError::Conflict("Authored scoped resource denied"))
+    ));
+    assert!(permit.0.mesh_denial_observed.get());
+    assert_unchanged(&store, &baseline, &first.next);
+    assert_native_blob_absent(&store, &batch.documents[0]);
+    assert_native_blob_absent(&store, &batch.resources[0].1);
+}

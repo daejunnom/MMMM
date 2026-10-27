@@ -4192,3 +4192,11 @@ resource를 다시 조회하므로 기존보다 후행 I/O·권한 오류가 추
 제출할 때 보유 Prefab의 모든 resource를 새로 수집하거나 그 전체 ACL을 검사하지는 않는다.
 실제 보유 CAS의 소수 표기와 Runtime 저장 연결은 미검증·미완료이며 검사 실행 결과는 CI에서
 확인한다. 현재 CAS bytes를 최초 작성 원문이나 검사 후 불변 snapshot으로 주장하지 않는다.
+
+Runtime native source의 신규 Prefab도 원 bytes·Value·projected pin을 유지하고 두 schema
+ResourceRef 경로만 잠정 비교 복사본에서 정규화한다. Project·권한·관계 확인 뒤 같은 bytes의
+exact 검사를 마쳐야 Prefab·Physics·raw resource CAS를 stage한다. 기존 일반 문서는 여전히
+선행 stage될 수 있으며 Prefab의 I/O와 관계·정수 오류가 동시에 생기면 관측 순서가 달라질
+수 있다. 검사 후 권한 철회 시 최종 transaction 재검사는 commit을 막지만 그 전에 미참조
+CAS가 남을 수 있다. 보유 문서 전체나 일반 owned-document API에 원문 검사를 새로 강제하지
+않는다. 작성한 실제 commit 경로 검사의 실행과 게임 검증은 별도다.
