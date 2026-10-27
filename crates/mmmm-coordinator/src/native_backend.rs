@@ -1542,35 +1542,13 @@ fn collect_owned_resources(
     pins: &mut BTreeMap<ResourceId, ResourceRef>,
     budget: &RequestBudget,
 ) -> AppResult<()> {
-    check_budget(budget)?;
-    match kind {
-        OwnedKind::Prefab => {
-            for node in value["nodes"].as_array().ok_or_else(invalid)? {
-                check_budget(budget)?;
-                if let Some(resource) = node.get("geometryResource") {
-                    collect_declared_resource(resource, pins)?;
-                }
-            }
-            for resource in value["resources"].as_array().ok_or_else(invalid)? {
-                check_budget(budget)?;
-                collect_declared_resource(resource, pins)?;
-            }
-        }
-        OwnedKind::Asset => collect_declared_resource(&value["resource"], pins)?,
-        OwnedKind::PhysicsDefinition => {
-            for collider in value["colliders"].as_array().ok_or_else(invalid)? {
-                check_budget(budget)?;
-                let shape = &collider["shape"]["shape"];
-                match shape["kind"].as_str() {
-                    Some("mesh") => collect_declared_resource(&shape["geometry"], pins)?,
-                    Some("box" | "sphere" | "capsule") => {}
-                    _ => return Err(invalid()),
-                }
-            }
-        }
-        OwnedKind::Instance | OwnedKind::CommandModule | OwnedKind::Clip => {}
-    }
-    Ok(())
+    crate::owned_resource_refs::visit_owned_resource_refs(
+        kind,
+        value,
+        || check_budget(budget),
+        |resource| collect_declared_resource(resource, pins),
+        invalid,
+    )
 }
 fn collect_declared_resource(
     value: &Value,

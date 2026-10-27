@@ -4381,3 +4381,12 @@ AS 제한은 관측됐으나 구체적인 OS 원인은 확정하지 않았고 �
 Coordinator의 test-profile 대상에서 파일·행 backtrace를 잃는다. 메모리 절감이나
 원 실패 해결은 보장하지 않으며 다른 OS 및 후속 정확한 SHA의 검사에서 실제 결과를
 별도 확인한다. Rust152의 PID 관측 오류와 원인을 합치지 않는다.
+`pack.build`의 실제 소유 문서 자원 조회와 feature origin 수집도 검증된 소유 kind를
+유지하고 schema 소유 ResourceRef 위치만 방문한다. 공통 방문기는 위치만 열거하며
+각 호출자의 decode·중복 키·개수·scope·CAS·예산 정책과 native batch의 Project 전체
+resourceIds 검사는 유지한다. opaque 객체의 오인으로 인한 오류는 제거되고 오류·취소
+순서 및 깊이 오류는 달라질 수 있다. feature의 257번째 자원 검사 시점과 Value-only
+`N.0` 원문 증거 부재는 기존 한계다. 격리 Store·scope/CAS를 거쳐 실제 pack_inputs가
+통제 backend에 도달하거나 권한 거절하는 검사와 origin stage·재읽기 검사를 작성했으나
+실행은 후속 CI 대상이다. 해당 fixture는 실제 compiler target·전체 lowering·완성 pack
+또는 게임 성공을 증명하지 않는다.

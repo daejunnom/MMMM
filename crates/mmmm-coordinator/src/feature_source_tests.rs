@@ -122,6 +122,117 @@ fn example(name: &str) -> Value {
     )
     .unwrap()
 }
+
+#[test]
+fn pack_origin_collects_only_owned_schema_resource_positions() {
+    // The controlled collector exercises the same owned-kind dispatch used
+    // after pack input lowering; it does not issue target or game authority.
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let budget = RequestBudget::new(Duration::from_secs(120), cancelled.clone()).unwrap();
+    let prefab_resource = resource("resource-pack-prefab", "application/json", b"prefab");
+    let geometry = resource("resource-pack-geometry", "application/json", b"geometry");
+    let asset_resource = resource("resource-pack-asset", "application/json", b"asset");
+    let physics_resource = resource("resource-pack-physics", "application/json", b"physics");
+    let opaque = resource("resource-pack-opaque", "application/json", b"opaque");
+
+    let mut prefab = example("prefab.json");
+    prefab["resources"] = json!([prefab_resource]);
+    prefab["nodes"][0]["geometryResource"] = json!(geometry);
+    // Same ID with conflicting metadata must not become a second pin merely
+    // because an extension or display payload resembles ResourceRef.
+    let mut false_pin = json!(prefab_resource);
+    false_pin["sha256"] = json!(raw_digest(b"not-prefab"));
+    prefab["nodes"][0]["extensions"]["test:opaque"] = false_pin;
+    prefab["nodes"][2]["display"]["payload"]["opaque"] = json!(opaque);
+    prefab["revision"] = json!(projected_digest("Prefab", &prefab).unwrap());
+    validate("Prefab", &prefab).unwrap();
+
+    let mut asset = example("asset.json");
+    asset["resource"] = json!(asset_resource);
+    asset["revision"] = json!(projected_digest("Asset", &asset).unwrap());
+    validate("Asset", &asset).unwrap();
+
+    let mut physics = example("physics-definition.json");
+    physics["colliders"][0]["shape"]["shape"] = json!({
+        "kind":"mesh", "geometry":physics_resource, "topologyDigest":"0".repeat(64)
+    });
+    physics["revision"] = json!(projected_digest("PhysicsDefinition", &physics).unwrap());
+    validate("PhysicsDefinition", &physics).unwrap();
+
+    let documents = [
+        (OwnedKind::Prefab, prefab),
+        (OwnedKind::Instance, example("instance.json")),
+        (OwnedKind::CommandModule, example("command-module.json")),
+        (OwnedKind::Clip, example("animation-clip.json")),
+        (OwnedKind::Asset, asset),
+        (OwnedKind::PhysicsDefinition, physics),
+    ];
+    validate("Instance", &documents[1].1).unwrap();
+    validate("CommandModule", &documents[2].1).unwrap();
+    validate("AnimationClip", &documents[3].1).unwrap();
+    let mut pins = BTreeMap::new();
+    for (kind, value) in &documents {
+        gather_owned_resources(*kind, value, &mut pins, &budget).unwrap();
+    }
+    assert_eq!(pins.len(), 4);
+    for expected in [
+        &prefab_resource,
+        &geometry,
+        &asset_resource,
+        &physics_resource,
+    ] {
+        assert!(same_resource(
+            pins.get(&expected.resource_id).unwrap(),
+            expected
+        ));
+    }
+    assert!(!pins.contains_key(&opaque.resource_id));
+
+    let mut conflict = documents[4].1.clone();
+    conflict["resource"]["resourceId"] = json!(prefab_resource.resource_id);
+    assert_eq!(
+        gather_owned_resources(OwnedKind::Asset, &conflict, &mut pins, &budget)
+            .unwrap_err()
+            .code,
+        "REVISION_CONFLICT"
+    );
+    let mut decimal = documents[4].1.clone();
+    decimal["resource"]["sizeBytes"] = json!(5.0);
+    assert_eq!(
+        gather_owned_resources(OwnedKind::Asset, &decimal, &mut BTreeMap::new(), &budget)
+            .unwrap_err()
+            .code,
+        "SCHEMA_INVALID"
+    );
+    // Preserve the existing late limit: the last insertion may make 257,
+    // while the next source visit and the product staging gate reject it.
+    let mut full = BTreeMap::new();
+    for index in 0..256 {
+        let pin = resource(
+            &format!("resource-existing-{index}"),
+            "application/json",
+            b"x",
+        );
+        full.insert(pin.resource_id.clone(), pin);
+    }
+    gather_owned_resources(OwnedKind::Asset, &documents[4].1, &mut full, &budget).unwrap();
+    assert_eq!(full.len(), 257);
+    assert_eq!(
+        gather_owned_resources(OwnedKind::Instance, &documents[1].1, &mut full, &budget)
+            .unwrap_err()
+            .code,
+        "BUDGET_EXCEEDED"
+    );
+    cancelled.store(true, Ordering::Relaxed);
+    let before = pins.clone();
+    assert_eq!(
+        gather_owned_resources(OwnedKind::Prefab, &documents[0].1, &mut pins, &budget)
+            .unwrap_err()
+            .code,
+        "CANCELLED"
+    );
+    assert_eq!(pins.len(), before.len());
+}
 struct NoData;
 impl PlanningDataPort for NoData {
     fn state_snapshot(
@@ -327,6 +438,124 @@ fn app_failure<T>(result: AppResult<T>) -> &'static str {
         Ok(_) => panic!("Expected a source failure"),
         Err(error) => error.code,
     }
+}
+
+#[test]
+fn owned_pack_origin_receipt_ignores_opaque_resource_shapes() {
+    // This exercises owned Project/CAS reads, an actual scoped resource and
+    // later private-product provenance checks. It does not call pack target
+    // verification, lowering, or a game host.
+    let root = TestRoot::new();
+    let mut store = root.open();
+    let input_bytes = br#"{"source":"owned pack input"}"#;
+    let input = resource("resource-pack-owned", "application/json", input_bytes);
+    let mut fake = json!(input);
+    fake["sha256"] = json!(raw_digest(b"opaque, not an authorized source"));
+
+    let mut prefab = example("prefab.json");
+    prefab["resources"] = json!([input]);
+    // The original example's block geometry points at a different Project
+    // resource; this fixture registers only the resource under test.
+    for node in prefab["nodes"].as_array_mut().unwrap() {
+        node.as_object_mut().unwrap().remove("blockGeometry");
+    }
+    prefab["nodes"][0]["extensions"]["test:opaque"] = fake;
+    prefab["revision"] = json!(projected_digest("Prefab", &prefab).unwrap());
+    validate("Prefab", &prefab).unwrap();
+    assert_eq!(
+        prefab["revision"],
+        json!(projected_digest("Prefab", &prefab).unwrap())
+    );
+    let mut instance = example("instance.json");
+    instance["prefabRevision"] = prefab["revision"].clone();
+    instance["revision"] = json!(projected_digest("Instance", &instance).unwrap());
+    validate("Instance", &instance).unwrap();
+
+    let mut project_value = example("project.json");
+    project_value["resourceIds"] = json!([input.resource_id]);
+    project_value["ownedResources"] = json!([
+        {"kind":"prefab", "objectId":prefab["prefabId"], "revision":prefab["revision"]},
+        {"kind":"instance", "objectId":instance["instanceId"], "revision":instance["revision"]}
+    ]);
+    project_value["revision"] = json!(projected_digest("Project", &project_value).unwrap());
+    validate("Project", &project_value).unwrap();
+    store.save_project(&project_value, None).unwrap();
+    let project = ProjectCatalog::from_project(&project_value).unwrap();
+    for (index, value) in [(0, &prefab), (1, &instance)] {
+        let pin: OwnedDocumentPin =
+            serde_json::from_value(project_value["ownedResources"][index].clone()).unwrap();
+        register_owned_document(
+            &mut store,
+            project.project_id(),
+            project.revision(),
+            &pin,
+            value,
+        )
+        .unwrap();
+    }
+    let registered_input = registered(
+        &mut store,
+        &project,
+        input.resource_id.as_str(),
+        input_bytes,
+    );
+    assert!(same_resource(&registered_input, &input));
+    let auth = AccessFixture::new(&project);
+    let owned = {
+        let mut source = BorrowedProjectSource::new(
+            PlanningStore::write(&mut store),
+            auth.access.clone(),
+            no_data(),
+        );
+        source
+            .inspect_owned(auth.principal.principal(), &project, 32 * 1024 * 1024)
+            .unwrap()
+    };
+    let mut origin = FeatureOrigin::default();
+    origin.objects = owned.iter().map(|(pin, _)| pin.clone()).collect();
+    for (pin, value) in &owned {
+        gather_owned_resources(pin.kind, value, &mut origin.resources, &auth.budget).unwrap();
+    }
+    assert_eq!(origin.resources.len(), 1);
+    assert!(same_resource(
+        origin.resources.get(&input.resource_id).unwrap(),
+        &input
+    ));
+
+    let mut producer = resource_port(&mut store, &auth, &project);
+    producer.origin = origin;
+    let output_bytes = br#"{"pack":"private fixture output"}"#;
+    let output = resource(
+        "resource-pack-private-output",
+        "application/json",
+        output_bytes,
+    );
+    producer.stage(&json!(output), output_bytes).unwrap();
+    let mut reader = LocalFeatureResources {
+        source: BorrowedProjectSource::new(producer.store.clone(), auth.access.clone(), no_data()),
+        store: producer.store.clone(),
+        principal: auth.principal.clone(),
+        project: project.clone(),
+        context: auth.context.clone(),
+        authority: auth.authority.clone(),
+        rights: producer.rights.clone(),
+        products: producer.products.clone(),
+        budget: auth.budget.clone(),
+        origin: FeatureOrigin::default(),
+    };
+    let context = auth.context["contextId"].as_str().unwrap();
+    assert_eq!(
+        reader
+            .read(context, &json!(output), ResourcePurpose::Read, 4096)
+            .unwrap()
+            .bytes,
+        output_bytes
+    );
+    assert_eq!(reader.origin.objects.len(), owned.len());
+    assert!(same_resource(
+        reader.origin.resources.get(&input.resource_id).unwrap(),
+        &input
+    ));
 }
 
 #[test]

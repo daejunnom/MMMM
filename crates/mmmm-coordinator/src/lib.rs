@@ -40,6 +40,7 @@ pub mod native_source_ingress;
 pub mod native_targets;
 pub mod observer;
 pub mod owned_planning_data;
+mod owned_resource_refs;
 pub mod peer;
 pub mod peer_management;
 pub mod planning_context;

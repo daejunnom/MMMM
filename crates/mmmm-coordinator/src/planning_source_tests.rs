@@ -181,6 +181,379 @@ fn no_data() -> AppError {
 fn no_data_port() -> SharedPlanningData {
     Rc::new(RefCell::new(Box::new(NoData)))
 }
+
+// This exercises the exact kind-scoped collector used by pack_inputs. The
+// isolated values do not grant Project access, authenticate CAS bytes, or
+// establish a verified target or an end-to-end pack build.
+#[test]
+fn pack_owned_resource_pins_ignore_opaque_values_and_keep_declared_refs() {
+    let mut prefab = example("prefab.json");
+    let mut fake = prefab["resources"][0].clone();
+    fake["sha256"] = json!("f".repeat(64));
+    prefab["nodes"][0]["extensions"]["test:opaque"] = fake;
+    let geometry = json!({"resourceId":"resource-geometry-test","sha256":"a".repeat(64),
+        "mediaType":"application/octet-stream","sizeBytes":4});
+    prefab["nodes"][0]["geometryResource"] = geometry.clone();
+    prefab["revision"] = json!(projected_digest("Prefab", &prefab).unwrap());
+    validate("Prefab", &prefab).unwrap();
+
+    let mut asset = example("asset.json");
+    asset["resource"] = prefab["resources"][0].clone();
+    asset["revision"] = json!(projected_digest("Asset", &asset).unwrap());
+    validate("Asset", &asset).unwrap();
+    let mut physics = example("physics-definition.json");
+    let mesh = json!({"resourceId":"resource-mesh-test","sha256":"b".repeat(64),
+        "mediaType":"application/octet-stream","sizeBytes":8});
+    physics["colliders"][0]["shape"]["shape"] =
+        json!({"kind":"mesh","geometry":mesh,"topologyDigest":"c".repeat(64)});
+    physics["revision"] = json!(projected_digest("PhysicsDefinition", &physics).unwrap());
+    validate("PhysicsDefinition", &physics).unwrap();
+    let instance = example("instance.json");
+    let module = example("command-module.json");
+    let clip = example("animation-clip.json");
+    validate("Instance", &instance).unwrap();
+    validate("CommandModule", &module).unwrap();
+    validate("AnimationClip", &clip).unwrap();
+    let budget =
+        RequestBudget::new(Duration::from_secs(5), Arc::new(AtomicBool::new(false))).unwrap();
+    let owned = [
+        (OwnedKind::Prefab, &prefab),
+        (OwnedKind::Asset, &asset),
+        (OwnedKind::PhysicsDefinition, &physics),
+        (OwnedKind::Instance, &instance),
+        (OwnedKind::CommandModule, &module),
+        (OwnedKind::Clip, &clip),
+    ];
+    let pins = owned_pack_resource_pins(owned, &budget).unwrap();
+    let ids = pins
+        .values()
+        .map(|pin| pin.resource_id.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        ids,
+        BTreeSet::from([
+            "resource-geometry-test",
+            "resource-mesh-test",
+            "resource-wall-blocks"
+        ])
+    );
+    assert_eq!(pins.len(), 3);
+
+    let mut conflicting = geometry;
+    conflicting["sizeBytes"] = json!(5);
+    let mut pins = BTreeMap::new();
+    gather_resource_pin(&prefab["nodes"][0]["geometryResource"], &mut pins).unwrap();
+    assert_eq!(
+        gather_resource_pin(&conflicting, &mut pins)
+            .unwrap_err()
+            .code,
+        "REVISION_CONFLICT"
+    );
+    let cancelled =
+        RequestBudget::new(Duration::from_secs(5), Arc::new(AtomicBool::new(true))).unwrap();
+    assert_eq!(
+        owned_pack_resource_pins([(OwnedKind::Prefab, &prefab)], &cancelled)
+            .unwrap_err()
+            .code,
+        "CANCELLED"
+    );
+}
+
+// A sentinel backend confirms authenticated source bytes reached the backend;
+// it issues no target capability and never completes a pack.
+struct PackCollectorSentinel {
+    reached: Rc<std::cell::Cell<bool>>,
+    expected: ResourceRef,
+    bytes: Vec<u8>,
+}
+fn unexpected_pack_port<T>() -> AppResult<T> {
+    Err(error(
+        "TEST_UNEXPECTED_PORT",
+        "Unexpected pack fixture port",
+    ))
+}
+impl PlanningEnvironmentPort for PackCollectorSentinel {
+    fn execution_budget_ms(&mut self, _: &PrincipalId, _: &Value) -> AppResult<u64> {
+        unexpected_pack_port()
+    }
+    fn inventory(&mut self, _: &PrincipalId, _: &Value) -> AppResult<InventorySnapshot> {
+        unexpected_pack_port()
+    }
+    fn binding_dependency(
+        &mut self,
+        _: &PrincipalId,
+        _: &BindingId,
+        _: &Sha256Digest,
+        _: &Value,
+    ) -> AppResult<Value> {
+        unexpected_pack_port()
+    }
+    fn native_route(
+        &mut self,
+        _: &PrincipalId,
+        _: NativeKind,
+        _: &Value,
+    ) -> AppResult<NativeActionRoute> {
+        unexpected_pack_port()
+    }
+    fn verified_native_target(
+        &mut self,
+        _: &PrincipalId,
+        _: &TargetProfileId,
+        _: NativeKind,
+        _: &Value,
+    ) -> AppResult<VerifiedNativeTarget> {
+        unexpected_pack_port()
+    }
+    fn snapshot_native_targets(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &PreparedNativeChange,
+        _: &Value,
+    ) -> AppResult<NativeTargetSnapshot> {
+        unexpected_pack_port()
+    }
+    fn registered_action_footprint(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &Value,
+        _: &ActionDescriptor,
+        _: &Value,
+    ) -> AppResult<RegisteredActionFootprint> {
+        unexpected_pack_port()
+    }
+    fn relocatable_modules(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &[Value],
+        _: &Value,
+    ) -> AppResult<BTreeSet<ModuleId>> {
+        unexpected_pack_port()
+    }
+    fn command_layout_support(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &Value,
+        _: &Value,
+    ) -> AppResult<CommandLayoutSupport> {
+        unexpected_pack_port()
+    }
+    fn command_layout_request(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &Value,
+        _: &Value,
+        _: &Value,
+    ) -> AppResult<Value> {
+        unexpected_pack_port()
+    }
+    fn verify_projection_references(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &InstanceProjection,
+        _: &Value,
+    ) -> AppResult<Vec<Value>> {
+        unexpected_pack_port()
+    }
+    fn compiler_target(
+        &mut self,
+        _: &PrincipalId,
+        _: &TargetProfileId,
+        _: &Value,
+    ) -> AppResult<VerifiedTarget> {
+        unexpected_pack_port()
+    }
+    fn pack_inputs(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &[Value],
+        _: &Value,
+    ) -> AppResult<PackBuildInputs> {
+        unexpected_pack_port()
+    }
+    fn recovery_route(
+        &mut self,
+        _: &PrincipalId,
+        _: &RecoveryPreparation,
+        _: &Value,
+    ) -> AppResult<NativeActionRoute> {
+        unexpected_pack_port()
+    }
+    fn recovery_scope(
+        &mut self,
+        _: &PrincipalId,
+        _: &RecoveryPreparation,
+        _: &ProjectCatalog,
+        _: &Value,
+    ) -> AppResult<WriteScope> {
+        unexpected_pack_port()
+    }
+    fn project_bindings_available(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+    ) -> AppResult<bool> {
+        unexpected_pack_port()
+    }
+}
+impl PlanningBackendPort for PackCollectorSentinel {
+    fn verify_live_target(
+        &mut self,
+        _: &PrincipalId,
+        _: &TargetProfileId,
+        _: &Value,
+        _: &Value,
+        _: &RequestBudget,
+    ) -> AppResult<VerifiedPlanningTarget> {
+        unexpected_pack_port()
+    }
+    fn lower_owned_pack(
+        &mut self,
+        _: &PrincipalId,
+        _: &ProjectCatalog,
+        _: &[Value],
+        resources: &[SceneResource],
+        _: &Value,
+        _: &RequestBudget,
+    ) -> AppResult<PackBuildInputs> {
+        self.reached.set(true);
+        assert_eq!(resources.len(), 1);
+        assert_eq!(
+            resources[0].reference.resource_id,
+            self.expected.resource_id
+        );
+        assert_eq!(resources[0].reference.sha256, self.expected.sha256);
+        assert_eq!(resources[0].reference.media_type, self.expected.media_type);
+        assert_eq!(resources[0].reference.size_bytes, self.expected.size_bytes);
+        assert_eq!(resources[0].bytes, self.bytes);
+        Err(error(
+            "TEST_PACK_SENTINEL",
+            "Authorized source reached the controlled backend",
+        ))
+    }
+}
+
+#[test]
+fn pack_inputs_reaches_backend_only_with_authorized_declared_cas_resource() {
+    let root = TestRoot::new();
+    let mut store = root.open();
+    let bytes = b"actual owned pack input".to_vec();
+    let blob = store.put_blob(&bytes).unwrap();
+    let resource = ResourceRef {
+        resource_id: ResourceId::new("resource-pack-declared").unwrap(),
+        sha256: blob.digest,
+        media_type: "application/octet-stream".into(),
+        size_bytes: bytes.len() as u64,
+    };
+    let (mut pin, mut prefab) = prefab_source();
+    prefab["resources"] = json!([resource]);
+    for node in prefab["nodes"].as_array_mut().unwrap() {
+        node.as_object_mut().unwrap().remove("blockGeometry");
+    }
+    prefab["nodes"][0]["extensions"]["test:opaque"] = json!({
+        "resourceId":"resource-pack-opaque-unregistered", "sha256":"f".repeat(64),
+        "mediaType":"application/octet-stream", "sizeBytes":1
+    });
+    prefab["revision"] = json!(projected_digest("Prefab", &prefab).unwrap());
+    validate("Prefab", &prefab).unwrap();
+    mmmm_contracts::verify_projected_digest("Prefab", &prefab).unwrap();
+    pin.revision = serde_json::from_value(prefab["revision"].clone()).unwrap();
+    let project = project_for(&pin, std::slice::from_ref(&resource.resource_id));
+    store.save_project(&project, None).unwrap();
+    register_prefab(&mut store, &project, &pin, &prefab);
+    let catalog = ProjectCatalog::from_project(&project).unwrap();
+    register_resource(
+        &mut store,
+        &serde_json::to_value(&resource).unwrap(),
+        ResourceOwner::Project(catalog.project_id().clone()),
+    )
+    .unwrap();
+    let reached = Rc::new(std::cell::Cell::new(false));
+    let backend: SharedPlanningBackend = Rc::new(RefCell::new(Box::new(PackCollectorSentinel {
+        reached: reached.clone(),
+        expected: resource.clone(),
+        bytes,
+    })));
+    let dependencies = Rc::new(RefCell::new(PlanningDependencyRegistry::default()));
+    let allowed = AccessFixture::new(&catalog);
+    let mut environment = ConcretePlanningEnvironment::new(
+        PlanningStore::read(&store),
+        allowed.access.clone(),
+        no_data_port(),
+        backend.clone(),
+        dependencies.clone(),
+    );
+    let result = environment.pack_inputs(
+        allowed.access.principal(),
+        &catalog,
+        std::slice::from_ref(&prefab),
+        &allowed.context,
+    );
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("sentinel must stop before pack completion"),
+    };
+    assert_eq!(error.code, "TEST_PACK_SENTINEL");
+    assert!(reached.get());
+
+    reached.set(false);
+    let denied = AccessFixture::scoped(&catalog, vec![pin.object_id.to_string()], vec![]);
+    let mut denied_source = BorrowedProjectSource::new(
+        PlanningStore::read(&store),
+        denied.access.clone(),
+        no_data_port(),
+    );
+    assert_eq!(
+        denied_source
+            .owned_object(
+                denied.access.principal(),
+                &catalog,
+                &pin,
+                Some(&denied.context),
+                MAX_DOCUMENT_BYTES
+            )
+            .unwrap(),
+        prefab,
+    );
+    let denied_resource = denied_source.resource_bytes(
+        denied.access.principal(),
+        &catalog,
+        &resource,
+        Some(&denied.context),
+        MAX_SOURCE_BYTES,
+    );
+    let denied_error = match denied_resource {
+        Ok(_) => panic!("resource scope must reject"),
+        Err(error) => error,
+    };
+    assert_eq!(denied_error.code, "PERMISSION_REQUIRED");
+    let mut environment = ConcretePlanningEnvironment::new(
+        PlanningStore::read(&store),
+        denied.access.clone(),
+        no_data_port(),
+        backend,
+        dependencies,
+    );
+    let denied_pack = match environment.pack_inputs(
+        denied.access.principal(),
+        &catalog,
+        &[prefab],
+        &denied.context,
+    ) {
+        Ok(_) => panic!("pack input resource scope must reject"),
+        Err(error) => error,
+    };
+    assert_eq!(denied_pack.code, "PERMISSION_REQUIRED");
+    assert!(!reached.get());
+}
+
 struct AccessFixture {
     sessions: SessionAuthority,
     token: crate::credential::SecretToken,

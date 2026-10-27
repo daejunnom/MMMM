@@ -1907,16 +1907,14 @@ impl FeatureSources for LocalFeatureSources {
         let owned = source
             .inspect_owned(principal.principal(), &project, 32 * 1024 * 1024)
             .map_err(service)?;
-        self.origin.objects = owned.iter().map(|(pin, _)| pin.clone()).collect();
-        let values = owned
-            .into_iter()
-            .map(|(_, value)| value)
-            .collect::<Vec<_>>();
+        let (pins, values): (Vec<_>, Vec<_>) = owned.into_iter().unzip();
+        self.origin.objects = pins;
         let inputs = environment
             .pack_inputs(principal.principal(), &project, &values, context)
             .map_err(service)?;
-        for value in &values {
-            gather_resources(value, &mut self.origin.resources, budget, 0).map_err(service)?;
+        for (pin, value) in self.origin.objects.iter().zip(&values) {
+            gather_owned_resources(pin.kind, value, &mut self.origin.resources, budget)
+                .map_err(service)?;
         }
         Ok(PackInputs { target, inputs })
     }
@@ -3432,45 +3430,39 @@ fn parse_feature_document(
     budget_check(budget)?;
     Ok(value)
 }
-fn gather_resources(
+fn gather_owned_resources(
+    kind: OwnedKind,
     value: &Value,
     resources: &mut BTreeMap<ResourceId, ResourceRef>,
     budget: &RequestBudget,
-    depth: usize,
 ) -> AppResult<()> {
     budget_check(budget)?;
-    if depth > 64 || resources.len() > 256 {
+    if resources.len() > 256 {
         return Err(limit());
     }
-    if value.get("resourceId").is_some()
-        && value.get("sha256").is_some()
-        && value.get("mediaType").is_some()
-        && value.get("sizeBytes").is_some()
-    {
-        let pin: ResourceRef = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
-        if resources
-            .get(&pin.resource_id)
-            .is_some_and(|old| !same_resource(old, &pin))
-        {
-            return Err(conflict());
-        }
-        resources.insert(pin.resource_id.clone(), pin);
-    } else {
-        match value {
-            Value::Array(values) => {
-                for value in values {
-                    gather_resources(value, resources, budget, depth + 1)?;
-                }
+    crate::owned_resource_refs::visit_owned_resource_refs(
+        kind,
+        value,
+        || budget_check(budget),
+        |resource| {
+            if resources.len() > 256 {
+                return Err(limit());
             }
-            Value::Object(values) => {
-                for value in values.values() {
-                    gather_resources(value, resources, budget, depth + 1)?;
-                }
+            // Keep this source's strict typed decode; unlike the planning
+            // collector it does not normalize Value-only decimal lengths.
+            let pin: ResourceRef =
+                serde_json::from_value(resource.clone()).map_err(|_| invalid())?;
+            if resources
+                .get(&pin.resource_id)
+                .is_some_and(|old| !same_resource(old, &pin))
+            {
+                return Err(conflict());
             }
-            _ => {}
-        }
-    }
-    Ok(())
+            resources.insert(pin.resource_id.clone(), pin);
+            Ok(())
+        },
+        invalid,
+    )
 }
 fn record_cost(context: &Value, payload: &Value, resources: &[&ResourceRef]) -> AppResult<usize> {
     let context = encode_json(context).map_err(|_| limit())?.len();

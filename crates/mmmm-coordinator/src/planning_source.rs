@@ -2089,10 +2089,10 @@ impl PlanningEnvironmentPort for ConcretePlanningEnvironment<'_> {
                 return Err(revision_conflict());
             }
         }
-        let mut pins = BTreeMap::new();
-        for (_, value) in &actual {
-            gather_resource_pins(value, &mut pins, 0)?;
-        }
+        let pins = owned_pack_resource_pins(
+            actual.iter().map(|(pin, value)| (pin.kind, value)),
+            self.access.budget(),
+        )?;
         let mut resources = Vec::with_capacity(pins.len());
         let mut remaining = MAX_SOURCE_BYTES;
         for resource in pins.into_values() {
@@ -2168,50 +2168,46 @@ impl PlanningEnvironmentPort for ConcretePlanningEnvironment<'_> {
     }
 }
 
-fn gather_resource_pins(
+fn owned_pack_resource_pins<'a>(
+    owned: impl IntoIterator<Item = (OwnedKind, &'a Value)>,
+    budget: &RequestBudget,
+) -> AppResult<BTreeMap<(String, Sha256Digest), ResourceRef>> {
+    let mut pins = BTreeMap::new();
+    for (kind, value) in owned {
+        crate::owned_resource_refs::visit_owned_resource_refs(
+            kind,
+            value,
+            || budget_check(budget),
+            |resource| gather_resource_pin(resource, &mut pins),
+            || {
+                error(
+                    "INVALID_INPUT",
+                    "Planning source violates its canonical contract",
+                )
+            },
+        )?;
+    }
+    Ok(pins)
+}
+
+fn gather_resource_pin(
     value: &Value,
     pins: &mut BTreeMap<(String, Sha256Digest), ResourceRef>,
-    depth: usize,
 ) -> AppResult<()> {
-    if depth > 64 {
-        return Err(source_budget());
-    }
-    match value {
-        Value::Array(values) => {
-            for child in values {
-                gather_resource_pins(child, pins, depth + 1)?;
-            }
+    let resource = decode_resource(value)?;
+    let key = (
+        resource.resource_id.as_str().to_owned(),
+        resource.sha256.clone(),
+    );
+    if let Some(prior) = pins.get(&key) {
+        if prior.media_type != resource.media_type || prior.size_bytes != resource.size_bytes {
+            return Err(revision_conflict());
         }
-        Value::Object(values) => {
-            if values.len() == 4
-                && ["resourceId", "sha256", "mediaType", "sizeBytes"]
-                    .iter()
-                    .all(|key| values.contains_key(*key))
-            {
-                let resource = decode_resource(value)?;
-                let key = (
-                    resource.resource_id.as_str().to_owned(),
-                    resource.sha256.clone(),
-                );
-                if let Some(prior) = pins.get(&key) {
-                    if prior.media_type != resource.media_type
-                        || prior.size_bytes != resource.size_bytes
-                    {
-                        return Err(revision_conflict());
-                    }
-                } else {
-                    if pins.len() >= 4096 {
-                        return Err(source_budget());
-                    }
-                    pins.insert(key, resource);
-                }
-            } else {
-                for child in values.values() {
-                    gather_resource_pins(child, pins, depth + 1)?;
-                }
-            }
+    } else {
+        if pins.len() >= 4096 {
+            return Err(source_budget());
         }
-        _ => (),
+        pins.insert(key, resource);
     }
     Ok(())
 }
