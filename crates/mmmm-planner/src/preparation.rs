@@ -874,7 +874,7 @@ impl NativePlanner<'_> {
 pub(crate) fn physics_mesh_resources(physics: &Value) -> AppResult<Vec<ResourceRef>> {
     validate("PhysicsDefinition", physics)?;
     let mut resources = BTreeMap::<String, ResourceRef>::new();
-    for collider in array(physics, "colliders")? {
+    for collider in crate::scene::array(physics, "colliders")? {
         let shape = &collider["shape"]["shape"];
         if text(shape, "kind")? == "mesh" {
             let geometry = &shape["geometry"];

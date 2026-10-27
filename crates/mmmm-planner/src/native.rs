@@ -512,13 +512,13 @@ fn reject_unwitnessed_physics_lengths(change: &Value) -> AppResult<()> {
         Ok(())
     }
 
-    for document in crate::array(change, "documentChanges")? {
+    for document in crate::scene::array(change, "documentChanges")? {
         if document["kind"] == "physics_definition" {
             check(&document["after"])?;
         }
     }
-    for projection in crate::array(change, "worldProjection")? {
-        for physics in crate::array(projection, "physicsDefinitions")? {
+    for projection in crate::scene::array(change, "worldProjection")? {
+        for physics in crate::scene::array(projection, "physicsDefinitions")? {
             check(physics)?;
         }
     }

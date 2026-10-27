@@ -46,7 +46,7 @@ fn unresolved() -> AppError {
         "Variant retains a missing or inconsistent typed target",
     )
 }
-fn array<'a>(value: &'a Value, field: &str) -> AppResult<&'a [Value]> {
+pub(crate) fn array<'a>(value: &'a Value, field: &str) -> AppResult<&'a [Value]> {
     value[field]
         .as_array()
         .map(Vec::as_slice)
