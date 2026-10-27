@@ -369,19 +369,14 @@ fn timestamp_utc(value: &str) -> bool {
 /// The collector verifies all actual bytes, including archive extraction, rights
 /// and inventory closure, before its trusted verifier authenticates the proof.
 pub fn artifact_inventory_digest(artifacts: &[ReleaseArtifact]) -> Result<String, PolicyError> {
-    if artifacts.is_empty() || artifacts.len() > 4096 {
-        return Err(invalid("Inventory must be nonempty and bounded"));
-    }
+    validate_inventory_paths(
+        artifacts.len(),
+        artifacts.iter().map(|entry| entry.path.as_str()),
+    )?;
     let mut sorted = artifacts.to_vec();
     sorted.sort_by(|left, right| left.path.cmp(&right.path));
-    let mut names = BTreeSet::new();
     for artifact in &sorted {
-        if !portable_path(&artifact.path)
-            || !sha256(&artifact.sha256)
-            || artifact.bytes == 0
-            || artifact.bytes > 8_589_934_592
-            || !names.insert(portable_key(&artifact.path))
-        {
+        if !sha256(&artifact.sha256) || artifact.bytes == 0 || artifact.bytes > 8_589_934_592 {
             return Err(invalid(
                 "Inventory has a traversal/link-like path, collision, unknown bytes or invalid digest",
             ));
@@ -391,6 +386,48 @@ pub fn artifact_inventory_digest(artifacts: &[ReleaseArtifact]) -> Result<String
     canonical_digest(&value)
         .map(|digest| digest.into_string())
         .map_err(|error| invalid(error.to_string()))
+}
+
+/// Check only the explicit path roster against the inventory path contract.
+/// This does not inspect files, links, permissions, bytes, or release evidence.
+/// The contract permits a path that is an ancestor of another path; a collector
+/// must separately reject that conflict before treating both as files.
+pub fn validate_artifact_inventory_paths(paths: &[&str]) -> Result<(), PolicyError> {
+    validate_inventory_paths(paths.len(), paths.iter().copied())
+}
+
+/// Validate a roster whose entries will each be collected as files.
+/// This adds an ancestor conflict check to the inventory path contract, but
+/// does not inspect the filesystem or establish any release evidence.
+pub fn validate_artifact_file_roster(paths: &[&str]) -> Result<(), PolicyError> {
+    validate_artifact_inventory_paths(paths)?;
+    let names: BTreeSet<String> = paths.iter().map(|path| portable_key(path)).collect();
+    for name in &names {
+        for (index, _) in name.match_indices('/') {
+            if names.contains(&name[..index]) {
+                return Err(invalid("Inventory file path has a file ancestor"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_inventory_paths<'a>(
+    count: usize,
+    paths: impl Iterator<Item = &'a str>,
+) -> Result<(), PolicyError> {
+    if count == 0 || count > 4096 {
+        return Err(invalid("Inventory must be nonempty and bounded"));
+    }
+    let mut names = BTreeSet::new();
+    for path in paths {
+        if !portable_path(path) || !names.insert(portable_key(path)) {
+            return Err(invalid(
+                "Inventory has a traversal/link-like path, collision, unknown bytes or invalid digest",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn portable_key(path: &str) -> String {

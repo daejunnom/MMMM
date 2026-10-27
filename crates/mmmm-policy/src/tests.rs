@@ -878,6 +878,43 @@ fn artifact_paths_sizes_collisions_and_inventory_digest_are_checked() {
 }
 
 #[test]
+fn inventory_path_preflight_shares_contract_and_file_roster_checks_ancestors() {
+    let entries = inventory();
+    let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+    assert!(validate_artifact_inventory_paths(&paths).is_ok());
+    assert!(validate_artifact_file_roster(&paths).is_ok());
+    assert!(validate_artifact_file_roster(&["build/output.zip"]).is_ok());
+    assert!(validate_artifact_file_roster(&["a", "ab/child"]).is_ok());
+    assert!(validate_artifact_file_roster(&["a/one", "a/two"]).is_ok());
+
+    for paths in [
+        vec!["../escape"],
+        vec!["same", "same"],
+        vec!["windows/file", "WINDOWS/FILE"],
+        vec!["caf\u{e9}", "cafe\u{301}"],
+    ] {
+        assert!(validate_artifact_inventory_paths(&paths).is_err());
+        assert!(validate_artifact_file_roster(&paths).is_err());
+    }
+    assert!(validate_artifact_inventory_paths(&[]).is_err());
+    assert!(validate_artifact_inventory_paths(&vec!["file"; 4097]).is_err());
+
+    for paths in [
+        ["a", "a/child"],
+        ["A", "a/child"],
+        ["caf\u{e9}", "CAFE\u{301}/child"],
+    ] {
+        assert!(validate_artifact_inventory_paths(&paths).is_ok());
+        assert!(validate_artifact_file_roster(&paths).is_err());
+        let mut existing = inventory();
+        existing.truncate(2);
+        existing[0].path = paths[0].into();
+        existing[1].path = paths[1].into();
+        assert!(artifact_inventory_digest(&existing).is_ok());
+    }
+}
+
+#[test]
 fn contradictory_duplicate_proofs_are_rejected_without_last_writer_wins() {
     let (_, binding, mut claims) = release_fixture();
     let mut duplicate = claims[0].clone();
