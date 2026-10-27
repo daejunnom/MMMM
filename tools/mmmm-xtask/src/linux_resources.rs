@@ -360,6 +360,8 @@ impl EnumerationFailureDiagnostic {
 struct EnumerationDiagnostic {
     pass: usize,
     native_errno: i32,
+    gap: EnumerationGap,
+    candidate_directory_opened: bool,
     original: EnumerationFailureDiagnostic,
     post_control: Option<EnumerationFailureDiagnostic>,
     candidate_close: Option<EnumerationFailureDiagnostic>,
@@ -367,17 +369,39 @@ struct EnumerationDiagnostic {
     final_anchor: Option<EnumerationFailureDiagnostic>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EnumerationGap {
+    UnboundCandidateDirectoryOpenEsrch,
+    UnboundCandidateStatOpenEnoent,
+}
+
+impl EnumerationGap {
+    fn native_errno(self) -> i32 {
+        match self {
+            Self::UnboundCandidateDirectoryOpenEsrch => 3,
+            Self::UnboundCandidateStatOpenEnoent => 2,
+        }
+    }
+
+    fn candidate_directory_opened(self) -> bool {
+        matches!(self, Self::UnboundCandidateStatOpenEnoent)
+    }
+}
+
 struct IncompleteEnumeration {
     original: ProcessError,
+    gap: EnumerationGap,
     post_control: Option<ProcessError>,
     candidate_close: Option<ProcessError>,
     enumeration_close: Option<ProcessError>,
     final_anchor: Option<ProcessError>,
 }
 impl IncompleteEnumeration {
-    fn new(original: ProcessError) -> Self {
+    fn new(original: ProcessError, gap: EnumerationGap) -> Self {
         Self {
             original,
+            gap,
             post_control: None,
             candidate_close: None,
             enumeration_close: None,
@@ -393,7 +417,9 @@ impl IncompleteEnumeration {
     fn diagnostic(&self, pass: usize) -> EnumerationDiagnostic {
         EnumerationDiagnostic {
             pass,
-            native_errno: 2,
+            native_errno: self.gap.native_errno(),
+            gap: self.gap,
+            candidate_directory_opened: self.gap.candidate_directory_opened(),
             original: EnumerationFailureDiagnostic::capture(&self.original),
             post_control: self
                 .post_control
@@ -1054,6 +1080,20 @@ fn initial_unbound_stat_open_incomplete(
         && matches!(file, MetadataRole::Stat)
         && matches!(operation, MetadataOperation::Open)
         && error.raw_os_error() == Some(2)
+}
+
+fn initial_unbound_directory_open_incomplete(
+    unbound: bool,
+    process: ProcessRole,
+    file: MetadataRole,
+    operation: MetadataOperation,
+    error: &std::io::Error,
+) -> bool {
+    unbound
+        && matches!(process, ProcessRole::EnumeratedCandidate)
+        && matches!(file, MetadataRole::PidDirectory)
+        && matches!(operation, MetadataOperation::Open)
+        && error.raw_os_error() == Some(3)
 }
 
 fn candidate_is_unbound(pid: i32, leader: i32, mut retained: impl Iterator<Item = i32>) -> bool {
@@ -2261,6 +2301,218 @@ mod native {
         }
     }
 
+    // This boundary receives only an error from the actual candidate directory
+    // open. It cannot manufacture a process identity, terminal proof, or FD.
+    fn candidate_directory_open_failure(
+        role: ProcessRole,
+        unbound: bool,
+        error: std::io::Error,
+        control: &mut ObservationControl<'_>,
+    ) -> Result<CandidateOpen, ProcessError> {
+        if initial_unbound_directory_open_incomplete(
+            unbound,
+            role,
+            MetadataRole::PidDirectory,
+            MetadataOperation::Open,
+            &error,
+        ) {
+            // There is no anchored candidate identity or opened candidate
+            // directory. Preserve the native error and retry a whole bounded
+            // enumeration only after control, enumeration close, and leader
+            // anchor checks. ESRCH here is not an owned-process exit proof.
+            let mut incomplete = IncompleteEnumeration::new(
+                metadata_io_error(
+                    role,
+                    MetadataRole::PidDirectory,
+                    MetadataOperation::Open,
+                    error,
+                ),
+                EnumerationGap::UnboundCandidateDirectoryOpenEsrch,
+            );
+            incomplete.post_control = control.check("candidate_directory_open").err();
+            return Ok(CandidateOpen::Incomplete(Box::new(incomplete)));
+        }
+        let result = if error.raw_os_error() == Some(libc::ENOENT) {
+            Ok(CandidateOpen::Unavailable)
+        } else {
+            Err(metadata_io_error(
+                role,
+                MetadataRole::PidDirectory,
+                MetadataOperation::Open,
+                error,
+            ))
+        };
+        control.finish(result, "candidate_directory_open")
+    }
+
+    #[cfg(test)]
+    mod candidate_directory_failure_tests {
+        use super::*;
+
+        #[test]
+        fn actual_failure_assembly_retains_errno_and_post_control() {
+            let mut phases = Vec::new();
+            let mut checkpoint = |phase| {
+                phases.push(phase);
+                Ok(())
+            };
+            let result = {
+                let mut control = ObservationControl::new(&mut checkpoint, true);
+                candidate_directory_open_failure(
+                    ProcessRole::EnumeratedCandidate,
+                    true,
+                    std::io::Error::from_raw_os_error(libc::ESRCH),
+                    &mut control,
+                )
+            };
+            let incomplete = match result {
+                Ok(CandidateOpen::Incomplete(incomplete)) => incomplete,
+                _ => panic!("unbound candidate ESRCH must remain an incomplete pass"),
+            };
+            assert_eq!(phases, ["candidate_directory_open"]);
+            assert!(incomplete.recoverable());
+            assert_eq!(incomplete.gap.native_errno(), libc::ESRCH);
+            assert!(!incomplete.gap.candidate_directory_opened());
+            assert!(
+                incomplete
+                    .original
+                    .message
+                    .contains("file_role=pid_directory; operation=open;")
+            );
+            assert!(incomplete.original.message.contains("os_error=Some(3)"));
+
+            let mut checkpoint = |_| {
+                let mut error = ProcessError::new("cancelled", "post-open checkpoint cancelled");
+                error.drained = false;
+                Err(error)
+            };
+            let mut control = ObservationControl::new(&mut checkpoint, true);
+            let result = candidate_directory_open_failure(
+                ProcessRole::EnumeratedCandidate,
+                true,
+                std::io::Error::from_raw_os_error(libc::ESRCH),
+                &mut control,
+            );
+            let incomplete = match result {
+                Ok(CandidateOpen::Incomplete(incomplete)) => incomplete,
+                _ => panic!("post-control error must retain the original incomplete pass"),
+            };
+            assert!(!incomplete.recoverable());
+            assert_eq!(incomplete.post_control.as_ref().unwrap().kind, "cancelled");
+            let error = incomplete.into_failure();
+            assert!(!error.drained);
+            assert!(error.message.contains("os_error=Some(3)"));
+            assert!(error.message.contains("post-open checkpoint cancelled"));
+        }
+
+        #[test]
+        fn retained_or_other_directory_failures_do_not_gain_a_retry() {
+            for (role, unbound, code) in [
+                (ProcessRole::EnumeratedCandidate, false, libc::ESRCH),
+                (ProcessRole::ReservedLeader, true, libc::ESRCH),
+                (ProcessRole::OwnedMember, true, libc::ESRCH),
+                (ProcessRole::EnumeratedCandidate, true, libc::EACCES),
+            ] {
+                let mut checkpoint = |_| Ok(());
+                let mut control = ObservationControl::new(&mut checkpoint, true);
+                let result = candidate_directory_open_failure(
+                    role,
+                    unbound,
+                    std::io::Error::from_raw_os_error(code),
+                    &mut control,
+                );
+                let error = match result {
+                    Err(error) => error,
+                    _ => panic!("bound or different errors must remain failures"),
+                };
+                assert_eq!(error.kind, "resource_observation");
+                assert!(error.message.contains(&format!("os_error=Some({code})")));
+            }
+        }
+
+        #[test]
+        fn candidate_directory_enoent_preserves_existing_unavailable_and_post_control() {
+            // The numeric enumeration role is the same for an unbound candidate
+            // and a namespace probe of a retained PID. Neither result asserts
+            // a retained identity's terminal state.
+            for unbound in [false, true] {
+                let mut phases = Vec::new();
+                let mut checkpoint = |phase| {
+                    phases.push(phase);
+                    Ok(())
+                };
+                let result = {
+                    let mut control = ObservationControl::new(&mut checkpoint, true);
+                    candidate_directory_open_failure(
+                        ProcessRole::EnumeratedCandidate,
+                        unbound,
+                        std::io::Error::from_raw_os_error(libc::ENOENT),
+                        &mut control,
+                    )
+                };
+                assert!(matches!(result, Ok(CandidateOpen::Unavailable)));
+                assert_eq!(phases, ["candidate_directory_open"]);
+
+                let mut checkpoint = |_| {
+                    let mut error =
+                        ProcessError::new("cancelled", "post-open checkpoint cancelled");
+                    error.drained = false;
+                    Err(error)
+                };
+                let mut control = ObservationControl::new(&mut checkpoint, true);
+                let result = candidate_directory_open_failure(
+                    ProcessRole::EnumeratedCandidate,
+                    unbound,
+                    std::io::Error::from_raw_os_error(libc::ENOENT),
+                    &mut control,
+                );
+                let error = match result {
+                    Err(error) => error,
+                    _ => panic!("post-control failure cannot become unavailable"),
+                };
+                assert_eq!(error.kind, "cancelled");
+                assert_eq!(error.message, "post-open checkpoint cancelled");
+                assert!(!error.drained);
+            }
+        }
+
+        #[test]
+        fn actual_failure_assembly_connects_to_bounded_second_pass() {
+            let mut pending = PendingObservations::default();
+            let mut calls = 0;
+            let (result, evidence) = enumeration_sample::<()>(&mut pending, |work, _| {
+                calls += 1;
+                work.entry()?;
+                if calls == 1 {
+                    let mut checkpoint = |_| Ok(());
+                    let mut control = ObservationControl::new(&mut checkpoint, true);
+                    match candidate_directory_open_failure(
+                        ProcessRole::EnumeratedCandidate,
+                        true,
+                        std::io::Error::from_raw_os_error(libc::ESRCH),
+                        &mut control,
+                    )? {
+                        CandidateOpen::Incomplete(incomplete) => {
+                            Ok(EnumerationPass::Incomplete(incomplete))
+                        }
+                        _ => panic!("failure assembly must not create an identity or FD"),
+                    }
+                } else {
+                    Err(ProcessError::new("timeout", "second pass deadline"))
+                }
+            });
+            let error = result.unwrap_err();
+            assert_eq!(calls, 2);
+            assert_eq!(error.kind, "timeout");
+            assert!(error.message.contains("first_incomplete_enumeration="));
+            assert!(error.message.contains("os_error=Some(3)"));
+            assert_eq!(evidence.count, 1);
+            assert_eq!(evidence.recovered_samples, 0);
+            assert_eq!(evidence.first.unwrap().native_errno, libc::ESRCH);
+            assert_eq!(evidence.following_failure.unwrap().kind, "timeout");
+        }
+    }
+
     fn open_process_checked(
         root: &File,
         pid: i32,
@@ -2279,18 +2531,12 @@ mod native {
             )
         };
         if descriptor < 0 {
-            let error = std::io::Error::last_os_error();
-            let result = if error.raw_os_error() == Some(libc::ENOENT) {
-                Ok(CandidateOpen::Unavailable)
-            } else {
-                Err(metadata_io_error(
-                    role,
-                    MetadataRole::PidDirectory,
-                    MetadataOperation::Open,
-                    error,
-                ))
-            };
-            return control.finish(result, "candidate_directory_open");
+            return candidate_directory_open_failure(
+                role,
+                unbound,
+                std::io::Error::last_os_error(),
+                control,
+            );
         }
         let directory = checked_open_file(
             Ok(unsafe { File::from_raw_fd(descriptor) }),
@@ -2314,12 +2560,10 @@ mod native {
                     &error,
                 ) =>
             {
-                let mut incomplete = IncompleteEnumeration::new(metadata_io_error(
-                    role,
-                    MetadataRole::Stat,
-                    MetadataOperation::Open,
-                    error,
-                ));
+                let mut incomplete = IncompleteEnumeration::new(
+                    metadata_io_error(role, MetadataRole::Stat, MetadataOperation::Open, error),
+                    EnumerationGap::UnboundCandidateStatOpenEnoent,
+                );
                 // Keep the original ENOENT even if control or exact FD close fails.
                 // A failure at either stage makes this gap non-recoverable.
                 incomplete.post_control = control.check("candidate_stat_open").err();
@@ -4132,12 +4376,27 @@ pub(super) mod tests {
     }
 
     fn incomplete_enumeration() -> Box<IncompleteEnumeration> {
-        Box::new(IncompleteEnumeration::new(metadata_io_error(
-            ProcessRole::EnumeratedCandidate,
-            MetadataRole::Stat,
-            MetadataOperation::Open,
-            std::io::Error::from_raw_os_error(2),
-        )))
+        Box::new(IncompleteEnumeration::new(
+            metadata_io_error(
+                ProcessRole::EnumeratedCandidate,
+                MetadataRole::Stat,
+                MetadataOperation::Open,
+                std::io::Error::from_raw_os_error(2),
+            ),
+            EnumerationGap::UnboundCandidateStatOpenEnoent,
+        ))
+    }
+
+    fn incomplete_candidate_directory() -> Box<IncompleteEnumeration> {
+        Box::new(IncompleteEnumeration::new(
+            metadata_io_error(
+                ProcessRole::EnumeratedCandidate,
+                MetadataRole::PidDirectory,
+                MetadataOperation::Open,
+                std::io::Error::from_raw_os_error(3),
+            ),
+            EnumerationGap::UnboundCandidateDirectoryOpenEsrch,
+        ))
     }
 
     #[test]
@@ -4191,6 +4450,133 @@ pub(super) mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn only_unbound_candidate_directory_open_esrch_is_new_enumeration_gap() {
+        for unbound in [false, true] {
+            for role in [
+                ProcessRole::ReservedLeader,
+                ProcessRole::OwnedMember,
+                ProcessRole::EnumeratedCandidate,
+            ] {
+                for file in [
+                    MetadataRole::PidDirectory,
+                    MetadataRole::Stat,
+                    MetadataRole::RssRollup,
+                ] {
+                    for operation in [
+                        MetadataOperation::Open,
+                        MetadataOperation::Rewind,
+                        MetadataOperation::Read,
+                    ] {
+                        for code in [2, 3, 4, 5, 13, 38] {
+                            assert_eq!(
+                                initial_unbound_directory_open_incomplete(
+                                    unbound,
+                                    role,
+                                    file,
+                                    operation,
+                                    &std::io::Error::from_raw_os_error(code),
+                                ),
+                                unbound
+                                    && matches!(role, ProcessRole::EnumeratedCandidate)
+                                    && matches!(file, MetadataRole::PidDirectory)
+                                    && matches!(operation, MetadataOperation::Open)
+                                    && code == 3,
+                            );
+                        }
+                        assert!(!initial_unbound_directory_open_incomplete(
+                            unbound,
+                            role,
+                            file,
+                            operation,
+                            &std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "untrusted native detail",
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn candidate_directory_gap_restarts_whole_pass_and_preserves_native_evidence() {
+        let mut pending = PendingObservations::default();
+        let mut calls = 0;
+        let (result, evidence) = enumeration_sample(&mut pending, |work, facts| {
+            calls += 1;
+            work.entry()?;
+            if calls == 1 {
+                facts.record(pending_observation_for_role(PendingRole::OwnedMember));
+                Ok(EnumerationPass::Incomplete(incomplete_candidate_directory()))
+            } else {
+                facts.record(pending_observation_for_role(PendingRole::ReservedLeader));
+                Ok(EnumerationPass::Complete(17))
+            }
+        });
+        assert_eq!(result.unwrap(), 17);
+        assert_eq!(calls, 2);
+        assert_eq!(pending.member.as_ref().unwrap().count, 1);
+        assert_eq!(pending.leader.as_ref().unwrap().count, 1);
+        assert_eq!(evidence.count, 1);
+        assert_eq!(evidence.recovered_samples, 1);
+        let first = evidence.first.unwrap();
+        assert_eq!(first.native_errno, 3);
+        assert!(!first.candidate_directory_opened);
+        assert!(matches!(
+            first.gap,
+            EnumerationGap::UnboundCandidateDirectoryOpenEsrch
+        ));
+        assert!(
+            first
+                .original
+                .message
+                .contains("file_role=pid_directory; operation=open;")
+        );
+        assert!(first.original.message.contains("os_error=Some(3)"));
+    }
+
+    #[test]
+    fn candidate_directory_gap_never_bypasses_bound_or_finalization_failures() {
+        for stage in 0..3 {
+            let mut pending = PendingObservations::default();
+            let mut calls = 0;
+            let (result, evidence) = enumeration_sample::<()>(&mut pending, |_, _| {
+                calls += 1;
+                let mut incomplete = incomplete_candidate_directory();
+                let mut failure = ProcessError::new("original_checkpoint", "bounded failure");
+                failure.drained = false;
+                match stage {
+                    0 => incomplete.post_control = Some(failure),
+                    1 => incomplete.enumeration_close = Some(failure),
+                    _ => incomplete.final_anchor = Some(failure),
+                }
+                Ok(EnumerationPass::Incomplete(incomplete))
+            });
+            let error = result.unwrap_err();
+            assert_eq!(calls, 1);
+            assert!(!error.drained);
+            assert!(error.message.contains("os_error=Some(3)"));
+            assert!(error.message.contains("bounded failure"));
+            assert!(!evidence.first.unwrap().candidate_directory_opened);
+        }
+
+        let mut pending = PendingObservations::default();
+        let mut calls = 0;
+        let (result, evidence) = enumeration_sample::<()>(&mut pending, |work, _| {
+            calls += 1;
+            work.entry()?;
+            Ok(EnumerationPass::Incomplete(incomplete_candidate_directory()))
+        });
+        assert_eq!(calls, 2);
+        assert_eq!(evidence.count, 2);
+        assert_eq!(evidence.recovered_samples, 0);
+        let error = result.unwrap_err();
+        assert!(error.message.contains("first_incomplete_enumeration="));
+        assert!(error.message.contains("os_error=Some(3)"));
     }
 
     #[test]

@@ -4365,3 +4365,11 @@ Asset resource, Physics mesh geometry만 수집해 opaque JSON의 우연한 Reso
 참조 순서와 오류·취소 우선순위, opaque 깊이 오류는 이전과 달라질 수 있다. 통제 포트
 회귀는 작성했으나 실행은 후속 CI 대상이며 실제 ACL/CAS·승인 target·게임 증거는 아니다.
 Value-only decimal은 원 숫자 lexeme을 입증하지 못하는 기존 한계를 유지한다.
+Rust152 Linux test는 성공했으나 Clippy는 열거 후보의 PID 디렉터리 open `ESRCH`에
+대한 resource 관측 실패로 종료돼 lint 결과가 없다. 원 실행의 후보 소유 여부와 커널
+분기는 확인되지 않으며 원 ZIP을 보존한다. 후속 Linux 감독기는 unbound 열거 후보의
+PID 디렉터리 최초 open `ESRCH`만 불완전 pass로 기록하고 기존 예산·pending·leader
+anchor 아래 최대 한 번 전체 재관측한다. 실제 errno·원 오류와 후속 제어 오류를 보존하고
+기존 ENOENT 의미는 유지한다. 실패 처리 주입 회귀를 작성했으나 실행은 후속 CI 대상이며
+실제 procfs 경합 재현, 원 실패 해결, 짧게 존재한 프로세스의 과거 관측이나 kernel hard
+quota의 증거는 아니다.
