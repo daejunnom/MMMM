@@ -196,8 +196,9 @@ impl NativePlanner<'_> {
             Ok(decoded)
         } else {
             // Existing Value-only adapters have no checkpoint or raw witness.
-            // Their schema-owned integer values retain the original path.
-            decode("Prefab", &value)
+            // load_owned already rejected decimal ResourceRef lengths. Keep
+            // the existing no-checkpoint boundary while preserving opaque data.
+            decode_prefab_scoped(&value, || Ok(()))
         }
     }
     pub(crate) fn load_current(

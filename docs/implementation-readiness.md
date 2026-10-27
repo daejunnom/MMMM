@@ -4346,3 +4346,9 @@ parameters, Prefab display payload, nullable beforeDefinition의 개별 회귀�
 Physics 외 typed ResourceRef의 Value-only decimal 수용은 원 숫자 표기의 exact 증거가
 아니며 이 변경은 CAS 권한 또는 게임 성공을 증명하지 않는다. 기존 입력 상한은 동시
 복사본의 전체 heap이나 단일 schema·serde 호출의 강제 시간 상한을 보장하지 않는다.
+Prefab Value-only fallback은 기존 source 계약과 정수형 ResourceRef 길이 거절 뒤 scoped
+변환을 사용해 extension과 display payload의 opaque ResourceRef 모양 값을 보존한다.
+원 CAS bytes가 있는 경로는 바꾸지 않았다. 통제 포트 검사 초안은 두 opaque 위치와
+두 schema 소유 ResourceRef 위치의 decimal 거절을 확인하며 실행은 후속 CI 대상이다.
+Value-only 경로의 checkpoint는 기존처럼 no-op이고, 자원별 추가 schema 검증은 비용을
+늘릴 수 있다. 실제 CAS·권한·완료 clone 또는 게임의 증거는 아니다.

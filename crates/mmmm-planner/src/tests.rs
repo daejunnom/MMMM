@@ -725,6 +725,7 @@ struct SnapshotSource {
     prefab_bytes: Vec<u8>,
     calls: std::rc::Rc<std::cell::Cell<usize>>,
     deny: bool,
+    value_only: bool,
 }
 
 impl ProjectSourcePort for SnapshotSource {
@@ -744,8 +745,11 @@ impl ProjectSourcePort for SnapshotSource {
         _: Option<&serde_json::Value>,
         _: u64,
     ) -> mmmm_application::AppResult<serde_json::Value> {
-        assert_eq!(pin.kind, OwnedKind::Instance);
-        Ok(self.instance.clone())
+        match pin.kind {
+            OwnedKind::Instance => Ok(self.instance.clone()),
+            OwnedKind::Prefab if self.value_only => Ok(self.prefab.clone()),
+            _ => mesh_unexpected(),
+        }
     }
     fn owned_object_bytes(
         &mut self,
@@ -756,6 +760,9 @@ impl ProjectSourcePort for SnapshotSource {
         _: u64,
     ) -> mmmm_application::AppResult<Option<PinnedOwnedObjectBytes>> {
         assert_eq!(pin.kind, OwnedKind::Prefab);
+        if self.value_only {
+            return Ok(None);
+        }
         Ok(Some(PinnedOwnedObjectBytes {
             value: self.prefab.clone(),
             bytes: self.prefab_bytes.clone(),
@@ -890,6 +897,7 @@ fn clone_snapshot_receives_original_validated_values_and_preserves_port_error() 
             prefab_bytes: prefab_bytes.clone(),
             calls: calls.clone(),
             deny,
+            value_only: false,
         };
         let mut planner = NativePlanner::new(
             Box::new(source),
@@ -934,4 +942,80 @@ fn clone_snapshot_receives_original_validated_values_and_preserves_port_error() 
             .code,
         "SOURCE_PROVENANCE_INVALID"
     );
+}
+
+#[test]
+fn value_only_prefab_preserves_opaque_shapes_and_rejects_decimal_resource_lengths() {
+    use std::{cell::Cell, rc::Rc};
+    for decimal_position in [0, 1, 2] {
+        let opaque = json!({"resourceId":"opaque-payload","sha256":"0".repeat(64),"mediaType":"application/json","sizeBytes":1.0});
+        let mut prefab = parse_json(include_bytes!("../../../examples/prefab.json")).unwrap();
+        prefab["nodes"][0]["extensions"]["test:opaque"] = opaque.clone();
+        prefab["nodes"][3]["display"]["payload"]["opaque"] = opaque.clone();
+        let geometry = prefab["resources"][0].clone();
+        prefab["nodes"][0]["geometryResource"] = geometry;
+        let size = prefab["resources"][0]["sizeBytes"].as_u64().unwrap();
+        if decimal_position == 1 {
+            prefab["resources"][0]["sizeBytes"] = json!(size as f64);
+        } else if decimal_position == 2 {
+            prefab["nodes"][0]["geometryResource"]["sizeBytes"] = json!(size as f64);
+        }
+        prefab["revision"] = json!(projected_digest("Prefab", &prefab).unwrap());
+        let mut instance = parse_json(include_bytes!("../../../examples/instance.json")).unwrap();
+        instance["prefabRevision"] = prefab["revision"].clone();
+        instance["revision"] = json!(projected_digest("Instance", &instance).unwrap());
+        let mut project = parse_json(include_bytes!("../../../examples/project.json")).unwrap();
+        for pin in project["ownedResources"].as_array_mut().unwrap() {
+            if pin["kind"] == "prefab" && pin["objectId"] == prefab["prefabId"] {
+                pin["revision"] = prefab["revision"].clone();
+            }
+            if pin["kind"] == "instance" && pin["objectId"] == instance["instanceId"] {
+                pin["revision"] = instance["revision"].clone();
+            }
+        }
+        project["revision"] = json!(projected_digest("Project", &project).unwrap());
+        let catalog = ProjectCatalog::from_project(&project).unwrap();
+        let source = SnapshotSource {
+            instance: instance.clone(),
+            prefab: prefab.clone(),
+            prefab_bytes: vec![],
+            calls: Rc::new(Cell::new(0)),
+            deny: false,
+            value_only: true,
+        };
+        let mut planner = NativePlanner::new(
+            Box::new(source),
+            Box::new(MeshEnvironment),
+            Box::new(mmmm_application::SystemClock),
+            PlannerOptions::default(),
+        )
+        .unwrap();
+        let mut sources = crate::preparation::Sources::default();
+        let result = planner.instance_source(
+            &mmmm_contracts::PrincipalId::new("principal-value-test").unwrap(),
+            &catalog,
+            instance["instanceId"].as_str().unwrap(),
+            Some(&instance["revision"]),
+            &json!({}),
+            &mut sources,
+        );
+        if decimal_position != 0 {
+            assert_eq!(result.unwrap_err().code, "CAPABILITY_UNAVAILABLE");
+        } else {
+            let (_, definition) = result.unwrap();
+            let output = wire("Prefab", &definition).unwrap();
+            assert_eq!(output["nodes"][0]["extensions"]["test:opaque"], opaque);
+            assert_eq!(output["nodes"][3]["display"]["payload"]["opaque"], opaque);
+            assert!(
+                output["nodes"][0]["extensions"]["test:opaque"]["sizeBytes"]
+                    .as_u64()
+                    .is_none()
+            );
+            assert!(
+                output["nodes"][3]["display"]["payload"]["opaque"]["sizeBytes"]
+                    .as_u64()
+                    .is_none()
+            );
+        }
+    }
 }
