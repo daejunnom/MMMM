@@ -4291,3 +4291,14 @@ OwnedPlanningData는 구조 편집을 거절하며, 검사는 그 거절을 확�
 테스트 fixture로 제공한다. 원 decimal Prefab과 Physics bytes·pin, 변형된 body/collider 및
 binding, resource pin과 다른 selection ID의 거절을 검사한다. 이는 scene.plan Service·운영
 SourceAdmission·physics mesh geometry 또는 게임 성공의 증거가 아니며 실행은 후속 CI 대상이다.
+
+PhysicsDefinition의 collider mesh가 Prefab 자원 목록에 중복 선언되지 않은 경우에도
+계획 projection에 해당 ResourceRef를 수집하고 기존 자원 접근·실제 bytes 검증 및
+source pin 경로를 사용하도록 했다. 동일 ID의 digest·media type·길이 불일치는
+거절하며 수신 projection에서도 필수 mesh pin을 대조한다. 구조 변경은 variant에서
+collider가 제거되기 전에 원 정의의 mesh 참조를 검사한다. 원 CAS 숫자 표기의 증거를
+아직 연결하지 않아 mesh `sizeBytes`가 Value에서 정수형이 아닌 경우 `1.0`을 포함해
+거절한다. 구조 경로의 여러 오류 순서 및 중복 읽기 예산 계상은 달라질 수 있다.
+동기 스키마 검사는 강제 중단 가능한 시간 상한이 아니며 정의를 여러 차례 검사할 수
+있다. 통제된 포트의 양성·실패 회귀를 작성했으나 실제 실행 결과는 후속 CI에서
+확인한다. 실제 production 권한·CAS 연결, 완성 plan 및 게임 물리 인수 증거는 아니다.

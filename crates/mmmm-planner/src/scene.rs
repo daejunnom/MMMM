@@ -2,7 +2,8 @@
 //! selected instance changes its definition pin; shared originals remain owned
 //! and unchanged. Source DTOs carry data, never authorization or bake evidence.
 use crate::preparation::{
-    Sources, append_instance, dependency, document, revise_instance, same_resource,
+    Sources, append_instance, dependency, document, physics_mesh_resources, revise_instance,
+    same_resource,
 };
 use crate::*;
 use mmmm_application::{AppError, AppResult};
@@ -505,12 +506,8 @@ impl NativePlanner<'_> {
                     .validate_selection_index(selection.physics_index())
                     .map_err(exchange)?;
             }
-            for collider in array(&value, "colliders")? {
-                if collider["shape"]["shape"]["kind"] == "mesh" {
-                    let resource: ResourceRef =
-                        decode("ResourceRef", &collider["shape"]["shape"]["geometry"])?;
-                    self.load_resource(principal, project, &resource, context, sources)?;
-                }
+            for resource in physics_mesh_resources(&value)? {
+                self.load_resource(principal, project, &resource, context, sources)?;
             }
             // A bound body must actually own this qualified visual node. Having
             // the same body label in a different definition proves nothing.
@@ -2130,6 +2127,88 @@ mod tests {
             .code,
             "ID_COLLISION"
         );
+    }
+
+    #[test]
+    fn variant_source_rejects_decimal_mesh_even_if_variant_would_drop_it() {
+        use crate::tests::{MeshEnvironment, MeshReadMode, MeshSource};
+        use std::{cell::Cell, rc::Rc};
+
+        let (before, mut original, _, _) = source();
+        original.command_module_ids.clear();
+        original.clip_ids.clear();
+        original
+            .nodes
+            .iter_mut()
+            .find(|node| node.node_id.as_str() == "door")
+            .unwrap()
+            .physics_binding = Some(mmmm_domain::types::PhysicsBinding {
+            physics_id: PhysicsId::new("physics-door").unwrap(),
+            body_id: mmmm_contracts::BodyId::new("body-door").unwrap(),
+        });
+        let candidate = original.clone();
+        let mut physics: Value =
+            serde_json::from_str(include_str!("../../../examples/physics-definition.json"))
+                .unwrap();
+        let mesh = ResourceRef {
+            resource_id: mmmm_contracts::ResourceId::new("resource-physics-mesh").unwrap(),
+            sha256: mmmm_contracts::raw_digest(b"mesh"),
+            media_type: "application/octet-stream".into(),
+            size_bytes: 4,
+        };
+        let mut body = physics["bodies"][0].clone();
+        body["bodyId"] = json!("body-extra");
+        body["visualBindings"] = json!([]);
+        body["colliderIds"] = json!(["collider-extra"]);
+        physics["bodies"].as_array_mut().unwrap().push(body);
+        let mut collider = physics["colliders"][0].clone();
+        collider["colliderId"] = json!("collider-extra");
+        collider["bodyId"] = json!("body-extra");
+        collider["shape"]["shape"] =
+            json!({"kind":"mesh","geometry":mesh,"topologyDigest":"0".repeat(64)});
+        collider["shape"]["shape"]["geometry"]["sizeBytes"] = json!(4.0);
+        physics["colliders"].as_array_mut().unwrap().push(collider);
+        physics["revision"] = json!(projected_digest("PhysicsDefinition", &physics).unwrap());
+        let filtered = physics_variant(&physics, &before.instance_id, &candidate)
+            .unwrap()
+            .unwrap();
+        assert_eq!(filtered["colliders"].as_array().unwrap().len(), 1);
+        assert_eq!(filtered["colliders"][0]["colliderId"], "collider-door");
+
+        let mut project: Value =
+            serde_json::from_str(include_str!("../../../examples/project.json")).unwrap();
+        project["ownedResources"].as_array_mut().unwrap().push(json!({"kind":"physics_definition","objectId":"physics-door","revision":physics["revision"]}));
+        project["revision"] = json!(projected_digest("Project", &project).unwrap());
+        let catalog = ProjectCatalog::from_project(&project).unwrap();
+        let reads = Rc::new(Cell::new(0));
+        let source = MeshSource {
+            physics,
+            mesh,
+            mode: MeshReadMode::Allowed,
+            reads: reads.clone(),
+        };
+        let mut planner = NativePlanner::new(
+            Box::new(source),
+            Box::new(MeshEnvironment),
+            Box::new(mmmm_application::SystemClock),
+            PlannerOptions::default(),
+        )
+        .unwrap();
+        let mut sources = Sources::default();
+        let error = planner
+            .variant_sources(
+                &PrincipalId::new("principal-mesh-test").unwrap(),
+                &catalog,
+                &json!({}),
+                &mut sources,
+                &before,
+                &original,
+                &candidate,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
+        assert_eq!(reads.get(), 0);
     }
 
     #[test]

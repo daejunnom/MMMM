@@ -521,6 +521,19 @@ fn validate_projection_closure(projection: &InstanceProjection) -> AppResult<()>
         .iter()
         .map(|resource| (&resource.resource_id, resource))
         .collect();
+    for physics in &projection.physics_definitions {
+        for required in crate::preparation::physics_mesh_resources(physics)? {
+            if resources
+                .get(&required.resource_id)
+                .is_none_or(|actual| !crate::preparation::same_resource(actual, &required))
+            {
+                return Err(AppError::new(
+                    "REFERENCE_UNRESOLVED",
+                    "Prepared projection lacks its exact physics mesh resource pin",
+                ));
+            }
+        }
+    }
     if resources.len() != projection.resource_pins.len()
         || projection.definition.resources.iter().any(|required| {
             resources
@@ -584,6 +597,75 @@ mod allocation_tests {
         let bytes_before = writer.bytes.clone();
         assert!(std::io::Write::write(&mut writer, &[0; 41]).is_err());
         assert_eq!(writer.bytes, bytes_before);
+    }
+
+    #[test]
+    fn receiver_requires_exact_physics_mesh_resource_and_valid_shape() {
+        let prefab =
+            mmmm_contracts::parse_json(include_bytes!("../../../examples/prefab.json")).unwrap();
+        let instance =
+            mmmm_contracts::parse_json(include_bytes!("../../../examples/instance.json")).unwrap();
+        let module =
+            mmmm_contracts::parse_json(include_bytes!("../../../examples/command-module.json"))
+                .unwrap();
+        let clip =
+            mmmm_contracts::parse_json(include_bytes!("../../../examples/animation-clip.json"))
+                .unwrap();
+        let mut definition: Prefab = crate::decode("Prefab", &prefab).unwrap();
+        definition
+            .nodes
+            .iter_mut()
+            .find(|node| node.node_id.as_str() == "door")
+            .unwrap()
+            .physics_binding = Some(mmmm_domain::types::PhysicsBinding {
+            physics_id: mmmm_contracts::PhysicsId::new("physics-door").unwrap(),
+            body_id: mmmm_contracts::BodyId::new("body-door").unwrap(),
+        });
+        let mesh = ResourceRef {
+            resource_id: ResourceId::new("resource-physics-mesh").unwrap(),
+            sha256: mmmm_contracts::raw_digest(b"mesh"),
+            media_type: "application/octet-stream".into(),
+            size_bytes: 4,
+        };
+        let mut physics =
+            mmmm_contracts::parse_json(include_bytes!("../../../examples/physics-definition.json"))
+                .unwrap();
+        physics["colliders"][0]["shape"]["shape"] =
+            serde_json::json!({"kind":"mesh","geometry":mesh,"topologyDigest":"0".repeat(64)});
+        let mut projection = InstanceProjection {
+            before: None,
+            before_definition: None,
+            after: crate::decode("Instance", &instance).unwrap(),
+            resource_pins: definition.resources.clone(),
+            definition,
+            command_modules: vec![crate::decode("CommandModule", &module).unwrap()],
+            clips: vec![crate::decode("AnimationClip", &clip).unwrap()],
+            physics_definitions: vec![physics],
+        };
+        assert_eq!(
+            validate_projection_closure(&projection).unwrap_err().code,
+            "REFERENCE_UNRESOLVED"
+        );
+        projection.resource_pins.push(mesh.clone());
+        validate_projection_closure(&projection).unwrap();
+        let index = projection.resource_pins.len() - 1;
+        for change in 0..3 {
+            let mut altered = mesh.clone();
+            match change {
+                0 => altered.sha256 = mmmm_contracts::raw_digest(b"other"),
+                1 => altered.media_type = "application/json".into(),
+                _ => altered.size_bytes += 1,
+            }
+            projection.resource_pins[index] = altered;
+            assert_eq!(
+                validate_projection_closure(&projection).unwrap_err().code,
+                "REFERENCE_UNRESOLVED"
+            );
+        }
+        projection.resource_pins[index] = mesh;
+        projection.physics_definitions[0]["colliders"][0]["shape"]["shape"]["kind"] =
+            serde_json::json!("unknown");
+        assert!(validate_projection_closure(&projection).is_err());
     }
 
     #[test]

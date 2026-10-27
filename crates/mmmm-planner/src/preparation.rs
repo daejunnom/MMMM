@@ -397,6 +397,17 @@ impl NativePlanner<'_> {
             .cloned()
             .map(|resource| (resource.resource_id.as_str().into(), resource))
             .collect();
+        for physics in &projection.physics_definitions {
+            for resource in physics_mesh_resources(physics)? {
+                if requested
+                    .get(resource.resource_id.as_str())
+                    .is_some_and(|old| !same_resource(old, &resource))
+                {
+                    return Err(conflict());
+                }
+                requested.insert(resource.resource_id.as_str().into(), resource);
+            }
+        }
         for node in &projection.definition.nodes {
             if let Some(resource) = &node.geometry_resource {
                 if requested
@@ -854,6 +865,37 @@ impl NativePlanner<'_> {
             dependencies,
         })
     }
+}
+
+// Value-only physics reads do not carry an exact numeric-lexeme witness. Keep
+// decimal mesh lengths unsupported here rather than treating a rounded Value
+// as proof that the original bytes contained an integer. This does not assert
+// mesh codec or topology support.
+pub(crate) fn physics_mesh_resources(physics: &Value) -> AppResult<Vec<ResourceRef>> {
+    validate("PhysicsDefinition", physics)?;
+    let mut resources = BTreeMap::<String, ResourceRef>::new();
+    for collider in array(physics, "colliders")? {
+        let shape = &collider["shape"]["shape"];
+        if text(shape, "kind")? == "mesh" {
+            let geometry = &shape["geometry"];
+            if geometry["sizeBytes"].as_u64().is_none() {
+                return Err(AppError::new(
+                    "CAPABILITY_UNAVAILABLE",
+                    "Physics mesh decimal length requires an original-byte witness",
+                ));
+            }
+            let resource: ResourceRef = decode("ResourceRef", geometry)?;
+            let id = resource.resource_id.as_str().to_owned();
+            if resources
+                .get(&id)
+                .is_some_and(|old| !same_resource(old, &resource))
+            {
+                return Err(conflict());
+            }
+            resources.insert(id, resource);
+        }
+    }
+    Ok(resources.into_values().collect())
 }
 
 pub(crate) fn empty_change(project: &ProjectCatalog, kind: NativeKind) -> PreparedNativeChange {
