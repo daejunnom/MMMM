@@ -245,6 +245,80 @@ fn prepared_neutral_zip_roundtrip_is_deterministic_and_preserves_originals() {
     assert_eq!(selection(), source);
 }
 
+#[test]
+fn reflected_explicit_inertia_survives_prepare_zip_and_inspect() {
+    // The original example has no explicit inertia; this derived input makes
+    // the reflected principal-frame conversion observable in a real bundle.
+    let mut source = physics();
+    let angle = std::f64::consts::FRAC_PI_8;
+    source["bodies"][0]["inertiaPolicy"] = json!("explicit");
+    source["bodies"][0]["inertiaDiagonal"] = json!([2.0, 3.0, 4.0]);
+    source["bodies"][0]["inertiaOrientationXyzw"] = json!([0.0, 0.0, angle.sin(), angle.cos()]);
+    source["revision"] = json!(projected_digest("PhysicsDefinition", &source).unwrap());
+    let mut coordinates = source["coordinates"].clone();
+    coordinates["basisToMinecraftRowMajor"] =
+        json!([-1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    let request = json!({"contextId":"context-fixture","selection":selection(),
+        "dataSnapshotId":"snapshot-fixture","coordinates":coordinates,"physics":source});
+    let mut resources = originals();
+    let bundle = exchange_prepare(
+        &request,
+        "bundle-reflected-inertia",
+        &mut resources,
+        ArchiveLimits::default(),
+    )
+    .unwrap();
+    let working = parse_json(bundle.payload("physics/definition.json").unwrap()).unwrap();
+    let preserved =
+        parse_json(bundle.payload(normalization::SOURCE_PHYSICS_PATH).unwrap()).unwrap();
+    // The source payload preserves the input JSON value; the input's raw JSON
+    // bytes and original numeric lexemes are not part of this contract.
+    assert_eq!(preserved, request["physics"]);
+    assert_eq!(
+        coordinates::CoordinateSystem::from_value(&working["coordinates"]).unwrap(),
+        coordinates::CoordinateSystem::from_value(&request["coordinates"]).unwrap()
+    );
+    assert_eq!(
+        working["bodies"][0]["inertiaDiagonal"],
+        json!([2.0, 3.0, 4.0])
+    );
+    assert_ne!(working["revision"], request["physics"]["revision"]);
+    mmmm_contracts::verify_projected_digest("PhysicsDefinition", &working).unwrap();
+
+    let resource = resources.add(
+        "bundle",
+        "application/zip",
+        bundle.zip_bytes(ArchiveLimits::default()).unwrap(),
+    );
+    let inspected = exchange_inspect(
+        &json!({"contextId":"context-fixture","resource":resource}),
+        &mut resources,
+        ArchiveLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(inspected.bundle().manifest(), bundle.manifest());
+    assert_eq!(
+        parse_json(
+            inspected
+                .bundle()
+                .payload("physics/definition.json")
+                .unwrap()
+        )
+        .unwrap(),
+        working
+    );
+    assert_eq!(
+        parse_json(
+            inspected
+                .bundle()
+                .payload(normalization::SOURCE_PHYSICS_PATH)
+                .unwrap()
+        )
+        .unwrap(),
+        preserved
+    );
+}
+
 fn z_up_coordinates() -> Value {
     let mut value = physics()["coordinates"].clone();
     value["basisToMinecraftRowMajor"] = json!([1, 0, 0, 0, 0, 0, 1, 0, 0, -1, 0, 0, 0, 0, 0, 1]);

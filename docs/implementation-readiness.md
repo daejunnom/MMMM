@@ -4001,6 +4001,31 @@ instantiate·parent supplier·entries·후관측 호출0, default listener의 �
 request-scoped 취득의 미구현 상태를 유지한다. 실제 클라이언트 인증·pairing·시각 검증도
 `not_run`이다.
 
+### 반사 좌표계의 명시적 주관성 교환
+
+교환 준비의 물리 정규화는 반사 기저와 명시적 주관성 방향이 함께 있는 경우에도
+principal tensor를 변환한다. 상대 기저를 R, 주축 방향을 Q, 주관성의 대각 행렬을 D로
+둘 때, 반사에서는 첫 주축의 부호를 뒤집는 고정 F = diag(-1,1,1)을 오른쪽에 적용해
+`Q' = R Q F`의 오른손 직교 프레임을 quaternion으로 기록한다. `F D Fᵀ = D`이므로
+주관성 모멘트의 순서·SI 크기와 변환된 tensor를 보존한다. 역반사에도 같은 F를 적용해
+원 주축 프레임을 수치 허용오차 안에서 복원한다. 부동소수점 재구성은 bit-exact 보장이
+아니며, 고정 부호 선택은 물리 tensor의 동등한 표현 규칙이다.
+
+기존 예제에서 유도한 비등방 주관성과 기울어진 주축을 사용해 독립 행렬 기대값,
+quaternion의 부호 동치·왕복, 허용된 근단위 입력을 검사하도록 작성했다. 별도의 기존
+fixture로 실제 `exchange.prepare → ZIP → exchange.inspect`와 원 PhysicsDefinition JSON
+값·working revision을 검사한다. 입력 원문의 raw bytes나 숫자 lexeme 보존을 주장하지
+않는다. joint 축 codec·mesh codec·비직교 기저와 지원하지 않는 primitive 축의 기존
+거절은 유지한다. 실제 외부 solver와 게임 인수는 별도다.
+
+Windows 관리 실행에서 두 Rust source의 stdin 포맷과 사후 digest, 정상 drain·export·
+scratch 제거·lease 해제를 확인했다. 그 뒤 `mmmm-exchange` 전체 테스트를 현재 Windows
+환경에서 시도했으나 Cargo가 `num-traits` build script를 실행하기 전에 Application
+Control 오류 4551로 차단해 command 101로 종료했다. 테스트는 시작되지 않았다. 원 stdout·
+stderr와 process/finish 기록, 실제 drain·export·scratch 제거·lease 해제 및 감독/정리
+오류 0을 보존한다. 이 실패를 코드 테스트 실패나 성공으로 재분류하지 않으며 해당 source의
+실제 테스트와 후속 CI 결과는 따로 확인한다.
+
 ## 첫 공개 배포 인수
 
 - [ ] 최종 고정 SHA와 정확한 게임 및 호스트 target profile을 식별한다.

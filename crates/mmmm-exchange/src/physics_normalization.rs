@@ -1,6 +1,7 @@
 //! Derive a physics revision in another declared coordinate system. The source
-//! bytes and authored SI quantities remain intact; unsupported geometry and
-//! joint-axis codecs are rejected before a derivative is returned.
+//! JSON value and authored SI quantities remain intact; original raw input bytes
+//! are not retained here. Unsupported geometry and joint-axis codecs are
+//! rejected before a derivative is returned.
 
 use crate::{
     ExchangeError, ExchangeResult,
@@ -54,7 +55,6 @@ pub fn normalize_physics(input: &Value, target: &CoordinateSystem) -> ExchangeRe
             "primitive and principal-inertia normalization cannot discard nonorthogonal basis components",
         ));
     }
-    let reflected = determinant < 0.0;
     let permutation = signed_permutation(relative.values());
     let distance_ratio = distance_scale(source) / distance_scale(target);
     if !distance_ratio.is_finite() || distance_ratio <= 0.0 {
@@ -65,13 +65,6 @@ pub fn normalize_physics(input: &Value, target: &CoordinateSystem) -> ExchangeRe
         return Err(unavailable(
             "joint basis conversion requires a declared solver joint-axis codec",
         ));
-    }
-    for body in definition.bodies() {
-        if reflected && body.inertia_orientation_xyzw.is_some() {
-            return Err(unavailable(
-                "reflected principal inertia orientation requires an explicit principal-axis codec",
-            ));
-        }
     }
     for collider in crate::array(input, "colliders")? {
         match collider["shape"]["shape"]["kind"].as_str() {
@@ -118,6 +111,11 @@ pub fn normalize_physics(input: &Value, target: &CoordinateSystem) -> ExchangeRe
             // The moments retain their principal-axis ordering and kg·m²
             // magnitude. Their eigenvectors therefore change by R*Q, not
             // R*Q*R^-1, which would require transforming the diagonal too.
+            // For an improper R, the first principal eigenvector is negated
+            // so that the quaternion describes a proper right-handed frame.
+            // In exact arithmetic its sign does not change the tensor or moment
+            // ordering. A reverse reflection recovers the original frame up to
+            // floating-point error and the quaternion's q/-q equivalence.
             body["inertiaOrientationXyzw"] =
                 json!(principal_orientation(&relative, quaternion(orientation)?)?);
         }
@@ -237,7 +235,14 @@ fn principal_orientation(relative: &Matrix4, orientation: [f64; 4]) -> ExchangeR
     .matrix()
     .map_err(transform_error)?;
     let matrix = relative.multiply(&authored).map_err(transform_error)?;
-    let m = matrix.values();
+    let mut m = *matrix.values();
+    if determinant3(relative.values()) < 0.0 {
+        // R*Q is improper. Right-multiply by F=diag(-1,1,1): flipping one
+        // eigenvector preserves (R*Q)*D*(R*Q)^T while making R*Q*F proper.
+        for index in [0, 4, 8] {
+            m[index] = -m[index];
+        }
+    }
     let trace = m[0] + m[5] + m[10];
     let quaternion = if trace > 0.0 {
         let s = 2.0 * (trace + 1.0).sqrt();
@@ -492,6 +497,148 @@ mod tests {
             result["colliders"][0]["shape"]["provenance"],
             "user_declared"
         );
+    }
+
+    #[test]
+    fn reflected_explicit_inertia_preserves_the_tensor_and_restores_the_principal_frame() {
+        // The original example has no explicit inertia. Distinct moments and a
+        // non-axis-aligned principal frame expose both axis ordering and sign.
+        let mut input = physics();
+        let angle = std::f64::consts::FRAC_PI_8;
+        let authored = [0.0, 0.0, angle.sin(), angle.cos()];
+        input["bodies"][0]["inertiaPolicy"] = json!("explicit");
+        input["bodies"][0]["inertiaDiagonal"] = json!([2.0, 3.0, 4.0]);
+        input["bodies"][0]["inertiaOrientationXyzw"] = json!(authored);
+        stamp(&mut input);
+        let source = CoordinateSystem::from_value(&input["coordinates"]).unwrap();
+        let reflected = coordinates(
+            [
+                -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+            "blocks",
+            1.0,
+        );
+        let expected = [[2.5, 0.5, 0.0], [0.5, 2.5, 0.0], [0.0, 0.0, 4.0]];
+        let mut first_tensor = None;
+        for sign in [1.0, -1.0] {
+            input["bodies"][0]["inertiaOrientationXyzw"] = json!(authored.map(|v| sign * v));
+            stamp(&mut input);
+            let before = input.clone();
+            let result = normalize_physics(&input, &reflected).unwrap();
+            assert_eq!(input, before);
+            assert_eq!(
+                result["bodies"][0]["inertiaDiagonal"],
+                json!([2.0, 3.0, 4.0])
+            );
+            assert_ne!(result["revision"], input["revision"]);
+            verify_projected_digest("PhysicsDefinition", &result).unwrap();
+            let actual = inertia_tensor(
+                quaternion(&result["bodies"][0]["inertiaOrientationXyzw"]).unwrap(),
+                [2.0, 3.0, 4.0],
+            );
+            for (row, expected_row) in actual.into_iter().zip(expected) {
+                close(row, expected_row);
+            }
+            if let Some(first) = first_tensor {
+                for (row, reference) in actual.into_iter().zip(first) {
+                    close(row, reference);
+                }
+            } else {
+                first_tensor = Some(actual);
+            }
+            let restored = normalize_physics(&result, &source).unwrap();
+            let restored_q = quaternion(&restored["bodies"][0]["inertiaOrientationXyzw"]).unwrap();
+            let overlap: f64 = restored_q
+                .into_iter()
+                .zip(authored)
+                .map(|(a, b)| a * b)
+                .sum();
+            assert!((overlap.abs() - 1.0).abs() < 1e-9);
+            assert_eq!(
+                restored["bodies"][0]["inertiaDiagonal"],
+                json!([2.0, 3.0, 4.0])
+            );
+        }
+    }
+
+    // Independent tensor construction: I_ij = sum_k R_ik D_k R_jk. This
+    // does not use principal_orientation or the production matrix converter.
+    fn inertia_tensor([x, y, z, w]: [f64; 4], moments: [f64; 3]) -> [[f64; 3]; 3] {
+        let rotation = [
+            [
+                1.0 - 2.0 * (y * y + z * z),
+                2.0 * (x * y - z * w),
+                2.0 * (x * z + y * w),
+            ],
+            [
+                2.0 * (x * y + z * w),
+                1.0 - 2.0 * (x * x + z * z),
+                2.0 * (y * z - x * w),
+            ],
+            [
+                2.0 * (x * z - y * w),
+                2.0 * (y * z + x * w),
+                1.0 - 2.0 * (x * x + y * y),
+            ],
+        ];
+        let mut tensor = [[0.0; 3]; 3];
+        for (row, output_row) in tensor.iter_mut().enumerate() {
+            for (column, entry) in output_row.iter_mut().enumerate() {
+                *entry = (0..3)
+                    .map(|axis| rotation[row][axis] * moments[axis] * rotation[column][axis])
+                    .sum();
+            }
+        }
+        tensor
+    }
+
+    #[test]
+    fn reflected_near_unit_inertia_retains_tensor_within_floating_point_tolerance() {
+        // The contract accepts a length error of up to 1e-9. Matrix-to-rotation
+        // conversion of such an input can change its nonorthogonal residue, so
+        // tensor comparison is bounded; the original JSON stays separate.
+        let mut input = physics();
+        let authored = [0.0, 0.0, 0.6, 0.8000000008];
+        input["bodies"][0]["inertiaPolicy"] = json!("explicit");
+        input["bodies"][0]["inertiaDiagonal"] = json!([2.0, 3.0, 4.0]);
+        input["bodies"][0]["inertiaOrientationXyzw"] = json!(authored);
+        stamp(&mut input);
+        let source = CoordinateSystem::from_value(&input["coordinates"]).unwrap();
+        let reflected = coordinates(
+            [
+                -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+            "blocks",
+            1.0,
+        );
+        let source_tensor = inertia_tensor(authored, [2.0, 3.0, 4.0]);
+        let result = normalize_physics(&input, &reflected).unwrap();
+        let actual = inertia_tensor(
+            quaternion(&result["bodies"][0]["inertiaOrientationXyzw"]).unwrap(),
+            [2.0, 3.0, 4.0],
+        );
+        for (row, values) in actual.iter().enumerate() {
+            for (column, observed) in values.iter().enumerate() {
+                let sign = if (row == 0) != (column == 0) {
+                    -1.0
+                } else {
+                    1.0
+                };
+                let expected = sign * source_tensor[row][column];
+                assert!((*observed - expected).abs() <= 1e-8 * expected.abs().max(1.0));
+            }
+        }
+        let restored = normalize_physics(&result, &source).unwrap();
+        let restored_q = quaternion(&restored["bodies"][0]["inertiaOrientationXyzw"]).unwrap();
+        let dot: f64 = restored_q
+            .into_iter()
+            .zip(authored)
+            .map(|(a, b)| a * b)
+            .sum();
+        let sign = if dot < 0.0 { -1.0 } else { 1.0 };
+        for (actual, expected) in restored_q.into_iter().zip(authored) {
+            assert!((sign * actual - expected).abs() <= 1e-8);
+        }
     }
 
     #[test]
